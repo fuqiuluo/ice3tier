@@ -45,7 +45,7 @@ export function AddNodeDialog({ network, open, onClose }: AddNodeDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? undefined : void requestClose())}>
-      <DialogContent title={t.addNode.title} dismissible={!state.tokenOutstanding} className="max-w-2xl">
+      <DialogContent title={t.addNode.title} dismissible={!state.tokenOutstanding} className="md:max-w-2xl">
         <DialogBody>
           {/* 每次打开都是一份新的状态：上一次生成的令牌不会留在这里。 */}
           {open ? <AddNodeFlow network={network} onStateChange={setState} onNavigate={close} /> : null}

@@ -17,9 +17,15 @@ interface PageHeaderProps {
  */
 export function PageHeader({ title, description, actions, className }: PageHeaderProps) {
   return (
-    <header data-page-header className={cn('flex shrink-0 items-center justify-between gap-6 pt-7 pb-6', className)}>
+    <header
+      data-page-header
+      className={cn(
+        'flex shrink-0 flex-wrap items-center justify-between gap-x-6 gap-y-3 pt-5 pb-4 md:pt-7 md:pb-6',
+        className,
+      )}
+    >
       <div className="min-w-0">
-        <h1 className="flex items-center gap-2.5 text-[22px] leading-[30px] font-bold tracking-tight text-balance">
+        <h1 className="flex items-center gap-2.5 text-xl leading-7 font-bold tracking-tight text-balance md:text-[22px] md:leading-[30px]">
           {title}
         </h1>
         {description !== undefined ? (
@@ -32,7 +38,8 @@ export function PageHeader({ title, description, actions, className }: PageHeade
 }
 
 /**
- * 页面的内容区：铺满面板，左右留 32 像素，不限制宽度；至少和面板一样高。
+ * 页面的内容区：铺满面板，左右留 32 像素（窄屏上 16），不限制宽度；至少和面板一样高。
+ * 它是一个容器（`@container`）：里面的版面按它的宽度变（`@2xl:` 这类），而不是按窗口的宽度，侧栏收起、展开都对。
  *
  * `fill` 的页面是一个竖着排的弹性盒子：里面要占满剩下高度的那一块（画图的画布）写 `flex-1`，
  * 而不是给它一个写死的高度。
@@ -50,7 +57,7 @@ export function Page({
     // 没有标题区的页面（节点详情）自己从面板顶上留出一段。
     <div
       className={cn(
-        'min-h-full w-full px-8 pb-8 [&>:not([data-page-header]):first-child]:mt-7',
+        '@container min-h-full w-full px-4 pb-6 md:px-8 md:pb-8 [&>:not([data-page-header]):first-child]:mt-5 md:[&>:not([data-page-header]):first-child]:mt-7',
         fill && 'flex flex-col',
         className,
       )}

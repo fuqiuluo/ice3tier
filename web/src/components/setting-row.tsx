@@ -42,7 +42,7 @@ export function SettingRow({
       </p>
     ) : null
   const name = (
-    <div className="min-w-0">
+    <div className="min-w-32 flex-1">
       <div className="flex items-center gap-1.5 text-sm">
         {htmlFor !== undefined ? <label htmlFor={htmlFor}>{label}</label> : <span id={labelId}>{label}</span>}
         {hint !== undefined ? <InfoTip>{hint}</InfoTip> : null}
@@ -65,9 +65,10 @@ export function SettingRow({
   }
   return (
     <div className={cn('px-5 py-2.5', className)}>
-      <div className="flex min-h-9 items-center justify-between gap-4">
+      {/* 控件和名字一行放不下时（窄屏上的输入框、分段切换）换到名字下面。 */}
+      <div className="flex min-h-9 flex-wrap items-center justify-between gap-x-4 gap-y-2">
         {name}
-        <div className="shrink-0">{children}</div>
+        <div className="max-w-full shrink-0">{children}</div>
       </div>
       {problem}
     </div>

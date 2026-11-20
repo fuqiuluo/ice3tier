@@ -35,6 +35,8 @@ export const nav: Messages['nav'] = {
   settings: 'Settings',
   collapse: 'Collapse sidebar',
   expand: 'Expand sidebar',
+  openMenu: 'Open navigation',
+  closeMenu: 'Close navigation',
   toggleGroup: (name, open) => `${open ? 'Collapse' : 'Expand'} ${name}`,
   signOut: 'Sign out',
   skipToContent: 'Skip to content',

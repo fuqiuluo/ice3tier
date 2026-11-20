@@ -6,12 +6,17 @@ import { toast } from '@/components/ui/toast'
 import { Tooltip } from '@/components/ui/tooltip'
 import { t } from '@/i18n'
 import { copyText } from '@/lib/clipboard'
+import { matchesMedia, NO_HOVER } from '@/lib/useMediaQuery'
 import { cn } from '@/lib/utils'
 
 /** 点过之后"已复制"保持多久。 */
 const COPIED_MS = 2000
 
-function useCopy(value: string): { copied: boolean; copy: () => void } {
+/**
+ * `quiet`：复制成功只在原地变一下（图标、悬停的说明）。触屏上没有悬停，原地那一下又常常看不到（手指挡着、图标藏着），
+ * 所以再弹一条通知；按钮上本来就写着"已复制"的不用。
+ */
+function useCopy(value: string, { quiet = false }: { quiet?: boolean } = {}): { copied: boolean; copy: () => void } {
   const [copied, setCopied] = useState(false)
 
   useEffect(() => {
@@ -22,8 +27,12 @@ function useCopy(value: string): { copied: boolean; copy: () => void } {
 
   const copy = () => {
     void copyText(value).then((ok) => {
-      if (ok) setCopied(true)
-      else toast.error(t.common.copyFailed)
+      if (!ok) {
+        toast.error(t.common.copyFailed)
+        return
+      }
+      setCopied(true)
+      if (quiet && matchesMedia(NO_HOVER)) toast.success(t.common.copied)
     })
   }
   return { copied, copy }
@@ -46,7 +55,7 @@ export function CopyButton({
   className,
   ...props
 }: CopyButtonProps) {
-  const { copied, copy } = useCopy(value)
+  const { copied, copy } = useCopy(value, { quiet: children === undefined })
   const Icon = copied ? Check : Copy
   if (children === undefined) {
     return (
@@ -84,7 +93,7 @@ interface CopyTextProps {
 
 /** 一个点一下就复制的值：虚拟 IP、名字、地址端口。 */
 export function CopyText({ value, children, mono = true, wrap = false, className }: CopyTextProps) {
-  const { copied, copy } = useCopy(value)
+  const { copied, copy } = useCopy(value, { quiet: true })
   return (
     <Tooltip content={copied ? t.common.copied : t.common.clickToCopy}>
       <button

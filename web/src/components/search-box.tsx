@@ -29,7 +29,7 @@ export function SearchBox({ value, onChange, placeholder, className }: SearchBox
   }, [])
 
   return (
-    <div className={cn('relative w-72', className)}>
+    <div className={cn('relative w-full sm:w-72', className)}>
       <Search
         className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-faint"
         aria-hidden
@@ -44,11 +44,11 @@ export function SearchBox({ value, onChange, placeholder, className }: SearchBox
         aria-keyshortcuts="Control+K"
         autoComplete="off"
         spellCheck={false}
-        className={cn(fieldBase, 'h-9 pr-14 pl-8.5 [&::-webkit-search-cancel-button]:hidden')}
+        className={cn(fieldBase, 'h-9 pr-3 pl-8.5 pointer-fine:pr-14 [&::-webkit-search-cancel-button]:hidden')}
       />
       <kbd
         aria-hidden
-        className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 rounded-sm bg-muted px-1 font-sans text-[11px] text-muted-foreground"
+        className="pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 rounded-sm bg-muted px-1 font-sans text-[11px] text-muted-foreground pointer-fine:block"
       >
         {t.common.searchShortcut}
       </kbd>

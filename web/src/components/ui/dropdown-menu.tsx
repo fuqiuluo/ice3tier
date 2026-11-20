@@ -26,7 +26,11 @@ function DropdownMenuContent({
         align={align}
         sideOffset={sideOffset}
         collisionPadding={8}
-        className={cn('z-50 min-w-40 rounded-xl bg-popover p-1 text-popover-foreground shadow-pop', POP, className)}
+        className={cn(
+          'z-50 max-w-[calc(100vw-1rem)] min-w-40 rounded-xl bg-popover p-1 text-popover-foreground shadow-pop',
+          POP,
+          className,
+        )}
         {...props}
       />
     </MenuPrimitive.Portal>

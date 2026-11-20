@@ -34,6 +34,8 @@ export const nav = {
   settings: '设置',
   collapse: '收起侧栏',
   expand: '展开侧栏',
+  openMenu: '打开导航',
+  closeMenu: '关闭导航',
   toggleGroup: (name: string, open: boolean) => `${open ? '收起' : '展开'}${name}`,
   signOut: '退出登录',
   skipToContent: '跳到正文',

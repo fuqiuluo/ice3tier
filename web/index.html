@@ -7,6 +7,16 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>ice3tier</title>
     <script>
+      // iOS 在输入框的字小于 16 像素时，聚焦会把整页放大。界面的字是 14 像素，所以在 iOS 上不让它自动放大；
+      // 双指缩放照常能用（iOS 不理会这个上限）。别的系统不加：那里没有这个毛病，加了反而缩放不了。
+      if (
+        /iP(hone|ad|od)/.test(navigator.userAgent) ||
+        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+      ) {
+        document.querySelector('meta[name="viewport"]').content += ', maximum-scale=1'
+      }
+    </script>
+    <script>
       // 页面画出来之前定下亮色还是暗色，和 src/lib/theme.ts 的规则一样：打开时不先闪一下白。
       try {
         var theme = JSON.parse(localStorage.getItem('i3t.theme') || '"system"')

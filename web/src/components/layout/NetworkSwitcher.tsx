@@ -54,7 +54,7 @@ export function NetworkSwitcher({ networks, current, onSignOut }: NetworkSwitche
     <DropdownMenu>
       <DropdownMenuTrigger
         aria-label={`${t.switcher.label}（${t.switcher.current}：${current.name}）`}
-        className="flex h-8 max-w-48 items-center gap-1.5 rounded-lg px-2 text-sm font-medium text-foreground/85 transition-colors outline-none hover:bg-foreground/[0.05] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-foreground/[0.06] data-[state=open]:text-foreground"
+        className="flex h-9 max-w-40 items-center gap-1.5 rounded-lg px-2 text-sm md:h-8 md:max-w-48 font-medium text-foreground/85 transition-colors outline-none hover:bg-foreground/[0.05] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-foreground/[0.06] data-[state=open]:text-foreground"
       >
         <NetworkIcon className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden />
         <span className="min-w-0 truncate">{current.name}</span>

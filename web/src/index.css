@@ -220,6 +220,12 @@
 
   --animate-rise: rise 160ms ease-out;
   --animate-fade: fade 140ms ease-out;
+  --animate-fade-out: fade-out 140ms ease-in forwards;
+  /* 窄屏上的抽屉（导航）从左边滑进来；从底边升起来的面板（对话框）从下面滑上来。关上时原路回去。 */
+  --animate-drawer-in: drawer-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-drawer-out: drawer-out 160ms cubic-bezier(0.4, 0, 1, 1) forwards;
+  --animate-sheet-in: sheet-in 260ms cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-sheet-out: sheet-out 160ms cubic-bezier(0.4, 0, 1, 1) forwards;
   --animate-flash: flash 1400ms ease-out;
   /*
    * 从一个按钮弹出来的东西（菜单、弹出层）：打开时从按钮那一侧长出来——淡入、放大、朝外挪几个像素，
@@ -288,6 +294,46 @@
       opacity: 1;
     }
   }
+  @keyframes fade-out {
+    from {
+      opacity: 1;
+    }
+    to {
+      opacity: 0;
+    }
+  }
+  @keyframes drawer-in {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(0);
+    }
+  }
+  @keyframes drawer-out {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(-100%);
+    }
+  }
+  @keyframes sheet-in {
+    from {
+      transform: translateY(100%);
+    }
+    to {
+      transform: translateY(0);
+    }
+  }
+  @keyframes sheet-out {
+    from {
+      transform: translateY(0);
+    }
+    to {
+      transform: translateY(100%);
+    }
+  }
   @keyframes flash {
     0% {
       background-color: rgb(42 91 215 / 0.12);
@@ -306,12 +352,13 @@
   html {
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+    /* 手机上点一下不闪那块灰：按下去的样子由部件自己画。 */
+    -webkit-tap-highlight-color: transparent;
   }
 
-  /* 桌面优先：窄于 960 像素时出现横向滚动条，而不是把表格挤坏。手机不在目标之内。 */
+  /* 窄屏（手机）上外壳换一种排法：侧栏收进抽屉，正文铺满；宽的表格在自己那一块里横向滚动，页面本身不横向滚动。 */
   body {
     margin: 0;
-    min-width: 960px;
     background: var(--background);
     color: var(--foreground);
     font-family: var(--font-sans);
@@ -375,6 +422,97 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/*
+ * 窄的地方，表格的一行排成一块（`<Table stack>`，见 components/table.tsx）：名字那一格和行末的开关、菜单在第一行，
+ * 其余的格子一格一行，左边写着它的表头。同一份内容，只是换了排法；表头不画出来，读屏软件照样读得到。
+ * 按表格自己那一块的宽度算，不是窗口的：窄屏上、或者表格放在半宽的卡片里时都这样排。
+ * 这些规则不在层里，所以压过格子上写的间距、对齐和高度。
+ */
+@container table (width < 42rem) {
+  table[data-stack],
+  table[data-stack] > tbody {
+    display: block;
+  }
+
+  table[data-stack] > thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  table[data-stack] > tbody > tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.375rem 0.75rem;
+    height: auto;
+    padding: 0.875rem 0.75rem;
+  }
+
+  table[data-stack] > tbody > tr > td {
+    display: block;
+    order: 3;
+    flex: 0 0 100%;
+    width: auto;
+    min-width: 0;
+    padding: 0;
+    text-align: start;
+    white-space: normal;
+  }
+
+  /* 第一行：名字占满剩下的地方，右边是开关、菜单。 */
+  table[data-stack] > tbody > tr > td[data-cell='main'] {
+    order: 0;
+    flex: 1 1 0;
+  }
+
+  table[data-stack] > tbody > tr > td[data-cell='end'] {
+    order: 1;
+    flex: none;
+  }
+
+  /* 第一行到这里为止：一个不占高度的整行，后面的格子从下一行开始。 */
+  table[data-stack] > tbody > tr:has(> td[data-cell='main'])::after {
+    content: '';
+    order: 1;
+    flex: 0 0 100%;
+    height: 0;
+    margin-bottom: -0.375rem;
+  }
+
+  /* 一格一行，左边是它的表头。 */
+  table[data-stack] > tbody > tr > td[data-cell='row'] {
+    position: relative;
+    min-height: 1.3125rem;
+    padding-left: 5.5rem;
+  }
+
+  table[data-stack] > tbody > tr > td[data-cell='row']::before {
+    content: attr(data-label) / '';
+    position: absolute;
+    top: var(--stack-label-top, 0);
+    left: 0;
+    width: 5rem;
+    color: var(--muted-foreground);
+    font-size: 0.75rem;
+    line-height: 1.3125rem;
+  }
+
+  /* 几格并排在同一行里（来源 → 方向 → 目标），排在一格一行的那些前面。 */
+  table[data-stack] > tbody > tr > td[data-cell='inline'] {
+    order: 2;
+    flex: none;
+    max-width: 100%;
+  }
+
+  table[data-stack] > tbody > tr > td[data-cell='hide'] {
+    display: none;
   }
 }
 

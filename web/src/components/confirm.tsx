@@ -73,7 +73,7 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
                 confirmRef.current.focus()
               }
             }}
-            className="fixed top-1/2 left-1/2 z-[71] w-[min(30rem,calc(100vw-3rem))] -translate-x-1/2 -translate-y-1/2 animate-fade rounded-xl bg-card p-6 shadow-pop outline-none"
+            className="fixed top-1/2 left-1/2 z-[71] w-[min(30rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 animate-fade rounded-xl bg-card p-5 md:p-6 shadow-pop outline-none"
           >
             <AlertDialog.Title className="text-base font-semibold">{options?.title}</AlertDialog.Title>
             <AlertDialog.Description asChild>

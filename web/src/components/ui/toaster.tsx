@@ -37,7 +37,7 @@ function ToastView({ item }: { item: ToastItem }) {
       onFocus={() => setHeld(true)}
       onBlur={() => setHeld(false)}
       className={cn(
-        'pointer-events-auto flex w-88 animate-rise items-start gap-2.5 rounded-lg bg-card px-3.5 py-3 shadow-pop',
+        'pointer-events-auto flex w-full animate-rise items-start gap-2.5 rounded-lg bg-card px-3.5 py-3 shadow-pop md:w-88',
       )}
     >
       <Icon
@@ -76,7 +76,7 @@ export function Toaster() {
     <ol
       aria-label={t.common.notifications}
       aria-live="polite"
-      className="pointer-events-none fixed right-5 bottom-5 z-[80] flex flex-col gap-2"
+      className="pointer-events-none fixed inset-x-3 bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-[80] flex flex-col gap-2 md:inset-x-auto md:right-5 md:bottom-5"
     >
       {items.map((item) => (
         <ToastView key={item.id} item={item} />
