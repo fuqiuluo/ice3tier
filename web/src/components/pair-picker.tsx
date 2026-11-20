@@ -19,9 +19,9 @@ interface PairPickerProps {
 export function PairPicker({ nodes, pair, onChange, labels, clearLabel }: PairPickerProps) {
   const set = (key: 'a' | 'b', id: NodeId) => onChange({ ...pair, [key]: id })
   return (
-    // 窄屏上 A、B 各占一半，排成一行。
-    <div className="flex w-full flex-wrap items-end gap-2 sm:w-auto sm:gap-3">
-      <label className="flex min-w-0 flex-1 basis-28 flex-col gap-1.5 text-[13px] font-medium sm:w-60 sm:flex-none sm:basis-auto">
+    // 窄的地方 A、B 各占一半，排成一行；宽了各是固定的宽度。
+    <div className="flex w-full flex-wrap items-end gap-2 @2xl:w-auto @2xl:gap-3">
+      <label className="flex min-w-0 flex-1 basis-28 flex-col gap-1.5 text-[13px] font-medium @2xl:w-60 @2xl:flex-none @2xl:basis-auto">
         {labels.a}
         <NodeSelect nodes={nodes} value={pair.a} onChange={(id) => set('a', id)} aria-label={labels.a} />
       </label>
@@ -30,7 +30,7 @@ export function PairPicker({ nodes, pair, onChange, labels, clearLabel }: PairPi
           <ArrowLeftRight aria-hidden />
         </Button>
       </Tooltip>
-      <label className="flex min-w-0 flex-1 basis-28 flex-col gap-1.5 text-[13px] font-medium sm:w-60 sm:flex-none sm:basis-auto">
+      <label className="flex min-w-0 flex-1 basis-28 flex-col gap-1.5 text-[13px] font-medium @2xl:w-60 @2xl:flex-none @2xl:basis-auto">
         {labels.b}
         <NodeSelect nodes={nodes} value={pair.b} onChange={(id) => set('b', id)} aria-label={labels.b} />
       </label>

@@ -185,7 +185,8 @@ export function PairsPage() {
                         onCheckedChange={(keepAlive) => setKeepAlive.mutate({ pair, keepAlive })}
                       />
                     </Td>
-                    <Td cell="row" label={p.colCongestion}>
+                    {/* 下拉框比一行字高：表头往下挪一点，和它里面的字对齐。 */}
+                    <Td cell="row" label={p.colCongestion} className="[--stack-label-top:0.375rem]">
                       <NativeSelect
                         aria-label={p.congestionSelect(a, b)}
                         className="h-8 w-36 text-[13px]"

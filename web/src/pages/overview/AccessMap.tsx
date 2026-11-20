@@ -204,7 +204,8 @@ function TargetView({ data }: NodeProps<TargetNode>) {
           data.width < MAP_SIZE.target.width ? 'gap-2.5 px-2.5' : 'gap-3 px-3',
         )}
       >
-        <IconBox kind="group" online={null} />
+        {/* 很窄的屏幕上这一块只有一百来像素：不画图标，把地方留给名字。 */}
+        {data.width >= 128 ? <IconBox kind="group" online={null} /> : null}
         <span className="min-w-0 flex-1">
           <span className="block truncate text-sm leading-5 font-medium">{target.group.name}</span>
           <span className="block truncate text-[13px] leading-[18px] text-muted-foreground tabular">

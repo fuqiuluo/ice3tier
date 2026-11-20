@@ -293,7 +293,7 @@ export function GroupsPage() {
                       ) : null}
                     </span>
                   </Td>
-                  <Td cell="row" label={g.colNodes}>
+                  <Td cell="row" label={g.colNodes} className="[--stack-label-top:0.3rem]">
                     {/* 成员和节点页的"分组"一样：点开改。All 的成员是全部节点，只能看。 */}
                     {group.builtin ? (
                       <NodeList nodes={group.nodes} online={online} empty={g.noMembers} />
@@ -314,7 +314,7 @@ export function GroupsPage() {
                       </CellButton>
                     )}
                   </Td>
-                  <Td cell="row" label={g.colRules}>
+                  <Td cell="row" label={g.colRules} className="[--stack-label-top:0.3rem]">
                     <Link
                       to={`${networkPath(network.id, 'access')}?group=${group.id}`}
                       aria-label={g.rulesOf(group.name)}
