@@ -13,13 +13,14 @@ import { Button } from '@/components/ui/button'
 import { Segmented } from '@/components/ui/segmented'
 import { t } from '@/i18n'
 import { REPORT_INTERVAL_SECS } from '@/lib/product'
+import { useElementSize } from '@/lib/useElementSize'
 import { useDocumentTitle } from '@/lib/useDocumentTitle'
 import { cn } from '@/lib/utils'
 import { useNetwork } from '@/pages/networks/context'
 import { AddNodeDialog } from '@/pages/nodes/AddNodeDialog'
 import { useLineColors } from '@/topology/colors'
 import { LineSample } from '@/topology/line-edge'
-import { buildTopology, type Selection } from '@/topology/graph'
+import { buildTopology, type Selection, STRETCH_NONE, STRETCH_X } from '@/topology/graph'
 import { nextPick, type Pair, readPair, writePair } from '@/topology/pair'
 
 import { BackboneView } from './BackboneView'
@@ -77,6 +78,9 @@ function GraphLegend() {
   )
 }
 
+/** 实时图那一块不到这么宽时，节点排成圆而不是横向拉宽的椭圆。 */
+const NARROW_GRAPH = 640
+
 /**
  * 拓扑：整个网络。节点、relay 和它们之间现在走的路。两种看法共用同一份路由矩阵：
  * 实时图（看得快）和路由矩阵（精确）。选中的一对节点写在地址里，两种看法之间、和路径诊断之间来回切换时跟着走。
@@ -106,11 +110,15 @@ export function TopologyPage() {
     pair.a !== null && pair.b !== null && pair.a !== pair.b && known(pair.a) && known(pair.b)
       ? { a: pair.a, b: pair.b }
       : null
+  // 图那一块窄的时候（手机）排成圆，不横向拉宽：整个网络缩进画布时，卡片能大一些。还没量到宽度时按宽的排。
+  // 量的是图和右边那一栏合起来的宽度：选中一对、多出右边那一栏时，排法不跟着变。
+  const [graphRef, graphArea] = useElementSize()
+  const stretch = graphArea.width > 0 && graphArea.width < NARROW_GRAPH ? STRETCH_NONE : STRETCH_X
   const shape = useMemo(
-    () => (matrix.data === undefined ? null : buildTopology(matrix.data, relays, selection)),
+    () => (matrix.data === undefined ? null : buildTopology(matrix.data, relays, selection, stretch)),
     // selection 由 pair 算出，按两个编号比较就够了。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [matrix.data, relays, selection?.a, selection?.b],
+    [matrix.data, relays, selection?.a, selection?.b, stretch],
   )
 
   const setPair = (next: Pair) => setParams(writePair(params, next), { replace: true })
@@ -193,6 +201,7 @@ export function TopologyPage() {
               {noRoutes ? <Notice title={g.noRoutesTitle}>{g.noRoutesBody}</Notice> : null}
               {view === 'graph' ? (
                 <div
+                  ref={graphRef}
                   className={cn(
                     'grid flex-1 grid-cols-1 gap-10',
                     panel !== null && '@4xl:grid-cols-[minmax(0,1fr)_16rem]',

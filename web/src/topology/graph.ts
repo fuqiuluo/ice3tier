@@ -35,6 +35,8 @@ const RING_GAP = 190
 const MIN_OUTER = 170
 /** 横向拉宽：圆变成椭圆，配合宽的画布。 */
 export const STRETCH_X = 1.6
+/** 不拉宽，就是圆：画布不比高宽多少时（手机）用它，缩进画布时点才不至于太小。 */
+export const STRETCH_NONE = 1
 /** 线离别的卡片至少这么远，近了就弯开。 */
 const LINE_CLEARANCE = 18
 
@@ -133,6 +135,8 @@ export interface TopologyShape {
   reverse: MatrixEntry | null
   /** 选中的那一对的路经过的点，图上其余的变暗。 */
   involved: Set<string>
+  /** 排的时候横向拉宽了多少（`STRETCH_X` 或 `STRETCH_NONE`）。 */
+  stretch: number
 }
 
 function ring(count: number, width: number, gap: number, minRadius: number): number {
@@ -147,11 +151,11 @@ function angleOf(count: number, index: number, start: number): number {
   return start + (2 * Math.PI * index) / Math.max(1, count)
 }
 
-function place(count: number, radius: number, index: number, start = TOP): { x: number; y: number } {
+function place(count: number, radius: number, index: number, stretch: number, start = TOP): { x: number; y: number } {
   if (count === 1 && radius === 0) return { x: 0, y: 0 }
   // 从 start 开始顺时针排，横向拉宽。
   const angle = angleOf(count, index, start)
-  return { x: Math.round(radius * STRETCH_X * Math.cos(angle)), y: Math.round(radius * Math.sin(angle)) }
+  return { x: Math.round(radius * stretch * Math.cos(angle)), y: Math.round(radius * Math.sin(angle)) }
 }
 
 /** 两个角度相差多少（0 到 π）。 */
@@ -197,7 +201,12 @@ function asHub(relays: number, others: number): boolean {
   return relays > 0 && others >= Math.max(3, 2 * relays)
 }
 
-function layout(matrix: RouteMatrix, relays: ReadonlySet<NodeId>, selection: Selection | null): TopoPoint[] {
+function layout(
+  matrix: RouteMatrix,
+  relays: ReadonlySet<NodeId>,
+  selection: Selection | null,
+  stretch: number,
+): TopoPoint[] {
   const hub = asHub(
     matrix.nodes.filter((node) => relays.has(node.id)).length,
     matrix.nodes.filter((node) => !relays.has(node.id)).length,
@@ -218,7 +227,7 @@ function layout(matrix: RouteMatrix, relays: ReadonlySet<NodeId>, selection: Sel
       id: pointId(node.id),
       node,
       relay: true,
-      ...place(inner.length, innerRadius, index),
+      ...place(inner.length, innerRadius, index, stretch),
       ...RELAY_BOX,
       picked: picked(node.id),
     })),
@@ -226,7 +235,7 @@ function layout(matrix: RouteMatrix, relays: ReadonlySet<NodeId>, selection: Sel
       id: pointId(node.id),
       node,
       relay: relays.has(node.id),
-      ...place(outer.length, outer.length === 1 && inner.length === 0 ? 0 : outerRadius, index, start),
+      ...place(outer.length, outer.length === 1 && inner.length === 0 ? 0 : outerRadius, index, stretch, start),
       ...NODE_BOX,
       picked: picked(node.id),
     })),
@@ -321,13 +330,14 @@ export function buildTopology(
   matrix: RouteMatrix,
   relays: ReadonlySet<NodeId>,
   selection: Selection | null,
+  stretch: number = STRETCH_X,
 ): TopologyShape {
   const known = new Set(matrix.nodes.map((node) => node.id))
   const relayIds = new Set([...relays].filter((id) => known.has(id)))
   for (const entry of matrix.entries) {
     if (entry.route.via === 'relay') for (const id of entry.route.relays) if (known.has(id)) relayIds.add(id)
   }
-  const points = layout(matrix, relayIds, selection)
+  const points = layout(matrix, relayIds, selection, stretch)
 
   const links = new Map<string, TopoLink>()
   /** 每一对节点之间有没有哪个方向是有路的。 */
@@ -508,10 +518,12 @@ export function buildTopology(
     forward,
     reverse,
     involved,
+    stretch,
   }
 }
 
-/** 布局的指纹：节点和 relay 的集合不变，点的位置就不变，画布不用重新缩放。 */
+/** 布局的指纹：节点和 relay 的集合不变、拉宽的程度不变，点的位置就不变，画布不用重新缩放。 */
 export function layoutSignature(shape: TopologyShape): string {
-  return shape.points.map((point) => `${point.id}${point.relay ? 'r' : ''}`).join(',')
+  const points = shape.points.map((point) => `${point.id}${point.relay ? 'r' : ''}`).join(',')
+  return shape.stretch === STRETCH_X ? points : `${points}@${shape.stretch}`
 }
