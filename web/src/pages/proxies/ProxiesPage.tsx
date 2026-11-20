@@ -150,7 +150,7 @@ export function ProxiesPage() {
         </FlowEmpty>
       ) : (
         <>
-          <Table>
+          <Table stack>
             <thead>
               <tr>
                 <Th>{s.colName}</Th>
@@ -190,7 +190,7 @@ export function ProxiesPage() {
                       className={cn((expanded || reasons.length > 0) && 'border-b-0')}
                       data-testid={`proxy-row-${proxy.name}`}
                     >
-                      <Td>
+                      <Td cell="main">
                         <NameCell
                           toggle={
                             <Switch
@@ -204,7 +204,7 @@ export function ProxiesPage() {
                           {proxy.name}
                         </NameCell>
                       </Td>
-                      <Td>
+                      <Td cell="row" label={s.colEntry}>
                         <NodeCell
                           network={network.id}
                           node={{ id: proxy.node, name: entryName }}
@@ -214,7 +214,7 @@ export function ProxiesPage() {
                           <Address>{proxy.status?.local ?? proxy.bind}</Address>
                         </NodeCell>
                       </Td>
-                      <Td>
+                      <Td cell="row" label={s.colExit}>
                         {proxy.exit === null ? (
                           <span className="text-muted-foreground">—</span>
                         ) : (
@@ -231,14 +231,14 @@ export function ProxiesPage() {
                           </NodeCell>
                         )}
                       </Td>
-                      <Td className="text-[13px] whitespace-nowrap">
+                      <Td cell="row" label={s.colAuth} className="text-[13px] whitespace-nowrap">
                         {proxy.username === '' ? (
                           <span className="text-muted-foreground">{s.noAuth}</span>
                         ) : (
                           <span className="font-mono">{proxy.username}</span>
                         )}
                       </Td>
-                      <Td data-keep>
+                      <Td cell="row" label={s.colStatus} data-keep>
                         <StatusCell
                           tone={status.tone}
                           label={s.status[status.code]}
@@ -253,7 +253,7 @@ export function ProxiesPage() {
                         />
                       </Td>
                       {laneShown ? (
-                        <Td data-keep>
+                        <Td cell="row" label={s.lane.title} data-keep>
                           <LaneCell
                             proxy={proxy}
                             view={lane}
@@ -263,7 +263,7 @@ export function ProxiesPage() {
                           />
                         </Td>
                       ) : null}
-                      <Td>
+                      <Td cell="row" label={s.colUsage}>
                         <UsageCell
                           usage={
                             status.code === 'listening' || counted
@@ -272,7 +272,7 @@ export function ProxiesPage() {
                           }
                         />
                       </Td>
-                      <Td className="pl-0 text-right" data-keep>
+                      <Td cell="end" className="pl-0 text-right" data-keep>
                         <RowActions label={t.common.actionsFor(proxy.name)}>
                           <DropdownMenuItem onSelect={() => setEditing({ proxy })}>
                             <Pencil aria-hidden />
@@ -300,6 +300,7 @@ export function ProxiesPage() {
                       <tr className={cn(!expanded && 'border-b last:border-b-0', !proxy.enabled && 'opacity-55')}>
                         <td
                           colSpan={columns}
+                          data-cell="full"
                           className="px-3 pt-0 pb-3"
                           data-testid={`proxy-lane-blocked-${proxy.name}`}
                         >
@@ -309,7 +310,7 @@ export function ProxiesPage() {
                     ) : null}
                     {expanded ? (
                       <tr className="border-b last:border-b-0">
-                        <td colSpan={columns} className="px-3 pt-0 pb-4">
+                        <td colSpan={columns} data-cell="full" className="px-3 pt-0 pb-4">
                           <LaneDetails network={network} proxy={proxy} nodes={all} />
                         </td>
                       </tr>

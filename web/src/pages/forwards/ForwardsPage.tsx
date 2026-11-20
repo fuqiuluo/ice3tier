@@ -189,7 +189,7 @@ export function ForwardsPage() {
         </FlowEmpty>
       ) : (
         <>
-          <Table>
+          <Table stack>
             <thead>
               <tr>
                 <Th>{f.colName}</Th>
@@ -228,7 +228,7 @@ export function ForwardsPage() {
                     data-testid={`forward-row-${label}`}
                     data-status={forward.status}
                   >
-                    <Td>
+                    <Td cell="main">
                       <NameCell
                         toggle={
                           <Tooltip content={blocked ? f.toggleBlocked : undefined}>
@@ -252,7 +252,7 @@ export function ForwardsPage() {
                         )}
                       </NameCell>
                     </Td>
-                    <Td>
+                    <Td cell="row" label={f.colListen}>
                       <NodeCell
                         network={network.id}
                         node={{ id: forward.listen_node, name: nodeName(all, forward.listen_node) }}
@@ -261,7 +261,7 @@ export function ForwardsPage() {
                         <ListenLine forward={forward} view={view} />
                       </NodeCell>
                     </Td>
-                    <Td>
+                    <Td cell="row" label={f.colTarget}>
                       <NodeCell
                         network={network.id}
                         node={{ id: forward.target_node, name: nodeName(all, forward.target_node) }}
@@ -270,7 +270,7 @@ export function ForwardsPage() {
                         <Address>{forward.target_addr}</Address>
                       </NodeCell>
                     </Td>
-                    <Td data-keep>
+                    <Td cell="row" label={f.colStatus} data-keep>
                       <StatusCell
                         tone={view.tone}
                         label={view.label}
@@ -283,7 +283,7 @@ export function ForwardsPage() {
                         reported={reported}
                       />
                     </Td>
-                    <Td>
+                    <Td cell="row" label={f.colUse}>
                       <UsageCell
                         udp={forward.protocol === 'udp'}
                         usage={
@@ -293,7 +293,7 @@ export function ForwardsPage() {
                         }
                       />
                     </Td>
-                    <Td className="pl-0 text-right" data-keep>
+                    <Td cell="end" className="pl-0 text-right" data-keep>
                       <RowActions label={t.common.actionsFor(label)}>
                         <DropdownMenuItem onSelect={() => setEditor({ forward })}>
                           <Pencil aria-hidden />

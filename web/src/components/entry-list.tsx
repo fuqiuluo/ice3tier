@@ -24,9 +24,9 @@ export function EntryRow({ className, ...props }: ComponentProps<typeof Tr>) {
 /** 名称那一格：开关在前，名字在后。 */
 export function NameCell({ toggle, children }: { toggle: ReactNode; children: ReactNode }) {
   return (
-    <span className="inline-flex items-center gap-3">
+    <span className="flex min-w-0 items-center gap-3">
       {toggle}
-      <span className="font-medium whitespace-nowrap">{children}</span>
+      <span className="truncate font-medium">{children}</span>
     </span>
   )
 }
@@ -47,7 +47,7 @@ export function NodeCell({
     <>
       <NodeLink network={network} node={node} online={online} />
       {children !== undefined && children !== null ? (
-        <div className="mt-0.5 flex items-center gap-1.5 text-xs whitespace-nowrap text-muted-foreground">
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-xs whitespace-nowrap text-muted-foreground">
           {children}
         </div>
       ) : null}
@@ -94,12 +94,13 @@ export function StatusCell({
       </StatusText>
       {line !== null ? (
         <div
+          // 一行排成一块时（窄的地方）没有悬停：原因写全，折行。
           className={cn(
-            'mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground',
+            'mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground @max-2xl/table:max-w-none @max-2xl/table:flex-wrap',
             narrow ? 'max-w-48' : 'max-w-64',
           )}
         >
-          <span className="truncate" title={full}>
+          <span className="truncate @max-2xl/table:whitespace-normal" title={full}>
             {line}
           </span>
           {action}

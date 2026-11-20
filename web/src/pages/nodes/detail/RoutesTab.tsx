@@ -259,7 +259,7 @@ export function RoutesTab({ network, node }: { network: Network; node: NodeDetai
 
   return (
     <div className={view === 'star' && !empty ? 'flex flex-1 flex-col gap-4' : 'space-y-4'}>
-      <div className="flex items-center justify-between gap-4 text-[13px] text-muted-foreground">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 text-[13px] text-muted-foreground">
         <p data-testid="routes-mode" className="flex items-center gap-2">
           {d.routesModeLabel}
           <Badge tone="outline">{modeLabel(mode)}</Badge>
@@ -320,7 +320,9 @@ export function RoutesTab({ network, node }: { network: Network; node: NodeDetai
           />
         )
       ) : (
-        <Table>
+        // 窄的地方一个对端排成一块：只写现在走的路（方式、协议、延迟，经中继时再写下一跳）、流量和持续了多久；
+        // 换一种选路模式会怎么走那一组不写。
+        <Table stack>
           <thead>
             {/* 两组列的名字：现在走的、换成另一种模式。后一组的底色一直铺到表格底。 */}
             <tr>
@@ -412,14 +414,14 @@ export function RoutesTab({ network, node }: { network: Network; node: NodeDetai
 
               // 没有内容的格子每列一道横线，和左边一组一样，不合并成一格。
               const dashes = [0, 1, 2, 3, 4, 5].map((column) => (
-                <Td key={column} className={cn(BAND, 'text-muted-foreground', fade)}>
+                <Td key={column} cell="hide" className={cn(BAND, 'text-muted-foreground', fade)}>
                   —
                 </Td>
               ))
               let otherCells: ReactNode
               if (pending) {
                 otherCells = (
-                  <Td colSpan={6} className={BAND}>
+                  <Td colSpan={6} cell="hide" className={BAND}>
                     <Skeleton className="h-3.5 w-40" />
                   </Td>
                 )
@@ -438,22 +440,22 @@ export function RoutesTab({ network, node }: { network: Network; node: NodeDetai
                 const delta = rtt === null || entry.rtt_ms === null ? null : rtt - entry.rtt_ms
                 otherCells = (
                   <>
-                    <Td className={BAND}>
+                    <Td cell="hide" className={BAND}>
                       <ModeBadge route={altRoute} peerOnline={peerOnline} />
                     </Td>
-                    <Td className={cn(BAND, 'text-sm')}>
+                    <Td cell="hide" className={cn(BAND, 'text-sm')}>
                       <NextHop middle={altMiddle} nodes={all} />
                     </Td>
-                    <Td className={cn(BAND, 'text-[13px]')}>
+                    <Td cell="hide" className={cn(BAND, 'text-[13px]')}>
                       <NextHopIp middle={altMiddle} nodes={all} />
                     </Td>
-                    <Td className={cn(BAND, 'text-[13px]')}>
+                    <Td cell="hide" className={cn(BAND, 'text-[13px]')}>
                       <Protocol route={altRoute} leg={altLeg} lane={laneTo(entry.peer.id)} />
                     </Td>
-                    <Td className={BAND}>
+                    <Td cell="hide" className={BAND}>
                       <span className="text-sm tabular">{lengthOf(altMiddle) ?? '—'}</span>
                     </Td>
-                    <Td className={cn(BAND, 'whitespace-nowrap')}>
+                    <Td cell="hide" className={cn(BAND, 'whitespace-nowrap')}>
                       {alternative.unmeasured ? (
                         <Tooltip content={t.routes.unmeasuredHint}>
                           <span tabIndex={0} className="cursor-help rounded-sm text-[13px] text-muted-foreground">
@@ -477,29 +479,33 @@ export function RoutesTab({ network, node }: { network: Network; node: NodeDetai
 
               return (
                 <Tr key={entry.peer.id} className="h-14">
-                  <Td>
+                  <Td cell="main">
                     <span className="inline-flex items-center gap-2">
                       <NodeLink network={network.id} node={entry.peer} online={peer?.online} />
                       <Flag code={peer?.country} />
                     </span>
                     <div className="text-xs text-muted-foreground tabular">{entry.peer.virtual_ip}</div>
                   </Td>
-                  <Td>
+                  <Td cell="inline">
                     <ModeBadge route={entry.route} peerOnline={peerOnline} hint={directHint} />
                   </Td>
-                  <Td className={cn('text-sm', fade)}>
+                  <Td
+                    cell={entry.route.via === 'relay' ? 'row' : 'hide'}
+                    label={d.routesColVia}
+                    className={cn('text-sm', fade)}
+                  >
                     <NextHop middle={nowMiddle} nodes={all} />
                   </Td>
-                  <Td className={cn('text-[13px]', fade)}>
+                  <Td cell="hide" className={cn('text-[13px]', fade)}>
                     <NextHopIp middle={nowMiddle} nodes={all} />
                   </Td>
-                  <Td className={cn('text-[13px]', fade)}>
+                  <Td cell="inline" className={cn('text-[13px]', fade)}>
                     <Protocol route={entry.route} leg={nowLeg} lane={laneTo(entry.peer.id)} />
                   </Td>
-                  <Td className={fade}>
+                  <Td cell="hide" className={fade}>
                     <span className="text-sm tabular">{lengthOf(nowMiddle) ?? '—'}</span>
                   </Td>
-                  <Td className={fade}>
+                  <Td cell="inline" className={fade}>
                     {entry.rtt_ms === null ? (
                       <span className="text-muted-foreground">—</span>
                     ) : (
@@ -507,12 +513,18 @@ export function RoutesTab({ network, node }: { network: Network; node: NodeDetai
                     )}
                   </Td>
                   {otherCells}
-                  <Td className={cn('text-xs whitespace-nowrap text-muted-foreground', fade)}>
+                  <Td
+                    cell="row"
+                    label={d.routesColTraffic}
+                    className={cn('text-xs whitespace-nowrap text-muted-foreground', fade)}
+                  >
                     <span className="tabular">
                       ↑ {formatBytes(entry.tx_bytes ?? 0)} ↓ {formatBytes(entry.rx_bytes ?? 0)}
                     </span>
                   </Td>
                   <Td
+                    cell="row"
+                    label={d.colSince}
                     className={cn('text-xs whitespace-nowrap text-muted-foreground tabular', fade)}
                     data-testid={`route-since-${entry.peer.id}`}
                   >
@@ -521,7 +533,7 @@ export function RoutesTab({ network, node }: { network: Network; node: NodeDetai
                       <span className="block text-warn">{d.rowStale(formatAge(entry.age_secs))}</span>
                     ) : null}
                   </Td>
-                  <Td>
+                  <Td cell="end">
                     <span className="flex items-center justify-end gap-0.5">
                       <IconLink
                         to={pairPath(network.id, 'topology', node.id, entry.peer.id)}

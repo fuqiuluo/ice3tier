@@ -176,7 +176,7 @@ export function LogTab() {
       ) : (
         <>
           <Toolbar>
-            <div className="relative w-60">
+            <div className="relative w-full sm:w-60">
               <Search
                 className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-faint"
                 aria-hidden
@@ -197,7 +197,7 @@ export function LogTab() {
                 setFilter({ ...filter, network: event.target.value === '' ? null : Number(event.target.value) })
               }
               aria-label={s.filterNetwork}
-              className="w-40"
+              className="min-w-0 flex-1 sm:w-40 sm:flex-none"
             >
               <option value="">{s.allNetworks}</option>
               {allNetworks.map((candidate) => (
@@ -212,7 +212,7 @@ export function LogTab() {
                 setFilter({ ...filter, action: event.target.value === '' ? null : event.target.value })
               }
               aria-label={s.filterAction}
-              className="w-52"
+              className="min-w-0 flex-1 sm:w-52 sm:flex-none"
             >
               <option value="">{s.allActions}</option>
               {kinds.map(([kind, label]) => (
@@ -256,7 +256,7 @@ export function LogTab() {
               </Button>
             ) : null}
           </Toolbar>
-          <Table aria-busy={log.isFetching && !log.isFetchingNextPage ? true : undefined}>
+          <Table stack aria-busy={log.isFetching && !log.isFetchingNextPage ? true : undefined}>
             <thead>
               <tr>
                 <Th className="w-32">{s.colTime}</Th>
@@ -268,11 +268,13 @@ export function LogTab() {
               {log.isPending ? <SkeletonRows columns={3} rows={6} /> : null}
               {rows.map((entry) => (
                 <Tr key={entry.id} data-testid={`log-row-${entry.id}`}>
-                  <Td className="align-top text-[13px] whitespace-nowrap text-muted-foreground">
+                  <Td cell="inline" className="align-top text-[13px] whitespace-nowrap text-muted-foreground">
                     <RelativeTime at={entry.at} />
                   </Td>
-                  <Td className="align-top text-[13px]">{networkLabel(entry.network)}</Td>
-                  <Td className="text-[13px]">
+                  <Td cell="inline" className="align-top text-[13px]">
+                    {networkLabel(entry.network)}
+                  </Td>
+                  <Td cell="full" className="text-[13px]">
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
                       <span className="font-medium" data-testid="log-action">
                         {logActionLabel(entry.action) ?? (

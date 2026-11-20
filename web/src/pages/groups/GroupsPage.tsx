@@ -261,7 +261,7 @@ export function GroupsPage() {
         <ErrorState title={g.loadFailed} error={groups.error} onRetry={() => void groups.refetch()} />
       ) : (
         <>
-          <Table>
+          <Table stack>
             <thead>
               <tr>
                 <Th>{g.colName}</Th>
@@ -281,7 +281,7 @@ export function GroupsPage() {
                   className={cn('h-16 hover:bg-muted/50', focus.focus === group.id && FOCUSED_ROW)}
                   data-testid={`group-row-${group.name}`}
                 >
-                  <Td>
+                  <Td cell="main">
                     <span className="inline-flex items-center gap-2.5">
                       <span className="font-medium">{group.name}</span>
                       {group.builtin ? (
@@ -293,7 +293,7 @@ export function GroupsPage() {
                       ) : null}
                     </span>
                   </Td>
-                  <Td>
+                  <Td cell="row" label={g.colNodes}>
                     {/* 成员和节点页的"分组"一样：点开改。All 的成员是全部节点，只能看。 */}
                     {group.builtin ? (
                       <NodeList nodes={group.nodes} online={online} empty={g.noMembers} />
@@ -314,7 +314,7 @@ export function GroupsPage() {
                       </CellButton>
                     )}
                   </Td>
-                  <Td>
+                  <Td cell="row" label={g.colRules}>
                     <Link
                       to={`${networkPath(network.id, 'access')}?group=${group.id}`}
                       aria-label={g.rulesOf(group.name)}
@@ -323,7 +323,7 @@ export function GroupsPage() {
                       <PolicyList rules={group.rules} empty={g.noRules} />
                     </Link>
                   </Td>
-                  <Td className="pl-0 text-right">
+                  <Td cell="end" className="pl-0 text-right">
                     {/* All 不能改名、删除、增减成员，没有菜单。 */}
                     {group.builtin ? null : (
                       <RowActions label={t.common.actionsFor(group.name)}>

@@ -8,15 +8,34 @@ import { cn } from '@/lib/utils'
  * 全站一种表格：第一列是名字，操作在最后一列的菜单里，数字右对齐。
  * 不放在框里：表头是一行灰色的小字，行与行之间一条很淡的线。表格向两边各伸出 12 像素，
  * 这样单元格里的字和页面标题左对齐，悬停时的底色又不贴着字。
+ *
+ * 放不下时在自己这一块里横向滚动。`stack` 的表格在窄的地方（不到 672 像素）换一种排法：一行排成一块，
+ * 名字和行末的菜单在第一行，其余的格子一格一行、左边写着表头（每一格用 `Td` 的 `cell` 说自己怎么排）。
+ * 排法写在 `index.css` 里，内容还是同一份。
  */
-export function Table({ className, ...props }: ComponentProps<'table'>) {
+export function Table({ className, stack = false, ...props }: ComponentProps<'table'> & { stack?: boolean }) {
   return (
     // relative：读屏用的 sr-only 文字是绝对定位的，不在这里面定位的话会跑到滚动区域外面，把整页撑宽。
-    <div className="relative -mx-3 overflow-x-auto">
-      <table className={cn('w-full border-collapse text-sm', className)} {...props} />
+    <div className="@container/table relative -mx-3 overflow-x-auto">
+      <table
+        data-stack={stack ? '' : undefined}
+        className={cn('w-full border-collapse text-sm', className)}
+        {...props}
+      />
     </div>
   )
 }
+
+/**
+ * `stack` 的表格在窄的地方，这一格怎么排：
+ * - `main`：第一行，占满剩下的宽度（名字）
+ * - `end`：第一行的右端（开关、菜单）
+ * - `row`：自己占一行，左边写着 `label`（它的表头）
+ * - `inline`：和旁边的 `inline` 并排在一行里，不写表头
+ * - `full`：自己占一行，不写表头
+ * - `hide`：不显示
+ */
+export type StackCell = 'main' | 'end' | 'row' | 'inline' | 'full' | 'hide'
 
 export function Th({ className, numeric = false, ...props }: ComponentProps<'th'> & { numeric?: boolean }) {
   return (
@@ -78,8 +97,23 @@ export function Tr({ className, dimmed = false, ...props }: ComponentProps<'tr'>
   )
 }
 
-export function Td({ className, numeric = false, ...props }: ComponentProps<'td'> & { numeric?: boolean }) {
-  return <td className={cn('px-3 py-3 align-middle', numeric && 'text-right tabular', className)} {...props} />
+interface TdProps extends ComponentProps<'td'> {
+  numeric?: boolean
+  /** 窄的地方怎么排，见 {@link StackCell}。 */
+  cell?: StackCell
+  /** `cell="row"` 时写在左边的名字：这一列的表头。 */
+  label?: string
+}
+
+export function Td({ className, numeric = false, cell, label, ...props }: TdProps) {
+  return (
+    <td
+      data-cell={cell}
+      data-label={label}
+      className={cn('px-3 py-3 align-middle', numeric && 'text-right tabular', className)}
+      {...props}
+    />
+  )
 }
 
 /** 表格下面的一行：共几项、翻页。表格最后一行不画底线，那条线由它来画。 */

@@ -202,7 +202,7 @@ function ReleaseCard({ overview }: { overview: UpdateOverview }) {
       {release !== null && release.packages.length > 0 ? (
         <>
           <h3 className="mt-6 mb-1 text-[13px] font-medium text-muted-foreground">{u.release.packages}</h3>
-          <Table>
+          <Table stack>
             <thead>
               <tr>
                 <Th>{u.release.colPlatform}</Th>
@@ -216,12 +216,16 @@ function ReleaseCard({ overview }: { overview: UpdateOverview }) {
                 const state = packageText(pkg.state)
                 return (
                   <Tr key={pkg.platform} data-testid={`package-${pkg.platform}`}>
-                    <Td className="font-mono text-[13px]">{pkg.platform}</Td>
-                    <Td className="font-mono text-[13px] text-muted-foreground">{pkg.file}</Td>
-                    <Td numeric className="text-[13px]">
+                    <Td cell="main" className="font-mono text-[13px]">
+                      {pkg.platform}
+                    </Td>
+                    <Td cell="full" className="font-mono text-[13px] break-all text-muted-foreground">
+                      {pkg.file}
+                    </Td>
+                    <Td cell="end" numeric className="text-[13px]">
                       {formatBytes(pkg.size)}
                     </Td>
-                    <Td className="text-[13px]">
+                    <Td cell="full" className="text-[13px]">
                       <Tooltip content={state.hint}>
                         <span tabIndex={0} className="rounded-sm">
                           <Badge tone={PACKAGE_TONES[pkg.state]}>{state.label}</Badge>
@@ -374,18 +378,18 @@ function NodeRow({ row, showNetwork, onForce }: { row: Row; showNetwork: boolean
   const ability = forceAbility(node)
   return (
     <Tr data-testid={`update-row-${node.name}`}>
-      <Td>
+      <Td cell="main">
         <NodeLink network={network.id} node={node} online={node.online} />
         {showNetwork ? <div className="mt-0.5 text-xs text-muted-foreground">{network.name}</div> : null}
       </Td>
-      <Td className="whitespace-nowrap">
+      <Td cell="row" label={u.nodes.colVersion} className="whitespace-nowrap">
         <div className="text-[13px] tabular">{node.version === '' ? '—' : node.version}</div>
         <div className="text-xs text-muted-foreground">{node.platform}</div>
       </Td>
-      <Td className="max-w-md">
+      <Td cell="row" label={u.nodes.colState} className="max-w-md">
         <UpdateStateView view={view} />
       </Td>
-      <Td className="text-right">
+      <Td cell="end" className="text-right">
         {node.update.available !== null ? (
           <ReasonButton
             size="sm"
@@ -476,7 +480,7 @@ function NodesCard({ overview, onForceAll }: { overview: UpdateOverview; onForce
           {shown.length === 0 ? (
             <p className="border-t py-6 text-center text-sm text-muted-foreground">{u.nodes.noneBehind}</p>
           ) : (
-            <Table>
+            <Table stack>
               <thead>
                 <tr>
                   <Th>{u.nodes.colNode}</Th>

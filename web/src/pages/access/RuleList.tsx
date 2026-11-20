@@ -63,7 +63,7 @@ export function RuleList({ network, graph, rules, focused, onEdit }: RuleListPro
   }, [focused])
 
   return (
-    <Table>
+    <Table stack>
       <thead>
         <tr>
           <Th>{a.colName}</Th>
@@ -90,7 +90,7 @@ export function RuleList({ network, graph, rules, focused, onEdit }: RuleListPro
               data-highlighted={focused === rule.id || undefined}
               className={cn('h-16 hover:bg-muted/50', focused === rule.id && 'bg-accent/60 hover:bg-accent')}
             >
-              <Td>
+              <Td cell="main">
                 <span className="inline-flex items-center gap-2.5">
                   {rule.name === '' ? (
                     <span className="text-muted-foreground">{a.unnamed}</span>
@@ -106,7 +106,7 @@ export function RuleList({ network, graph, rules, focused, onEdit }: RuleListPro
                   ) : null}
                 </span>
               </Td>
-              <Td>
+              <Td cell="end">
                 <Switch
                   aria-label={a.ruleSwitch(label)}
                   checked={rule.enabled}
@@ -114,16 +114,16 @@ export function RuleList({ network, graph, rules, focused, onEdit }: RuleListPro
                   onCheckedChange={(checked) => void actions.toggle(rule, checked)}
                 />
               </Td>
-              <Td className={cn(!rule.enabled && 'opacity-55')}>
+              <Td cell="inline" className={cn(!rule.enabled && 'opacity-55')}>
                 <GroupCell group={rule.src} graph={graph} />
               </Td>
-              <Td className={cn(!rule.enabled && 'opacity-55')}>
+              <Td cell="inline" className={cn(!rule.enabled && 'opacity-55')}>
                 <DirectionCell direction={rule.direction} />
               </Td>
-              <Td className={cn(!rule.enabled && 'opacity-55')}>
+              <Td cell="inline" className={cn(!rule.enabled && 'opacity-55')}>
                 <GroupCell group={rule.dst} graph={graph} />
               </Td>
-              <Td className="pl-0 text-right">
+              <Td cell="end" className="pl-0 text-right">
                 <RowActions label={a.ruleActions(label)}>
                   <DropdownMenuItem onSelect={() => onEdit(rule)}>
                     <Pencil aria-hidden />

@@ -134,7 +134,7 @@ export function PairsPage() {
               ]}
             />
           </div>
-          <Table>
+          <Table stack>
             <thead>
               <tr>
                 <Th>{p.colPair}</Th>
@@ -162,8 +162,8 @@ export function PairsPage() {
                     data-testid={`pair-row-${a}-${b}`}
                     data-stored={stored}
                   >
-                    <Td className="whitespace-nowrap">
-                      <span className="inline-flex items-center gap-2.5">
+                    <Td cell="main" className="whitespace-nowrap">
+                      <span className="inline-flex flex-wrap items-center gap-x-2.5 gap-y-1">
                         <NodeLink
                           network={network.id}
                           node={{ id: pair.a, name: a }}
@@ -177,7 +177,7 @@ export function PairsPage() {
                         />
                       </span>
                     </Td>
-                    <Td>
+                    <Td cell="row" label={p.colKeepAlive}>
                       <Switch
                         aria-label={p.toggle(a, b)}
                         checked={pair.keep_alive}
@@ -185,7 +185,7 @@ export function PairsPage() {
                         onCheckedChange={(keepAlive) => setKeepAlive.mutate({ pair, keepAlive })}
                       />
                     </Td>
-                    <Td>
+                    <Td cell="row" label={p.colCongestion}>
                       <NativeSelect
                         aria-label={p.congestionSelect(a, b)}
                         className="h-8 w-36 text-[13px]"
@@ -202,7 +202,12 @@ export function PairsPage() {
                         ))}
                       </NativeSelect>
                     </Td>
-                    <Td className="text-[13px] whitespace-nowrap" data-testid={`pair-setting-${a}-${b}`}>
+                    <Td
+                      cell="row"
+                      label={p.colSetting}
+                      className="text-[13px] whitespace-nowrap"
+                      data-testid={`pair-setting-${a}-${b}`}
+                    >
                       {stored ? (
                         <span className="inline-flex items-center gap-2">
                           {p.settingCustom}

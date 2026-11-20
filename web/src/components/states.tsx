@@ -78,14 +78,14 @@ export function ErrorState({ title, error, onRetry, className }: ErrorStateProps
   )
 }
 
-/** 表格第一次加载时的骨架行，形状和将要出现的行一致。 */
+/** 表格第一次加载时的骨架行，形状和将要出现的行一致（窄的地方一行排成一块时只留前两格）。 */
 export function SkeletonRows({ rows = 4, columns }: { rows?: number; columns: number }) {
   return (
     <>
       {Array.from({ length: rows }, (_, row) => (
         <tr key={row} className="border-b last:border-b-0">
           {Array.from({ length: columns }, (_, column) => (
-            <td key={column} className="px-3 py-4">
+            <td key={column} data-cell={column === 0 ? 'main' : column === 1 ? 'full' : 'hide'} className="px-3 py-4">
               <Skeleton className={cn('h-3', column === 0 ? 'w-32' : 'w-16')} />
             </td>
           ))}

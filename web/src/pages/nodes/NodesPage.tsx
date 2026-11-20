@@ -544,7 +544,7 @@ export function NodesPage() {
               </ul>
             ) : null}
 
-            <Table>
+            <Table stack>
               <thead>
                 <tr>
                   <Th className="w-10 pr-0">
@@ -596,7 +596,7 @@ export function NodesPage() {
                       )}
                       data-testid={`node-row-${node.name}`}
                     >
-                      <Td className="pr-0">
+                      <Td cell="hide" className="pr-0">
                         <Checkbox
                           aria-label={t.nodes.selectOne(node.name)}
                           checked={selected.has(node.id)}
@@ -610,7 +610,7 @@ export function NodesPage() {
                           }
                         />
                       </Td>
-                      <Td>
+                      <Td cell="main">
                         <div className="flex items-center gap-2.5">
                           <Link
                             to={nodePath(network.id, node.id)}
@@ -622,16 +622,17 @@ export function NodesPage() {
                           {issue !== undefined ? <IssueIcon message={issue.message} tone={issue.tone} /> : null}
                         </div>
                       </Td>
-                      <Td>
+                      <Td cell="inline">
                         <span className="inline-flex items-center gap-1.5">
                           <Flag code={node.country} />
                           <CopyText value={node.virtual_ip} />
                         </span>
-                        <div className="text-xs text-muted-foreground">
+                        {/* 一行排成一块时（窄的地方）不写域名：详情里有。 */}
+                        <div className="text-xs text-muted-foreground @max-2xl/table:hidden">
                           <CopyText value={node.fqdn} mono={false} className="text-xs" />
                         </div>
                       </Td>
-                      <Td>
+                      <Td cell="full">
                         <CellButton
                           onClick={() => setDialog({ kind: 'groups', node })}
                           aria-label={t.nodes.editGroupsOf(node.name)}
@@ -647,7 +648,7 @@ export function NodesPage() {
                           )}
                         </CellButton>
                       </Td>
-                      <Td className="text-[13px] whitespace-nowrap">
+                      <Td cell="inline" className="text-[13px] whitespace-nowrap">
                         {/* 在线与否的圆点在这一格的最前面，和"在线""3 分钟前"这句话放在一起。 */}
                         <span className="inline-flex items-center gap-2">
                           <StatusDot tone={node.online ? 'ok' : 'idle'} />
@@ -668,10 +669,10 @@ export function NodesPage() {
                           )}
                         </span>
                       </Td>
-                      <Td>
+                      <Td cell="hide">
                         <VersionCell node={node} />
                       </Td>
-                      <Td className="pl-0 text-right" data-keep>
+                      <Td cell="end" className="pl-0 text-right" data-keep>
                         <RowActions label={t.common.actionsFor(node.name)}>
                           <DropdownMenuItem onSelect={() => void navigate(nodePath(network.id, node.id))}>
                             <Server aria-hidden />
