@@ -163,7 +163,7 @@ export function AccessPage() {
   const othersEnabled = data?.rules.some((rule) => rule.enabled && !isAllToAll(rule)) ?? false
 
   return (
-    <Page fill className="@container">
+    <Page fill>
       <PageHeader
         title={t.access.title}
         description={t.access.subtitle}

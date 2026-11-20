@@ -43,16 +43,16 @@ export function Output({
       className={cn('min-w-0 overflow-hidden rounded-lg border bg-card', className)}
       data-testid="diagnosis-output"
     >
-      <header className="flex min-h-10 items-center justify-between gap-3 px-4">
+      <header className="flex min-h-10 flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 py-1.5">
         <button
           type="button"
           onClick={() => setOpen(!open)}
           aria-expanded={open}
           className="flex min-w-0 items-center gap-2 rounded-sm text-[13px] font-semibold"
         >
-          {d.sections.raw}
+          <span className="shrink-0 whitespace-nowrap">{d.sections.raw}</span>
           <ChevronDown
-            className={cn('size-3.5 text-muted-foreground transition-transform', !open && '-rotate-90')}
+            className={cn('size-3.5 shrink-0 text-muted-foreground transition-transform', !open && '-rotate-90')}
             aria-hidden
           />
           <span className="truncate text-xs font-normal text-muted-foreground">{d.outputHint}</span>

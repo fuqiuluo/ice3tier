@@ -6,6 +6,7 @@ import {
   type Edge,
   type EdgeProps,
   getBezierPath,
+  getSmoothStepPath,
   Handle,
   type Node as FlowNode,
   type NodeProps,
@@ -19,11 +20,13 @@ import { Link, useSearchParams } from 'react-router'
 import {
   buildAccessMap,
   layoutAccessMap,
+  layoutAccessMapNarrow,
   MAP_SIZE,
   type MapFlow,
   type MapRule,
   type MapTarget,
   mapTargetId,
+  NARROW_MAP,
 } from '@/access/map'
 import { q } from '@/api/queries'
 import { type AccessGraph, type GroupId, type Network, type Node } from '@/api/types'
@@ -33,6 +36,7 @@ import { Segmented } from '@/components/ui/segmented'
 import { t, useLocale } from '@/i18n'
 import { allGroupId, nodeGroupIds } from '@/lib/groups'
 import { useResolvedTheme } from '@/lib/theme'
+import { useElementSize } from '@/lib/useElementSize'
 import { cn } from '@/lib/utils'
 import { networkPath } from '@/pages/networks/context'
 
@@ -45,6 +49,9 @@ type View = 'node' | 'group'
 /** 左边那一块：选中的节点或分组，点开换一个。 */
 interface SubjectData extends Record<string, unknown> {
   view: View
+  width: number
+  /** 窄的排法：连线从左下角垂下去，而不是从右边出去。 */
+  narrow: boolean
   title: string
   subtitle: string
   online: boolean | null
@@ -61,6 +68,8 @@ interface PillData extends Record<string, unknown> {
 
 interface TargetData extends Record<string, unknown> {
   target: MapTarget
+  width: number
+  height: number
   onOpen: (group: GroupId) => void
 }
 
@@ -78,7 +87,8 @@ interface FlowEdgeData extends Record<string, unknown> {
   flow: MapFlow
   enabled: boolean
 }
-type MapEdge = Edge<FlowEdgeData, 'flow'>
+/** `flow` 是横着的一段曲线；`trunk` 是窄的排法里从上面垂下来、拐进胶囊的那一段。 */
+type MapEdge = Edge<FlowEdgeData, 'flow' | 'trunk'>
 
 const HIDDEN_HANDLE = '!size-1 !min-h-0 !min-w-0 !border-0 !bg-transparent'
 
@@ -103,7 +113,7 @@ function IconBox({ kind, online }: { kind: View; online: boolean | null }) {
 
 function SubjectView({ data }: NodeProps<SubjectNode>) {
   return (
-    <div style={{ width: MAP_SIZE.subject.width, height: MAP_SIZE.subject.height }}>
+    <div style={{ width: data.width, height: MAP_SIZE.subject.height }}>
       <DropdownMenu>
         <DropdownMenuTrigger
           aria-label={`${data.view === 'node' ? m.pickNode : m.pickGroup}（${data.title}）`}
@@ -137,7 +147,17 @@ function SubjectView({ data }: NodeProps<SubjectNode>) {
           ))}
         </DropdownMenuContent>
       </DropdownMenu>
-      <Handle type="source" position={Position.Right} className={HIDDEN_HANDLE} isConnectable={false} />
+      {data.narrow ? (
+        <Handle
+          type="source"
+          position={Position.Bottom}
+          style={{ left: NARROW_MAP.trunk }}
+          className={HIDDEN_HANDLE}
+          isConnectable={false}
+        />
+      ) : (
+        <Handle type="source" position={Position.Right} className={HIDDEN_HANDLE} isConnectable={false} />
+      )}
     </div>
   )
 }
@@ -173,13 +193,16 @@ function PillView({ data }: NodeProps<PillNode>) {
 function TargetView({ data }: NodeProps<TargetNode>) {
   const { target } = data
   return (
-    <div style={{ width: MAP_SIZE.target.width, height: MAP_SIZE.target.height }}>
+    <div style={{ width: data.width, height: data.height }}>
       <Handle type="target" position={Position.Left} className={HIDDEN_HANDLE} isConnectable={false} />
       <button
         type="button"
         onClick={() => data.onOpen(target.group.id)}
         aria-label={m.groupLabel(target.group.name, target.members)}
-        className="nodrag nopan pointer-events-auto flex size-full items-center gap-3 rounded-xl border bg-card px-3 text-left shadow-card transition-colors hover:border-border-strong"
+        className={cn(
+          'nodrag nopan pointer-events-auto flex size-full items-center rounded-xl border bg-card text-left shadow-card transition-colors hover:border-border-strong',
+          data.width < MAP_SIZE.target.width ? 'gap-2.5 px-2.5' : 'gap-3 px-3',
+        )}
       >
         <IconBox kind="group" online={null} />
         <span className="min-w-0 flex-1">
@@ -205,16 +228,7 @@ function NoteView({ data }: NodeProps<NoteNode>) {
 /**
  * 一条连线：虚线，顺着访问的方向流动；双向的画两条，一来一回。启用的是绿的，停用的灰而且不动。
  */
-function FlowEdgeView({
-  sourceX,
-  sourceY,
-  targetX,
-  targetY,
-  sourcePosition,
-  targetPosition,
-  data,
-}: EdgeProps<MapEdge>) {
-  const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition, curvature: 0.4 })
+function FlowLines({ path, data }: { path: string; data: FlowEdgeData | undefined }) {
   const flow = data?.flow ?? 'out'
   const enabled = data?.enabled ?? true
   const lines: { offset: number; reverse: boolean }[] =
@@ -244,8 +258,63 @@ function FlowEdgeView({
   )
 }
 
+function FlowEdgeView({
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  data,
+}: EdgeProps<MapEdge>) {
+  const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition, curvature: 0.4 })
+  return <FlowLines path={path} data={data} />
+}
+
+/**
+ * 窄的排法里，从上面那一块垂下来、拐进一个胶囊的线：几条共用竖着的那一段，像一棵树的干。
+ * 干是一根不动的线（几条叠在一起的虚线各自流动会花）；方向看胶囊到分组的那一段和胶囊上的字。
+ */
+function TrunkEdgeView({
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  data,
+}: EdgeProps<MapEdge>) {
+  const [path] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    sourcePosition,
+    targetX,
+    targetY,
+    targetPosition,
+    borderRadius: 10,
+    offset: 0,
+  })
+  const enabled = data?.enabled ?? true
+  return (
+    <path
+      d={path}
+      fill="none"
+      style={{
+        stroke: enabled ? 'var(--ok-dot)' : 'var(--idle-dot)',
+        strokeWidth: 1.4,
+        strokeDasharray: enabled ? undefined : '3 4',
+      }}
+    />
+  )
+}
+
 const nodeTypes = { subject: SubjectView, pill: PillView, target: TargetView, note: NoteView }
-const edgeTypes = { flow: FlowEdgeView }
+const edgeTypes = { flow: FlowEdgeView, trunk: TrunkEdgeView }
+
+/** 画布不到这么宽时用窄的排法。 */
+const NARROW_BELOW = 640
+/** 窄的排法里，图的两边和画布的边之间留的距离，和图的顶离画布的顶的距离（上面是切换视角的那一行）。 */
+const NARROW_INSET = { x: 16, top: 68 } as const
 
 const byName = <T extends { name: string }>(a: T, b: T) => a.name.localeCompare(b.name, undefined, { numeric: true })
 
@@ -264,14 +333,18 @@ function buildFlow(
   group: GroupId | undefined,
   pick: (key: string) => void,
   openGroup: (group: GroupId) => void,
-): { nodes: MapNode[]; edges: MapEdge[] } {
+  /** 窄的排法时图有多宽；宽的排法是 `null`。 */
+  narrowWidth: number | null,
+): { nodes: MapNode[]; edges: MapEdge[]; height: number } {
   const subjectGroup = graph.groups.find((entry) => entry.id === group)
   const subjectName = view === 'node' ? (node?.name ?? '') : (subjectGroup?.name ?? '')
   const map = buildAccessMap(
     graph,
     view === 'node' ? nodeGroupIds(node ?? { groups: [] }, graph.groups) : new Set(group === undefined ? [] : [group]),
   )
-  const layout = layoutAccessMap(map, (direction) => (direction === 'both' ? m.both : m.oneWay))
+  const narrow = narrowWidth === null ? null : layoutAccessMapNarrow(map, narrowWidth)
+  const layout = narrow ?? layoutAccessMap(map, (direction) => (direction === 'both' ? m.both : m.oneWay))
+  const targetSize = narrow === null ? MAP_SIZE.target : { width: narrow.targetWidth, height: NARROW_MAP.target.height }
 
   const options: SubjectData['options'] =
     view === 'node'
@@ -296,6 +369,8 @@ function buildFlow(
     position: { x: layout.subject.x, y: layout.subject.y },
     data: {
       view,
+      width: layout.subject.width,
+      narrow: narrow !== null,
       title: subjectName,
       subtitle: view === 'node' ? (node?.virtual_ip ?? '') : m.members(subjectGroup?.nodes.length ?? 0),
       online: view === 'node' ? (node?.online ?? false) : null,
@@ -336,16 +411,24 @@ function buildFlow(
       id: entry.id,
       type: 'target',
       position: { x: place.x, y: place.y },
-      data: { target: entry, onOpen: openGroup },
+      data: { target: entry, width: targetSize.width, height: targetSize.height, onOpen: openGroup },
       draggable: false,
       selectable: false,
     }
   })
 
-  const edges: MapEdge[] = map.rules.flatMap((entry) => {
+  // 停用的先画：窄的排法里几条线共用一段，启用的实线要盖在停用的虚线上面。
+  const edges: MapEdge[] = [...map.rules].reverse().flatMap((entry) => {
     const data = { flow: entry.flow, enabled: entry.rule.enabled }
     return [
-      { id: `in:${entry.id}`, type: 'flow', source: 'subject', target: entry.id, data, focusable: false },
+      {
+        id: `in:${entry.id}`,
+        type: narrow === null ? 'flow' : 'trunk',
+        source: 'subject',
+        target: entry.id,
+        data,
+        focusable: false,
+      },
       {
         id: `out:${entry.id}`,
         type: 'flow',
@@ -361,25 +444,34 @@ function buildFlow(
     const note: NoteNode = {
       id: 'note',
       type: 'note',
-      position: { x: MAP_SIZE.subject.width + MAP_SIZE.gapX, y: -MAP_SIZE.pill.height / 2 },
+      position:
+        narrow === null
+          ? { x: MAP_SIZE.subject.width + MAP_SIZE.gapX, y: -MAP_SIZE.pill.height / 2 }
+          : { x: NARROW_MAP.indent, y: MAP_SIZE.subject.height + NARROW_MAP.top },
       data: { text: m.noRules },
       draggable: false,
       selectable: false,
     }
-    return { nodes: [subject, note], edges: [] }
+    return { nodes: [subject, note], edges: [], height: narrow?.height ?? 0 }
   }
-  return { nodes: [subject, ...pills, ...targets], edges }
+  return { nodes: [subject, ...pills, ...targets], edges, height: narrow?.height ?? 0 }
 }
 
 /**
  * 总览的访问地图：整个面板是一块点阵的画布。左上角换视角（节点、分组），右上角是整个网络的状态。
  * 看哪个写在地址里（`view`、`node`、`group`：分组的编号），刷新、分享都还是这一个。
+ *
+ * 画布窄的时候（手机）三列横着放不下：缩到放得下，字就小得看不清。这时换成竖着的排法（`layoutAccessMapNarrow`），
+ * 按原大小画，从顶上排起，长了就往下拖。
  */
 export function AccessMap({ network, nodes }: { network: Network; nodes: readonly Node[] }) {
   const locale = useLocale()
   const theme = useResolvedTheme()
   const [params, setParams] = useSearchParams()
   const graph = useQuery(q.graph(network.id))
+  const [canvasRef, canvas] = useElementSize()
+  // 还没量到宽度时（宽度是 0）按宽的排。
+  const narrowWidth = canvas.width > 0 && canvas.width < NARROW_BELOW ? canvas.width - NARROW_INSET.x * 2 : null
 
   const view: View = params.get('view') === 'group' ? 'group' : 'node'
   const nodeParam = Number(params.get('node'))
@@ -404,15 +496,18 @@ export function AccessMap({ network, nodes }: { network: Network; nodes: readonl
   const openGroup = (id: GroupId) => update({ view: 'group', group: String(id) })
 
   const flow = useMemo(
-    () => (graph.data === undefined ? null : buildFlow(graph.data, nodes, network, view, node, group, pick, openGroup)),
+    () =>
+      graph.data === undefined
+        ? null
+        : buildFlow(graph.data, nodes, network, view, node, group, pick, openGroup, narrowWidth),
     // pick、openGroup 只读地址里的参数，参数变了这里会跟着重算；语言变了文字要重算。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [graph.data, nodes, network, view, node, group, locale],
+    [graph.data, nodes, network, view, node, group, locale, narrowWidth],
   )
   const subjectKey = view === 'node' ? `node:${node?.id ?? ''}` : `group:${group ?? ''}`
 
   return (
-    <div className="relative min-h-0 flex-1">
+    <div ref={canvasRef} className="relative min-h-0 flex-1">
       {graph.isError && graph.data === undefined ? (
         <div className="p-8">
           <ErrorState title={m.loadFailed} error={graph.error} onRetry={() => void graph.refetch()} />
@@ -420,17 +515,28 @@ export function AccessMap({ network, nodes }: { network: Network; nodes: readonl
       ) : flow !== null ? (
         <div className="absolute inset-0">
           <ReactFlow<MapNode, MapEdge>
-            // 换了看的对象就整个重画，重新缩放到刚好看全。
-            key={subjectKey}
+            // 换了看的对象就整个重画，重新缩放到刚好看全；换了排法、窄的排法下宽度变了也是。
+            key={`${subjectKey}:${narrowWidth ?? 'wide'}`}
             aria-label={m.canvas}
             colorMode={theme}
             nodes={flow.nodes}
             edges={flow.edges}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
-            fitView
-            fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
-            minZoom={0.3}
+            {...(narrowWidth === null
+              ? { fitView: true, fitViewOptions: { padding: 0.25, maxZoom: 1 }, minZoom: 0.3 }
+              : {
+                  // 原大小，从顶上排起；左右不能拖，比画布长时才能往下拖。
+                  defaultViewport: { x: NARROW_INSET.x, y: NARROW_INSET.top, zoom: 1 },
+                  translateExtent: [
+                    [-NARROW_INSET.x, -NARROW_INSET.top],
+                    [
+                      narrowWidth + NARROW_INSET.x,
+                      Math.max(flow.height + NARROW_INSET.x, canvas.height - NARROW_INSET.top),
+                    ],
+                  ],
+                  minZoom: 1,
+                })}
             maxZoom={1.5}
             nodesConnectable={false}
             nodesDraggable={false}
@@ -441,12 +547,12 @@ export function AccessMap({ network, nodes }: { network: Network; nodes: readonl
             deleteKeyCode={null}
           >
             <Background variant={BackgroundVariant.Dots} gap={18} size={1.2} color="var(--border-strong)" />
-            <Controls showInteractive={false} position="bottom-left" />
+            {narrowWidth === null ? <Controls showInteractive={false} position="bottom-left" /> : null}
           </ReactFlow>
         </div>
       ) : null}
 
-      <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-4 p-5">
+      <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-3 p-4 md:gap-4 md:p-5">
         <Segmented
           className="pointer-events-auto shadow-nav"
           aria-label={m.view}

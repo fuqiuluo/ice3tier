@@ -135,7 +135,7 @@ export function TopologyPage() {
     ) : null
 
   return (
-    <Page fill className="@container">
+    <Page fill>
       <PageHeader
         title={g.title}
         description={g.subtitle}

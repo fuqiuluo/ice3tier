@@ -415,9 +415,10 @@ export function HostsTab({ network, a, b, tested, nodes }: HostsTabProps) {
   const pick = (keys: readonly Group['key'][]) => all.filter((group) => keys.includes(group.key))
   const halves = [pick(['node', 'system', 'resources', 'network']), pick(['connections', 'peer'])]
   const renderTable = (subset: Group[], first: boolean) => (
-    <table className="w-full min-w-[28rem] table-fixed border-collapse text-[13px]">
+    // 窄的地方三列也放得下：名字那一列窄一些，长的值（地址）折行，A、B 才能并排着比。
+    <table className="w-full min-w-[19rem] table-fixed border-collapse text-[13px] wrap-anywhere">
       <colgroup>
-        <col className="w-28" />
+        <col className="w-[5.25rem] @md:w-28" />
         <col />
         <col />
       </colgroup>

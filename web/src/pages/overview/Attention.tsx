@@ -185,7 +185,7 @@ export function AttentionChip({ network, nodes }: { network: Network; nodes: rea
             <span data-testid="overview-status">{text}</span>
             <ChevronRight className="size-3.5 text-faint" aria-hidden />
           </PopoverTrigger>
-          <PopoverContent align="end" className="w-[440px] p-1.5">
+          <PopoverContent align="end" className="w-[440px] max-w-[calc(100vw-1.5rem)] p-1.5">
             <h2 className="px-2.5 pt-1.5 pb-1 text-xs font-medium text-faint">{o.attention}</h2>
             <ul>
               {attention.map((item) => (

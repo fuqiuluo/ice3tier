@@ -126,29 +126,35 @@ export function NodeDetailPage() {
 
   return (
     // 竖着排、占满面板：路由的星状图要铺满下面剩下的高度。
-    <Page fill className="@container">
-      <nav aria-label={t.nav.breadcrumb} className="mb-5 flex items-center gap-1.5 text-base text-muted-foreground">
-        <Link to={listPath} className="rounded-sm hover:text-foreground hover:underline">
+    <Page fill>
+      <nav
+        aria-label={t.nav.breadcrumb}
+        className="mb-4 flex min-w-0 items-center gap-1.5 text-base text-muted-foreground @xl:mb-5"
+      >
+        <Link to={listPath} className="shrink-0 rounded-sm hover:text-foreground hover:underline">
           {t.nodes.title}
         </Link>
-        <ChevronRight className="size-4 text-faint" aria-hidden />
-        <span className="font-medium text-foreground" aria-current="page">
+        <ChevronRight className="size-4 shrink-0 text-faint" aria-hidden />
+        <span className="truncate font-medium text-foreground" aria-current="page">
           {node.name}
         </span>
       </nav>
 
-      <header className="mb-8 flex items-center justify-between gap-6">
-        <div className="flex min-w-0 items-center gap-4">
+      {/* 窄的时候：名字占满一行，角色徽标放不下就换到下一行，域名单独一行，「更多」只剩图标。 */}
+      <header className="mb-5 flex items-start justify-between gap-2 @xl:mb-8 @xl:items-center @xl:gap-6">
+        <div className="flex min-w-0 items-start gap-3 @xl:items-center @xl:gap-4">
           {/* 左边一块是它的系统，和下面两行一样高，名字和状态都从它右边对齐开始。 */}
           <span
             aria-hidden
-            className="flex size-[52px] shrink-0 items-center justify-center rounded-xl border bg-muted/60 text-foreground/80"
+            className="flex size-11 shrink-0 items-center justify-center rounded-xl border bg-muted/60 text-foreground/80 @xl:size-[52px]"
           >
             <OsIcon platform={node.platform} className="size-6" fallback={<Server className="size-6" />} />
           </span>
           <div className="min-w-0">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <h1 className="truncate text-[22px] leading-[30px] font-bold tracking-tight">{node.name}</h1>
+            <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+              <h1 className="min-w-0 truncate text-xl leading-7 font-bold tracking-tight @xl:text-[22px] @xl:leading-[30px]">
+                {node.name}
+              </h1>
               <Tooltip content={t.nodes.rename}>
                 <Button
                   variant="ghost"
@@ -160,29 +166,33 @@ export function NodeDetailPage() {
                   <Pencil aria-hidden />
                 </Button>
               </Tooltip>
-              <span className="ml-1 flex shrink-0 items-center gap-1.5">
+              <span className="flex shrink-0 items-center gap-1.5 @xl:ml-1">
                 <HeaderBadges network={network} node={node} attached={attachedCount(nodes.data ?? [], node.id)} />
                 {issue !== undefined ? <IssueIcon message={issue.message} tone={issue.tone} /> : null}
               </span>
             </div>
             {/* 名字下面一行：状态、虚拟 IP、域名，同一种字、同一个颜色，细竖线隔开。点值就复制（悬停有说明），不另画复制图标，间距才匀。 */}
-            <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] leading-5 text-muted-foreground">
-              <StatusText tone={node.online ? 'ok' : 'idle'} className="gap-1.5 text-muted-foreground">
-                {node.online ? t.common.online : t.common.offline}
-              </StatusText>
-              <MetaDivider />
-              <CopyText value={node.virtual_ip} mono={false} className="tabular [&>svg]:hidden" />
-              <MetaDivider />
-              <CopyText value={node.fqdn} mono={false} className="[&>svg]:hidden" />
+            <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[13px] leading-5 text-muted-foreground">
+              <span className="flex items-center gap-3">
+                <StatusText tone={node.online ? 'ok' : 'idle'} className="gap-1.5 text-muted-foreground">
+                  {node.online ? t.common.online : t.common.offline}
+                </StatusText>
+                <MetaDivider />
+                <CopyText value={node.virtual_ip} mono={false} className="tabular [&>svg]:hidden" />
+              </span>
+              <span className="hidden @xl:block">
+                <MetaDivider />
+              </span>
+              <CopyText value={node.fqdn} mono={false} className="max-w-full [&>svg]:hidden" />
             </p>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" aria-label={d.more}>
+              <Button variant="ghost" aria-label={d.more} className="@max-xl:size-9 @max-xl:px-0">
                 <EllipsisVertical aria-hidden />
-                {d.more}
+                <span className="@max-xl:hidden">{d.more}</span>
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent>

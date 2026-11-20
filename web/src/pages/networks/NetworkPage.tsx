@@ -374,7 +374,7 @@ export function NetworkPage() {
   const [expanding, setExpanding] = useState(false)
 
   return (
-    <Page className="@container">
+    <Page>
       <PageHeader
         title={n.title}
         description={n.subtitle}

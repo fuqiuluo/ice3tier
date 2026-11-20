@@ -119,7 +119,7 @@ function ExitSettingsList({ node, ctl }: { node: NodeDetail; ctl: ExitForm }) {
           error={shown('quota') ?? shown('resetDay')}
         >
           <div
-            className="flex items-center gap-2"
+            className="flex flex-wrap items-center gap-2"
             onBlur={(event) => {
               // 在数和单位、账期之间挪动焦点不算离开。
               if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return

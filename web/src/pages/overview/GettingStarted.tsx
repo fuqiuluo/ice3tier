@@ -27,7 +27,7 @@ function Progress({ current }: { current: number }) {
         const state: StepState = index < current ? 'done' : index === current ? 'current' : 'upcoming'
         return (
           <li key={title} aria-current={state === 'current' ? 'step' : undefined} className="flex items-center gap-x-3">
-            {position > 0 ? <span aria-hidden className="h-px w-8 bg-border-strong" /> : null}
+            {position > 0 ? <span aria-hidden className="h-px w-4 bg-border-strong @xl:w-8" /> : null}
             <span className="flex items-center gap-2">
               <span aria-hidden className="flex size-4 items-center justify-center">
                 {state === 'done' ? (
@@ -98,7 +98,7 @@ function Slot({
 
 /**
  * 节点不足两个时，总览页就是引导：不另做一个全屏向导。
- * 左边是添加节点的流程，宽度到一行命令放得下为止，不跟着窗口拉长；右边的画布占掉剩下的地方，
+ * 左边是添加节点的流程，宽度到一行命令放得下为止，不跟着窗口拉长；右边的画布占掉剩下的地方（窄的时候排在流程下面），
  * 上面是这两个节点的实况：没来的是虚线框，来了变成实卡。画布宽的时候两个节点横着排，窄的时候竖着排。
  * 用户走开再回来它还在原地，进度由数据决定，不需要记"做到第几步"；用命令行加的节点这里一样会发现。
  */
@@ -110,7 +110,8 @@ export function GettingStarted({ network, nodes }: { network: Network; nodes: re
   return (
     <Page fill>
       <PageHeader title={g.title} description={g.step3Body} />
-      <div className="grid flex-1 grid-cols-[minmax(0,54rem)_minmax(16rem,1fr)] gap-10">
+      {/* 窄的时候两块上下排：流程在上，实况在下。 */}
+      <div className="grid flex-1 grid-cols-1 gap-8 @4xl:grid-cols-[minmax(0,54rem)_minmax(16rem,1fr)] @4xl:gap-10">
         <div className="min-w-0 space-y-7">
           <Progress current={current} />
           {/* 换了一个节点就是一份新的流程：上一个节点的令牌不留在这里。 */}
@@ -121,7 +122,10 @@ export function GettingStarted({ network, nodes }: { network: Network; nodes: re
           />
         </div>
 
-        <section aria-label={g.live} className="@container flex min-h-72 flex-col rounded-xl bg-sidebar p-5">
+        <section
+          aria-label={g.live}
+          className="@container flex min-h-56 flex-col rounded-xl bg-sidebar p-5 @4xl:min-h-72"
+        >
           <h2 className="text-xs font-medium text-muted-foreground">{g.live}</h2>
           <div aria-live="polite" className="flex flex-1 flex-col items-center justify-center py-6 @2xl:flex-row">
             <Slot network={network} label={g.slotFirst} node={first} waiting={g.waiting} />

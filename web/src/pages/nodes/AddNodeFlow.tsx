@@ -308,7 +308,7 @@ export function AddNodeFlow({ network, intro, onStateChange, onNavigate }: AddNo
                   />
                 )}
               </Field>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <Field label={t.addNode.ttlLabel}>
                   {(props) => (
                     <NativeSelect
@@ -346,7 +346,7 @@ export function AddNodeFlow({ network, intro, onStateChange, onNavigate }: AddNo
                   label={t.addNode.successorLabel}
                   optional={t.common.optional}
                   hint={t.addNode.successorHint}
-                  className="col-span-2"
+                  className="sm:col-span-2"
                 >
                   {(props) => (
                     <div className="flex items-center gap-2">

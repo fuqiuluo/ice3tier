@@ -127,7 +127,7 @@ export function PathPage() {
   const hosts = (test?.hosts ?? []).filter((host) => host.state === 'done')
 
   return (
-    <Page className="@container">
+    <Page>
       <PageHeader
         title={p.title}
         description={p.subtitle}

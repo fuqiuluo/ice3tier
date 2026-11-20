@@ -166,7 +166,7 @@ export function ProxyDialog({ network, proxy, onClose }: ProxyDialogProps) {
       errorDetail={formErrorDetail(failure)}
       onSubmit={submit}
     >
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Field label={d.exit} hint={d.exitHint} error={shown(exitProblem) ?? fieldError(failure, 'exit')}>
           {(props) => (
             <NodeSelect
@@ -215,7 +215,7 @@ export function ProxyDialog({ network, proxy, onClose }: ProxyDialogProps) {
         )}
       </Field>
 
-      <div className="grid grid-cols-[minmax(0,1fr)_8rem] gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_8rem]">
         <Field label={d.address} hint={d.whereHint[where]} error={shown(addressProblem)}>
           {() => (
             <div className="space-y-2">
@@ -253,7 +253,7 @@ export function ProxyDialog({ network, proxy, onClose }: ProxyDialogProps) {
         </Field>
       </div>
 
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Field
           label={d.username}
           error={shown(authProblem) ?? fieldError(failure, 'username')}

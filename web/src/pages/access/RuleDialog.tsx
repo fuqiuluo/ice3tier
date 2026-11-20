@@ -139,7 +139,7 @@ export function RuleDialog({ network, graph, rule, draft, open, onClose }: RuleD
       errorDetail={formErrorDetail(failure)}
       onSubmit={submit}
     >
-      <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-start gap-3">
+      <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
         <Field label={d.srcLabel} error={touched && src === null ? d.groupRequired : null}>
           {(props) => (
             <Combobox
