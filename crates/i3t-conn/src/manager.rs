@@ -628,7 +628,9 @@ impl Manager {
             }
         };
         self.forget(peer, &conn);
-        tracing::info!(%peer, reason, "和对端的连接结束");
+        // 封好的包在端口忙的时候是直接丢的，没有别的地方看得到丢了多少。
+        let unsent_sealed_packets = conn.sealed.as_ref().map_or(0, |session| session.unsent());
+        tracing::info!(%peer, reason, unsent_sealed_packets, "和对端的连接结束");
     }
 
     /// 把对端发来的一个不保证送达的数据报排进上层的队列。队列满了就丢：上层来不及取，留着也只会过期。

@@ -266,6 +266,11 @@ impl Session {
         self.unsent.fetch_add(u64::try_from(packets).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
+    /// 端口忙着没有发出去的封好的包一共多少个。
+    pub(crate) fn unsent(&self) -> u64 {
+        self.unsent.load(Ordering::Relaxed)
+    }
+
     /// 发出、收下的封好的包在线上一共多少字节。
     pub(crate) fn traffic(&self) -> (u64, u64) {
         (self.sent_bytes.load(Ordering::Relaxed), self.received_bytes.load(Ordering::Relaxed))
