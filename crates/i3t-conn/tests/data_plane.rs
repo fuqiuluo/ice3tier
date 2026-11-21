@@ -270,6 +270,32 @@ async fn removing_a_peer_from_the_netmap_closes_its_connection_and_refuses_new_d
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_begun_under_a_peers_old_key_leaves_no_connection_once_the_key_has_changed() {
+    let (a, r, old) = (Node::start(1), Node::start(9), Node::start(2));
+    // 同一个编号、另一把密钥：换了密钥之后 netmap 里的 2 号。它自己不上线，只出一把公钥。
+    let new = Node::start(2);
+    r.apply(&View { relay_clients: Some(&[&a, &old]), ..View::default() });
+    r.wait_tcp_listening().await;
+    // 拿着旧密钥的那一个还挂在 relay 上，也还认 A。
+    old.apply(&View { peers: &[Peer::via(&a, &[&r])], relays: &[&r], ..View::default() });
+
+    // A 认得 2 号（旧密钥），但到它还没有路：拨号读完 netmap 之后停在等路上。
+    a.apply(&View { peers: &[Peer { endpoints: false, ..Peer::direct(&old) }], ..View::default() });
+    let dialing = tokio::spawn({
+        let endpoint = Arc::clone(&a.endpoint);
+        let peer = old.id;
+        async move { endpoint.open(peer).await.map(drop) }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // netmap 变了：2 号换了公钥，同时有了经 relay 的路。拨号接着拿开始时读到的旧公钥去握手，和拿旧密钥的那一个握得成。
+    a.apply(&View { peers: &[Peer::via(&new, &[&r])], relays: &[&r], ..View::default() });
+    let outcome = tokio::time::timeout(SOON, dialing).await.expect("拨号迟迟不结束").unwrap();
+    assert!(matches!(outcome, Err(OpenError::ConnectionLost { .. })), "{outcome:?}");
+    assert_eq!(a.endpoint.connection_rtt(new.id), None, "拿旧公钥握成的连接不该算成 2 号的连接");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nodes_that_do_not_know_each_others_addresses_find_a_direct_path_through_in_band_signals() {
     let (a, r, b) = (Node::start(1), Node::start(9), Node::start(2));
     // netmap 里没有对方的端点，也没有人替它们转信令：只能靠已经建好的连接。

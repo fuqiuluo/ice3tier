@@ -415,7 +415,9 @@ impl Manager {
             Err(error) => return Err(lost(error.to_string())),
         };
         match tokio::time::timeout_at(deadline, connecting).await {
-            Ok(Ok(connection)) => Ok(self.register(peer, connection, Origin { dialer: self.me, key: peer_key, algorithm })),
+            Ok(Ok(connection)) => self
+                .register(peer, connection, Origin { dialer: self.me, key: peer_key, algorithm })
+                .ok_or_else(|| lost("握手期间对端从 netmap 里消失了，或者换了公钥".to_owned())),
             Ok(Err(error)) => {
                 tracing::info!(%peer, %error, "和对端的握手失败");
                 Err(lost(error.to_string()))
@@ -428,7 +430,11 @@ impl Manager {
     }
 
     /// 登记一条握手完成的连接，并开始接收它上面的流。
-    fn register(self: &Arc<Self>, peer: NodeId, quic: quinn::Connection, origin: Origin) -> Arc<Conn> {
+    ///
+    /// 握手要花时间，这期间 netmap 可能变了：对端被删掉，或者换了公钥。所以拿着连接表的锁再核对一次，对不上的不登记，
+    /// 关掉，返回 `None`。[`follow_netmap`](Self::follow_netmap) 清扫时也要这把锁：这里读到的还是旧的 netmap，
+    /// 清扫就排在登记之后，会看到这一条；读到的是新的，就在这里拦下。
+    fn register(self: &Arc<Self>, peer: NodeId, quic: quinn::Connection, origin: Origin) -> Option<Arc<Conn>> {
         let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
         let Origin { dialer, key, algorithm } = origin;
         let streams = StreamCount::new();
@@ -445,6 +451,12 @@ impl Manager {
         });
         let surplus = {
             let mut peers = self.peers();
+            if self.netmap.borrow().peer(peer).map(|info| info.key) != Some(key) {
+                drop(peers);
+                tracing::info!(%peer, %dialer, "握手期间对端从 netmap 里消失了，或者换了公钥：这条连接不登记，关闭");
+                conn.quic.close(VarInt::from_u32(CLOSE_REVOKED), b"revoked");
+                return None;
+            }
             let entry = peers.entry(peer).or_default();
             entry.conns.push(Arc::clone(&conn));
             entry.arrived.notify_waiters();
@@ -456,7 +468,7 @@ impl Manager {
             old.quic.close(VarInt::from_u32(CLOSE_SURPLUS), b"too many connections");
         }
         tokio::spawn(Arc::clone(self).serve(peer, Arc::clone(&conn)));
-        conn
+        Some(conn)
     }
 
     fn forget(&self, peer: NodeId, conn: &Arc<Conn>) {
