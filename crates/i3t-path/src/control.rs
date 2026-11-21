@@ -1835,6 +1835,21 @@ mod tests {
     const MS: Duration = Duration::from_millis(1);
 
     #[tokio::test]
+    async fn a_peer_on_this_nodes_own_relay_is_carried_in_tcp_exactly_when_its_session_is() {
+        let (harness, _relay) = own_relay_harness();
+        let slot = &harness.control.peers[&node(2)].slot;
+        slot.set_hop(Hop::Local);
+        assert!(slot.carried_in_tcp(&harness.control.shared), "它的会话绑在一条接进来的 TCP 上");
+
+        let over_udp = Harness::with_me(&[(2, &[])], &serde_json::json!({ "reach": "relay_only" }));
+        let relay = Arc::new(OwnRelay { clients: vec![(node(2), SessionLeg::Udp)], ..OwnRelay::default() });
+        over_udp.control.shared.local_relay.set(relay as Arc<dyn crate::LocalRelay>).ok().unwrap();
+        let slot = &over_udp.control.peers[&node(2)].slot;
+        slot.set_hop(Hop::Local);
+        assert!(!slot.carried_in_tcp(&over_udp.control.shared), "它的会话走 UDP");
+    }
+
+    #[tokio::test]
     async fn the_leg_from_this_nodes_own_relay_is_measured_on_the_session_instead_of_being_priced_near_zero() {
         let (mut harness, relay) = own_relay_harness();
         let start = Instant::now();

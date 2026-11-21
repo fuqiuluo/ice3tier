@@ -11,6 +11,16 @@
 //! 1. 待发队列最多 [`SEND_QUEUE_PACKETS`] 个包，满了就丢新来的；
 //! 2. 内核里还没发出去的数据最多 [`UNSENT_LIMIT_BYTES`]。不设的话数据积在内核的发送缓冲里，队列设多短都没用。
 //!
+//! # 为什么有两条队
+//!
+//! 这条 TCP 上走的东西有两种。一种的量有人管：端到端连接自己的包（连接有拥塞控制，丢了它就慢下来），
+//! 以及到 relay 的握手、保活和路径探测（本来就没有几个）。另一种的量没有人管：封好的网络包，
+//! 要发多少是包里面的协议说了算，一条不降速的 UDP 流能一直比这条线宽得多。
+//!
+//! 两种排在一条队里的话，后一种把队排满，保活就进不来：连续三次没有回音，这条 TCP 被当作断了拆掉重连
+//! （实测：2 Mbit/s 的线上灌 20 Mbit/s 的 UDP，每六七秒拆一次）。所以各排各的（[`FrameSender::try_send`] 和
+//! [`FrameSender::try_send_bulk`]），写的时候两条队轮着取：哪一种把自己的队排满，丢的都是它自己的，另一种至少有一半的线路。
+//!
 //! 第二条在 Linux 上用 `TCP_NOTSENT_LOWAT`：未发出的数据到了这个数，写就会停下来等。别的系统没有效果相同、
 //! 标准库又够得着的选项，退而求其次把整个发送缓冲区（`SO_SNDBUF`）缩到同样的大小，它连已发出未确认的数据也算在内，
 //! 所以更紧，高延迟的链路上吞吐会低一些。
@@ -25,7 +35,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
-/// 待发队列最多排多少个包。
+/// 每一条待发队列最多排多少个包。
 pub const SEND_QUEUE_PACKETS: usize = 32;
 /// 内核里还没发出去的数据的上限。
 pub const UNSENT_LIMIT_BYTES: u32 = 16 * 1024;
@@ -58,39 +68,101 @@ fn limit_unsent(socket: &SockRef<'_>) -> io::Result<()> {
 /// 往一条 TCP 中转腿里发包的一头。可以克隆，谁都不会被它阻塞。
 #[derive(Debug, Clone)]
 pub struct FrameSender {
-    queue: mpsc::Sender<Bytes>,
+    regular: mpsc::Sender<Bytes>,
+    bulk: mpsc::Sender<Bytes>,
 }
 
 impl FrameSender {
-    /// 把一个数据报排进待发队列。队列满了，或者这条 TCP 已经断了，返回 `false`，数据报被丢掉。
+    /// 把一个数据报排进待发队列：连接自己的包，握手、保活、探测。队列满了，或者这条 TCP 已经断了，返回 `false`，数据报被丢掉。
     pub fn try_send(&self, datagram: Bytes) -> bool {
-        self.queue.try_send(datagram).is_ok()
+        self.regular.try_send(datagram).is_ok()
+    }
+
+    /// 把一个量没有人管的数据报（封好的网络包）排进它们自己的那条队，别的和 [`try_send`](Self::try_send) 一样。
+    /// 这条队排满了不妨碍另一条。
+    pub fn try_send_bulk(&self, datagram: Bytes) -> bool {
+        self.bulk.try_send(datagram).is_ok()
     }
 
     /// 这条 TCP 的写入是不是已经结束了。
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.queue.is_closed()
+        self.regular.is_closed()
     }
 
     /// 两个发送端是不是通向同一条 TCP。
     #[must_use]
     pub fn same_leg(&self, other: &Self) -> bool {
-        self.queue.same_channel(&other.queue)
+        self.regular.same_channel(&other.regular)
+    }
+}
+
+/// 两条待发队列里的哪一条。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// 量有人管的：连接自己的包，握手、保活、探测。
+    Regular,
+    /// 量没有人管的：封好的网络包。
+    Bulk,
+}
+
+impl Lane {
+    const fn other(self) -> Self {
+        match self {
+            Self::Regular => Self::Bulk,
+            Self::Bulk => Self::Regular,
+        }
     }
 }
 
 /// [`FrameSender`] 的另一头，交给 [`write_frames`]。
 #[derive(Debug)]
 pub struct FrameQueue {
-    queue: mpsc::Receiver<Bytes>,
+    regular: mpsc::Receiver<Bytes>,
+    bulk: mpsc::Receiver<Bytes>,
+    /// 下一个先从哪一条队里取。
+    turn: Lane,
 }
 
-/// 建一条待发队列，容量是 [`SEND_QUEUE_PACKETS`]。
+impl FrameQueue {
+    /// `lane` 那条队里现成的下一个。取到了，下一回就轮到另一条。
+    fn take(&mut self, lane: Lane) -> Option<Bytes> {
+        let queue = match lane {
+            Lane::Regular => &mut self.regular,
+            Lane::Bulk => &mut self.bulk,
+        };
+        let datagram = queue.try_recv().ok()?;
+        self.turn = lane.other();
+        Some(datagram)
+    }
+
+    /// 现成的下一个数据报：两条队轮着取，轮到的那条空着就取另一条的。
+    fn next_ready(&mut self) -> Option<Bytes> {
+        let turn = self.turn;
+        self.take(turn).or_else(|| self.take(turn.other()))
+    }
+
+    /// 下一个数据报，两条队都空着就等。所有的 [`FrameSender`] 都被丢弃、排着的也取完了之后是 `None`。
+    async fn next(&mut self) -> Option<Bytes> {
+        if let Some(datagram) = self.next_ready() {
+            return Some(datagram);
+        }
+        let (datagram, lane) = tokio::select! {
+            Some(datagram) = self.regular.recv() => (datagram, Lane::Regular),
+            Some(datagram) = self.bulk.recv() => (datagram, Lane::Bulk),
+            else => return None,
+        };
+        self.turn = lane.other();
+        Some(datagram)
+    }
+}
+
+/// 建一对待发队列，容量各是 [`SEND_QUEUE_PACKETS`]。
 #[must_use]
 pub fn frame_queue() -> (FrameSender, FrameQueue) {
-    let (sender, receiver) = mpsc::channel(SEND_QUEUE_PACKETS);
-    (FrameSender { queue: sender }, FrameQueue { queue: receiver })
+    let (regular, regular_queue) = mpsc::channel(SEND_QUEUE_PACKETS);
+    let (bulk, bulk_queue) = mpsc::channel(SEND_QUEUE_PACKETS);
+    (FrameSender { regular, bulk }, FrameQueue { regular: regular_queue, bulk: bulk_queue, turn: Lane::Regular })
 }
 
 /// 把队列里的数据报加上长度前缀写进 TCP，直到所有的 [`FrameSender`] 都被丢弃。
@@ -102,11 +174,11 @@ pub fn frame_queue() -> (FrameSender, FrameQueue) {
 /// 这条 TCP 写不进去了。
 pub async fn write_frames(mut writer: OwnedWriteHalf, mut queue: FrameQueue) -> io::Result<()> {
     let mut batch = BytesMut::with_capacity(2 * WRITE_BATCH_BYTES);
-    while let Some(first) = queue.queue.recv().await {
+    while let Some(first) = queue.next().await {
         batch.clear();
         put(&mut batch, &first);
         while batch.len() < WRITE_BATCH_BYTES {
-            let Ok(next) = queue.queue.try_recv() else { break };
+            let Some(next) = queue.next_ready() else { break };
             put(&mut batch, &next);
         }
         writer.write_all(&batch).await?;
@@ -195,6 +267,41 @@ mod tests {
         let (sender, _queue) = frame_queue();
         let accepted = (0..SEND_QUEUE_PACKETS + 10).filter(|_| sender.try_send(Bytes::from_static(b"x"))).count();
         assert_eq!(accepted, SEND_QUEUE_PACKETS);
+    }
+
+    #[tokio::test]
+    async fn bulk_datagrams_filling_their_queue_leave_room_for_the_others() {
+        let (sender, _queue) = frame_queue();
+        let accepted = (0..SEND_QUEUE_PACKETS + 10).filter(|_| sender.try_send_bulk(Bytes::from_static(b"bulk"))).count();
+        assert_eq!(accepted, SEND_QUEUE_PACKETS);
+        assert!(sender.try_send(Bytes::from_static(b"keep-alive")), "保活还进得来");
+    }
+
+    #[tokio::test]
+    async fn the_two_queues_are_written_in_turn_and_each_keeps_its_order() {
+        let (client, server) = pair().await;
+        configure(&client).unwrap();
+        let (sender, queue) = frame_queue();
+        // 写任务还没有开始：量没有人管的包先排满，然后才来了三个别的。
+        for index in 0..SEND_QUEUE_PACKETS {
+            assert!(sender.try_send_bulk(Bytes::from(format!("bulk {index}"))));
+        }
+        for index in 0..3 {
+            assert!(sender.try_send(Bytes::from(format!("regular {index}"))));
+        }
+        drop(sender);
+        let writer = tokio::spawn(write_frames(client.into_split().1, queue));
+
+        let mut reader = FrameReader::new(server.into_split().0);
+        let mut received = Vec::new();
+        while let Some(datagram) = reader.next().await.unwrap() {
+            received.push(String::from_utf8(datagram.to_vec()).unwrap());
+        }
+        writer.await.unwrap().unwrap();
+        assert_eq!(received[..6], ["regular 0", "bulk 0", "regular 1", "bulk 1", "regular 2", "bulk 2"], "轮着来，不排在那 32 个后面");
+        let bulk: Vec<&String> = received.iter().filter(|datagram| datagram.starts_with("bulk")).collect();
+        assert_eq!(bulk.len(), SEND_QUEUE_PACKETS, "一条队空了，另一条接着写完");
+        assert!(bulk.iter().enumerate().all(|(index, datagram)| **datagram == format!("bulk {index}")), "各自的先后不变");
     }
 
     #[tokio::test]

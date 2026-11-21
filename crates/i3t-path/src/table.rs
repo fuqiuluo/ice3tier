@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use crate::backbone::Gates;
 use crate::control::{Ctrl, Inbound};
 use crate::timing::{PEER_ACTIVE, SILENCE, STASH_MAX_AGE, UNANSWERED_WINDOW};
-use crate::{LocalRelay, RouteChange, Status};
+use crate::{LocalRelay, RouteChange, SessionLeg, Status};
 
 /// 路可疑或者没有路的时候，留着最后几个包，路恢复时立刻补发。
 const STASH_PACKETS: usize = 4;
@@ -131,13 +131,15 @@ pub(crate) struct RelaySlot {
     pub(crate) id: NodeId,
     /// 最近一次从它收到任何东西。
     pub(crate) last_rx: Stamp,
+    /// 最近一次从本节点拨给它的那条 TCP 里读到东西。
+    pub(crate) last_rx_tcp: Stamp,
     /// 最近一次经它发包。
     pub(crate) last_tx: Stamp,
 }
 
 impl RelaySlot {
     pub(crate) fn new(id: NodeId) -> Arc<Self> {
-        Arc::new(Self { id, last_rx: Stamp::default(), last_tx: Stamp::default() })
+        Arc::new(Self { id, last_rx: Stamp::default(), last_rx_tcp: Stamp::default(), last_tx: Stamp::default() })
     }
 }
 
@@ -215,7 +217,31 @@ pub(crate) struct PeerSlot {
     contact: Stamp,
     /// 当前的路可疑（探测没有回答），或者根本没有路。这时发的包多留一份，见 [`PeerSlot::flush`]。
     doubt: AtomicBool,
+    /// 现在的路是哪一种（[`Carriage`] 的值）。和 `inner` 里的路一起改；发包的路径上不拿锁就要看它。
+    carriage: AtomicU8,
     inner: Mutex<SlotInner>,
+}
+
+/// 一条路把包装在什么里面走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Carriage {
+    /// 一个包一个数据报（直连、经 relay 的 UDP），或者没有路。
+    Datagrams = 0,
+    /// 本节点到 relay 的那一段是一条 TCP。
+    Tcp = 1,
+    /// 本节点自己是 relay，对端挂在上面：它的会话走什么要问本节点的 relay。
+    LocalSession = 2,
+}
+
+impl Carriage {
+    const fn of(hop: &Hop) -> Self {
+        match hop {
+            Hop::None | Hop::Direct(_) | Hop::RelayUdp { .. } => Self::Datagrams,
+            Hop::RelayTcp { .. } => Self::Tcp,
+            Hop::Local => Self::LocalSession,
+        }
+    }
 }
 
 impl PeerSlot {
@@ -228,6 +254,7 @@ impl PeerSlot {
             last_rx: Stamp::default(),
             contact: Stamp::default(),
             doubt: AtomicBool::new(true),
+            carriage: AtomicU8::new(Carriage::Datagrams as u8),
             inner: Mutex::new(SlotInner { hop: Hop::None, scratch: Vec::new(), stash: VecDeque::new() }),
         })
     }
@@ -237,7 +264,19 @@ impl PeerSlot {
     }
 
     pub(crate) fn set_hop(&self, hop: Hop) {
-        self.lock().hop = hop;
+        let mut inner = self.lock();
+        self.carriage.store(Carriage::of(&hop) as u8, Ordering::Relaxed);
+        inner.hop = hop;
+    }
+
+    /// 到它的包现在是不是装在一条 TCP 里走：本节点到 relay 的那一段是 TCP，或者本节点自己是 relay、它经 TCP 挂在上面。
+    pub(crate) fn carried_in_tcp(&self, shared: &Shared) -> bool {
+        let carriage = self.carriage.load(Ordering::Relaxed);
+        if carriage == Carriage::LocalSession as u8 {
+            let leg = shared.local_relay.get().and_then(|relay| relay.session_leg(self.id));
+            return matches!(leg, Some(SessionLeg::Accepted(_) | SessionLeg::Dialled(_)));
+        }
+        carriage == Carriage::Tcp as u8
     }
 
     /// 这个对端是不是活跃的：最近有包要发给它，或者有人要和它通信。
@@ -360,9 +399,10 @@ impl PeerSlot {
             Hop::RelayTcp { relay, sender, header } => {
                 relay.last_tx.touch(&shared.clock);
                 let mut unsent = Unsent::NONE;
+                // 排它们自己的那条队：把队排满了，连接的包和到 relay 的保活还进得来。
                 // 队列满了也接着试后面的：中间可能正好腾出了位置。
                 for packet in packets.segments() {
-                    if !sender.try_send(frame(header.as_slice(), packet)) {
+                    if !sender.try_send_bulk(frame(header.as_slice(), packet)) {
                         unsent.packets += 1;
                         unsent.bytes += packet.len();
                     }
@@ -718,6 +758,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_route_through_a_tcp_leg_counts_as_carried_in_tcp() {
+        let shared = shared();
+        let slot = PeerSlot::new(NodeId::new(2).unwrap());
+        let addr: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        let header = FrameHeader::single(RelayHeader { dst: slot.id, src: shared.me });
+        let relay = || RelaySlot::new(NodeId::new(9).unwrap());
+        assert!(!slot.carried_in_tcp(&shared), "没有路");
+        slot.set_hop(Hop::Direct(addr));
+        assert!(!slot.carried_in_tcp(&shared), "直连");
+        slot.set_hop(Hop::RelayUdp { relay: relay(), addr, header });
+        assert!(!slot.carried_in_tcp(&shared), "经 relay，到 relay 的那一段是 UDP");
+        slot.set_hop(Hop::RelayTcp { relay: relay(), sender: i3t_underlay::tcp_leg::frame_queue().0, header });
+        assert!(slot.carried_in_tcp(&shared), "到 relay 的那一段是 TCP");
+        slot.set_hop(Hop::Local);
+        assert!(!slot.carried_in_tcp(&shared), "本节点没有在当 relay：问不到会话，按不是算");
+        slot.set_hop(Hop::None);
+        assert!(!slot.carried_in_tcp(&shared), "路没了，标记跟着清掉");
+    }
+
+    #[tokio::test]
     async fn packets_dropped_for_want_of_a_route_or_of_room_in_a_tcp_relay_queue_are_reported() {
         let shared = shared();
         let slot = PeerSlot::new(NodeId::new(2).unwrap());
@@ -729,12 +789,16 @@ mod tests {
         let header = FrameHeader::single(RelayHeader { dst: slot.id, src: shared.me });
         slot.set_hop(Hop::RelayTcp { relay: RelaySlot::new(NodeId::new(9).unwrap()), sender: sender.clone(), header });
         assert_eq!(slot.send_or_drop(&shared, &packets), Unsent::NONE, "队列里有地方");
-        // 把队列填到只剩一个位置：三个包里排得进去的只有头一个。
+        // 把它们那条队填到只剩一个位置：三个包里排得进去的只有头一个。
         for _ in 3..i3t_underlay::tcp_leg::SEND_QUEUE_PACKETS - 1 {
-            assert!(sender.try_send(Bytes::new()));
+            assert!(sender.try_send_bulk(Bytes::new()));
         }
         assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 2, bytes: 150 }, "后两个没有排进去，其中最后一个是短的");
         assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 3, bytes: 250 }, "队列满了");
+        // 满的只是丢了也没关系的包那条队：连接的包和路径层自己的帧（到 relay 的保活走的也是这一条）照样排得进去。
+        slot.send(&shared, &Packets { contents: &[0x40; 100], segment_size: None, ecn: None }).unwrap();
+        slot.send_frame(&shared, b"probe");
+        assert!(sender.try_send(Bytes::new()), "连接的包那条队还远没有满");
     }
 
     #[tokio::test]

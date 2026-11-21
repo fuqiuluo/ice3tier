@@ -13,6 +13,7 @@ use i3t_model::control::RelayUse;
 use i3t_path::{BackboneInbox, RelayStatus, SessionLeg};
 use i3t_proto::backbone::{Link, RelayState, Row};
 use i3t_proto::datagram::{self, MAX_RELAY_HOPS, RelayHeader, RouteHeader};
+use i3t_proto::sealed::KIND_SEALED;
 use i3t_proto::session::{self, Accepted, Auth, Challenge, Echo, Frame, Nonce, Pong, RefusalReason, Refused};
 use i3t_proto::{Datagram, MAX_CONN_PACKET_LEN, NodeId, PublicKey};
 use i3t_underlay::tcp_leg::FrameSender;
@@ -273,7 +274,7 @@ impl Relay {
                 // 队列满了也接着试后面的：中间可能正好腾出了位置。
                 let mut all_sent = true;
                 for datagram in contents.chunks(stride) {
-                    all_sent &= sender.try_send(Bytes::copy_from_slice(datagram));
+                    all_sent &= queue_on_tcp(&sender, datagram, RelayHeader::LEN);
                 }
                 all_sent
             }
@@ -785,7 +786,7 @@ impl Inner {
             Ok(NextHop::Local) => self.deliver_locally(src, run, stride, header_len),
             Ok(NextHop::Session(binding)) => {
                 if self.admit(src, run.len(), now) {
-                    let sent = self.send(&binding, ecn, run, stride);
+                    let sent = self.send(&binding, ecn, run, stride, header_len);
                     if sent > 0 {
                         self.users.lock().expect("relay users mutex poisoned").forwarded(src, dst, sent, now);
                     }
@@ -883,8 +884,8 @@ impl Inner {
         self.bandwidth.lock().expect("relay bandwidth mutex poisoned").as_mut().is_none_or(|bandwidth| bandwidth.admit(src, bytes, now))
     }
 
-    /// 把一串数据报送到会话上，返回送出去了多少字节。
-    fn send(&self, binding: &Binding, ecn: Option<Ecn>, run: &[u8], stride: usize) -> usize {
+    /// 把一串数据报送到会话上，返回送出去了多少字节。每个数据报开头的中转头是 `header_len` 字节。
+    fn send(&self, binding: &Binding, ecn: Option<Ecn>, run: &[u8], stride: usize, header_len: usize) -> usize {
         match binding {
             Binding::Udp(destination) => {
                 let packets = run.len().div_ceil(stride);
@@ -900,7 +901,7 @@ impl Inner {
             Binding::Tcp { sender, .. } => {
                 let mut sent = 0;
                 for datagram in run.chunks(stride) {
-                    if sender.try_send(Bytes::copy_from_slice(datagram)) {
+                    if queue_on_tcp(sender, datagram, header_len) {
                         self.counters.forwarded(1, datagram.len());
                         sent += datagram.len();
                     } else {
@@ -947,6 +948,15 @@ impl Inner {
         tracing::debug!(from = %source.addr, node = %refused.node, reason = ?refused.reason, "拒绝转发，回一个错误帧");
         self.reply(source, &refused.to_bytes_echoing(&echo));
     }
+}
+
+/// 把一个带着 `header_len` 字节中转头的数据报排进 `sender` 那条 TCP 的待发队列，返回排进去没有。
+///
+/// 里面装的是封好的网络包时排它们自己的那条队：这种包的量没有人管，和别的排在一起会把会话的保活、
+/// 连接自己的包挤掉（见 [`i3t_underlay::tcp_leg`]）。只看中转头后面的那一个字节，里面的东西不动。
+fn queue_on_tcp(sender: &FrameSender, datagram: &[u8], header_len: usize) -> bool {
+    let datagram_bytes = Bytes::copy_from_slice(datagram);
+    if datagram.get(header_len) == Some(&KIND_SEALED) { sender.try_send_bulk(datagram_bytes) } else { sender.try_send(datagram_bytes) }
 }
 
 /// 从 `data` 开头起，连续多少字节的数据报带着同一个中转头（最多 `max_segments` 个数据报）。`header_len` 是第一个数据报的头的长度。
@@ -1023,6 +1033,21 @@ mod tests {
         assert_eq!(same_route_run(&data[2 * stride..], stride, LEN, 64), stride, "目的变了");
         assert_eq!(same_route_run(&data[3 * stride..], stride, LEN, 64), stride, "来源变了");
         assert_eq!(same_route_run(&data[4 * stride..], stride, LEN, 64), data.len() - 4 * stride, "最后一个可以短");
+    }
+
+    #[test]
+    fn sealed_packets_bound_for_a_tcp_session_queue_apart_from_everything_else() {
+        use i3t_underlay::tcp_leg::{SEND_QUEUE_PACKETS, frame_queue};
+
+        // 没有人在写这条 TCP：排进去的都留在队里。
+        let (sender, _queue) = frame_queue();
+        let mut sealed = frame(2, 1, 100);
+        sealed[RelayHeader::LEN] = KIND_SEALED;
+        let queued = (0..3 * SEND_QUEUE_PACKETS).filter(|_| queue_on_tcp(&sender, &sealed, RelayHeader::LEN)).count();
+        assert_eq!(queued, SEND_QUEUE_PACKETS, "封好的网络包只占它们自己的那条队");
+        assert!(queue_on_tcp(&sender, &frame(2, 1, 100), RelayHeader::LEN), "连接的包排另一条");
+        assert!(queue_on_tcp(&sender, &frame(2, 1, 0), RelayHeader::LEN), "中转头后面什么都没有的也算别的");
+        assert!(sender.try_send(Bytes::from_static(b"pong")), "relay 给这个会话的保活应答还排得进去");
     }
 
     #[test]

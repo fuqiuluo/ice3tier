@@ -12,7 +12,8 @@
 - rules：访问规则只允许 a 访问 b：a 发起的照常（TCP、ping、UDP 的问答，比 MTU 大、切成了片的也通），b 发起的连不上；
   对端发来的新会话在本节点被丢掉。
 - relay：两个节点之间不通，经 relay：ping 和 20MB。
-- tcp_relay：一端用不了 UDP，连接经 relay 的 TCP 中转：ping 和 20MB。
+- tcp_relay：一端用不了 UDP，连接经 relay 的 TCP 中转：ping 和 20MB；线路限到 2 Mbit/s、两个方向各灌 20 Mbit/s 的 UDP 时，
+  到 relay 的那条 TCP 不被当作断了。
 - nat：两端都在 NAT 后面：ping 和 20MB。
 - firewall：开关开着时，默认拒绝入站的防火墙（iptables 的 INPUT 策略是 DROP）也让别的节点进来；从真网卡来、冒充虚拟 IP 的包被丢掉。
   开关关着时 `nft list ruleset` 和 `iptables-save` 装之前、装着、拆之后都一样，冒充的包照样进来（防火墙由这台机器自己管）。
@@ -55,7 +56,7 @@ from harness import (  # noqa: E402
     send_checked, settled_snapshot, snapshot_difference, start_digest_server, start_ticker, start_udp_echo, start_whoami,
     system_snapshot, tail, udp_dial, use_nameserver, vnet_dropped, vnet_ready, without_empty_filter,
 )
-from lab import Lab, NatKind, isolate, private_link, wait_until  # noqa: E402
+from lab import Lab, NatKind, Shape, isolate, private_link, wait_until  # noqa: E402
 
 # 当场失败的（ICMP 不可达、RST）不到一秒。
 FAST = 1.0
@@ -211,6 +212,37 @@ def carried(t: Checks, a: Node, b: Node, what: str, size: int = 20 * MB) -> None
     print(f"  {what}：{size // MB}MB 用了 {sent.get('seconds')} 秒，路是 {current_route(a, b)}")
 
 
+# 往一个地址按固定的速率发 UDP，不管对面收不收。参数：目的地址、Mbit/s、秒。
+UDP_FLOOD = r'''
+import socket, sys, time
+target, mbit, seconds = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+payload = bytes(1200)
+gap = len(payload) * 8 / (mbit * 1e6)
+start, sent = time.monotonic(), 0
+while (now := time.monotonic() - start) < seconds:
+    while sent < now / gap:
+        try:
+            sock.sendto(payload, (target, 9))
+        except OSError:
+            pass
+        sent += 1
+    time.sleep(0.001)
+'''
+
+
+def survives_flood(t: Checks, sender: Node, target: Node, leg: Node, what: str) -> None:
+    """`sender` 经虚拟网卡往 `target` 灌一条比线路宽十倍的 UDP 流：`leg` 到 relay 的那条 TCP 不能因此被当作断了。
+
+    这样的流的量没有人管（包不进连接，连接的拥塞控制管不着）。它和到 relay 的保活排在一条队里的话，保活进不来，
+    连续三次没有回音那条 TCP 就被拆掉重连，每六七秒一次。"""
+    mark = len(leg.read_log())
+    sender.host.run(sys.executable, "-c", UDP_FLOOD, target.virtual_ip, "20", "20")
+    during = leg.read_log()[mark:]
+    t.check(f"{what}：到 relay 的 TCP 没有被当作断了", "TCP 中转不可用" not in during,
+            tail("\n".join(line for line in during.splitlines() if " INFO " in line), 6))
+
+
 def relayed_pair(lab: Lab, work: Path, *, a_host, b_host) -> tuple[Node, Node, Node]:
     r = Node(lab.host("r"), work, 9, declare=("relay",))
     a, b = Node(a_host, work, 1), Node(b_host, work, 2)
@@ -241,6 +273,11 @@ def tcp_relay(lab: Lab, work: Path, t: Checks) -> None:
     if installed(t, a, b):
         wait_until(lambda: "经 TCP" in b.read_log() or "TCP" in b.read_log(), timeout=20, what="b 经 TCP 挂上 relay")
         carried(t, a, b, "经 TCP 中转")
+        b_host.shape(Shape(rtt_ms=20, rate_mbit=2))
+        survives_flood(t, b, a, b, "b 往外灌（占的是它自己那条 TCP 的待发队列）")
+        survives_flood(t, a, b, b, "a 往 b 灌（占的是 relay 发给 b 的那条队列）")
+        b_host.shape(None)
+        t.check("灌完之后 ping 照通", received(ping(b, a.virtual_ip, count=3)) >= 2)
     if t.failures:
         print(tail(a.read_log(), 20), tail(b.read_log()), sep="\n  ---\n")
 

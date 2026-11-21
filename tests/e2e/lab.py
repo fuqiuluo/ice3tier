@@ -117,7 +117,8 @@ class Host:
         self.lab.shape(self.name, "up0", shape)
 
     def block_udp(self, blocked: bool = True, except_with: "Host | None" = None) -> None:
-        """模拟一个用不了 UDP 的网络：这台主机发出和收到的 UDP 全部丢掉（回环除外）。
+        """模拟一个用不了 UDP 的网络：这台主机发出和收到的 UDP 全部丢掉。回环和节点的虚拟网卡除外：
+        用不了 UDP 的是外面的网络，经虚拟网卡走的 UDP 在外面看是节点之间的连接（这时经 TCP 中转）。
 
         `except_with`：和这一台主机之间的 UDP 照常通。真实的例子是一个机房的 UDP 到大多数地方都不通，到个别对端却打得通。"""
         self.run("nft", "delete", "table", "inet", "noudp", check=False)
@@ -129,11 +130,13 @@ table inet noudp {{
     chain out {{
         type filter hook output priority filter;
         {spared_out}
+        oifname "i3t*" accept
         oifname != "lo" meta l4proto udp drop
     }}
     chain in {{
         type filter hook input priority filter;
         {spared_in}
+        iifname "i3t*" accept
         iifname != "lo" meta l4proto udp drop
     }}
 }}

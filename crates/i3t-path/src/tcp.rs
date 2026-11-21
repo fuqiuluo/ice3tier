@@ -201,6 +201,7 @@ async fn read(shared: &Shared, relay: &RelaySlot, leg: &Leg, mut reader: FrameRe
             Err(_) => return "读出错",
         };
         relay.last_rx.touch(&shared.clock);
+        relay.last_rx_tcp.touch(&shared.clock);
         match Datagram::parse(&frame) {
             Ok(Datagram::Relayed { header, .. }) if header.dst == shared.me => {
                 // 连接层来不及收的时候在这里等，压力传回这条 TCP，relay 那头的队列会开始丢包。

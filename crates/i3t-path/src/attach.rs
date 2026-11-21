@@ -88,6 +88,8 @@ pub(crate) struct Session {
     checked: Option<Instant>,
     /// 这个会话走在 TCP 里：帧不会丢，只会迟到，所以握手不重发、每一步等得更久。
     reliable: bool,
+    /// 这个会话走的那条 TCP 上最近一次读到东西（不管是什么）的时刻，见 [`heard`](Self::heard)。
+    heard: Option<Instant>,
 }
 
 impl Session {
@@ -101,12 +103,31 @@ impl Session {
             interval: PROBE_INTERVAL,
             checked: None,
             reliable: false,
+            heard: None,
         }
     }
 
     /// 走在 TCP 里的会话。`estimate` 是同一段链路上一个会话留下的测量值，接着用（见 [`measured`](Self::measured)）。
     pub(crate) const fn over_tcp(estimate: Estimate) -> Self {
-        Self { state: State::Idle, estimate, train: Train::new(), training: false, interval: PROBE_INTERVAL, checked: None, reliable: true }
+        Self {
+            state: State::Idle,
+            estimate,
+            train: Train::new(),
+            training: false,
+            interval: PROBE_INTERVAL,
+            checked: None,
+            reliable: true,
+            heard: None,
+        }
+    }
+
+    /// 这个会话走的那条 TCP 上在 `at` 读到了东西。
+    ///
+    /// 走在 TCP 里的保活，回答丢不了，只会被排在它前面的数据挡着：对端往这边发的数据把这条 TCP 占满时，回答要晚半秒到一秒才到
+    /// （实测：2 Mbit/s 的线，对面灌 20 Mbit/s），早就过了按平时的延迟算出来的超时。这条 TCP 上还在读到东西就说明它两个方向都通着
+    /// （确认到不了对面的话，对面很快就发不动了），所以这样的超时不算数，见 [`keep_alive`](Self::keep_alive)。
+    pub(crate) fn heard(&mut self, at: Instant) {
+        self.heard = Some(at);
     }
 
     /// 这段链路上测到的全部结果。会话没了之后链路还是那一段，留给下一个会话接着用。
@@ -284,7 +305,9 @@ impl Session {
             Some((nonce, sent)) => {
                 self.estimate.lost();
                 self.train.overdue(nonce, sent);
-                (true, missed + 1)
+                // 发出这个保活之后那条 TCP 上还读到过东西：它没有断，回答只是还排在后面。接着问，但不算一次没有回应。
+                let delivering = self.reliable && self.heard.is_some_and(|heard| heard > sent);
+                (true, if delivering { missed } else { missed + 1 })
             }
             None => (since_ping >= self.interval || (urgent && since_ping >= SILENCE), missed),
         };
@@ -476,6 +499,50 @@ mod tests {
         now += timeout;
         assert_eq!(session.poll(now, false).event, Some(Event::Down { reason: "保活连续没有回应" }));
         assert!(session.is_idle());
+    }
+
+    #[test]
+    fn late_answers_do_not_take_down_a_tcp_session_that_still_delivers() {
+        let start = Instant::now();
+        let mut session = Session::over_tcp(Estimate::new());
+        let Send::Init { nonce } = session.start(start, false) else { panic!("握手从 INIT 开始") };
+        session.on_challenge(&Challenge { nonce, cookie: COOKIE }, start + 20 * MS);
+        let up = start + 40 * MS;
+        assert!(session.on_ok(&ok(nonce), up).event.is_some());
+        let timeout = session.rtt().unwrap().probe_timeout();
+        let mut now = up + PROBE_INTERVAL;
+        assert!(session.poll(now, false).send.is_some());
+        // 回答一直不来，可是每一次问过之后那条 TCP 上都还读到了东西：一直接着问，会话不拆。
+        for _ in 0..3 * MAX_TIMEOUTS {
+            session.heard(now + MS);
+            now += timeout;
+            let step = session.poll(now, false);
+            assert!(matches!(step, Step { send: Some(Send::Ping { .. }), event: None }), "接着问，不拆：{step:?}");
+        }
+        // 之后那条 TCP 上什么都读不到了：照旧连续三次没有回应就拆。
+        for _ in 1..MAX_TIMEOUTS {
+            now += timeout;
+            assert!(session.poll(now, false).send.is_some());
+        }
+        now += timeout;
+        assert_eq!(session.poll(now, false).event, Some(Event::Down { reason: "保活连续没有回应" }));
+    }
+
+    #[test]
+    fn hearing_something_does_not_excuse_a_udp_session() {
+        // 走 UDP 的回答是真的会丢的：别的包到得了不说明保活的回答也到得了，照旧算。
+        let (mut session, up) = established();
+        let timeout = session.rtt().unwrap().probe_timeout();
+        let mut now = up + PROBE_INTERVAL;
+        assert!(session.poll(now, false).send.is_some());
+        for _ in 1..MAX_TIMEOUTS {
+            session.heard(now + MS);
+            now += timeout;
+            assert!(session.poll(now, false).send.is_some());
+        }
+        session.heard(now + MS);
+        now += timeout;
+        assert_eq!(session.poll(now, false).event, Some(Event::Down { reason: "保活连续没有回应" }));
     }
 
     #[test]

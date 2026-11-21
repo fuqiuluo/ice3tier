@@ -259,6 +259,16 @@ impl Paths {
         }
     }
 
+    /// 到 `peer` 的包现在是不是装在一条 TCP 里走：本节点到 relay 的那一段是 TCP，或者本节点自己是 relay、对端经 TCP 挂在上面。
+    /// 不认识这个对端、没有路时是 `false`。
+    ///
+    /// 那一段是一条可靠的流，有它自己的重传和拥塞控制。没有人管量的包（[`send_or_drop`](Self::send_or_drop) 发的那种）
+    /// 把它灌满之后，同一条流上的东西都跟着晚到；量要有人管着才不会这样，所以连接层这时不该用那个入口发大量的包。
+    #[must_use]
+    pub fn carried_in_tcp(&self, peer: NodeId) -> bool {
+        self.shared.table().peers.get(&peer).is_some_and(|slot| slot.carried_in_tcp(&self.shared))
+    }
+
     /// 等到可以再发。可以有多个任务同时等。
     ///
     /// # Errors
