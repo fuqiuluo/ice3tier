@@ -13,10 +13,14 @@ use quinn::{AckFrequencyConfig, ClientConfig, EndpointConfig, IdleTimeout, MtuDi
 use quinn_proto::HashedConnectionIdGenerator;
 
 use crate::congestion::Algorithm;
+use crate::sealed::PacketTransport;
 use crate::tuning::Tuning;
 
 /// 节点之间的连接在 TLS 握手里声明的协议名。
 pub(crate) const ALPN: &[u8] = b"i3t/1";
+/// 同一个协议，外加"收得了封好的网络包"（见 [`crate::sealed`]）。两端都声明了才会协商出它；
+/// 对端是不认识它的旧程序时，握手落到 [`ALPN`]，那条连接上网络包照旧走数据报。
+pub(crate) const ALPN_SEALED: &[u8] = b"i3t/2";
 /// TLS 要一个服务器名字。校验只看公钥，这个名字没有人看。
 pub(crate) const SERVER_NAME: &str = "i3t";
 
@@ -125,12 +129,23 @@ pub(crate) fn endpoint(key: &NodeKey) -> Result<EndpointConfig, QuicConfigError>
     Ok(config)
 }
 
+/// 握手时声明哪些协议名，最想要的在前。接受连接的一方按自己的顺序，挑第一个对端也声明了的。
+fn protocols(packets: PacketTransport) -> Vec<Vec<u8>> {
+    match packets {
+        PacketTransport::Sealed => vec![ALPN_SEALED.to_vec(), ALPN.to_vec()],
+        PacketTransport::Datagram => vec![ALPN.to_vec()],
+    }
+}
+
 /// 接受连接一方的配置。`is_allowed` 决定认不认对端的公钥，每次握手都会问。
 pub(crate) fn server(
     key: &NodeKey,
     is_allowed: impl Fn(&PublicKey) -> bool + Send + Sync + 'static,
+    packets: PacketTransport,
 ) -> Result<ServerConfig, QuicConfigError> {
-    let crypto = QuicServerConfig::try_from(tls::server_config(key, is_allowed, ALPN)?).map_err(|_| QuicConfigError::CipherSuite)?;
+    let mut tls = tls::server_config(key, is_allowed, ALPN)?;
+    tls.alpn_protocols = protocols(packets);
+    let crypto = QuicServerConfig::try_from(tls).map_err(|_| QuicConfigError::CipherSuite)?;
     let mut server = ServerConfig::with_crypto(Arc::new(crypto));
     server.transport_config(transport(&Tuning::default(), Algorithm::from_env(), AckFrequency::default()));
     // 对端在 QUIC 库眼里的地址是固定的虚拟地址，不会变。
@@ -139,8 +154,15 @@ pub(crate) fn server(
 }
 
 /// 拨出一方的配置：只接受公钥是 `expected` 的对端。
-pub(crate) fn client(key: &NodeKey, expected: PublicKey, transport: Arc<TransportConfig>) -> Result<ClientConfig, QuicConfigError> {
-    let crypto = QuicClientConfig::try_from(tls::client_config(key, expected, ALPN)?).map_err(|_| QuicConfigError::CipherSuite)?;
+pub(crate) fn client(
+    key: &NodeKey,
+    expected: PublicKey,
+    transport: Arc<TransportConfig>,
+    packets: PacketTransport,
+) -> Result<ClientConfig, QuicConfigError> {
+    let mut tls = tls::client_config(key, expected, ALPN)?;
+    tls.alpn_protocols = protocols(packets);
+    let crypto = QuicClientConfig::try_from(tls).map_err(|_| QuicConfigError::CipherSuite)?;
     let mut client = ClientConfig::new(Arc::new(crypto));
     client.transport_config(transport);
     Ok(client)
@@ -174,7 +196,7 @@ mod tests {
         let crypto = QuicServerConfig::try_from(tls::server_config(&far, |_| true, ALPN).unwrap()).unwrap();
         let listener = quinn::Endpoint::server(ServerConfig::with_crypto(Arc::new(crypto)), loopback).unwrap();
         let dialer = quinn::Endpoint::client(loopback).unwrap();
-        let config = client(&near, far.public(), transport(&Tuning::default(), Algorithm::Bbr, ack)).unwrap();
+        let config = client(&near, far.public(), transport(&Tuning::default(), Algorithm::Bbr, ack), PacketTransport::default()).unwrap();
 
         let dialing = dialer.connect_with(config, listener.local_addr().unwrap(), SERVER_NAME).unwrap();
         let (ours, theirs) = tokio::join!(dialing, async { listener.accept().await.unwrap().await });

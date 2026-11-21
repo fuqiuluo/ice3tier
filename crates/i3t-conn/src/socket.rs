@@ -17,6 +17,8 @@ use i3t_underlay::Ecn;
 use quinn::udp::{BATCH_SIZE, EcnCodepoint, RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 
+use crate::sealed::Inbox;
+
 /// 虚拟地址的前缀。取自 IPv6 的唯一本地地址段，不会和任何真实的地址混淆；后 32 位是节点编号。
 const VIRTUAL_PREFIX: [u16; 6] = [0xfd69, 0x3374, 0, 0, 0, 0];
 /// 虚拟地址的端口。QUIC 库要求端口不是 0，除此之外它没有意义。
@@ -59,14 +61,17 @@ const fn ecn_to_quic(ecn: Ecn) -> EcnCodepoint {
 }
 
 /// 交给 QUIC 库的 socket。
+///
+/// 路径层交上来的包里，封好的网络包（虚拟网卡的 IP 包，不进 QUIC）在这里就分出去，QUIC 库看不到它们。
 pub(crate) struct PathSocket {
     paths: Arc<Paths>,
     me: NodeId,
+    inbox: Arc<Inbox>,
 }
 
 impl PathSocket {
-    pub(crate) fn new(paths: Arc<Paths>, me: NodeId) -> Arc<Self> {
-        Arc::new(Self { paths, me })
+    pub(crate) fn new(paths: Arc<Paths>, me: NodeId, inbox: Arc<Inbox>) -> Arc<Self> {
+        Arc::new(Self { paths, me, inbox })
     }
 }
 
@@ -92,14 +97,10 @@ impl AsyncUdpSocket for PathSocket {
         let mut metas = [PacketMeta { peer: self.me, len: 0, stride: 0, ecn: None }; BATCH_SIZE];
         let limit = bufs.len().min(meta.len()).min(BATCH_SIZE);
         let count = ready!(self.paths.poll_recv(cx, &mut bufs[..limit], &mut metas[..limit]))?;
-        for (out, packet) in meta.iter_mut().zip(&metas[..count]) {
-            *out = RecvMeta {
-                addr: virtual_addr(packet.peer),
-                len: packet.len,
-                stride: packet.stride,
-                ecn: packet.ecn.map(ecn_to_quic),
-                dst_ip: None,
-            };
+        for ((out, packet), buf) in meta.iter_mut().zip(&metas[..count]).zip(bufs.iter_mut()) {
+            // 整个缓冲区都是封好的包时长度是 0，QUIC 库就当这一格是空的。
+            let len = self.inbox.sift(packet.peer, &mut buf[..packet.len], packet.stride);
+            *out = RecvMeta { addr: virtual_addr(packet.peer), len, stride: packet.stride, ecn: packet.ecn.map(ecn_to_quic), dst_ip: None };
         }
         Poll::Ready(Ok(count))
     }

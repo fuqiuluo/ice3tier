@@ -1,5 +1,6 @@
 //! 按对端管理连接：一对节点一条连接，按需建立，空闲回收，对端从 netmap 里消失就立刻关闭。
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,7 +13,7 @@ use i3t_crypto::tls;
 use i3t_model::Netmap;
 use i3t_model::control::{PeerUse, Signal};
 use i3t_model::netmap::Congestion;
-use i3t_path::Paths;
+use i3t_path::{Packets, Paths};
 use i3t_proto::flow::{Channel, DatagramHeader, MAX_DATAGRAM_BODY_LEN, Recipient};
 use i3t_proto::{NodeId, PublicKey};
 use quinn::rustls::pki_types::CertificateDer;
@@ -22,6 +23,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use crate::congestion::Algorithm;
 use crate::contract::{Datagram, DatagramSendError, DatagramSender, Incoming, OpenError, PacketSender};
 use crate::quic::{self, AckFrequency, SERVER_NAME};
+use crate::sealed::{self, Inbox, PacketTransport, Role, Session};
 use crate::socket;
 use crate::stream::{self, RecvHalf, SendHalf, StreamCount};
 use crate::tuning::Tuning;
@@ -73,6 +75,7 @@ const CLOSE_SHUTDOWN: u32 = 1;
 const CLOSE_REVOKED: u32 = 2;
 const CLOSE_IDENTITY: u32 = 3;
 const CLOSE_SURPLUS: u32 = 4;
+const CLOSE_KEYS_SPENT: u32 = 5;
 
 type Stream = Incoming<SendHalf, RecvHalf>;
 
@@ -100,7 +103,7 @@ pub struct ConnectionCounters {
     pub lost_bytes: u64,
     /// 拥塞控制认定发生了拥塞的次数。
     pub congestion_events: u64,
-    /// 线上的字节数（UDP 数据报的内容，含 QUIC 的头）。
+    /// 线上的字节数（UDP 数据报的内容，含 QUIC 的头），连同不进 QUIC 的、封好的网络包。
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }
@@ -136,9 +139,17 @@ impl DatagramQueues {
     }
 }
 
+/// 虚拟网卡的包在新建的连接上怎么走，和收封好的包的那一头。那一头和 QUIC 库的 socket 共用，所以由装配的一方建好传进来。
+pub(crate) struct PacketRoute {
+    pub transport: PacketTransport,
+    pub inbox: Arc<Inbox>,
+}
+
 /// 一条和对端的连接。
 struct Conn {
     quic: quinn::Connection,
+    /// 握手时两端都声明了收得了封好的包：这条连接上网络包用它封了直接走路径层，不进 QUIC。
+    sealed: Option<Arc<Session>>,
     /// 这条连接是谁拨的。两边同时拨号时，双方都留下编号小的那个节点拨的那一条。
     dialer: NodeId,
     /// 对端握手时用的公钥。netmap 里它的公钥变了，这条连接就不算数了。
@@ -152,8 +163,24 @@ struct Conn {
     held: AtomicBool,
     /// 这条连接建立时用的拥塞控制。连接一直用它，节点对的设置后来改了也不变。
     algorithm: Algorithm,
-    /// 最近一次在这条连接上收发网络包的时刻。只运包的连接没有流，空闲回收按它算（见 [`Manager::idle_verdict`]）。
+    /// 最近一次在这条连接上发网络包、或者从数据报里收到网络包的时刻；收到封好的包的时刻记在 `sealed` 里。
+    /// 只运包的连接没有流，空闲回收按这两个算（见 [`Manager::idle_verdict`]）。
     packets: PacketClock,
+}
+
+impl Conn {
+    /// 最近一次收发网络包的时刻，两种走法都算。
+    fn last_packet(&self) -> Option<Instant> {
+        let heard = self.sealed.as_ref().and_then(|session| session.heard());
+        self.packets.last(self.established).max(heard)
+    }
+
+    /// 线上发出、收到的字节数：QUIC 的（含它自己的开销和重传），加上封好的网络包。
+    fn traffic(&self) -> (u64, u64) {
+        let stats = self.quic.stats();
+        let (sealed_sent, sealed_received) = self.sealed.as_ref().map_or((0, 0), |session| session.traffic());
+        (stats.udp_tx.bytes.saturating_add(sealed_sent), stats.udp_rx.bytes.saturating_add(sealed_received))
+    }
 }
 
 /// 一条连接上最近一次收发网络包的时刻，记成连接建立之后的毫秒数加一（0 是还没有过）：每个包只写一次原子数。
@@ -229,6 +256,10 @@ pub(crate) struct Manager {
     /// 对端开过来的流排在这里等上层来取。
     incoming: mpsc::Sender<Stream>,
     datagrams: DatagramQueues,
+    /// 新建的连接上网络包怎么走。进程启动时定。
+    packets: PacketTransport,
+    /// 收到的封好的包在这里按连接的密钥解开。连接登记时把密钥交给它，结束时收回。
+    inbox: Arc<Inbox>,
     closed: watch::Sender<bool>,
 }
 
@@ -240,6 +271,7 @@ impl Manager {
         netmap: watch::Receiver<Arc<Netmap>>,
         incoming: mpsc::Sender<Stream>,
         datagrams: DatagramQueues,
+        packets: PacketRoute,
     ) -> Arc<Self> {
         let (quic, server) = endpoint;
         let (me, ack) = {
@@ -261,6 +293,8 @@ impl Manager {
             handshakes: Arc::default(),
             incoming,
             datagrams,
+            packets: packets.transport,
+            inbox: packets.inbox,
             closed: watch::Sender::new(false),
         })
     }
@@ -314,6 +348,7 @@ impl Manager {
     pub(crate) fn connection_report(&self, peer: NodeId) -> Option<ConnectionReport> {
         let conn = self.preferred(peer)?;
         let stats = conn.quic.stats();
+        let (bytes_sent, bytes_received) = conn.traffic();
         Some(ConnectionReport {
             established: conn.established,
             rtt: stats.path.rtt,
@@ -326,8 +361,8 @@ impl Manager {
                 lost_packets: stats.path.lost_packets,
                 lost_bytes: stats.path.lost_bytes,
                 congestion_events: stats.path.congestion_events,
-                bytes_sent: stats.udp_tx.bytes,
-                bytes_received: stats.udp_rx.bytes,
+                bytes_sent,
+                bytes_received,
             },
         })
     }
@@ -433,7 +468,7 @@ impl Manager {
         let lost = |reason: String| OpenError::ConnectionLost { peer, reason };
         let algorithm = self.algorithm_for(peer);
         let transport = self.configs().transport(algorithm);
-        let config = quic::client(&self.key, peer_key, transport).map_err(|error| lost(error.to_string()))?;
+        let config = quic::client(&self.key, peer_key, transport, self.packets).map_err(|error| lost(error.to_string()))?;
         let connecting = match self.quic.connect_with(config, socket::virtual_addr(peer), SERVER_NAME) {
             Ok(connecting) => connecting,
             Err(ConnectError::EndpointStopping) => return Err(OpenError::Closed),
@@ -463,8 +498,10 @@ impl Manager {
         let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
         let Origin { dialer, key, algorithm } = origin;
         let streams = StreamCount::new();
+        let sealed = self.sealed_session(peer, &quic, dialer);
         let conn = Arc::new(Conn {
             quic,
+            sealed,
             dialer,
             key,
             serial,
@@ -487,7 +524,11 @@ impl Manager {
             entry.arrived.notify_waiters();
             entry.take_surplus()
         };
-        tracing::info!(%peer, %dialer, congestion = %Congestion::from(algorithm), "和对端的连接建立");
+        // 对端握手完成得早的话，它的头几个封好的包已经到了：登记密钥时一并收下。
+        if let Some(session) = &conn.sealed {
+            self.inbox.admit(peer, session);
+        }
+        tracing::info!(%peer, %dialer, congestion = %Congestion::from(algorithm), sealed_packets = conn.sealed.is_some(), "和对端的连接建立");
         for old in surplus {
             tracing::info!(%peer, dialer = %old.dialer, "和这个对端的连接超过了 {MAX_CONNS_PER_PEER} 条，关闭最旧的一条");
             old.quic.close(VarInt::from_u32(CLOSE_SURPLUS), b"too many connections");
@@ -496,12 +537,30 @@ impl Manager {
         Some(conn)
     }
 
+    /// 握手时两端都声明了收得了封好的包的话，从这次握手里导出这条连接封包用的密钥。
+    fn sealed_session(&self, peer: NodeId, quic: &quinn::Connection, dialer: NodeId) -> Option<Arc<Session>> {
+        if !sealed::agreed(quic) {
+            return None;
+        }
+        let role = if dialer == self.me { Role::Dialer } else { Role::Acceptor };
+        match Session::derive(quic, role) {
+            Ok(session) => Some(Arc::new(session)),
+            Err(error) => {
+                tracing::warn!(%peer, ?error, "从握手里导不出封包的密钥：这条连接上网络包走数据报");
+                None
+            }
+        }
+    }
+
     fn forget(&self, peer: NodeId, conn: &Arc<Conn>) {
+        if let Some(session) = &conn.sealed {
+            self.inbox.dismiss(peer, session);
+        }
         if let Some(entry) = self.peers().get_mut(&peer) {
             let before = entry.conns.len();
             entry.conns.retain(|other| !Arc::ptr_eq(other, conn));
             if entry.conns.len() < before {
-                let (sent, received) = traffic(&conn.quic);
+                let (sent, received) = conn.traffic();
                 entry.closed_traffic = (entry.closed_traffic.0.saturating_add(sent), entry.closed_traffic.1.saturating_add(received));
             }
         }
@@ -519,7 +578,7 @@ impl Manager {
                 let (sent, received) = entry
                     .conns
                     .iter()
-                    .map(|conn| traffic(&conn.quic))
+                    .map(|conn| conn.traffic())
                     .fold(entry.closed_traffic, |(a, b), (c, d)| (a.saturating_add(c), b.saturating_add(d)));
                 PeerUse { peer, flows: u32::try_from(flows).unwrap_or(u32::MAX), tx_bytes: sent, rx_bytes: received }
             })
@@ -556,6 +615,11 @@ impl Manager {
                     if let Some(reason) = self.idle_verdict(peer, &conn) {
                         conn.quic.close(VarInt::from_u32(CLOSE_IDLE), reason.as_bytes());
                         break reason.to_owned();
+                    }
+                    // 关掉之后上层有包要发时会重建，新的连接是新的密钥。
+                    if conn.sealed.as_ref().is_some_and(|session| session.is_spent()) {
+                        conn.quic.close(VarInt::from_u32(CLOSE_KEYS_SPENT), b"sealed packet keys spent");
+                        break "封包的密钥用到头了".to_owned();
                     }
                 }
             }
@@ -627,6 +691,41 @@ impl Manager {
         permit.send(Datagram { peer, payload: payload.freeze() });
     }
 
+    /// 把一个网络包帧用这条连接的密钥封好，直接交给路径层，不进 QUIC。
+    ///
+    /// 端口忙着发不出去时这个包就丢了，照样算发过：这里没有队列可排，包里面的协议自己会重传、会降速。
+    fn send_sealed(&self, peer: NodeId, conn: &Conn, session: &Session, frame: &[u8]) -> Result<(), DatagramSendError> {
+        thread_local! {
+            /// 封包用的缓冲区，每个线程一个，不用每个包分配一次。
+            static SEALED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+        // 上限和走数据报时是同一个数，上层切片的办法不用变。封好之后多出 29 个字节，比 QUIC 的包头加数据报帧头
+        // （至少 30 个）还少，所以装得进连接现在探测到的包长。
+        let max = conn.quic.max_datagram_size().ok_or(DatagramSendError::Unsupported(peer))?;
+        if frame.len() > max {
+            return Err(DatagramSendError::TooLarge { len: frame.len(), max });
+        }
+        SEALED.with_borrow_mut(|packet| {
+            if let Err(spent) = session.seal(frame, packet) {
+                // 关掉之后上层会重建，新的连接是新的密钥。
+                conn.quic.close(VarInt::from_u32(CLOSE_KEYS_SPENT), b"sealed packet keys spent");
+                return Err(DatagramSendError::ConnectionLost { peer, reason: spent.to_string() });
+            }
+            match self.paths.try_send(peer, &Packets { contents: packet, segment_size: None, ecn: None }) {
+                Ok(()) => session.sent(packet.len()),
+                Err(_) => session.not_sent(),
+            }
+            Ok(())
+        })?;
+        // 空的数据报对端收到就丢，要的只是连接为它走一个来回：对端的进程换过的话，回来的是重置。
+        if session.probe_due()
+            && let Err(error) = conn.quic.send_datagram(Bytes::new())
+        {
+            tracing::trace!(%peer, %error, "没能让连接去问对端还在不在");
+        }
+        Ok(())
+    }
+
     /// 发数据报用的句柄。它不让连接多活：本端关掉之后，拿着它也发不出去。
     pub(crate) fn datagram_handle(self: &Arc<Self>) -> DatagramHandle {
         DatagramHandle { manager: Arc::downgrade(self) }
@@ -638,7 +737,7 @@ impl Manager {
     /// 一条经网卡的 TCP）因此包在走就一直留着，包停了照常回收。
     fn idle_verdict(&self, peer: NodeId, conn: &Arc<Conn>) -> Option<&'static str> {
         let streams_ended = conn.streams.idle_since()?;
-        let idle = conn.packets.last(conn.established).map_or(streams_ended, |packet| packet.max(streams_ended)).elapsed();
+        let idle = conn.last_packet().map_or(streams_ended, |packet| packet.max(streams_ended)).elapsed();
         let preferred = self.preferred(peer).is_some_and(|preferred| Arc::ptr_eq(&preferred, conn));
         let keep_alive = self.netmap.borrow().peer(peer).is_some_and(|info| info.keep_alive);
         let idle_close = self.configs().tuning.idle_close;
@@ -755,6 +854,10 @@ impl Manager {
                     if !valid {
                         tracing::info!(%peer, "对端不在 netmap 里了，或者换了公钥：关闭和它的连接");
                         conn.quic.close(VarInt::from_u32(CLOSE_REVOKED), b"revoked");
+                        // 它的封好的包从现在起也不收了，不等这条连接的任务自己收场。
+                        if let Some(session) = &conn.sealed {
+                            self.inbox.dismiss(peer, session);
+                        }
                     }
                     valid
                 });
@@ -798,12 +901,6 @@ impl Manager {
         self.closed.send_replace(true);
         self.quic.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"shutdown");
     }
-}
-
-/// 一条连接在线上发出、收到的字节数（含 QUIC 自己的开销和重传）。
-fn traffic(connection: &quinn::Connection) -> (u64, u64) {
-    let stats = connection.stats();
-    (stats.udp_tx.bytes, stats.udp_rx.bytes)
 }
 
 /// 一条连接是谁拨的、对端握手时的公钥、用的拥塞控制。
@@ -1025,13 +1122,19 @@ impl DatagramHandle {
 
 impl PacketSender for DatagramHandle {
     fn send_packet(&self, peer: NodeId, frame: Bytes) -> Result<(), DatagramSendError> {
-        let conn = self.connection(peer)?;
-        let len = frame.len();
-        conn.quic.send_datagram(frame).map_err(|error| match error {
-            SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled => DatagramSendError::Unsupported(peer),
-            SendDatagramError::TooLarge => DatagramSendError::TooLarge { len, max: conn.quic.max_datagram_size().unwrap_or(0) },
-            SendDatagramError::ConnectionLost(reason) => DatagramSendError::ConnectionLost { peer, reason: reason.to_string() },
-        })?;
+        let manager = self.manager.upgrade().ok_or(DatagramSendError::NotConnected(peer))?;
+        let conn = manager.preferred(peer).ok_or(DatagramSendError::NotConnected(peer))?;
+        match &conn.sealed {
+            Some(session) => manager.send_sealed(peer, &conn, session, &frame)?,
+            None => {
+                let len = frame.len();
+                conn.quic.send_datagram(frame).map_err(|error| match error {
+                    SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled => DatagramSendError::Unsupported(peer),
+                    SendDatagramError::TooLarge => DatagramSendError::TooLarge { len, max: conn.quic.max_datagram_size().unwrap_or(0) },
+                    SendDatagramError::ConnectionLost(reason) => DatagramSendError::ConnectionLost { peer, reason: reason.to_string() },
+                })?;
+            }
+        }
         conn.packets.touch(conn.established);
         Ok(())
     }
@@ -1101,9 +1204,9 @@ mod tests {
             let (me, peer) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
             let transport = quic::transport(&Tuning::default(), Algorithm::from_env(), AckFrequency::default());
             Self {
-                listener: quinn::Endpoint::server(quic::server(&me, |_| true).unwrap(), loopback).unwrap(),
+                listener: quinn::Endpoint::server(quic::server(&me, |_| true, PacketTransport::default()).unwrap(), loopback).unwrap(),
                 dialer: quinn::Endpoint::client(loopback).unwrap(),
-                config: quic::client(&peer, me.public(), transport).unwrap(),
+                config: quic::client(&peer, me.public(), transport, PacketTransport::default()).unwrap(),
                 peer_key: peer.public(),
                 next_serial: 1,
                 far_ends: Vec::new(),
@@ -1119,6 +1222,7 @@ mod tests {
             self.next_serial += 1;
             Arc::new(Conn {
                 quic: near.unwrap(),
+                sealed: None,
                 dialer: NodeId::new(2).unwrap(),
                 key: self.peer_key,
                 serial,

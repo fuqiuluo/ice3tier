@@ -20,8 +20,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::contract::{Acceptor, Connector, Datagram, Datagrams, Incoming, OpenError, Packets};
-use crate::manager::{ConnectionReport, DATAGRAM_BACKLOG, DatagramHandle, DatagramQueues, Manager, PACKET_BACKLOG};
+use crate::manager::{ConnectionReport, DATAGRAM_BACKLOG, DatagramHandle, DatagramQueues, Manager, PACKET_BACKLOG, PacketRoute};
 use crate::quic::{self, QuicConfigError};
+use crate::sealed::{Inbox, PacketTransport};
 use crate::socket::PathSocket;
 use crate::stream::{RecvHalf, SendHalf};
 use crate::tuning::Tuning;
@@ -84,10 +85,21 @@ pub struct Endpoint {
 impl Endpoint {
     /// 绑定端口并启动。要在 tokio 运行时里调用。
     ///
+    /// 虚拟网卡的包怎么走按环境变量来（[`PacketTransport::from_env`]），没有设置时用默认的。
+    ///
     /// # Errors
     ///
     /// 端口绑不上，或者建不出 QUIC 的配置（节点密钥有问题）。
     pub fn bind(config: EndpointConfig) -> Result<Self, EndpointError> {
+        Self::bind_with(config, PacketTransport::from_env())
+    }
+
+    /// 和 [`bind`](Self::bind) 一样，只是指定虚拟网卡的包怎么走，不看环境变量。
+    ///
+    /// # Errors
+    ///
+    /// 端口绑不上，或者建不出 QUIC 的配置（节点密钥有问题）。
+    pub fn bind_with(config: EndpointConfig, packets: PacketTransport) -> Result<Self, EndpointError> {
         let EndpointConfig { key, bind, netmap, addr_servers } = config;
         let me = netmap.borrow().me.id;
         let port = Arc::new(UdpPort::bind(bind).map_err(|source| EndpointError::Bind { addr: bind, source })?);
@@ -107,19 +119,22 @@ impl Endpoint {
 
         // 接受连接时认不认对端的公钥，每次握手都按当时的 netmap 来。
         let allowed = netmap.clone();
-        let server = quic::server(&key, move |key| allowed.borrow().peers.iter().any(|peer| peer.key == *key))?;
-        let socket = PathSocket::new(Arc::clone(&paths), me);
-        let quic =
-            quinn::Endpoint::new_with_abstract_socket(quic::endpoint(&key)?, Some(server.clone()), socket, Arc::new(quinn::TokioRuntime))
-                .map_err(EndpointError::Quic)?;
+        let server = quic::server(&key, move |key| allowed.borrow().peers.iter().any(|peer| peer.key == *key), packets)?;
 
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_BACKLOG);
         let (to_acceptor, for_acceptor) = mpsc::channel(DATAGRAM_BACKLOG);
         let (to_initiator, for_initiator) = mpsc::channel(DATAGRAM_BACKLOG);
         let (to_packets, for_packets) = mpsc::channel(PACKET_BACKLOG);
+        // 封好的网络包不经 QUIC 库：socket 收到就交给它，解开之后和走数据报来的网络包排进同一个队列。
+        let inbox = Inbox::new(to_packets.clone());
+        let socket = PathSocket::new(Arc::clone(&paths), me, Arc::clone(&inbox));
+        let quic =
+            quinn::Endpoint::new_with_abstract_socket(quic::endpoint(&key)?, Some(server.clone()), socket, Arc::new(quinn::TokioRuntime))
+                .map_err(EndpointError::Quic)?;
         let queues = DatagramQueues { acceptor: to_acceptor, initiator: to_initiator, packets: to_packets };
         let datagrams = DatagramInbox { acceptor: for_acceptor.into(), initiator: for_initiator.into(), packets: for_packets.into() };
-        let manager = Manager::new(key, (quic, server), Arc::clone(&paths), netmap, incoming_tx, queues);
+        let route = PacketRoute { transport: packets, inbox };
+        let manager = Manager::new(key, (quic, server), Arc::clone(&paths), netmap, incoming_tx, queues, route);
 
         // 信令两条路都走：已经有连接的话在连接里送（有 relay 的网络因此不依赖 controller），同时交给装配方的钩子。
         let signal_hook: Arc<RwLock<Option<SignalHook>>> = Arc::default();

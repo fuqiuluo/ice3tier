@@ -1,15 +1,19 @@
 //! 虚拟网卡的包：第一个包之前把连接建起来，直连和经 relay 都通，和数据报上下文互不串门；
 //! 只运包的连接在包走的时候不被当作空闲回收，包停了照常回收。
+//!
+//! 两端都是现在的程序时，包单独加密、不进 QUIC；有一端不认识这种包时照旧走连接的数据报。两种走法上层看不出区别。
 
 // 这个文件里全是测试。clippy.toml 的 allow-unwrap-in-tests 只管 #[test] 函数本身，管不到它们调用的辅助函数。
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::{Node, Peer, SOON, View};
+use common::{Node, Peer, SOON, View, is_direct};
+use i3t_conn::ConnectionCounters;
 use i3t_conn::contract::{Datagram, DatagramSendError, DatagramSender, Datagrams, OpenError, PacketSender, Packets};
 use i3t_model::control::Route;
 use i3t_proto::flow::{DatagramHeader, PacketHeader, Recipient};
@@ -104,8 +108,8 @@ async fn a_connection_that_only_carries_packets_stays_while_they_flow_and_goes_w
     assert_eq!(sender.send_packet(b.id, packet(b"late")), Err(DatagramSendError::NotConnected(b.id)));
 }
 
-/// 从 `from` 到 `to` 一个一个地送 `count` 个网络包，每个都等对面收到再送下一个，所以一个包就是一个 QUIC 包。
-/// 返回这期间 `to` 发了多少个包：它没有别的要发，发的都是确认。
+/// 从 `from` 到 `to` 一个一个地送 `count` 个网络包，每个都等对面收到再送下一个，所以一个包就是一个 QUIC 包
+/// （两端的网络包都走数据报时）。返回这期间 `to` 发了多少个包：它没有别的要发，发的都是确认。
 async fn acks_for(from: &Node, to: &Node, count: usize) -> u64 {
     let sent = || to.endpoint.connection_report(from.id).expect("连接还在").counters.sent_packets;
     let sender = from.endpoint.packet_sender();
@@ -123,7 +127,8 @@ async fn acks_for(from: &Node, to: &Node, count: usize) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_peer_acknowledges_as_seldom_as_the_network_asks_from_the_next_connection_on() {
     const PACKETS: usize = 300;
-    let (a, b) = (Node::start(1), Node::start(2));
+    // 数的是 QUIC 的确认，所以网络包要走连接的数据报：封好的包不进 QUIC，对端不为它们发确认。
+    let (a, b) = (Node::start_datagram_only(1), Node::start_datagram_only(2));
     b.apply(&View { peers: &[Peer::direct(&a)], ..View::default() });
     // 等待时间取最长的，测的就只是阈值：包一个接一个地到，攒够之前等不满这么久。
     let asking =
@@ -155,6 +160,126 @@ async fn the_peer_acknowledges_as_seldom_as_the_network_asks_from_the_next_conne
     tokio::time::timeout(SOON, sender.connect(b.id)).await.expect("重新建连接超时").unwrap();
     let seldom = acks_for(&a, &b, PACKETS).await;
     assert!(seldom * 2 < often, "新的连接上对端确认得少了：原来 {often} 个，现在 {seldom} 个");
+}
+
+/// `from` 到 `to` 的那条连接上，QUIC 自己累计的计数。
+fn counters(from: &Node, to: &Node) -> ConnectionCounters {
+    from.endpoint.connection_report(to.id).expect("连接还在").counters
+}
+
+/// 从 `from` 到 `to` 一个一个地送 `count` 个 1000 字节的网络包，每个都等对面收到。返回这期间两端的连接各自增加的计数。
+async fn one_way(from: &Node, to: &Node, count: usize) -> (ConnectionCounters, ConnectionCounters) {
+    let sender = from.endpoint.packet_sender();
+    tokio::time::timeout(SOON, sender.connect(to.id)).await.expect("建连接超时").unwrap();
+    sender.send_packet(to.id, packet(b"first")).unwrap();
+    next(to).await;
+    let before = (counters(from, to), counters(to, from));
+    for _ in 0..count {
+        sender.send_packet(to.id, packet(&[0x45; 1000])).unwrap();
+        assert_eq!(next(to).await.payload.len(), 1001);
+    }
+    (counters(from, to).since(before.0), counters(to, from).since(before.1))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packets_between_current_nodes_stay_out_of_the_connection_and_still_count_as_traffic() {
+    const PACKETS: usize = 300;
+    let (a, b) = pair();
+    let (sent, received) = one_way(&a, &b, PACKETS).await;
+    // 连接自己这期间只有路径 MTU 的探测和零星的保活：包没有进它，对端也没有为这些包发任何确认。
+    assert!(sent.sent_packets < 50, "发的一方的连接只多发了几个包：{sent:?}");
+    assert!(received.sent_packets < 50, "收的一方没有为这些包发确认：{received:?}");
+    // 流量照样记在这条连接名下。
+    let carried = u64::try_from(PACKETS * 1000).unwrap();
+    assert!(sent.bytes_sent >= carried && received.bytes_received >= carried, "{sent:?} {received:?}");
+
+    // 包不进连接，连接照样自己把路径 MTU 探测做完，能带的帧跟着变大：网卡上一整个 1280 字节的 IP 包不用切。
+    let deadline = Instant::now() + SOON;
+    while a.endpoint.connection_report(b.id).expect("连接还在").mtu < i3t_proto::MAX_CONN_PACKET_LEN {
+        assert!(Instant::now() < deadline, "连接上只有封好的包在走时，路径 MTU 一直没有探测上去");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    a.endpoint.packet_sender().send_packet(b.id, packet(&[0x45; 1280])).unwrap();
+    assert_eq!(next(&b).await.payload.len(), 1281);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_does_not_know_sealed_packets_gets_them_as_datagrams_whoever_dials() {
+    const PACKETS: usize = 100;
+    for new_dials in [true, false] {
+        let (new, old) = (Node::start(1), Node::start_datagram_only(2));
+        new.apply(&View { peers: &[Peer::direct(&old)], ..View::default() });
+        old.apply(&View { peers: &[Peer::direct(&new)], ..View::default() });
+        let (dialer, acceptor) = if new_dials { (&new, &old) } else { (&old, &new) };
+        let (sent, _) = one_way(dialer, acceptor, PACKETS).await;
+        assert!(sent.sent_packets >= u64::try_from(PACKETS).unwrap(), "包走的是连接的数据报，一个包一个 QUIC 包：{sent:?}");
+        // 反方向用同一条连接，也是数据报。
+        let (back, _) = one_way(acceptor, dialer, PACKETS).await;
+        assert!(back.sent_packets >= u64::try_from(PACKETS).unwrap(), "{back:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_one_way_flow_keeps_its_route_and_costs_the_connection_about_a_packet_a_second() {
+    let (a, b) = pair();
+    let sender = a.endpoint.packet_sender();
+    tokio::time::timeout(SOON, sender.connect(b.id)).await.expect("建连接超时").unwrap();
+    a.wait_route(&b, "直连", is_direct).await;
+    sender.send_packet(b.id, packet(b"first")).unwrap();
+    next(&b).await;
+    // 等连接自己的路径 MTU 探测做完，之后它发的就只有"问一下对端还在不在"。
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before = (counters(&a, &b), counters(&b, &a));
+    // B 一个包都不回：没有任何回程的流量。
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        sender.send_packet(b.id, packet(&[0x45; 200])).unwrap();
+        next(&b).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(is_direct(&a.route_to(&b)), "没有回程的包，路也没有被当成断了：{:?}", a.route_to(&b));
+    let (asked, answered) = (counters(&a, &b).since(before.0), counters(&b, &a).since(before.1));
+    assert!((1..=10).contains(&asked.sent_packets), "三秒里连接替它问了对端几次：{asked:?}");
+    assert!(answered.sent_packets <= 10, "对端只回了那几次的确认：{answered:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packets_resume_within_seconds_after_the_peer_crashed_and_came_back() {
+    let (a, r) = (Node::start(1), Node::start(9));
+    let first = Node::start(2);
+    let key = Arc::clone(&first.key);
+    // A 和 B 只经 relay R 来往：B 重启换了端口之后，A 发的包照样经 R 送到新的 B 手上。
+    let via_relay = |b: &Node| {
+        r.apply(&View { relay_clients: Some(&[&a, b]), ..View::default() });
+        a.apply(&View { peers: &[Peer::via(b, &[&r])], relays: &[&r], reach: Some("relay_only"), ..View::default() });
+        b.apply(&View { peers: &[Peer::via(&a, &[&r])], relays: &[&r], reach: Some("relay_only"), ..View::default() });
+    };
+    via_relay(&first);
+    r.wait_tcp_listening().await;
+    let sender = a.endpoint.packet_sender();
+    tokio::time::timeout(3 * SOON, sender.connect(first.id)).await.expect("经 relay 建连接超时").unwrap();
+    sender.send_packet(first.id, packet(b"\x45 before")).unwrap();
+    assert_eq!(next(&first).await.peer, a.id);
+
+    // B 崩溃了：一个包也不再发，连关闭帧也没有。然后带着同一把密钥回来。
+    first.block_all();
+    drop(first);
+    let back = Node::start_with_key(2, key);
+    via_relay(&back);
+
+    // A 只管接着发，没有任何回程的包。新的 B 没有那条连接的密钥，这些包它解不开；A 的连接隔一秒替它问一次，
+    // 新的 B 回一个无状态重置，A 这才知道连接没了，不用等 15 秒的保活。
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        while sender.send_packet(back.id, packet(b"\x45 into the void")).is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    ended.await.expect("旧连接应该在几秒之内结束，而不是等到保活或者空闲超时");
+
+    // 重建之后照常，旧连接上那些解不开的包一个也没有混进来。
+    tokio::time::timeout(3 * SOON, sender.connect(back.id)).await.expect("重新建连接超时").unwrap();
+    sender.send_packet(back.id, packet(b"\x45 after")).unwrap();
+    assert_eq!(&next(&back).await.payload[..], &packet(b"\x45 after")[..]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
