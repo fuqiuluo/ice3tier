@@ -22,14 +22,28 @@ fn node(raw: u32) -> NodeId {
 struct FakeDevice {
     from_kernel: AsyncMutex<mpsc::UnboundedReceiver<io::Result<Vec<u8>>>>,
     to_kernel: mpsc::UnboundedSender<Vec<u8>>,
+    /// 引擎开始了几次"等下一个包"。真的网卡上每一次都不便宜（Windows：一个内核事件加一个阻塞线程的任务）。
+    waits: AtomicUsize,
+}
+
+impl FakeDevice {
+    fn copy(packet: io::Result<Vec<u8>>, buf: &mut [u8]) -> io::Result<usize> {
+        let packet = packet?;
+        buf[..packet.len()].copy_from_slice(&packet);
+        Ok(packet.len())
+    }
 }
 
 impl Device for FakeDevice {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.waits.fetch_add(1, Ordering::Relaxed);
         let Some(packet) = self.from_kernel.lock().await.recv().await else { return std::future::pending().await };
-        let packet = packet?;
-        buf[..packet.len()].copy_from_slice(&packet);
-        Ok(packet.len())
+        Self::copy(packet, buf)
+    }
+
+    fn try_recv(&self, buf: &mut [u8]) -> Option<io::Result<usize>> {
+        let packet = self.from_kernel.try_lock().ok()?.try_recv().ok()?;
+        Some(Self::copy(packet, buf))
     }
 
     async fn send(&self, packet: &[u8]) -> io::Result<()> {
@@ -105,6 +119,7 @@ struct World {
     /// 对端发来的帧从这里进来。
     peers: mpsc::UnboundedSender<Datagram>,
     net: FakeNet,
+    device: Arc<FakeDevice>,
     netmap: watch::Sender<Arc<Netmap>>,
     counters: Arc<Counters>,
     engine: tokio::task::JoinHandle<Stopped>,
@@ -143,11 +158,11 @@ fn world(map: Netmap, connected: &[u32], dial_delay: Duration) -> World {
         queued: AtomicUsize::new(0),
         inbox: AsyncMutex::new(inbox),
     }));
-    let device = Arc::new(FakeDevice { from_kernel: AsyncMutex::new(from_kernel), to_kernel });
+    let device = Arc::new(FakeDevice { from_kernel: AsyncMutex::new(from_kernel), to_kernel, waits: AtomicUsize::new(0) });
     let (netmap, netmap_rx) = watch::channel(Arc::new(map));
     let counters = Arc::new(Counters::default());
-    let engine = tokio::spawn(Engine::new(device, Arc::new(net.clone()), netmap_rx, Arc::clone(&counters)).run());
-    World { app, kernel, wire, peers, net, netmap, counters, engine }
+    let engine = tokio::spawn(Engine::new(Arc::clone(&device), Arc::new(net.clone()), netmap_rx, Arc::clone(&counters)).run());
+    World { app, kernel, wire, peers, net, device, netmap, counters, engine }
 }
 
 impl World {
@@ -211,6 +226,8 @@ async fn packets_already_waiting_on_the_device_are_handed_down_together_and_then
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(flushed(), [5], "五个现成的包一口气交下去，然后发一次，不是每个包发一次");
+    let waits = world.device.waits.load(Ordering::Relaxed);
+    assert!(waits <= 2, "只等两次：开头等到第一个包，取完现成的之后等下一个。中间和末尾不为了看一眼就开始等：{waits} 次");
 }
 
 #[tokio::test]

@@ -21,6 +21,12 @@ pub trait Device: Send + Sync + 'static {
     /// 读下一个本机发出、经这块网卡走的包，放进 `buf`，返回长度。
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
 
+    /// 网卡上现在就有包的话读一个，没有就是 `None`，不等。
+    ///
+    /// 引擎读到一个包之后用它把紧跟着的也取出来。"把 [`recv`](Self::recv) 试一下、还要等就丢掉"代替不了它：
+    /// Windows 上 `recv` 每等一次都要建一个内核事件、往阻塞线程池里派一个任务，丢掉时再取消掉，每一阵包的末尾白做一遍。
+    fn try_recv(&self, buf: &mut [u8]) -> Option<io::Result<usize>>;
+
     /// 把一个包交给本机的内核，像是从这块网卡进来的。
     fn send(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
 }
@@ -224,6 +230,13 @@ impl Tun {
 impl Device for Tun {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.device.recv(buf).await
+    }
+
+    fn try_recv(&self, buf: &mut [u8]) -> Option<io::Result<usize>> {
+        match self.device.try_recv(buf) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+            result => Some(result),
+        }
     }
 
     async fn send(&self, packet: &[u8]) -> io::Result<()> {

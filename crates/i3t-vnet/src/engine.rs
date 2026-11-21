@@ -28,13 +28,10 @@
 //! 每个包不另外记日志：丢掉的每一种原因第一次记一行，之后每分钟最多一行，带着这段时间丢了多少。
 
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
-use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -340,16 +337,6 @@ struct Outbound<D, S> {
     log: DropLog,
 }
 
-/// 这个 future 现在就有结果的话取出来，还要等的话丢掉它。只能用在丢掉了不会弄丢东西的 future 上：
-/// 读网卡是这样的，[`Outbound::run`] 里它本来就和别的事件一起等，等到别的事件时一样被丢掉。
-fn ready_now<F: Future>(future: F) -> Option<F::Output> {
-    let mut future = pin!(future);
-    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(output) => Some(output),
-        Poll::Pending => None,
-    }
-}
-
 /// 出去的方向这一轮等到了什么。
 enum Event {
     Read(io::Result<usize>),
@@ -389,7 +376,7 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                         }
                         taken += 1;
                         if taken < OUTBOUND_BURST {
-                            read = ready_now(self.device.recv(&mut buf[1..]));
+                            read = self.device.try_recv(&mut buf[1..]);
                         }
                     }
                 }
