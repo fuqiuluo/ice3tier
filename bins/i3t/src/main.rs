@@ -3,6 +3,8 @@
 //! 终端上的文字跟着系统的语言（见 `i3t_lang`），日志不翻译。
 
 mod network;
+#[cfg(windows)]
+mod service;
 mod show;
 mod texts;
 #[cfg(target_os = "linux")]
@@ -61,6 +63,17 @@ enum Command {
     Run {
         #[arg(long)]
         r#static: Option<PathBuf>,
+        // Windows 的服务控制管理器启动服务时带着它（见 `service`），不是给人用的。
+        #[cfg(windows)]
+        #[arg(long, hide = true)]
+        service: bool,
+    },
+    // Windows 上把节点登记成系统服务、注销它。安装脚本用。
+    #[cfg(windows)]
+    #[command(hide = true)]
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     Set {
         #[arg(value_parser = parse_setting)]
@@ -96,6 +109,13 @@ enum Command {
 enum NetworkCommand {
     Status,
     Cleanup,
+}
+
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceCommand {
+    Install,
+    Uninstall,
 }
 
 /// `i3t hosts` 做什么：打印那一段、写进 hosts 文件（`--apply`）、从里面去掉（`--remove`）。
@@ -163,6 +183,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         network::cleanup()?;
         return Ok(ExitCode::SUCCESS);
     }
+    // 登记和注销服务也不碰状态目录：它由安装脚本建，访问控制也是脚本设的。
+    #[cfg(windows)]
+    if let Command::Service { command } = &cli.command {
+        change_service(command)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let t = &texts().ui;
     let version: Version = VERSION.parse().context(t.bad_version)?;
     let state = StateDir::open(match cli.state_dir {
@@ -189,17 +215,36 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             // 安装脚本装的 `i3t` 包装脚本在加入之后自己重启系统服务，这时不该再叫人去 `i3t run`。
             match std::env::var("I3T_SERVICE") {
                 Ok(service) if !service.is_empty() => println!("{}", (t.start_service)(&service)),
-                _ => println!("{}", t.start_with_run),
+                _ => {
+                    // Windows 上装成了系统服务、加入的又是服务的那个状态目录：直接把服务启动起来。
+                    #[cfg(windows)]
+                    if runs_as_service(&state) {
+                        println!("{}", (t.start_service)(service::NAME));
+                        service::restart().context(texts().service.needs_admin)?;
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    println!("{}", t.start_with_run);
+                }
             }
         }
-        Command::Run { r#static } => match run_node(&state, &version, r#static) {
-            Ok(code) => return Ok(code),
-            Err(error) if is_unrecoverable(&error) => {
-                eprintln!("i3t: {}", i3t_lang::current().chain(error.chain()));
-                return Ok(ExitCode::from(NO_RESTART_EXIT_CODE));
+        #[cfg(windows)]
+        Command::Run { r#static, service: true } => return run_as_service(state, version, r#static),
+        Command::Run { r#static, .. } => {
+            #[cfg(windows)]
+            if runs_as_service(&state) {
+                bail!((texts().service.run_is_service)(service::NAME));
             }
-            Err(error) => return Err(error),
-        },
+            match run_node(&state, &version, r#static, &LogTo::Stderr, shutdown_signal()) {
+                Ok(Outcome::Stopped) => {}
+                // 程序文件换过了：请看护程序（systemd 之类）把进程重新拉起来。
+                Ok(Outcome::Restart) => return Ok(ExitCode::from(RESTART_EXIT_CODE)),
+                Err(error) if is_unrecoverable(&error) => {
+                    eprintln!("i3t: {}", i3t_lang::current().chain(error.chain()));
+                    return Ok(ExitCode::from(NO_RESTART_EXIT_CODE));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Command::Set { setting, value } => {
             let change = setting.change(&value)?;
             if let Change::CanForward(_) = change {
@@ -260,6 +305,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             network::status(&state, live.as_ref());
         }
         Command::Network { command: NetworkCommand::Cleanup } => unreachable!("Cleanup 已在打开状态目录之前处理"),
+        #[cfg(windows)]
+        Command::Service { .. } => unreachable!("Service 已在打开状态目录之前处理"),
         Command::Hosts { apply, remove } => {
             let action = match (apply, remove) {
                 (true, _) => HostsAction::Apply,
@@ -280,11 +327,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// 启动并运行节点，返回应该交给看护程序的退出码。
-fn run_node(state: &StateDir, version: &Version, r#static: Option<PathBuf>) -> anyhow::Result<ExitCode> {
+/// 启动并运行节点，直到 `shutdown` 完成，或者节点自己要求重新启动。日志写到 `log`。
+fn run_node(
+    state: &StateDir,
+    version: &Version,
+    r#static: Option<PathBuf>,
+    log: &LogTo,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<Outcome> {
     let t = &texts().ui;
     let config = Config::load(&state.config_path())?;
-    init_logging(config.log.level.as_str());
+    init_logging(config.log.level.as_str(), log);
     #[cfg(unix)]
     raise_open_file_limit();
     // 程序文件在哪里要趁早查：更新换过文件之后，系统报出来的就不是原来的位置了。
@@ -292,11 +345,50 @@ fn run_node(state: &StateDir, version: &Version, r#static: Option<PathBuf>) -> a
     let source = r#static.map_or(Source::Controller, Source::Static);
     let threads = node::starting_performance(state, &source)?.threads;
     let runtime = runtime(threads).context(t.start_runtime)?;
-    Ok(match runtime.block_on(node::run(state.clone(), source, program, threads, shutdown_signal()))? {
-        Outcome::Stopped => ExitCode::SUCCESS,
-        // 程序文件换过了：请看护程序（systemd 之类）把进程重新拉起来。
-        Outcome::Restart => ExitCode::from(RESTART_EXIT_CODE),
-    })
+    runtime.block_on(node::run(state.clone(), source, program, threads, shutdown))
+}
+
+/// 这个状态目录里的节点是不是由系统服务运行的：服务登记着，目录就是服务用的那一个。
+#[cfg(windows)]
+fn runs_as_service(state: &StateDir) -> bool {
+    let same = |a: &std::path::Path, b: &std::path::Path| matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b);
+    system_state_dir().is_some_and(|system| same(&system, state.path())) && service::is_installed()
+}
+
+/// 服务控制管理器启动的节点：日志写进状态目录里的文件（服务没有终端），停止的通知来自 SCM。
+#[cfg(windows)]
+fn run_as_service(state: StateDir, version: Version, r#static: Option<PathBuf>) -> anyhow::Result<ExitCode> {
+    let log = state.path().join(SERVICE_LOG);
+    let job = move |stop: service::Stop| match run_node(&state, &version, r#static, &LogTo::File(log.clone()), stop) {
+        Ok(Outcome::Stopped) => 0,
+        Ok(Outcome::Restart) => u32::from(RESTART_EXIT_CODE),
+        Err(error) => {
+            // 出错可能早于日志初始化（配置文件读不了），所以直接写进日志文件。
+            append_line(&log, &format!("i3t: {}", i3t_lang::current().chain(error.chain())));
+            // 重启也救不了的以 0 停止，服务控制管理器不再拉；别的它过一会儿重新启动。
+            if is_unrecoverable(&error) { 0 } else { 1 }
+        }
+    };
+    service::dispatch(job).context(texts().service.not_started_by_system)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `i3t service install`、`i3t service uninstall`。
+#[cfg(windows)]
+fn change_service(command: &ServiceCommand) -> anyhow::Result<()> {
+    let t = &texts().service;
+    match command {
+        ServiceCommand::Install => {
+            let program = std::env::current_exe().context(t.needs_admin)?;
+            service::install(&program).context(t.needs_admin)?;
+            println!("{}", (t.installed)(service::NAME));
+        }
+        ServiceCommand::Uninstall => {
+            service::uninstall().context(t.needs_admin)?;
+            println!("{}", (t.uninstalled)(service::NAME));
+        }
+    }
+    Ok(())
 }
 
 /// 这条错误重启也救不了：`i3t run` 应以 [`NO_RESTART_EXIT_CODE`]（78 / `EX_CONFIG`）退出，让 systemd 停止自动重启。
@@ -358,15 +450,60 @@ fn current_thread() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().context(texts().ui.start_runtime)
 }
 
-/// 日志写到标准错误。级别来自配置文件，可以用环境变量 `I3T_LOG` 临时覆盖（写法同 `RUST_LOG`，可以按模块设）。
-fn init_logging(level: &str) {
+/// 节点的日志写到哪里。
+enum LogTo {
+    /// 标准错误：终端，或者 systemd、launchd 替它收着。
+    Stderr,
+    /// 一个文件。Windows 的服务没有终端，也没有人替它收标准错误。
+    #[cfg(windows)]
+    File(PathBuf),
+}
+
+/// Windows 上作为服务运行时的日志文件，在状态目录里。
+#[cfg(windows)]
+const SERVICE_LOG: &str = "i3t.log";
+
+/// 日志文件超过这么大，下次启动时改名留作上一份（`i3t.log.old`），重新开始写。
+#[cfg(windows)]
+const SERVICE_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 初始化日志。级别来自配置文件，可以用环境变量 `I3T_LOG` 临时覆盖（写法同 `RUST_LOG`，可以按模块设）。
+fn init_logging(level: &str, to: &LogTo) {
     let filter = std::env::var("I3T_LOG").unwrap_or_else(|_| level.to_owned());
     let filter = tracing_subscriber::EnvFilter::try_new(&filter).unwrap_or_else(|err| {
         eprintln!("{}", (texts().ui.bad_log_env)(&filter, &err.to_string(), level));
         tracing_subscriber::EnvFilter::new(level)
     });
-    // 输出到文件或者日志服务时不带颜色的控制符。
-    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(std::io::stderr().is_terminal()).with_writer(std::io::stderr).init();
+    let logs = tracing_subscriber::fmt().with_env_filter(filter);
+    match to {
+        // 输出到文件或者日志服务时不带颜色的控制符。
+        LogTo::Stderr => logs.with_ansi(std::io::stderr().is_terminal()).with_writer(std::io::stderr).init(),
+        #[cfg(windows)]
+        LogTo::File(path) => match open_log(path) {
+            Ok(file) => logs.with_ansi(false).with_writer(std::sync::Mutex::new(file)).init(),
+            // 日志文件打不开不该让节点起不来。
+            Err(_) => logs.with_ansi(false).with_writer(std::io::sink).init(),
+        },
+    }
+}
+
+/// 打开日志文件接着写；已经太大的先改名留作上一份。
+#[cfg(windows)]
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if std::fs::metadata(path).is_ok_and(|file| file.len() > SERVICE_LOG_MAX_BYTES) {
+        // 改不了名就接着往原来的文件里写。
+        let _kept = std::fs::rename(path, path.with_extension("log.old"));
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// 往日志文件里添一行。写不进去就算了：这已经是报错的最后一条路。
+#[cfg(windows)]
+fn append_line(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _written = writeln!(file, "{line}");
+    }
 }
 
 /// 把能同时打开的文件数的软上限抬到硬上限。
@@ -417,12 +554,20 @@ async fn interrupted(ctrl_c: impl Future<Output = std::io::Result<()>>) {
     }
 }
 
+/// 装成系统服务时的状态目录：Unix 上是 `/var/lib/i3t`，Windows 上是 `%ProgramData%\i3t`。安装脚本建它。
+fn system_state_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("ProgramData").filter(|value| !value.is_empty()).map(|base| PathBuf::from(base).join("i3t"))
+    } else {
+        Some(PathBuf::from("/var/lib/i3t"))
+    }
+}
+
 /// 没有用 `--state-dir` 指定时状态目录放在哪里。
 ///
-/// 装成系统服务时安装脚本会建好 `/var/lib/i3t`，存在就用它；否则放在当前用户自己的目录里。
+/// 装成系统服务时安装脚本会建好系统的那一个（[`system_state_dir`]），存在就用它；否则放在当前用户自己的目录里。
 fn default_state_dir() -> anyhow::Result<PathBuf> {
-    let system = PathBuf::from("/var/lib/i3t");
-    if cfg!(unix) && system.is_dir() {
+    if let Some(system) = system_state_dir().filter(|system| system.is_dir()) {
         return Ok(system);
     }
     let from_env = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);

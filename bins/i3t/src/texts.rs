@@ -11,6 +11,8 @@ pub struct Texts {
     pub network: Net,
     #[cfg(target_os = "linux")]
     pub linux: Linux,
+    #[cfg(windows)]
+    pub service: Service,
 }
 
 pub fn texts() -> &'static Texts {
@@ -196,6 +198,19 @@ pub struct Net {
     pub hosts_left: fn(&str) -> String,
 }
 
+/// Windows 上装成系统服务之后说的话。参数都是服务的名字。
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct Service {
+    pub installed: fn(&str) -> String,
+    pub uninstalled: fn(&str) -> String,
+    /// 在终端里执行 `i3t run`，而这个节点是由系统服务运行的。
+    pub run_is_service: fn(&str) -> String,
+    pub needs_admin: &'static str,
+    /// `i3t run --service` 不是服务控制管理器启动的。
+    pub not_started_by_system: &'static str,
+}
+
 /// `i3t tune` 说的话。这个命令只在 Linux 上做事，别的平台上只说一句只有 Linux 有（[`Ui::tune_linux_only`]），
 /// 这些文字也就只在 Linux 上编进去。
 #[cfg(target_os = "linux")]
@@ -374,6 +389,14 @@ static ZH: Texts = Texts {
         hosts_removed: |path| format!("从 {path} 去掉了 i3t hosts 写的那一段"),
         hosts_no_block: |path| format!("{path} 里没有 i3t hosts 写的那一段"),
         hosts_left: |path| format!("{path} 里还有 i3t hosts --apply 写的名字，虚拟网卡没装时它们不通：i3t hosts --remove 去掉"),
+    },
+    #[cfg(windows)]
+    service: Service {
+        installed: |name| format!("已登记系统服务 {name}，开机自动启动"),
+        uninstalled: |name| format!("已注销系统服务 {name}"),
+        run_is_service: |name| format!("节点已装成系统服务，由它运行：Start-Service {name}"),
+        needs_admin: "操作系统服务失败（要以管理员身份运行）",
+        not_started_by_system: "--service 只在由 Windows 的服务管理器启动时使用",
     },
     #[cfg(target_os = "linux")]
     linux: Linux {
@@ -557,6 +580,14 @@ static EN: Texts = Texts {
         hosts_left: |path| {
             format!("{path} still has names from i3t hosts --apply, which don't work without the virtual adapter: i3t hosts --remove")
         },
+    },
+    #[cfg(windows)]
+    service: Service {
+        installed: |name| format!("Registered system service {name}; it starts at boot"),
+        uninstalled: |name| format!("Removed system service {name}"),
+        run_is_service: |name| format!("The node is installed as a system service, which runs it: Start-Service {name}"),
+        needs_admin: "Changing the system service failed (run as administrator)",
+        not_started_by_system: "--service is only for the Windows service manager",
     },
     #[cfg(target_os = "linux")]
     linux: Linux {
