@@ -208,7 +208,7 @@ fn the_networks_acknowledgement_settings_reach_every_node_and_stay_within_their_
     let (mut laptop, mut nas) = (lab.join(network.id, &[]), lab.join(network.id, &[]));
     lab.settle(&mut [&mut laptop, &mut nas]);
     let sent = |netmap: &netmap::Netmap| (netmap.network.ack_eliciting_threshold, netmap.network.max_ack_delay_ms);
-    assert_eq!((sent(laptop.netmap()), sent(nas.netmap())), ((10, 2), (10, 2)), "新建的网络用默认值");
+    assert_eq!((sent(laptop.netmap()), sent(nas.netmap())), ((3, 2), (3, 2)), "新建的网络用默认值");
 
     let change = UpdateNetwork { ack_eliciting_threshold: Some(4), ..UpdateNetwork::default() };
     let changed = lab.controller.update_network(network.id, &change).unwrap();

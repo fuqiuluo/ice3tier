@@ -31,7 +31,7 @@ const HELP: Help = Help {
     network_delete: "删除网络（要先删掉其中的节点）",
     network_cidr: "地址段。有节点之后只能扩大",
     network_max_relay_hops: "最大中转级数，1 到 4",
-    network_ack_eliciting_threshold: "确认阈值，1 到 100：对端攒到多于这么多个包才单独发确认。只对新建的连接生效",
+    network_ack_eliciting_threshold: "确认阈值，1 到 100，默认 3：对端攒到多于这么多个包才单独发确认。超过 3 时吞吐要看对端的定时器准不准。只对新建的连接生效",
     network_max_ack_delay_ms: "确认最长等待，1 到 25 毫秒：没攒够时对端最多等这么久。只对新建的连接生效",
     routing: "选路模式",
     reach: "路径限制",

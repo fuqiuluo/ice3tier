@@ -211,7 +211,7 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
     let home = api.network("home").await;
     assert_eq!((home.name.as_str(), home.domain.as_str(), home.nodes), ("home", "home.i3t", 0));
     assert_eq!(home.cidr, "10.66.0.0/16".parse().unwrap());
-    assert_eq!((home.ack_eliciting_threshold, home.max_ack_delay_ms), (10, 2), "没写的设置用默认值");
+    assert_eq!((home.ack_eliciting_threshold, home.max_ack_delay_ms), (3, 2), "没写的设置用默认值");
     let defaults = home.defaults.clone().expect("controller 报出各项设置的默认值");
     assert_eq!(
         (home.routing, home.max_relay_hops, home.reach, home.class, home.ack_eliciting_threshold, home.max_ack_delay_ms),

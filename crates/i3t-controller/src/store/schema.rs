@@ -560,7 +560,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), u32::try_from(MIGRATIONS.len()).unwrap());
         let network = store.network_by_name("home").unwrap().unwrap();
-        assert_eq!((network.ack_eliciting_threshold, network.max_ack_delay_ms), (10, 2));
+        assert_eq!((network.ack_eliciting_threshold, network.max_ack_delay_ms), (3, 2));
         assert_eq!(network.max_relay_hops, 2, "别的设置不动");
     }
 }

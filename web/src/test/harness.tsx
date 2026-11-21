@@ -100,14 +100,14 @@ export const NETWORK: Network = {
   created_at: 1_794_000_000,
   nodes: 0,
   class: null,
-  ack_eliciting_threshold: 10,
+  ack_eliciting_threshold: 3,
   max_ack_delay_ms: 2,
   defaults: {
     routing: 'direct_first',
     max_relay_hops: 2,
     reach: 'any',
     class: null,
-    ack_eliciting_threshold: 10,
+    ack_eliciting_threshold: 3,
     max_ack_delay_ms: 2,
   },
 }

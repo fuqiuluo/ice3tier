@@ -49,7 +49,7 @@ fn netmap() -> Netmap {
             max_relay_hops: 2,
             reach: Default::default(),
             class: None,
-            ack_eliciting_threshold: 10,
+            ack_eliciting_threshold: 3,
             max_ack_delay_ms: 2,
         },
         me: LocalNode {

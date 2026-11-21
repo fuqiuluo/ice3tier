@@ -62,7 +62,8 @@ export const networks: Messages['networks'] = {
   connectionNote: 'Applies to connections made from now on',
   ackThresholdLabel: 'ACK threshold',
   ackThresholdDesc: 'A peer sends an ACK only after more than this many packets',
-  ackThresholdHint: 'Higher means fewer ACK packets on the way back. 1 is an ACK every two packets.',
+  ackThresholdHint:
+    "Higher means fewer ACK packets on the way back. Above 3, throughput depends on how precise the peer's timer is: it drops sharply towards Windows peers.",
   ackThresholdUnit: 'packets',
   ackDelayLabel: 'Max ACK delay',
   ackDelayDesc: 'How long a peer waits below the threshold',

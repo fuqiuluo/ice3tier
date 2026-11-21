@@ -536,19 +536,52 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn two_nodes_find_their_direct_path_and_measure_its_latency_and_throughput_end_to_end() {
+    /// 两个互相知道地址的节点 1 和 2，节点 2 提供测量服务。`settings` 在各自的 netmap 交出去之前改网络的设置。
+    fn measuring_pair(settings: impl Fn(&mut i3t_model::netmap::Network)) -> (TestNode, TestNode, tokio::task::JoinHandle<()>) {
         let keys = [Arc::new(NodeKey::generate().unwrap()), Arc::new(NodeKey::generate().unwrap())];
-        let mut a = test_node(Arc::clone(&keys[0]), netmap(1, &[(2, keys[1].public(), None)], "any"), true);
-        let mut b = test_node(Arc::clone(&keys[1]), netmap(2, &[(1, keys[0].public(), None)], "any"), true);
-        a.netmap.send_replace(Arc::new(netmap(1, &[(2, keys[1].public(), Some(b.endpoint.local_addr()))], "any")));
-        b.netmap.send_replace(Arc::new(netmap(2, &[(1, keys[0].public(), Some(a.endpoint.local_addr()))], "any")));
+        let of = |me: u32, peer: u32, addr: Option<SocketAddr>| {
+            let mut netmap = netmap(me, &[(peer, keys[usize::try_from(peer - 1).unwrap()].public(), addr)], "any");
+            settings(&mut netmap.network);
+            netmap
+        };
+        let a = test_node(Arc::clone(&keys[0]), of(1, 2, None), true);
+        let b = test_node(Arc::clone(&keys[1]), of(2, 1, None), true);
+        a.netmap.send_replace(Arc::new(of(1, 2, Some(b.endpoint.local_addr()))));
+        b.netmap.send_replace(Arc::new(of(2, 1, Some(a.endpoint.local_addr()))));
         let serving = tokio::spawn({
             let (endpoint, handler) = (Arc::clone(&b.endpoint), Arc::new(MeasureOnly(Arc::clone(&b.diag))));
             async move { i3t_flow::serve(&*endpoint, handler).await }
         });
+        (a, b, serving)
+    }
 
-        let items = TestItems { direct: true, direct_quality: true, relay_quality: false, route: true, throughput: true, host: true };
+    /// 全套的主动测试：直连、延迟、选路、吞吐、主机的状况。
+    const EVERYTHING: TestItems =
+        TestItems { direct: true, direct_quality: true, relay_quality: false, route: true, throughput: true, host: true };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_throughput_of_a_connection_does_not_hang_on_the_peers_acknowledgement_timer() {
+        // 网络默认的确认阈值下，对端等确认的定时器再慢，吞吐也不受影响：窗口里总有够数的包，对端不等定时器就确认。
+        // 这里把等待调到最长，代替定时器不准的对端：Windows 默认的粒度是十几毫秒，说好等 2 毫秒，实际等的是这个数。
+        let (mut a, b, serving) = measuring_pair(|network| network.max_ack_delay_ms = 25);
+        b.diag.order(order(41, 1, TestRole::Responder, EVERYTHING));
+        a.diag.order(order(41, 2, TestRole::Initiator, EVERYTHING));
+        let report = next_report(&mut a.reports).await;
+        let throughput = report.paths[0].throughput.as_ref().unwrap();
+        let (up, down) = (throughput.up.unwrap(), throughput.down.unwrap());
+        assert_eq!((up.bytes, up.stopped_by), (THROUGHPUT_BYTES, TransferEnd::Bytes), "{up:?}");
+        assert_eq!((down.bytes, down.stopped_by), (THROUGHPUT_BYTES, TransferEnd::Bytes), "{down:?}");
+        // 阈值比拥塞控制的最小窗口大的时候（默认值曾经是 10），不是每次都传不完，更多的时候是慢十倍以上：
+        // 实测回环上这二十兆正常不到 0.2 秒，那时十次里有七八次至少一个方向要 1.4 到 5 秒。
+        let unhurried = THROUGHPUT_TIME.as_millis() / 2;
+        assert!(u128::from(up.ms) < unhurried && u128::from(down.ms) < unhurried, "对端等得久，传得就慢了：{up:?} {down:?}");
+        serving.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_nodes_find_their_direct_path_and_measure_its_latency_and_throughput_end_to_end() {
+        let (mut a, mut b, serving) = measuring_pair(|_| {});
+        let items = EVERYTHING;
         b.diag.order(order(40, 1, TestRole::Responder, items));
         a.diag.order(order(40, 2, TestRole::Initiator, items));
         let report = next_report(&mut a.reports).await;

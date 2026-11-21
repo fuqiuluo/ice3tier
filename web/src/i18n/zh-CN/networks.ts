@@ -59,7 +59,7 @@ export const networks = {
   connectionNote: '只对之后新建的连接生效',
   ackThresholdLabel: '确认阈值',
   ackThresholdDesc: '对端收到超过这么多个包才发一次确认',
-  ackThresholdHint: '调大，回程的确认包更少。1 是每两个包确认一次',
+  ackThresholdHint: '调大，回程的确认包更少。超过 3 时吞吐要看对端的定时器准不准，对端是 Windows 时会明显变慢',
   ackThresholdUnit: '个包',
   ackDelayLabel: '确认最长等待',
   ackDelayDesc: '不够数时，对端最多等这么久',

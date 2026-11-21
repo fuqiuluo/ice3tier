@@ -148,7 +148,7 @@ describe('网络', () => {
     const threshold = screen.getByLabelText(n.ackThresholdLabel)
     const delay = screen.getByLabelText(n.ackDelayLabel)
     const save = screen.getByRole('button', { name: n.saveSettings })
-    expect(threshold).toHaveValue('10')
+    expect(threshold).toHaveValue('3')
     expect(delay).toHaveValue('2')
     expect(save).toBeDisabled()
     expect(screen.getByText(n.connectionNote)).toBeVisible()
@@ -158,7 +158,7 @@ describe('网络', () => {
     await user.type(threshold, '4')
     // 表单里的值一和默认值不一样，这一行就标出来，写着默认值。
     expect(screen.getByText(t.common.modified)).toBeVisible()
-    expect(screen.getByText(t.common.defaultIs(`10 ${n.ackThresholdUnit}`), { exact: false })).toBeVisible()
+    expect(screen.getByText(t.common.defaultIs(`3 ${n.ackThresholdUnit}`), { exact: false })).toBeVisible()
     await user.click(save)
     await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
     expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ ack_eliciting_threshold: 4, max_ack_delay_ms: 2 })

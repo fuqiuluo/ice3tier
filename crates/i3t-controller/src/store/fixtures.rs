@@ -16,7 +16,7 @@ pub(crate) fn home() -> NewNetwork {
         reach: Reach::Any,
         created_at: 1_000,
         class: None,
-        ack_eliciting_threshold: 10,
+        ack_eliciting_threshold: 3,
         max_ack_delay_ms: 2,
     }
 }

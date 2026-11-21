@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(record.name, "home");
         assert_eq!(record.domain(), "home.i3t");
         assert_eq!(record.cidr, "10.66.0.0/16".parse().unwrap());
-        assert_eq!((record.ack_eliciting_threshold, record.max_ack_delay_ms), (10, 2));
+        assert_eq!((record.ack_eliciting_threshold, record.max_ack_delay_ms), (3, 2));
         assert_eq!(store.network_by_name("home").unwrap(), Some(record.clone()));
         assert_eq!(store.networks().unwrap(), vec![record.clone()]);
 
