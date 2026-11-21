@@ -101,6 +101,9 @@ try {
     if ($run.Text -notmatch 'Start-Service i3t') { Fail "i3t run: unexpected answer: $($run.Text)" }
 
     Step 'i3t join joins and starts the service'
+    Write-Host ("diag: OutputEncoding={0} preamble={1} tokenLength={2} startsWith={3}" -f $OutputEncoding.WebName, $OutputEncoding.GetPreamble().Length, $token.Length, $token.StartsWith('i3t-'))
+    $hex = 'abc' | & powershell.exe -NoProfile -Command '$s = [Console]::OpenStandardInput(); $b = New-Object byte[] 32; $n = $s.Read($b, 0, 32); ($b[0..($n - 1)] | ForEach-Object { $_.ToString("X2") }) -join " "'
+    Write-Host "diag: piped bytes: $hex"
     $token | & i3t join --can-relay
     if ($LASTEXITCODE -ne 0) { Fail 'i3t join failed' }
     Wait-Online
@@ -140,9 +143,9 @@ try {
     Step 'ok'
 } catch {
     Write-Host "`n--- failed; the node says:"
-    Get-Content -LiteralPath (Join-Path $state 'i3t.log') -Tail 80 -ErrorAction SilentlyContinue
+    Get-Content -LiteralPath (Join-Path $state 'i3t.log') -Tail 80 -Encoding UTF8 -ErrorAction SilentlyContinue
     Write-Host '--- the controller says:'
-    Get-Content -LiteralPath (Join-Path $work 'ctl.err') -Tail 40 -ErrorAction SilentlyContinue
+    Get-Content -LiteralPath (Join-Path $work 'ctl.err') -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue
     throw
 } finally {
     if ($controller -and (-not $controller.HasExited)) { Stop-Process -Id $controller.Id -Force -ErrorAction SilentlyContinue }
