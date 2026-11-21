@@ -4,7 +4,7 @@ const count = (n: number, one: string, many: string) => (n === 1 ? `1 ${one}` : 
 
 export const networks: Messages['networks'] = {
   title: 'Networks',
-  subtitle: 'Name, address range and routing of this network',
+  subtitle: 'Name, address range, routing and connections of this network',
   switchTo: (name) => `Switch to ${name}`,
   nodes: (n) => count(n, 'node', 'nodes'),
   createdAt: 'Created',
@@ -56,6 +56,17 @@ export const networks: Messages['networks'] = {
   classHint: 'Proxy usernames, listeners, port forwards and exits take precedence',
   saveSettings: 'Save',
   settingsSaved: 'Settings saved',
+  connection: 'Connections',
+  connectionNote: 'Applies to connections made from now on',
+  ackThresholdLabel: 'ACK threshold',
+  ackThresholdDesc: 'A peer sends an ACK only after more than this many packets. Default 10.',
+  ackThresholdHint: 'Higher means fewer ACK packets on the way back. 1 is an ACK every two packets.',
+  ackThresholdUnit: 'packets',
+  ackDelayLabel: 'Max ACK delay',
+  ackDelayDesc: 'How long a peer waits below the threshold. Default 2 ms.',
+  ackDelayHint: 'A high threshold with a long delay tends to drop one-way traffic.',
+  ackDelayUnit: 'ms',
+  wholeNumberBetween: (min, max) => `Must be a whole number from ${min} to ${max}`,
 
   dangerTitle: 'Delete network',
   dangerBody: "Deletes its policies, credentials and enrollment tokens. This can't be undone.",

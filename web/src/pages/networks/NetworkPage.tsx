@@ -19,7 +19,7 @@ import { Input, NativeSelect } from '@/components/ui/input'
 import { ClassSelect } from '@/components/usage'
 import { t } from '@/i18n'
 import { cidrContains, formatCidr, parseCidr } from '@/lib/cidr'
-import { MAX_RELAY_HOPS } from '@/lib/product'
+import { ACK_ELICITING_THRESHOLD, MAX_ACK_DELAY_MS, MAX_RELAY_HOPS } from '@/lib/product'
 import { useDocumentTitle } from '@/lib/useDocumentTitle'
 import { validateNetworkCidr } from '@/lib/validate'
 
@@ -90,6 +90,45 @@ const REACH_DESC: Record<Reach, () => string> = {
   any: () => n.reachAnyDesc,
   direct_only: () => n.reachDirectOnlyDesc,
   relay_only: () => n.reachRelayOnlyDesc,
+}
+
+/** 设置卡片的底边：保存出的错，左边一句这张卡片的设置什么时候生效之类的话，右边取消和保存。 */
+function SaveBar({
+  error,
+  note,
+  canSave,
+  dirty,
+  pending,
+  onReset,
+}: {
+  error: unknown
+  note?: string
+  canSave: boolean
+  dirty: boolean
+  pending: boolean
+  onReset: () => void
+}) {
+  const failure = formFailure(error, {})
+  return (
+    <>
+      {failure !== null ? (
+        <div className="px-5 pb-1">
+          <FormError message={formError(failure)} detail={formErrorDetail(failure)} />
+        </div>
+      ) : null}
+      <footer className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2 border-t px-5 py-3">
+        {note !== undefined ? <p className="mr-auto text-[13px] text-muted-foreground">{note}</p> : null}
+        <div className="flex items-center gap-2">
+          <Button size="sm" onClick={onReset} disabled={!dirty || pending}>
+            {t.common.cancel}
+          </Button>
+          <Button size="sm" type="submit" variant="primary" disabled={!canSave} pending={pending}>
+            {n.saveSettings}
+          </Button>
+        </div>
+      </footer>
+    </>
+  )
 }
 
 /**
@@ -212,22 +251,138 @@ function RoutingCard({ network }: { network: Network }) {
             />
           </SettingRow>
         </div>
-        {save.isError ? (
-          <div className="px-5 pb-1">
-            <FormError
-              message={formError(formFailure(save.error, {}))}
-              detail={formErrorDetail(formFailure(save.error, {}))}
+        <SaveBar error={save.error} canSave={dirty} dirty={dirty} pending={save.isPending} onReset={reset} />
+      </form>
+    </BoxCard>
+  )
+}
+
+/** 输入框里写的是不是 `range` 里的一个整数；不是的话是 `null`。 */
+function wholeNumberWithin(raw: string, range: { min: number; max: number }): number | null {
+  const text = raw.trim()
+  if (!/^\d{1,4}$/.test(text)) return null
+  const value = Number(text)
+  return value >= range.min && value <= range.max ? value : null
+}
+
+/** 一个整数和它的单位：设置卡片里一行右边的控件。 */
+function NumberWithUnit({
+  id,
+  value,
+  unit,
+  invalid,
+  onChange,
+}: {
+  id: string
+  value: string
+  unit: string
+  invalid: boolean
+  onChange: (value: string) => void
+}) {
+  return (
+    // 和选路那张卡片的下拉一样宽，两张卡片的控件左右对齐。
+    <span className="flex w-48 items-center gap-2">
+      <Input
+        id={id}
+        inputMode="numeric"
+        className="min-w-0 flex-1 tabular"
+        aria-invalid={invalid ? true : undefined}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      {/* 单位留一样宽，两行的输入框对齐。 */}
+      <span className="w-14 shrink-0 text-[13px] text-muted-foreground">{unit}</span>
+    </span>
+  )
+}
+
+/**
+ * 节点之间的连接的设置，和选路那张卡片一个样子：一项一行，底边取消和保存。现在只有请对端怎样确认的两项，
+ * 以后别的连接参数接着往下加行。节点只在建连接时用这些值，所以底边写着"只对之后新建的连接生效"。
+ */
+function ConnectionCard({ network }: { network: Network }) {
+  const [threshold, setThreshold] = useState(String(network.ack_eliciting_threshold))
+  const [delay, setDelay] = useState(String(network.max_ack_delay_ms))
+  const thresholdId = useId()
+  const delayId = useId()
+
+  const save = useAction(network.id, {
+    mutationFn: (body: UpdateNetwork) => api.updateNetwork(network.id, body),
+    success: n.settingsSaved,
+    toastError: false,
+  })
+
+  const nextThreshold = wholeNumberWithin(threshold, ACK_ELICITING_THRESHOLD)
+  const nextDelay = wholeNumberWithin(delay, MAX_ACK_DELAY_MS)
+  const dirty = nextThreshold !== network.ack_eliciting_threshold || nextDelay !== network.max_ack_delay_ms
+  const reset = () => {
+    setThreshold(String(network.ack_eliciting_threshold))
+    setDelay(String(network.max_ack_delay_ms))
+    save.reset()
+  }
+
+  return (
+    <BoxCard>
+      <BoxCardHeader title={n.connection} />
+      <form
+        noValidate
+        aria-label={n.connection}
+        onSubmit={(event) => {
+          event.preventDefault()
+          if (dirty && nextThreshold !== null && nextDelay !== null)
+            save.mutate({ ack_eliciting_threshold: nextThreshold, max_ack_delay_ms: nextDelay })
+        }}
+      >
+        <div className="divide-y">
+          <SettingRow
+            label={n.ackThresholdLabel}
+            hint={n.ackThresholdHint}
+            htmlFor={thresholdId}
+            description={n.ackThresholdDesc}
+            error={
+              nextThreshold === null
+                ? n.wholeNumberBetween(ACK_ELICITING_THRESHOLD.min, ACK_ELICITING_THRESHOLD.max)
+                : null
+            }
+          >
+            <NumberWithUnit
+              id={thresholdId}
+              value={threshold}
+              unit={n.ackThresholdUnit}
+              invalid={nextThreshold === null}
+              onChange={(value) => {
+                setThreshold(value)
+                save.reset()
+              }}
             />
-          </div>
-        ) : null}
-        <footer className="flex items-center justify-end gap-2 border-t px-5 py-3">
-          <Button size="sm" onClick={reset} disabled={!dirty || save.isPending}>
-            {t.common.cancel}
-          </Button>
-          <Button size="sm" type="submit" variant="primary" disabled={!dirty} pending={save.isPending}>
-            {n.saveSettings}
-          </Button>
-        </footer>
+          </SettingRow>
+          <SettingRow
+            label={n.ackDelayLabel}
+            hint={n.ackDelayHint}
+            htmlFor={delayId}
+            description={n.ackDelayDesc}
+            error={nextDelay === null ? n.wholeNumberBetween(MAX_ACK_DELAY_MS.min, MAX_ACK_DELAY_MS.max) : null}
+          >
+            <NumberWithUnit
+              id={delayId}
+              value={delay}
+              unit={n.ackDelayUnit}
+              invalid={nextDelay === null}
+              onChange={(value) => {
+                setDelay(value)
+                save.reset()
+              }}
+            />
+          </SettingRow>
+        </div>
+        <SaveBar
+          error={save.error}
+          note={n.connectionNote}
+          canSave={dirty && nextThreshold !== null && nextDelay !== null}
+          dirty={dirty}
+          pending={save.isPending}
+          onReset={reset}
+        />
       </form>
     </BoxCard>
   )
@@ -363,8 +518,8 @@ function DangerCard({ network }: { network: Network }) {
 }
 
 /**
- * 网络页：和节点详情的概览一个样子，两栏卡片。左边基本信息、其他网络、删除网络；右边选路的设置。
- * 窄的时候一栏，选路排在基本信息后面。
+ * 网络页：和节点详情的概览一个样子，两栏卡片。左边基本信息、其他网络、删除网络；右边是设置：选路、连接。
+ * 窄的时候一栏，设置排在左边那几张后面。
  */
 export function NetworkPage() {
   useDocumentTitle(n.title)
@@ -392,11 +547,17 @@ export function NetworkPage() {
           <OthersCard networks={networks.data ?? []} current={network} />
           <DangerCard network={network} />
         </div>
-        {/* key：切换网络或者保存之后，表单从最新的设置重新开始。 */}
-        <RoutingCard
-          key={`${network.id}:${network.routing}:${network.max_relay_hops}:${network.reach}:${network.class ?? 'auto'}`}
-          network={network}
-        />
+        <div className="space-y-6">
+          {/* key：切换网络或者保存之后，表单从最新的设置重新开始。 */}
+          <RoutingCard
+            key={`${network.id}:${network.routing}:${network.max_relay_hops}:${network.reach}:${network.class ?? 'auto'}`}
+            network={network}
+          />
+          <ConnectionCard
+            key={`${network.id}:${network.ack_eliciting_threshold}:${network.max_ack_delay_ms}`}
+            network={network}
+          />
+        </div>
       </div>
 
       <CreateNetworkDialog open={creating} onClose={() => setCreating(false)} />

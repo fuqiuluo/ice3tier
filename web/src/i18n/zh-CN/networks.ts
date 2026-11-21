@@ -1,7 +1,7 @@
 /** 网络：新建、设置、删除。 */
 export const networks = {
   title: '网络',
-  subtitle: '这个网络的名字、地址段和选路',
+  subtitle: '这个网络的名字、地址段、选路和连接',
   switchTo: (name: string) => `切换到 ${name}`,
   nodes: (n: number) => `${n} 个节点`,
   createdAt: '创建时间',
@@ -53,6 +53,17 @@ export const networks = {
   classHint: '代理用户名、监听器、端口转发和出口的设置优先',
   saveSettings: '保存',
   settingsSaved: '设置已保存',
+  connection: '连接',
+  connectionNote: '只对之后新建的连接生效',
+  ackThresholdLabel: '确认阈值',
+  ackThresholdDesc: '对端收到超过这么多个包才发一次确认，默认 10',
+  ackThresholdHint: '调大，回程的确认包更少。1 是每两个包确认一次',
+  ackThresholdUnit: '个包',
+  ackDelayLabel: '确认最长等待',
+  ackDelayDesc: '不够数时，对端最多等这么久，默认 2 毫秒',
+  ackDelayHint: '阈值和等待都调大时，单向流量容易丢包',
+  ackDelayUnit: '毫秒',
+  wholeNumberBetween: (min: number, max: number) => `需为 ${min} 到 ${max} 的整数`,
 
   dangerTitle: '删除网络',
   dangerBody: '策略、凭据和注册令牌一并删除，无法恢复',

@@ -148,6 +148,10 @@ export interface Network {
   nodes: number
   /** 网络的默认服务等级；`null` 表示 `auto`。 */
   class: ServiceClass | null
+  /** 节点之间的连接上，请对端攒到多于这么多个包才单独发一个确认包。 */
+  ack_eliciting_threshold: number
+  /** 没攒够时，对端最多等多少毫秒就发确认。 */
+  max_ack_delay_ms: number
 }
 
 export interface CreateNetwork {
@@ -157,6 +161,8 @@ export interface CreateNetwork {
   max_relay_hops?: number
   reach?: Reach
   class?: ServiceClass | null
+  ack_eliciting_threshold?: number
+  max_ack_delay_ms?: number
 }
 
 export interface UpdateNetwork {
@@ -166,6 +172,9 @@ export interface UpdateNetwork {
   reach?: Reach
   /** 写 `null` 表示改回 `auto`。 */
   class?: ServiceClass | null
+  /** 这两项只对改了之后新建立的连接生效。 */
+  ack_eliciting_threshold?: number
+  max_ack_delay_ms?: number
 }
 
 export interface NodePair {

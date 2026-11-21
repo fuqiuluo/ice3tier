@@ -100,6 +100,8 @@ export const NETWORK: Network = {
   created_at: 1_794_000_000,
   nodes: 0,
   class: null,
+  ack_eliciting_threshold: 10,
+  max_ack_delay_ms: 2,
 }
 
 interface RenderOptions {
