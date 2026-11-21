@@ -79,6 +79,8 @@ pub struct View<'a> {
     /// 网络的 `reach` 设置：`"direct_only"`、`"relay_only"`，不写就是都可以。
     pub reach: Option<&'static str>,
     pub dial_out_only: bool,
+    /// 网络的确认设置：对端攒到多于几个包才单独发确认，没攒够时最多等几毫秒。不写就是默认值。
+    pub ack: Option<(u32, u32)>,
 }
 
 impl Node {
@@ -277,6 +279,10 @@ fn build_netmap(me: NodeId, view: &View<'_>) -> Arc<Netmap> {
     let mut network = serde_json::json!({ "name": "test", "domain": "test.i3t", "cidr": "10.66.0.0/16" });
     if let Some(reach) = view.reach {
         network["reach"] = reach.into();
+    }
+    if let Some((eliciting_threshold, max_delay_ms)) = view.ack {
+        network["ack_eliciting_threshold"] = eliciting_threshold.into();
+        network["max_ack_delay_ms"] = max_delay_ms.into();
     }
     let netmap = serde_json::json!({
         "version": 1,

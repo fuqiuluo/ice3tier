@@ -104,6 +104,59 @@ async fn a_connection_that_only_carries_packets_stays_while_they_flow_and_goes_w
     assert_eq!(sender.send_packet(b.id, packet(b"late")), Err(DatagramSendError::NotConnected(b.id)));
 }
 
+/// 从 `from` 到 `to` 一个一个地送 `count` 个网络包，每个都等对面收到再送下一个，所以一个包就是一个 QUIC 包。
+/// 返回这期间 `to` 发了多少个包：它没有别的要发，发的都是确认。
+async fn acks_for(from: &Node, to: &Node, count: usize) -> u64 {
+    let sent = || to.endpoint.connection_report(from.id).expect("连接还在").counters.sent_packets;
+    let sender = from.endpoint.packet_sender();
+    // 先送一个不算数的：拨号的一端握手完了，对面可能还没有把这条连接登记好。
+    sender.send_packet(to.id, packet(b"first")).unwrap();
+    next(to).await;
+    let before = sent();
+    for _ in 0..count {
+        sender.send_packet(to.id, packet(b"one way")).unwrap();
+        next(to).await;
+    }
+    sent() - before
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_peer_acknowledges_as_seldom_as_the_network_asks_from_the_next_connection_on() {
+    const PACKETS: usize = 300;
+    let (a, b) = (Node::start(1), Node::start(2));
+    b.apply(&View { peers: &[Peer::direct(&a)], ..View::default() });
+    // 等待时间取最长的，测的就只是阈值：包一个接一个地到，攒够之前等不满这么久。
+    let asking =
+        |eliciting_threshold| a.apply(&View { peers: &[Peer::direct(&b)], ack: Some((eliciting_threshold, 25)), ..View::default() });
+    let quick = i3t_conn::Tuning { idle_close: Some(Duration::from_millis(500)), ..i3t_conn::Tuning::default() };
+    a.endpoint.tune(quick);
+    b.endpoint.tune(quick);
+    let sender = a.endpoint.packet_sender();
+
+    // 阈值 1 是 QUIC 库自己的做法：每两个包一个确认。
+    asking(1);
+    tokio::time::timeout(SOON, sender.connect(b.id)).await.expect("建连接超时").unwrap();
+    let established = a.endpoint.connection_report(b.id).expect("连接建起来了").established;
+    let often = acks_for(&a, &b, PACKETS).await;
+    assert!(often >= 100, "每两个包一个确认，{PACKETS} 个包应该有一百多个：{often}");
+
+    // 设置换了，已有的连接还是建立时的那样。
+    asking(10);
+    let unchanged = acks_for(&a, &b, PACKETS).await;
+    assert_eq!(a.endpoint.connection_report(b.id).map(|report| report.established), Some(established), "换设置不动已有的连接");
+    assert!(unchanged >= 100, "已有的连接不跟着变：{unchanged}");
+
+    // 等它空闲回收，再建的连接用新的设置：十来个包才一个确认。
+    let deadline = Instant::now() + 3 * SOON;
+    while a.endpoint.connection_report(b.id).is_some() || b.endpoint.connection_report(a.id).is_some() {
+        assert!(Instant::now() < deadline, "包停了之后连接一直没有回收");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::timeout(SOON, sender.connect(b.id)).await.expect("重新建连接超时").unwrap();
+    let seldom = acks_for(&a, &b, PACKETS).await;
+    assert!(seldom * 2 < often, "新的连接上对端确认得少了：原来 {often} 个，现在 {seldom} 个");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn packets_cross_a_relay_when_there_is_no_direct_path() {
     let (a, r, b) = (Node::start(1), Node::start(9), Node::start(2));

@@ -21,7 +21,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::congestion::Algorithm;
 use crate::contract::{Datagram, DatagramSendError, DatagramSender, Incoming, OpenError, PacketSender};
-use crate::quic::{self, SERVER_NAME};
+use crate::quic::{self, AckFrequency, SERVER_NAME};
 use crate::socket;
 use crate::stream::{self, RecvHalf, SendHalf, StreamCount};
 use crate::tuning::Tuning;
@@ -213,7 +213,7 @@ pub(crate) struct Manager {
     quic: quinn::Endpoint,
     paths: Arc<Paths>,
     netmap: watch::Receiver<Arc<Netmap>>,
-    /// 现在的档位设置和按它建好的配置。之后建立的连接用它；空闲回收每次检查时读它。
+    /// 现在的档位设置、网络的确认设置和按它们建好的配置。之后建立的连接用它；空闲回收每次检查时读它。
     configs: Mutex<Configs>,
     /// 接受连接一方的配置里不随档位和拥塞控制变的那部分（TLS）。
     server: quinn::ServerConfig,
@@ -242,14 +242,17 @@ impl Manager {
         datagrams: DatagramQueues,
     ) -> Arc<Self> {
         let (quic, server) = endpoint;
-        let me = netmap.borrow().me.id;
+        let (me, ack) = {
+            let netmap = netmap.borrow();
+            (netmap.me.id, AckFrequency::from(&netmap.network))
+        };
         Arc::new(Self {
             me,
             key,
             quic,
             paths,
             netmap,
-            configs: Mutex::new(Configs::new(Tuning::default(), &server)),
+            configs: Mutex::new(Configs::new(Tuning::default(), ack, &server)),
             server,
             default_algorithm: Algorithm::from_env(),
             controller_online: AtomicBool::new(true),
@@ -268,10 +271,32 @@ impl Manager {
 
     /// 换上新的档位设置。之后建立的连接（本端拨出的、对端连进来的）用它，已有的连接保持原样。
     pub(crate) fn tune(&self, tuning: Tuning) {
-        let configs = Configs::new(tuning, &self.server);
+        let mut configs = self.configs();
+        let ack = configs.ack;
+        self.rebuild(&mut configs, tuning, ack);
+    }
+
+    /// 换上网络现在的确认设置。和档位一样：之后建立的连接用它，已有的连接保持建立时的设置。
+    fn request_acks(&self, ack: AckFrequency) {
+        let mut configs = self.configs();
+        if configs.ack == ack {
+            return;
+        }
+        let tuning = configs.tuning;
+        self.rebuild(&mut configs, tuning, ack);
+        tracing::info!(
+            eliciting_threshold = ack.eliciting_threshold,
+            max_delay = ?ack.max_delay,
+            "网络的确认设置换了：之后建立的连接请对端照它确认"
+        );
+    }
+
+    /// 按新的档位和确认设置重建配置。调用者一直拿着 `current` 的锁，换档位的和换确认设置的不会互相盖掉对方的那一半。
+    fn rebuild(&self, current: &mut Configs, tuning: Tuning, ack: AckFrequency) {
+        let configs = Configs::new(tuning, ack, &self.server);
         // 认不出是哪个对端的连接请求（不会走到握手）也要有一份配置可用：用默认的拥塞控制。
         self.quic.set_server_config(Some(configs.server(self.default_algorithm).as_ref().clone()));
-        *self.configs() = configs;
+        *current = configs;
     }
 
     /// 和 `peer` 之间新建的连接用哪种拥塞控制：节点对设置了的话用它，否则用节点的默认。
@@ -717,11 +742,12 @@ impl Manager {
         self.netmap.borrow().peers.iter().find(|peer| peer.key == key).map(|peer| (peer.id, key))
     }
 
-    /// 跟随 netmap：对端被删除（吊销）或者换了公钥，和它的连接立刻关闭。
+    /// 跟随 netmap：对端被删除（吊销）或者换了公钥，和它的连接立刻关闭；网络的确认设置换了，之后建立的连接用新的。
     pub(crate) async fn follow_netmap(self: Arc<Self>) {
         let mut netmap = self.netmap.clone();
         while netmap.changed().await.is_ok() {
             let current = Arc::clone(&netmap.borrow_and_update());
+            self.request_acks(AckFrequency::from(&current.network));
             self.peers().retain(|&peer, entry| {
                 let expected = current.peer(peer).map(|info| info.key);
                 entry.conns.retain(|conn| {
@@ -788,24 +814,25 @@ struct Origin {
     algorithm: Algorithm,
 }
 
-/// 按一份档位设置建好的配置：每种拥塞控制一份传输参数，和用它的、接受连接一方的配置。
+/// 按一份档位设置和网络的确认设置建好的配置：每种拥塞控制一份传输参数，和用它的、接受连接一方的配置。
 ///
 /// 拥塞控制在 QUIC 库里是按连接的传输参数选的，建立之后不能换，所以每种各备一份，建连接时按节点对的设置挑。
 struct Configs {
     tuning: Tuning,
+    ack: AckFrequency,
     bbr: (Arc<TransportConfig>, Arc<quinn::ServerConfig>),
     cubic: (Arc<TransportConfig>, Arc<quinn::ServerConfig>),
 }
 
 impl Configs {
-    fn new(tuning: Tuning, server: &quinn::ServerConfig) -> Self {
+    fn new(tuning: Tuning, ack: AckFrequency, server: &quinn::ServerConfig) -> Self {
         let build = |algorithm: Algorithm| {
-            let transport = quic::transport(&tuning, algorithm);
+            let transport = quic::transport(&tuning, algorithm, ack);
             let mut server = server.clone();
             server.transport_config(Arc::clone(&transport));
             (transport, Arc::new(server))
         };
-        Self { tuning, bbr: build(Algorithm::Bbr), cubic: build(Algorithm::Cubic) }
+        Self { tuning, ack, bbr: build(Algorithm::Bbr), cubic: build(Algorithm::Cubic) }
     }
 
     fn of(&self, algorithm: Algorithm) -> &(Arc<TransportConfig>, Arc<quinn::ServerConfig>) {
@@ -1072,7 +1099,7 @@ mod tests {
         fn new() -> Self {
             let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
             let (me, peer) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
-            let transport = quic::transport(&Tuning::default(), Algorithm::from_env());
+            let transport = quic::transport(&Tuning::default(), Algorithm::from_env(), AckFrequency::default());
             Self {
                 listener: quinn::Endpoint::server(quic::server(&me, |_| true).unwrap(), loopback).unwrap(),
                 dialer: quinn::Endpoint::client(loopback).unwrap(),
