@@ -78,7 +78,9 @@ try {
     $token = (Ctl token create --expires 30m).token
 
     Step 'install without a token'
-    & $installer -From $dir
+    $env:I3T_FROM = $dir
+    & $installer
+    if ($env:I3T_FROM) { Fail 'the installer left its settings in the environment' }
     $service = Get-Service -Name i3t
     if ($service.StartType -ne 'Automatic') { Fail "the service does not start at boot: $($service.StartType)" }
     if ($service.Status -ne 'Stopped') { Fail 'the service runs before joining' }
@@ -121,15 +123,15 @@ try {
     if (($revived -eq 0) -or ($revived -eq $killed)) { Fail 'the service did not come back within 30 s' }
     Wait-Online
 
-    Step 'install over the joined node'
-    & $installer -From $dir
+    Step 'install over the joined node, piped the way the one-line command does it'
+    $env:I3T_FROM = $dir
+    Get-Content -LiteralPath $installer -Raw | Invoke-Expression
     Wait-Online
 
-    Step 'uninstall and purge, piped the way the one-line command does it'
+    Step 'uninstall and purge, piped too'
     $env:I3T_UNINSTALL = '1'
     $env:I3T_PURGE = '1'
     Get-Content -LiteralPath $installer -Raw | Invoke-Expression
-    Remove-Item Env:I3T_UNINSTALL, Env:I3T_PURGE
     foreach ($path in $installed, $state) {
         if (Test-Path -LiteralPath $path) { Fail "$path is still there" }
     }

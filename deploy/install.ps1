@@ -7,34 +7,25 @@ Install the node as a system service (it runs in the background and starts at bo
 Install, join and start in one command:
   $env:I3T_TOKEN = '<TOKEN>'; irm https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.ps1 | iex
 
-Saved to a file, the settings are parameters:
-  .\install.ps1 -Token <TOKEN> [-CanRelay] [-CanExit]
-  .\install.ps1 -Version v0.1.34       Install a specific release tag instead of the latest
-  .\install.ps1 -ReleaseBase <URL>     Release base URL (default: GitHub Releases)
-  .\install.ps1 -From <DIR>            Take i3t.exe and wintun.dll from a local directory instead of downloading
-  .\install.ps1 -Uninstall [-Purge]    Remove the service and the program; -Purge also deletes the node's key and settings
-
-The piped form reads the same settings from the environment: I3T_TOKEN, I3T_CAN_RELAY=1, I3T_CAN_EXIT=1, I3T_VERSION,
-I3T_RELEASE_BASE, I3T_FROM, I3T_UNINSTALL=1, I3T_PURGE=1.
+Settings are environment variables, set before the command. They apply to one run: the script clears them.
+  I3T_TOKEN          Enrollment token; joins the network and starts the service
+  I3T_CAN_RELAY=1    Declare relay capability when joining
+  I3T_CAN_EXIT=1     Declare exit capability when joining
+  I3T_VERSION        Install a specific release tag (e.g. v0.1.34) instead of the latest
+  I3T_RELEASE_BASE   Release base URL (default: GitHub Releases)
+  I3T_FROM           Take i3t.exe and wintun.dll from a local directory instead of downloading
+  I3T_UNINSTALL=1    Remove the service and the program
+  I3T_PURGE=1        With I3T_UNINSTALL, also delete the node's key and settings
 
 What it installs:
   %ProgramFiles%\ice3tier   i3t.exe and wintun.dll (the virtual adapter's driver), added to the machine PATH
   %ProgramData%\i3t         the node's key and settings, readable by SYSTEM and Administrators only; the log is i3t.log
   service "i3t"             starts at boot, restarts when it fails; `i3t join` starts it
 #>
-param(
-    [string]$Token = $env:I3T_TOKEN,
-    [switch]$CanRelay,
-    [switch]$CanExit,
-    [string]$Version = $env:I3T_VERSION,
-    [string]$ReleaseBase = $env:I3T_RELEASE_BASE,
-    [string]$From = $env:I3T_FROM,
-    [switch]$Uninstall,
-    [switch]$Purge
-)
 
 # Everything runs in a child scope: piped into iex, this script shares the caller's session and must not leave its
-# variables, functions or preferences behind. Failures are thrown, never `exit`: that would close the caller's window.
+# variables, functions or preferences behind. That is also why the settings are not parameters: iex would create them
+# in the caller's scope. Failures are thrown, never `exit`: that would close the caller's window.
 & {
     $ErrorActionPreference = 'Stop'
     # Windows PowerShell 5.1 draws a progress bar that slows downloads to a crawl.
@@ -48,10 +39,18 @@ param(
     $exe = Join-Path $dir 'i3t.exe'
     $state = Join-Path $env:ProgramData 'i3t'
 
-    $relay = $CanRelay -or ($env:I3T_CAN_RELAY -eq '1')
-    $canExit = $CanExit -or ($env:I3T_CAN_EXIT -eq '1')
-    $removing = $Uninstall -or ($env:I3T_UNINSTALL -eq '1')
-    $purging = $Purge -or ($env:I3T_PURGE -eq '1')
+    $token = $env:I3T_TOKEN
+    $relay = $env:I3T_CAN_RELAY -eq '1'
+    $canExit = $env:I3T_CAN_EXIT -eq '1'
+    $version = $env:I3T_VERSION
+    $releaseBase = $env:I3T_RELEASE_BASE
+    $from = $env:I3T_FROM
+    $removing = $env:I3T_UNINSTALL -eq '1'
+    $purging = $env:I3T_PURGE -eq '1'
+    # One run only: left set, I3T_UNINSTALL would turn the next install in this window into an uninstall.
+    foreach ($name in 'I3T_TOKEN', 'I3T_CAN_RELAY', 'I3T_CAN_EXIT', 'I3T_VERSION', 'I3T_RELEASE_BASE', 'I3T_FROM', 'I3T_UNINSTALL', 'I3T_PURGE') {
+        Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    }
 
     function Say([string]$text) {
         Write-Host "==> $text"
@@ -121,7 +120,7 @@ param(
         return
     }
     if ($purging) {
-        throw '-Purge can only be used with -Uninstall'
+        throw 'I3T_PURGE can only be used with I3T_UNINSTALL'
     }
 
     if (($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') -and ($env:PROCESSOR_ARCHITEW6432 -ne 'AMD64')) {
@@ -131,17 +130,17 @@ param(
     $work = Join-Path ([IO.Path]::GetTempPath()) ('i3t-install-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work | Out-Null
     try {
-        if ($From) {
+        if ($from) {
             foreach ($name in 'i3t.exe', 'wintun.dll') {
-                $source = Join-Path $From $name
-                if (-not (Test-Path -LiteralPath $source)) { throw "$name not found in $From" }
+                $source = Join-Path $from $name
+                if (-not (Test-Path -LiteralPath $source)) { throw "$name not found in $from" }
                 Copy-Item -LiteralPath $source -Destination $work
             }
-            $license = Join-Path $From 'wintun-LICENSE.txt'
+            $license = Join-Path $from 'wintun-LICENSE.txt'
             if (Test-Path -LiteralPath $license) { Copy-Item -LiteralPath $license -Destination $work }
         } else {
-            if (-not $ReleaseBase) { $ReleaseBase = 'https://github.com/fuqiuluo/ice3tier/releases' }
-            $url = if ($Version) { "$ReleaseBase/download/$Version/$asset" } else { "$ReleaseBase/latest/download/$asset" }
+            if (-not $releaseBase) { $releaseBase = 'https://github.com/fuqiuluo/ice3tier/releases' }
+            $url = if ($version) { "$releaseBase/download/$version/$asset" } else { "$releaseBase/latest/download/$asset" }
             Say "Downloading $url"
             # Windows PowerShell 5.1 does not offer TLS 1.2 by default on older systems.
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -181,13 +180,13 @@ param(
         # This window too, so that `i3t` works in it right away.
         if (@($env:Path -split ';') -notcontains $dir) { $env:Path = $env:Path.TrimEnd(';') + ';' + $dir }
 
-        if ($Token) {
+        if ($token) {
             Say 'Joining the network'
             $arguments = @('join')
             if ($relay) { $arguments += '--can-relay' }
             if ($canExit) { $arguments += '--can-exit' }
             # `i3t join` starts the service once the node has joined.
-            $Token | & $exe @arguments
+            $token | & $exe @arguments
             if ($LASTEXITCODE -ne 0) { throw 'i3t join failed' }
             Say 'i3t is running (check with: i3t status)'
         } elseif (Test-Path -LiteralPath (Join-Path $state 'controller.json')) {
