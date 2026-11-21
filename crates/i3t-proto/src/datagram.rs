@@ -19,6 +19,7 @@
 //! | `0x0a`、`0x0b` | 地址查询与应答 | [`crate::addr`] |
 //! | `0x0d` | 经多个 relay 转发的包 | 本模块 |
 //! | `0x0e` | 骨干矩阵的一行，也是 relay 的过载和下线通知 | [`crate::backbone`] |
+//! | `0x11` | 封好的网络包：虚拟网卡的 IP 包，单独加密，不进 QUIC | [`crate::sealed`] |
 //!
 //! [`Datagram::parse`] 一次调用就把上面这些全部分出来。其余的首字节不认识，数据报直接丢掉，不回应。
 //!
@@ -56,6 +57,7 @@
 //! 只经一个 relay 时用前一种 9 字节的头，两种头可以同时存在。
 
 use crate::node::NodeId;
+use crate::sealed::{self, SealedHeader};
 use crate::{addr, backbone, probe, session};
 
 /// 连接层的一个包最长多少字节。
@@ -82,6 +84,7 @@ const _: () = {
     // 帧的类型不能和 QUIC 包的首字节混淆。
     assert!(KIND_RELAYED < QUIC_FIXED_BIT && KIND_ROUTED < QUIC_FIXED_BIT && backbone::KIND_ROW < QUIC_FIXED_BIT);
     assert!(session::KIND_ERROR < QUIC_FIXED_BIT && probe::KIND_PONG < QUIC_FIXED_BIT && addr::KIND_REPLY < QUIC_FIXED_BIT);
+    assert!(sealed::KIND_SEALED < QUIC_FIXED_BIT);
 };
 
 /// 经 relay 转发的包前面的头。
@@ -264,6 +267,8 @@ pub enum Datagram<'a> {
     Relayed { header: RelayHeader, packet: &'a [u8] },
     /// 经多个 relay 转发的包。`packet` 是去掉头之后的连接包。
     Routed { header: RouteHeader, packet: &'a [u8] },
+    /// 对端直连发来的封好的网络包，就是整个数据报。这里只核对过长度；密钥在连接层，认不认由它定。
+    Sealed(&'a [u8]),
     /// 骨干矩阵的一行，是整个数据报。这里只核对过长度对得上，内容用 [`backbone::Row::parse`] 取，签名由收的一方去验。
     Row(&'a [u8]),
     /// 中转会话帧。[`session::Frame::is_request`] 为真的归 relay 处理，其余是 relay 的应答，归路径层。
@@ -303,6 +308,8 @@ impl<'a> Datagram<'a> {
             }
             addr::KIND_QUERY => addr::Query::parse(datagram).map(Self::AddrQuery).ok_or(malformed),
             addr::KIND_REPLY => addr::Reply::parse(datagram).map(Self::AddrReply).ok_or(malformed),
+            sealed::KIND_SEALED if SealedHeader::is_complete(datagram) => Ok(Self::Sealed(datagram)),
+            sealed::KIND_SEALED => Err(malformed),
             kind => Err(DatagramError::UnknownKind(kind)),
         }
     }
@@ -365,6 +372,16 @@ mod tests {
     }
 
     #[test]
+    fn a_sealed_packet_is_recognised_whole_and_a_truncated_one_is_malformed() {
+        let mut datagram = SealedHeader { session: 7, counter: 9 }.to_bytes().to_vec();
+        datagram.extend_from_slice(&[0xab; SealedHeader::TAG_LEN + 1]);
+        assert_eq!(Datagram::parse(&datagram), Ok(Datagram::Sealed(&datagram)));
+        assert_eq!(relayed_dst(&datagram), None, "它不是中转帧");
+        let short = &datagram[..datagram.len() - 1];
+        assert_eq!(Datagram::parse(short), Err(DatagramError::Malformed { kind: sealed::KIND_SEALED }));
+    }
+
+    #[test]
     fn packets_with_the_quic_fixed_bit_go_to_the_connection_untouched() {
         for first in [0x40, 0x7f, 0xc0, 0xff] {
             let datagram = [first, 1, 2, 3];
@@ -415,7 +432,7 @@ mod tests {
     #[test]
     fn empty_and_unknown_datagrams_are_rejected() {
         assert_eq!(Datagram::parse(&[]), Err(DatagramError::Empty));
-        for kind in [0x00, 0x11, 0x3f, 0x80, 0xbf] {
+        for kind in [0x00, 0x12, 0x3f, 0x80, 0xbf] {
             assert_eq!(Datagram::parse(&[kind, 0, 0, 0, 1, 0, 0, 0, 2]), Err(DatagramError::UnknownKind(kind)));
             assert_eq!(relayed_dst(&[kind, 0, 0, 0, 1, 0, 0, 0, 2]), None);
             assert_eq!(forwarding_header_len(&[kind, 0, 0, 0, 1, 0, 0, 0, 2]), None);

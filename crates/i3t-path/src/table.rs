@@ -14,6 +14,7 @@ use i3t_model::control::Signal;
 use i3t_proto::NodeId;
 use i3t_proto::datagram::{RelayHeader, RouteHeader};
 use i3t_proto::probe::TestId;
+use i3t_proto::sealed::KIND_SEALED;
 use i3t_underlay::lan::LanDiscovery;
 use i3t_underlay::tcp_leg::FrameSender;
 use i3t_underlay::{Ecn, Transmit, UdpPort};
@@ -269,7 +270,11 @@ impl PeerSlot {
         let suspicious = self.doubt.load(Ordering::Relaxed)
             || !self.last_rx.within(clock, STASH_WHEN_SILENT)
             || self.contact.within(clock, STASH_AFTER_CONTACT);
-        if suspicious && let Some(last) = packets.segments().last() {
+        // 封好的网络包不留：它本来就不保证送达，补发一个过了时的 IP 包没有用，还会把连接自己的包从留底里挤出去。
+        if suspicious
+            && let Some(last) = packets.segments().last()
+            && last.first() != Some(&KIND_SEALED)
+        {
             // 放满了就挪用最旧的那一份的缓冲，不再分配。
             let mut copy =
                 if stash.len() == STASH_PACKETS { stash.pop_front().map(|(_, copy)| copy).unwrap_or_default() } else { Vec::new() };
@@ -625,6 +630,23 @@ mod tests {
         shared.port.writable().await.unwrap();
         slot.send(&shared, &Packets { contents: &[5; 100], segment_size: None, ecn: None }).unwrap();
         assert!(slot.lock().stash.is_empty(), "连接正常时不留底");
+    }
+
+    #[tokio::test]
+    async fn sealed_packets_are_sent_but_never_kept_for_resending() {
+        let shared = shared();
+        let receiver = UdpPort::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        // 刚建的对端的路是可疑的：连接包这时都留底。
+        let slot = PeerSlot::new(NodeId::new(2).unwrap());
+        slot.set_hop(Hop::Direct(receiver.local_addr()));
+        let mut sealed = vec![KIND_SEALED];
+        sealed.resize(100, 6);
+        shared.port.writable().await.unwrap();
+        slot.send(&shared, &Packets { contents: &sealed, segment_size: None, ecn: None }).unwrap();
+        assert_eq!(receive(&receiver).await, Some(sealed), "照样发出去");
+        assert!(slot.lock().stash.is_empty(), "封好的网络包不留底");
+        slot.send(&shared, &Packets { contents: &[0x40; 100], segment_size: None, ecn: None }).unwrap();
+        assert_eq!(slot.lock().stash.len(), 1, "同样的时候连接包是留的");
     }
 
     #[tokio::test]

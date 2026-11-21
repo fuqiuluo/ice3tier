@@ -647,6 +647,7 @@ impl Inner {
             Ok(
                 Datagram::Session(_)
                 | Datagram::Conn(_)
+                | Datagram::Sealed(_)
                 | Datagram::Relayed { .. }
                 | Datagram::Routed { .. }
                 | Datagram::Row(_)

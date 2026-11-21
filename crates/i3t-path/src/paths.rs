@@ -579,8 +579,9 @@ impl Paths {
     fn classify<'t>(&self, table: &'t Table, from: SocketAddr, datagram: &[u8]) -> Verdict<'t> {
         let clock = &self.shared.clock;
         match Datagram::parse(datagram) {
-            // 直连的连接包：来源地址不是任何对端已验证的直连地址时丢掉。
-            Ok(Datagram::Conn(_)) => match table.direct.get(&from) {
+            // 直连的连接包，或者封好的网络包（它和连接包走同一条路，一样交给连接层）：
+            // 来源地址不是任何对端已验证的直连地址时丢掉。
+            Ok(Datagram::Conn(_) | Datagram::Sealed(_)) => match table.direct.get(&from) {
                 Some(slot) => {
                     slot.last_rx_direct.touch(clock);
                     slot.received(&self.shared);
