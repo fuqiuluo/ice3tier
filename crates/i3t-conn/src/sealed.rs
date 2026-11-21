@@ -152,7 +152,7 @@ pub(crate) struct Session {
     /// 线上的字节数（整个封好的包）。
     sent_bytes: AtomicU64,
     received_bytes: AtomicU64,
-    /// 端口忙着发不出去而丢掉的包数。
+    /// 没有发出去就丢掉的包数：端口忙着、经 TCP 中转时队列满了，或者当时没有路。
     unsent: AtomicU64,
 }
 
@@ -261,12 +261,12 @@ impl Session {
         self.sent_bytes.fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
-    /// `packets` 个封好的包因为端口忙着没有发出去。
+    /// `packets` 个封好的包没有发出去，丢掉了。
     pub(crate) fn not_sent(&self, packets: usize) {
         self.unsent.fetch_add(u64::try_from(packets).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
-    /// 端口忙着没有发出去的封好的包一共多少个。
+    /// 没有发出去就丢掉的封好的包一共多少个。
     pub(crate) fn unsent(&self) -> u64 {
         self.unsent.load(Ordering::Relaxed)
     }
@@ -349,14 +349,14 @@ impl Batch {
         self.ended || self.packets >= limit
     }
 
-    /// 把攒着的交给路径层，然后清空。端口忙着发不出去时这一批就丢了：这里没有队列可排，包里面的协议自己会重传、会降速。
+    /// 把攒着的交给路径层，然后清空。发不出去的（端口忙着、经 TCP 中转时队列满了、没有路）就丢了：
+    /// 这里没有队列可排，包里面的协议自己会重传、会降速。
     pub(crate) fn send(&mut self, paths: &Paths) {
         let Some((peer, session)) = self.to.take() else { return };
         let segment_size = (self.packets > 1).then_some(self.stride);
-        match paths.try_send(peer, &Packets { contents: &self.contents, segment_size, ecn: None }) {
-            Ok(()) => session.sent(self.contents.len()),
-            Err(_) => session.not_sent(self.packets),
-        }
+        let unsent = paths.send_or_drop(peer, &Packets { contents: &self.contents, segment_size, ecn: None });
+        session.sent(self.contents.len() - unsent.bytes);
+        session.not_sent(unsent.packets);
         self.contents.clear();
         self.packets = 0;
         self.ended = false;

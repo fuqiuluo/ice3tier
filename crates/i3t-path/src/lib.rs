@@ -69,7 +69,7 @@ pub use report::{
     Alternative, BackboneLink, BackboneRow, CandidateReport, DirectFailureCause, DirectKind, DirectState, DirectStatus, LegReport,
     PathReport, RelayLeg,
 };
-pub use table::Packets;
+pub use table::{Packets, Unsent};
 pub use tcp::connect_first;
 
 /// 本节点的 relay 角色，路径层要它做的几件事。实现在 `i3t-relay`。

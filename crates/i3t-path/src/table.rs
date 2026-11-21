@@ -14,7 +14,6 @@ use i3t_model::control::Signal;
 use i3t_proto::NodeId;
 use i3t_proto::datagram::{RelayHeader, RouteHeader};
 use i3t_proto::probe::TestId;
-use i3t_proto::sealed::KIND_SEALED;
 use i3t_underlay::lan::LanDiscovery;
 use i3t_underlay::tcp_leg::FrameSender;
 use i3t_underlay::{Ecn, Transmit, UdpPort};
@@ -51,6 +50,27 @@ pub struct Packets<'a> {
 impl<'a> Packets<'a> {
     fn segments(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
         self.contents.chunks(self.segment_size.unwrap_or(self.contents.len()).max(1))
+    }
+}
+
+/// 一批包里没有发出去的那一部分。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unsent {
+    pub packets: usize,
+    pub bytes: usize,
+}
+
+impl Unsent {
+    /// 都发出去了。
+    pub const NONE: Self = Self { packets: 0, bytes: 0 };
+
+    /// 一个都没有发出去。
+    pub(crate) fn all(packets: &Packets<'_>) -> Self {
+        Self { packets: packets.segments().count(), bytes: packets.contents.len() }
+    }
+
+    fn unless(sent: bool, packets: &Packets<'_>) -> Self {
+        if sent { Self::NONE } else { Self::all(packets) }
     }
 }
 
@@ -270,11 +290,7 @@ impl PeerSlot {
         let suspicious = self.doubt.load(Ordering::Relaxed)
             || !self.last_rx.within(clock, STASH_WHEN_SILENT)
             || self.contact.within(clock, STASH_AFTER_CONTACT);
-        // 封好的网络包不留：它本来就不保证送达，补发一个过了时的 IP 包没有用，还会把连接自己的包从留底里挤出去。
-        if suspicious
-            && let Some(last) = packets.segments().last()
-            && last.first() != Some(&KIND_SEALED)
-        {
+        if suspicious && let Some(last) = packets.segments().last() {
             // 放满了就挪用最旧的那一份的缓冲，不再分配。
             let mut copy =
                 if stash.len() == STASH_PACKETS { stash.pop_front().map(|(_, copy)| copy).unwrap_or_default() } else { Vec::new() };
@@ -309,6 +325,58 @@ impl PeerSlot {
                     relay.send_to_client(self.id, transmit.contents, transmit.segment_size, transmit.ecn);
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// 发一批丢了也没关系的包（封好的网络包），不等，也不留底：端口忙着、经 TCP 中转时队列满了，或者没有路，
+    /// 发不出去的就丢掉。返回没有发出去的那一部分。
+    ///
+    /// 它直接问内核，不走 [`send`](Self::send) 用的那个入口。那个入口是给会等"可写"的连接用的：内核说过一次
+    /// "现在发不了"之后，运行时记下端口不可写，到它收到下一次可写的通知之前，再来的包不问内核就当作发不了。
+    /// 连接会等；不等的调用方在这段时间里一个包也发不出去，尽管内核一有地方就能收。
+    ///
+    /// 不留底：这样的包本来就不保证送达，补发一个过了时的没有用，还会把连接自己的包从留底里挤出去。
+    pub(crate) fn send_or_drop(&self, shared: &Shared, packets: &Packets<'_>) -> Unsent {
+        self.last_tx.touch(&shared.clock);
+        let mut inner = self.lock();
+        let SlotInner { hop, scratch, .. } = &mut *inner;
+        match hop {
+            Hop::None => Unsent::all(packets),
+            Hop::Direct(addr) => {
+                let sent = shared.port.send_or_drop(&Transmit {
+                    destination: *addr,
+                    contents: packets.contents,
+                    segment_size: packets.segment_size,
+                    ecn: packets.ecn,
+                });
+                Unsent::unless(sent, packets)
+            }
+            Hop::RelayUdp { relay, addr, header } => {
+                relay.last_tx.touch(&shared.clock);
+                let sent = shared.port.send_or_drop(&framed(header.as_slice(), scratch, packets, *addr));
+                Unsent::unless(sent, packets)
+            }
+            Hop::RelayTcp { relay, sender, header } => {
+                relay.last_tx.touch(&shared.clock);
+                let mut unsent = Unsent::NONE;
+                // 队列满了也接着试后面的：中间可能正好腾出了位置。
+                for packet in packets.segments() {
+                    if !sender.try_send(frame(header.as_slice(), packet)) {
+                        unsent.packets += 1;
+                        unsent.bytes += packet.len();
+                    }
+                }
+                unsent
+            }
+            Hop::Local => {
+                let transmit = framed(&self.header(shared), scratch, packets, shared.port.local_addr());
+                // 那边只说是不是全送出去了：有一个没送出去，这一批就都算没发。
+                let sent = shared
+                    .local_relay
+                    .get()
+                    .is_some_and(|relay| relay.send_to_client(self.id, transmit.contents, transmit.segment_size, transmit.ecn));
+                Unsent::unless(sent, packets)
             }
         }
     }
@@ -633,20 +701,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sealed_packets_are_sent_but_never_kept_for_resending() {
+    async fn packets_that_may_be_dropped_go_straight_to_the_kernel_and_are_never_kept_for_resending() {
         let shared = shared();
         let receiver = UdpPort::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         // 刚建的对端的路是可疑的：连接包这时都留底。
         let slot = PeerSlot::new(NodeId::new(2).unwrap());
         slot.set_hop(Hop::Direct(receiver.local_addr()));
-        let mut sealed = vec![KIND_SEALED];
-        sealed.resize(100, 6);
-        shared.port.writable().await.unwrap();
-        slot.send(&shared, &Packets { contents: &sealed, segment_size: None, ecn: None }).unwrap();
-        assert_eq!(receive(&receiver).await, Some(sealed), "照样发出去");
-        assert!(slot.lock().stash.is_empty(), "封好的网络包不留底");
+        // 端口刚绑定，运行时还没有收到它的头一次"可写"通知，在它看来端口是不可写的，和内核说过一次"现在发不了"之后一样。
+        // 这里故意不等可写：经过运行时的那个入口这时一个包也发不出去。
+        let packets = Packets { contents: &[6; 100], segment_size: None, ecn: None };
+        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent::NONE);
+        assert_eq!(receive(&receiver).await, Some(vec![6; 100]));
+        assert!(slot.lock().stash.is_empty(), "丢了也没关系的包不留底");
         slot.send(&shared, &Packets { contents: &[0x40; 100], segment_size: None, ecn: None }).unwrap();
         assert_eq!(slot.lock().stash.len(), 1, "同样的时候连接包是留的");
+    }
+
+    #[tokio::test]
+    async fn packets_dropped_for_want_of_a_route_or_of_room_in_a_tcp_relay_queue_are_reported() {
+        let shared = shared();
+        let slot = PeerSlot::new(NodeId::new(2).unwrap());
+        let packets = Packets { contents: &[6; 250], segment_size: Some(100), ecn: None };
+        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 3, bytes: 250 }, "没有路");
+
+        // 没有人在写这条 TCP：排进队列的包不会走。
+        let (sender, _queue) = i3t_underlay::tcp_leg::frame_queue();
+        let header = FrameHeader::single(RelayHeader { dst: slot.id, src: shared.me });
+        slot.set_hop(Hop::RelayTcp { relay: RelaySlot::new(NodeId::new(9).unwrap()), sender: sender.clone(), header });
+        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent::NONE, "队列里有地方");
+        // 把队列填到只剩一个位置：三个包里排得进去的只有头一个。
+        for _ in 3..i3t_underlay::tcp_leg::SEND_QUEUE_PACKETS - 1 {
+            assert!(sender.try_send(Bytes::new()));
+        }
+        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 2, bytes: 150 }, "后两个没有排进去，其中最后一个是短的");
+        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 3, bytes: 250 }, "队列满了");
     }
 
     #[tokio::test]

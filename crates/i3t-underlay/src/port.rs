@@ -265,7 +265,8 @@ impl UdpPort {
 
     /// 发送，内核的发送缓冲区满了就丢掉。返回有没有发出去。
     ///
-    /// 给不等待的调用方用：relay 转发（它不替任何人排队），以及路径层自己的帧（它们都有各自的重试）。
+    /// 给不等待的调用方用：relay 转发（它不替任何人排队），路径层自己的帧（它们都有各自的重试），
+    /// 以及封好的网络包（丢了由包里面的协议重传）。
     /// 它直接问内核，不看运行时记的"可写"状态，所以刚绑定好的端口上也能立刻发。
     pub fn send_or_drop(&self, transmit: &Transmit<'_>) -> bool {
         let Some(transmit) = self.outgoing(transmit) else { return false };

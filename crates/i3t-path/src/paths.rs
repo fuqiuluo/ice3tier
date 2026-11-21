@@ -28,7 +28,7 @@ use crate::diag::{
     DirectAttempt, DirectFailure, HopReport, Pin, RouteDecision, Side, TestPath, TestSpec, TrainError, TrainReport, TrainSpec,
 };
 use crate::report::{BackboneRow, PathReport};
-use crate::table::{Clock, Packets, PeerSlot, Shared, Table};
+use crate::table::{Clock, Packets, PeerSlot, Shared, Table, Unsent};
 use crate::{LocalRelay, RouteChange, Status};
 
 /// 交给控制任务的内部事件最多攒多少。
@@ -243,6 +243,19 @@ impl Paths {
         match table.peers.get(&peer) {
             Some(slot) => slot.send(&self.shared, packets),
             None => Ok(()),
+        }
+    }
+
+    /// 把一批丢了也没关系的包发给 `peer`，不等：端口忙着、经 TCP 中转时队列满了，或者没有路，发不出去的就丢掉。
+    /// 返回没有发出去的那一部分。
+    ///
+    /// 不等 [`writable`](Self::writable) 的调用方用这个，不用 [`try_send`](Self::try_send)：那个入口说过一次"现在发不了"之后，
+    /// 要等到有人等来了可写才会再去问内核。
+    pub fn send_or_drop(&self, peer: NodeId, packets: &Packets<'_>) -> Unsent {
+        let table = self.shared.table();
+        match table.peers.get(&peer) {
+            Some(slot) => slot.send_or_drop(&self.shared, packets),
+            None => Unsent::all(packets),
         }
     }
 
