@@ -101,9 +101,13 @@ try {
     if ($run.Text -notmatch 'Start-Service i3t') { Fail "i3t run: unexpected answer: $($run.Text)" }
 
     Step 'i3t join joins and starts the service'
-    Write-Host ("diag: OutputEncoding={0} preamble={1} tokenLength={2} startsWith={3}" -f $OutputEncoding.WebName, $OutputEncoding.GetPreamble().Length, $token.Length, $token.StartsWith('i3t-'))
-    $hex = 'abc' | & powershell.exe -NoProfile -Command '$s = [Console]::OpenStandardInput(); $b = New-Object byte[] 32; $n = $s.Read($b, 0, 32); ($b[0..($n - 1)] | ForEach-Object { $_.ToString("X2") }) -join " "'
-    Write-Host "diag: piped bytes: $hex"
+    $probe = Join-Path $work 'stdin-hex.ps1'
+    Set-Content -LiteralPath $probe -Value '$stdin = [Console]::OpenStandardInput(); $bytes = New-Object byte[] 64; $read = $stdin.Read($bytes, 0, 64); Write-Output ("read=" + $read + " " + [BitConverter]::ToString($bytes, 0, $read))'
+    $head = $token.Substring(0, 8)
+    Write-Host ('diag: piped to powershell.exe: ' + ($head | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe))
+    Write-Host ('diag: piped to findstr: ' + ($head | & findstr.exe /N .))
+    Write-Host ('diag: i3t on the PATH: ' + (Get-Command i3t).Source)
+    Write-Host ('diag: echo through cmd: ' + (& cmd.exe /c "echo $head| findstr /N ."))
     $token | & i3t join --can-relay
     if ($LASTEXITCODE -ne 0) { Fail 'i3t join failed' }
     Wait-Online
