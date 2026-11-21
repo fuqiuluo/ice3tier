@@ -31,6 +31,8 @@ const HELP: Help = Help {
     network_delete: "Delete a network (its nodes first)",
     network_cidr: "Address range. Can only grow once nodes join",
     network_max_relay_hops: "Max relay hops, 1 to 4",
+    network_ack_eliciting_threshold: "ACK threshold, 1 to 100: a peer sends an ACK of its own only after more than this many packets. Applies to new connections",
+    network_max_ack_delay_ms: "Max ACK delay, 1 to 25 ms: how long a peer waits below the threshold. Applies to new connections",
     routing: "Routing mode",
     reach: "Path restriction",
     class: "QoS: auto (Auto), interactive (Low latency), reliable (No loss), bulk (Background)",
@@ -279,6 +281,8 @@ const UI: Ui = Ui {
     reach: "Path restriction",
     max_relay_hops: "Max relay hops",
     class: "QoS",
+    ack_eliciting_threshold: "ACK threshold",
+    max_ack_delay: "Max ACK delay",
 
     nodes_header: ["ID", "NAME", "VIRTUAL-IP", "STATE", "ROLES", "VERSION", "PLATFORM", "GROUPS"],
     no_nodes: "No nodes yet",

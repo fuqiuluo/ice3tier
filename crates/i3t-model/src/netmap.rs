@@ -87,6 +87,13 @@ pub struct Network {
     /// 网络的默认服务等级：代理、端口转发、出口都没有指定等级时用它；没有值时是 `auto`。
     #[serde(default)]
     pub class: Option<Class>,
+    /// 节点之间的连接上，请对端攒到多于这么多个包才单独发一个确认包；这期间它有别的包要发，确认就搭在里面。
+    /// 旧的 controller 不发这一项，读成 [`DEFAULT_ACK_ELICITING_THRESHOLD`]。
+    #[serde(default = "default_ack_eliciting_threshold")]
+    pub ack_eliciting_threshold: u32,
+    /// 没攒够时，对端最多等多少毫秒就发确认。旧的 controller 不发这一项，读成 [`DEFAULT_MAX_ACK_DELAY_MS`]。
+    #[serde(default = "default_max_ack_delay_ms")]
+    pub max_ack_delay_ms: u32,
 }
 
 impl Network {
@@ -113,6 +120,28 @@ impl Network {
 
 const fn default_max_relay_hops() -> u8 {
     2
+}
+
+/// [`Network::ack_eliciting_threshold`] 的默认值。
+///
+/// QUIC 库自己的做法是每收到两个包就单独回一个确认包。虚拟网卡上跑着 TCP 时，回程本来就有里面那条连接自己的确认要送，
+/// 再加上这些单独的确认包，回程的包数翻了一倍；回程按包数限速的线路上，能送过去的数据因此只有一半。
+/// 取 10 之后回程只剩里面的确认，实测吞吐翻倍，小包的往返延迟不变；回程没有包可搭的单向流量，
+/// 确认包从每两个包一个降到每十来个包一个。
+pub const DEFAULT_ACK_ELICITING_THRESHOLD: u32 = 10;
+
+/// [`Network::max_ack_delay_ms`] 的默认值。
+///
+/// 要小：发送方的窗口里装不下 [`Network::ack_eliciting_threshold`] 那么多个包时，对端永远攒不够，每一轮都要等满这么久才有确认。
+/// 实测等 25 毫秒、阈值又超过窗口时，单向流量丢掉两成到九成；等 2 毫秒时不丢。
+pub const DEFAULT_MAX_ACK_DELAY_MS: u32 = 2;
+
+pub(crate) const fn default_ack_eliciting_threshold() -> u32 {
+    DEFAULT_ACK_ELICITING_THRESHOLD
+}
+
+pub(crate) const fn default_max_ack_delay_ms() -> u32 {
+    DEFAULT_MAX_ACK_DELAY_MS
 }
 
 /// 选路模式。
@@ -799,6 +828,18 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_netmap_from_a_controller_without_the_acknowledgement_settings_reads_as_the_defaults() {
+        let network = minimal().network;
+        assert_eq!((network.ack_eliciting_threshold, network.max_ack_delay_ms), (10, 2), "旧的 controller 不发：用默认值");
+        let mut json = serde_json::to_value(minimal()).unwrap();
+        assert_eq!((&json["network"]["ack_eliciting_threshold"], &json["network"]["max_ack_delay_ms"]), (&10.into(), &2.into()));
+        json["network"]["ack_eliciting_threshold"] = 4.into();
+        json["network"]["max_ack_delay_ms"] = 5.into();
+        let network = serde_json::from_value::<Netmap>(json).unwrap().network;
+        assert_eq!((network.ack_eliciting_threshold, network.max_ack_delay_ms), (4, 5));
     }
 
     #[test]

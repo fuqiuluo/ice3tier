@@ -13,6 +13,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::ParseIntError;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use i3t_proto::flow::Class;
@@ -211,7 +212,21 @@ pub struct Network {
     /// 网络的默认服务等级；`null` 表示 `auto`。
     #[serde(default)]
     pub class: Option<Class>,
+    /// 节点之间的连接上，请对端攒到多于这么多个包才单独发一个确认包（[`ACK_ELICITING_THRESHOLD`] 之内）。
+    /// 比这个字段旧的 controller 不给，读成默认值。
+    #[serde(default = "crate::netmap::default_ack_eliciting_threshold")]
+    pub ack_eliciting_threshold: u32,
+    /// 没攒够时，对端最多等多少毫秒就发确认（[`MAX_ACK_DELAY_MS`] 之内）。比这个字段旧的 controller 不给，读成默认值。
+    #[serde(default = "crate::netmap::default_max_ack_delay_ms")]
+    pub max_ack_delay_ms: u32,
 }
+
+/// [`Network::ack_eliciting_threshold`] 可以取的值。1 是 QUIC 库自己的做法（每两个包确认一次）。
+pub const ACK_ELICITING_THRESHOLD: RangeInclusive<u32> = 1..=100;
+
+/// [`Network::max_ack_delay_ms`] 可以取的值。QUIC 库不让对端等得比 1 毫秒短；往返时间不到 25 毫秒的连接上，
+/// 它也不让对端等得比 25 毫秒长。
+pub const MAX_ACK_DELAY_MS: RangeInclusive<u32> = 1..=25;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CreateNetwork {
@@ -229,6 +244,11 @@ pub struct CreateNetwork {
     pub reach: Option<Reach>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<Class>,
+    /// 省略时用默认值，见 [`Network::ack_eliciting_threshold`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_eliciting_threshold: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ack_delay_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -245,6 +265,11 @@ pub struct UpdateNetwork {
     /// 写 `null` 表示改回 `auto`。
     #[serde(default, deserialize_with = "nullable", skip_serializing_if = "Option::is_none")]
     pub class: Option<Option<Class>>,
+    /// 只对改了之后新建立的连接生效：已有的连接保持建立时的设置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_eliciting_threshold: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ack_delay_ms: Option<u32>,
 }
 
 /// 一个网络的总览。

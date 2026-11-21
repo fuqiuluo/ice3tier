@@ -202,6 +202,34 @@ fn a_forward_may_leave_its_port_to_the_node_except_on_a_virtual_ip() {
 }
 
 #[test]
+fn the_networks_acknowledgement_settings_reach_every_node_and_stay_within_their_ranges() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let (mut laptop, mut nas) = (lab.join(network.id, &[]), lab.join(network.id, &[]));
+    lab.settle(&mut [&mut laptop, &mut nas]);
+    let sent = |netmap: &netmap::Netmap| (netmap.network.ack_eliciting_threshold, netmap.network.max_ack_delay_ms);
+    assert_eq!((sent(laptop.netmap()), sent(nas.netmap())), ((10, 2), (10, 2)), "新建的网络用默认值");
+
+    let change = UpdateNetwork { ack_eliciting_threshold: Some(4), ..UpdateNetwork::default() };
+    let changed = lab.controller.update_network(network.id, &change).unwrap();
+    assert_eq!((changed.ack_eliciting_threshold, changed.max_ack_delay_ms), (4, 2), "没写的那一项不变");
+    lab.controller.update_network(network.id, &UpdateNetwork { max_ack_delay_ms: Some(25), ..UpdateNetwork::default() }).unwrap();
+    lab.settle(&mut [&mut laptop, &mut nas]);
+    assert_eq!((sent(laptop.netmap()), sent(nas.netmap())), ((4, 25), (4, 25)));
+
+    for refused in [
+        UpdateNetwork { ack_eliciting_threshold: Some(0), ..UpdateNetwork::default() },
+        UpdateNetwork { ack_eliciting_threshold: Some(101), ..UpdateNetwork::default() },
+        UpdateNetwork { max_ack_delay_ms: Some(0), ..UpdateNetwork::default() },
+        UpdateNetwork { max_ack_delay_ms: Some(26), ..UpdateNetwork::default() },
+    ] {
+        assert!(lab.controller.update_network(network.id, &refused).is_err(), "{refused:?}");
+    }
+    let kept = lab.controller.network(network.id).unwrap();
+    assert_eq!((kept.ack_eliciting_threshold, kept.max_ack_delay_ms), (4, 25), "被拒绝的改动什么都不留下");
+}
+
+#[test]
 fn classes_and_the_optimistic_reply_set_on_the_network_proxy_forward_and_exit_reach_the_netmaps() {
     let mut lab = Lab::new();
     let network = lab.network("home");

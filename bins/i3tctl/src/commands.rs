@@ -338,10 +338,17 @@ impl Session {
         match command {
             NetworkCommand::List => self.show_list(self.get("/networks").await?, render::networks),
             NetworkCommand::Create { name, settings } => {
-                let NetworkSettings { cidr, routing, max_relay_hops, reach, class } = settings;
-                let class = class.and_then(crate::cli::Inherit::into_override);
-                let request =
-                    CreateNetwork { name, cidr, routing: routing.map(Into::into), max_relay_hops, reach: reach.map(Into::into), class };
+                let NetworkSettings { cidr, routing, max_relay_hops, reach, class, ack_eliciting_threshold, max_ack_delay_ms } = settings;
+                let request = CreateNetwork {
+                    name,
+                    cidr,
+                    routing: routing.map(Into::into),
+                    max_relay_hops,
+                    reach: reach.map(Into::into),
+                    class: class.and_then(crate::cli::Inherit::into_override),
+                    ack_eliciting_threshold,
+                    max_ack_delay_ms,
+                };
                 self.show(self.send(Method::POST, "/networks", &request).await?, render::network)
             }
             NetworkCommand::Show => {
@@ -350,9 +357,16 @@ impl Session {
             }
             NetworkCommand::Set { settings } => {
                 let network = self.network().await?;
-                let NetworkSettings { cidr, routing, max_relay_hops, reach, class } = settings;
-                let class = class.map(crate::cli::Inherit::into_override);
-                let request = UpdateNetwork { cidr, routing: routing.map(Into::into), max_relay_hops, reach: reach.map(Into::into), class };
+                let NetworkSettings { cidr, routing, max_relay_hops, reach, class, ack_eliciting_threshold, max_ack_delay_ms } = settings;
+                let request = UpdateNetwork {
+                    cidr,
+                    routing: routing.map(Into::into),
+                    max_relay_hops,
+                    reach: reach.map(Into::into),
+                    class: class.map(crate::cli::Inherit::into_override),
+                    ack_eliciting_threshold,
+                    max_ack_delay_ms,
+                };
                 self.show(self.send(Method::PATCH, &format!("/networks/{}", network.id), &request).await?, render::network)
             }
             NetworkCommand::Delete { network } => {

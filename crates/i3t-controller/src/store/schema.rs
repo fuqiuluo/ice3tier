@@ -27,6 +27,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0014_node_auto_update.sql"),
     include_str!("migrations/0015_proxies.sql"),
     include_str!("migrations/0016_proxy_lane.sql"),
+    include_str!("migrations/0017_network_ack_frequency.sql"),
 ];
 
 #[cfg(test)]
@@ -177,12 +178,14 @@ mod tests {
 
     #[test]
     fn listeners_become_proxies_with_their_exit_and_credentials_go_away() {
-        use crate::store::fixtures::{home, new_node};
+        use crate::store::fixtures::new_node;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("controller.db");
         let nodes: Vec<i3t_proto::NodeId> = {
             let store = Store::prepare(Connection::open(&path).unwrap(), &MIGRATIONS[..BEFORE_PROXIES]).unwrap();
-            let network = store.insert_network(&home()).unwrap();
+            // 旧的表结构里没有后来加的列，用不了现在的 `insert_network`。
+            home_network(&store.conn);
+            let network = i3t_model::admin::NetworkId(1);
             let nodes: Vec<_> = (1..=3).map(|seed| store.insert_node(&new_node(network, seed)).unwrap()).collect();
             let (a, b) = (nodes[0].get(), nodes[1].get());
             store
@@ -441,7 +444,7 @@ mod tests {
 
     #[test]
     fn proxies_whose_pair_was_stored_as_always_get_ice3proxy_and_the_pair_setting_goes() {
-        use crate::store::fixtures::{home, new_node};
+        use crate::store::fixtures::new_node;
         use i3t_model::admin::{NetworkId, PairSetting};
         use i3t_model::netmap::{Congestion, LaneMode};
 
@@ -450,7 +453,9 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         let nodes: Vec<i3t_proto::NodeId> = {
             let store = Store::prepare(Connection::open(data.join("controller.db")).unwrap(), &MIGRATIONS[..BEFORE_PROXY_LANE]).unwrap();
-            let network = store.insert_network(&home()).unwrap();
+            // 旧的表结构里没有后来加的列，用不了现在的 `insert_network`。
+            home_network(&store.conn);
+            let network = i3t_model::admin::NetworkId(1);
             let nodes: Vec<_> = (1..=5).map(|seed| store.insert_node(&new_node(network, seed)).unwrap()).collect();
             let [one, two, three, four, five] = [0, 1, 2, 3, 4].map(|index| nodes[index].get());
             store
@@ -539,5 +544,23 @@ mod tests {
         let node = |id: u32| store.node(i3t_proto::NodeId::new(id).unwrap()).unwrap().unwrap();
         assert!(node(1).auto_update && node(2).auto_update, "以前只有全局的开关，已有的节点都按开着算");
         assert!(node(2).forward_target, "别的开关不动");
+    }
+
+    /// 第 17 版之前：网络没有确认频率的设置。
+    const BEFORE_NETWORK_ACK_FREQUENCY: usize = 16;
+
+    #[test]
+    fn an_existing_network_gets_the_default_acknowledgement_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        {
+            let store = Store::prepare(Connection::open(&path).unwrap(), &MIGRATIONS[..BEFORE_NETWORK_ACK_FREQUENCY]).unwrap();
+            home_network(&store.conn);
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), u32::try_from(MIGRATIONS.len()).unwrap());
+        let network = store.network_by_name("home").unwrap().unwrap();
+        assert_eq!((network.ack_eliciting_threshold, network.max_ack_delay_ms), (10, 2));
+        assert_eq!(network.max_relay_hops, 2, "别的设置不动");
     }
 }

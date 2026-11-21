@@ -252,6 +252,8 @@ impl NetworkView {
                 max_relay_hops: self.network.max_relay_hops,
                 reach: self.network.reach,
                 class: self.network.class,
+                ack_eliciting_threshold: self.network.ack_eliciting_threshold,
+                max_ack_delay_ms: self.network.max_ack_delay_ms,
             },
             me: LocalNode {
                 id,

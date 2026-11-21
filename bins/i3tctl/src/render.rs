@@ -319,6 +319,8 @@ pub fn network(network: &Network) {
     fields.add(t.reach, label(&network.reach));
     fields.add(t.max_relay_hops, network.max_relay_hops.to_string());
     fields.add(t.class, (codes.class)(network.class.unwrap_or_default()).to_owned());
+    fields.add(t.ack_eliciting_threshold, network.ack_eliciting_threshold.to_string());
+    fields.add(t.max_ack_delay, format!("{} ms", network.max_ack_delay_ms));
     fields.print();
 }
 

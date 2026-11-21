@@ -31,6 +31,8 @@ const HELP: Help = Help {
     network_delete: "删除网络（要先删掉其中的节点）",
     network_cidr: "地址段。有节点之后只能扩大",
     network_max_relay_hops: "最大中转级数，1 到 4",
+    network_ack_eliciting_threshold: "确认阈值，1 到 100：对端攒到多于这么多个包才单独发确认。只对新建的连接生效",
+    network_max_ack_delay_ms: "确认最长等待，1 到 25 毫秒：没攒够时对端最多等这么久。只对新建的连接生效",
     routing: "选路模式",
     reach: "路径限制",
     class: "QoS：auto 自动、interactive 低延迟、reliable 不丢包、bulk 后台",
@@ -279,6 +281,8 @@ const UI: Ui = Ui {
     reach: "路径限制",
     max_relay_hops: "最大中转级数",
     class: "QoS",
+    ack_eliciting_threshold: "确认阈值",
+    max_ack_delay: "确认最长等待",
 
     nodes_header: ["编号", "名字", "虚拟 IP", "状态", "角色", "版本", "平台", "分组"],
     no_nodes: "还没有节点",

@@ -168,6 +168,14 @@ async fn the_command_line_drives_a_running_controller() {
     assert_eq!(networks[0]["name"], "home");
     fixture.ok(&["network", "set", "--routing", "lowest-cost", "--max-relay-hops", "3"]).await;
     assert_eq!(fixture.json(&["network", "show"]).await["routing"], "lowest_cost");
+    let shown = fixture.json(&["network", "show"]).await;
+    assert_eq!((&shown["ack_eliciting_threshold"], &shown["max_ack_delay_ms"]), (&10.into(), &2.into()), "默认值");
+    let set = fixture.ok(&["network", "set", "--ack-eliciting-threshold", "4", "--max-ack-delay-ms", "5"]).await;
+    assert!(set.contains("确认阈值") && set.contains("5 ms"), "{set}");
+    let shown = fixture.json(&["network", "show"]).await;
+    assert_eq!((&shown["ack_eliciting_threshold"], &shown["max_ack_delay_ms"]), (&4.into(), &5.into()));
+    let refused = fixture.fails(&["network", "set", "--max-ack-delay-ms", "26"]).await;
+    assert!(refused.contains("1 到 25"), "{refused}");
 
     // 分组。
     assert!(fixture.ok(&["group", "list"]).await.contains("All（内置）"));

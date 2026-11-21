@@ -1,7 +1,10 @@
 //! 网络的增删改查。
 
-use i3t_model::admin::{CreateNetwork, Direction, GroupRef, LogRef, Network, NetworkId, RefKind, Rule, UpdateNetwork, action};
-use i3t_model::netmap::{Reach, RoutingMode};
+use i3t_model::admin::{
+    ACK_ELICITING_THRESHOLD, CreateNetwork, Direction, GroupRef, LogRef, MAX_ACK_DELAY_MS, Network, NetworkId, RefKind, Rule,
+    UpdateNetwork, action,
+};
+use i3t_model::netmap::{DEFAULT_ACK_ELICITING_THRESHOLD, DEFAULT_MAX_ACK_DELAY_MS, Reach, RoutingMode};
 use ipnet::Ipv4Net;
 use serde_json::json;
 
@@ -38,6 +41,9 @@ impl Controller {
     pub fn create_network(&self, request: &CreateNetwork) -> Result<Network, Error> {
         let name = naming::label("网络", &request.name).in_field("name")?;
         let max_relay_hops = check_max_relay_hops(request.max_relay_hops.unwrap_or(DEFAULT_MAX_RELAY_HOPS))?;
+        let ack_eliciting_threshold =
+            check_ack_eliciting_threshold(request.ack_eliciting_threshold.unwrap_or(DEFAULT_ACK_ELICITING_THRESHOLD))?;
+        let max_ack_delay_ms = check_max_ack_delay_ms(request.max_ack_delay_ms.unwrap_or(DEFAULT_MAX_ACK_DELAY_MS))?;
         let mut inner = self.lock();
         let now = inner.clock.now();
         let id = inner.store.atomically(|store| {
@@ -62,6 +68,8 @@ impl Controller {
                 reach: request.reach.unwrap_or(Reach::Any),
                 created_at: now,
                 class: request.class,
+                ack_eliciting_threshold,
+                max_ack_delay_ms,
             })?;
             let all = store.builtin_group(id)?.ok_or(Error::NotFound(Entity::Group))?;
             let all = GroupRef { id: all, name: BUILTIN_GROUP.to_owned(), builtin: true };
@@ -98,6 +106,12 @@ impl Controller {
             if let Some(max_relay_hops) = request.max_relay_hops {
                 network.max_relay_hops = check_max_relay_hops(max_relay_hops)?;
             }
+            if let Some(threshold) = request.ack_eliciting_threshold {
+                network.ack_eliciting_threshold = check_ack_eliciting_threshold(threshold)?;
+            }
+            if let Some(delay) = request.max_ack_delay_ms {
+                network.max_ack_delay_ms = check_max_ack_delay_ms(delay)?;
+            }
             network.routing = request.routing.unwrap_or(network.routing);
             network.reach = request.reach.unwrap_or(network.reach);
             network.class = request.class.unwrap_or(network.class);
@@ -111,6 +125,8 @@ impl Controller {
                 "max_relay_hops": network.max_relay_hops,
                 "reach": network.reach,
                 "class": network.class,
+                "ack_eliciting_threshold": network.ack_eliciting_threshold,
+                "max_ack_delay_ms": network.max_ack_delay_ms,
             });
             store.log_refs(now, Some(id), action::NETWORK_UPDATE, &format!("修改网络 {} 的设置", network.name), &refs, params)?;
             Ok::<_, Error>(network)
@@ -156,6 +172,8 @@ impl Inner {
             created_at: record.created_at,
             nodes: self.store.node_count(Some(record.id))?,
             class: record.class,
+            ack_eliciting_threshold: record.ack_eliciting_threshold,
+            max_ack_delay_ms: record.max_ack_delay_ms,
         })
     }
 }
@@ -168,6 +186,30 @@ fn check_max_relay_hops(hops: u8) -> Result<u8, Error> {
             "max_relay_hops",
             "out_of_range",
             format!("最大中转级数要在 {} 到 {} 之间", MAX_RELAY_HOPS.start(), MAX_RELAY_HOPS.end()),
+        ))
+    }
+}
+
+fn check_ack_eliciting_threshold(threshold: u32) -> Result<u32, Error> {
+    if ACK_ELICITING_THRESHOLD.contains(&threshold) {
+        Ok(threshold)
+    } else {
+        Err(Error::invalid_field(
+            "ack_eliciting_threshold",
+            "out_of_range",
+            format!("确认阈值要在 {} 到 {} 之间", ACK_ELICITING_THRESHOLD.start(), ACK_ELICITING_THRESHOLD.end()),
+        ))
+    }
+}
+
+fn check_max_ack_delay_ms(delay: u32) -> Result<u32, Error> {
+    if MAX_ACK_DELAY_MS.contains(&delay) {
+        Ok(delay)
+    } else {
+        Err(Error::invalid_field(
+            "max_ack_delay_ms",
+            "out_of_range",
+            format!("确认的最长等待要在 {} 到 {} 毫秒之间", MAX_ACK_DELAY_MS.start(), MAX_ACK_DELAY_MS.end()),
         ))
     }
 }

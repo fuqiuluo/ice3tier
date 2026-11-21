@@ -59,6 +59,8 @@ pub struct Help {
     pub network_delete: &'static str,
     pub network_cidr: &'static str,
     pub network_max_relay_hops: &'static str,
+    pub network_ack_eliciting_threshold: &'static str,
+    pub network_max_ack_delay_ms: &'static str,
     pub routing: &'static str,
     pub reach: &'static str,
     pub class: &'static str,
@@ -318,6 +320,8 @@ pub struct Ui {
     pub reach: &'static str,
     pub max_relay_hops: &'static str,
     pub class: &'static str,
+    pub ack_eliciting_threshold: &'static str,
+    pub max_ack_delay: &'static str,
 
     pub nodes_header: [&'static str; 8],
     pub no_nodes: &'static str,

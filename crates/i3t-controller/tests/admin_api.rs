@@ -211,10 +211,15 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
     let home = api.network("home").await;
     assert_eq!((home.name.as_str(), home.domain.as_str(), home.nodes), ("home", "home.i3t", 0));
     assert_eq!(home.cidr, "10.66.0.0/16".parse().unwrap());
-    let explicit = json!({ "name": "lab", "cidr": "10.99.3.4/24", "routing": "lowest_cost", "max_relay_hops": 3, "reach": "direct_only" });
+    assert_eq!((home.ack_eliciting_threshold, home.max_ack_delay_ms), (10, 2), "没写的设置用默认值");
+    let explicit = json!({
+        "name": "lab", "cidr": "10.99.3.4/24", "routing": "lowest_cost", "max_relay_hops": 3, "reach": "direct_only",
+        "ack_eliciting_threshold": 4, "max_ack_delay_ms": 5
+    });
     let lab: model::Network = api.ok(Method::POST, "/networks", Some(explicit)).await;
     assert_eq!(lab.cidr, "10.99.3.0/24".parse().unwrap());
     assert_eq!((lab.max_relay_hops, serde_json::to_value(lab.routing).unwrap()), (3, json!("lowest_cost")));
+    assert_eq!((lab.ack_eliciting_threshold, lab.max_ack_delay_ms), (4, 5));
 
     let listed: Vec<model::Network> = api.ok(Method::GET, "/networks", None).await;
     assert_eq!(listed, vec![home.clone(), lab.clone()]);
@@ -225,6 +230,9 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
         api.ok(Method::PATCH, &format!("/networks/{}", lab.id), Some(json!({ "reach": "any", "cidr": "10.99.0.0/16" }))).await;
     assert_eq!((changed.cidr, serde_json::to_value(changed.reach).unwrap()), ("10.99.0.0/16".parse().unwrap(), json!("any")));
     assert_eq!(changed.max_relay_hops, 3, "没写的字段不变");
+    let quieter: model::Network =
+        api.ok(Method::PATCH, &format!("/networks/{}", lab.id), Some(json!({ "ack_eliciting_threshold": 20 }))).await;
+    assert_eq!((quieter.ack_eliciting_threshold, quieter.max_ack_delay_ms), (20, 5));
 
     let overlap = api.fails(Method::POST, "/networks", Some(json!({ "name": "x", "cidr": "10.66.1.0/24" })), StatusCode::CONFLICT).await;
     assert_eq!(overlap.code, model::ErrorCode::RangeOverlaps);
@@ -1027,6 +1035,13 @@ async fn vague_errors_say_what_was_wrong_and_which_field() {
     let hops = json!({ "max_relay_hops": 9 });
     let hops = api.fails(Method::PATCH, &format!("/networks/{}", network.id), Some(hops), StatusCode::BAD_REQUEST).await;
     assert_eq!((hops.what.as_deref(), hops.field.as_deref()), (Some("out_of_range"), Some("max_relay_hops")));
+    for (field, value) in
+        [("ack_eliciting_threshold", 0), ("ack_eliciting_threshold", 101), ("max_ack_delay_ms", 0), ("max_ack_delay_ms", 26)]
+    {
+        let refused =
+            api.fails(Method::PATCH, &format!("/networks/{}", network.id), Some(json!({ field: value })), StatusCode::BAD_REQUEST).await;
+        assert_eq!((refused.what.as_deref(), refused.field.as_deref()), (Some("out_of_range"), Some(field)), "{field} = {value}");
+    }
     let path = api.fails(Method::GET, "/networks/x/nodes", None, StatusCode::BAD_REQUEST).await;
     assert_eq!((path.what.as_deref(), path.field.as_deref()), (Some("path"), Some("network")));
     let endpoint = api.fails(Method::GET, "/nowhere", None, StatusCode::NOT_FOUND).await;
