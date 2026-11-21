@@ -111,14 +111,13 @@ sudo i3t status
   echo <注册令牌> | sudo i3t join
   ```
 
-- **Windows。** 从 [最新的发布](https://github.com/fuqiuluo/ice3tier/releases/latest) 下载 `i3t-windows-x86_64.zip` 并解压，`wintun.dll` 要留在 `i3t.exe` 旁边。以管理员身份打开 PowerShell，在这个目录里执行：
+- **Windows。** 以管理员身份打开 PowerShell，执行：
 
   ```powershell
-  echo <注册令牌> | .\i3t.exe join
-  .\i3t.exe run
+  $env:I3T_TOKEN = '<注册令牌>'; irm https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.ps1 | iex
   ```
 
-  `i3t.exe run` 运行着，节点就在线。
+  节点装成系统服务 `i3t`：在后台运行，开机自动启动。不带令牌也可以装，之后用 `echo <注册令牌> | i3t join` 加入，加入后服务会自动启动。`i3t status` 查看状态；卸载是 `$env:I3T_UNINSTALL = '1'; irm … | iex`。
 
 - **没有 systemd 的 Linux。** 脚本只装 `/usr/local/bin/i3t`。用 `echo <注册令牌> | sudo i3t join` 加入，再用你的 init 系统让 `sudo i3t run` 一直运行。
 

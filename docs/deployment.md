@@ -111,14 +111,13 @@ Other cases:
   echo <enrollment-token> | sudo i3t join
   ```
 
-- **Windows.** Download `i3t-windows-x86_64.zip` from the [latest release](https://github.com/fuqiuluo/ice3tier/releases/latest) and unpack it; keep `wintun.dll` next to `i3t.exe`. In a PowerShell window opened as administrator, in that folder:
+- **Windows.** In a PowerShell window opened as administrator:
 
   ```powershell
-  echo <enrollment-token> | .\i3t.exe join
-  .\i3t.exe run
+  $env:I3T_TOKEN = '<enrollment-token>'; irm https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.ps1 | iex
   ```
 
-  The node runs as long as `i3t.exe run` does.
+  The node is installed as the system service `i3t`: it runs in the background and starts at boot. You can also install without a token and join later with `echo <enrollment-token> | i3t join`, which starts the service. `i3t status` shows its state; to uninstall, `$env:I3T_UNINSTALL = '1'; irm … | iex`.
 
 - **Linux without systemd.** The script installs `/usr/local/bin/i3t` only. Join with `echo <enrollment-token> | sudo i3t join` and keep `sudo i3t run` running with your init system.
 
