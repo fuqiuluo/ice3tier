@@ -171,7 +171,8 @@ async fn the_command_line_drives_a_running_controller() {
     let shown = fixture.json(&["network", "show"]).await;
     assert_eq!((&shown["ack_eliciting_threshold"], &shown["max_ack_delay_ms"]), (&10.into(), &2.into()), "默认值");
     let set = fixture.ok(&["network", "set", "--ack-eliciting-threshold", "4", "--max-ack-delay-ms", "5"]).await;
-    assert!(set.contains("确认阈值") && set.contains("5 ms"), "{set}");
+    assert!(set.contains("4（默认 10）") && set.contains("5 ms（默认 2 ms）"), "改过的设置后面写着默认值：{set}");
+    assert!(set.contains("lowest_cost（默认 direct_first）") && !set.contains("any（默认"), "没改过的不写：{set}");
     let shown = fixture.json(&["network", "show"]).await;
     assert_eq!((&shown["ack_eliciting_threshold"], &shown["max_ack_delay_ms"]), (&4.into(), &5.into()));
     let refused = fixture.fails(&["network", "set", "--max-ack-delay-ms", "26"]).await;

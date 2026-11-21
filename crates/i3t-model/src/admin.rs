@@ -26,7 +26,10 @@ use crate::control::{
     ListenState, ListenTraffic, PathCandidate, PeerLanes, PerformanceReport, RelayState, RelayUse, Route, RouteAlternative, RouteCause,
     RouteSince, SelfUpdate, TargetCause, TryOutcome, VnetReport,
 };
-use crate::netmap::{Attachment, Congestion, ExitRole, ForwardProtocol, ListenerProtocol, Profile, ProxyProtocol, Reach, RoutingMode};
+use crate::netmap::{
+    Attachment, Congestion, DEFAULT_ACK_ELICITING_THRESHOLD, DEFAULT_MAX_ACK_DELAY_MS, ExitRole, ForwardProtocol, ListenerProtocol,
+    Profile, ProxyProtocol, Reach, RoutingMode,
+};
 use crate::update::{FailureKind, SelfUpdateBlocker, UpdateCause, UpdateStatus, UpdateTiming, Version};
 
 pub mod action;
@@ -219,6 +222,37 @@ pub struct Network {
     /// 没攒够时，对端最多等多少毫秒就发确认（[`MAX_ACK_DELAY_MS`] 之内）。比这个字段旧的 controller 不给，读成默认值。
     #[serde(default = "crate::netmap::default_max_ack_delay_ms")]
     pub max_ack_delay_ms: u32,
+    /// 各项设置的默认值。比这个字段旧的 controller 不给，是 `null`：这时说不出哪些设置改过。
+    #[serde(default)]
+    pub defaults: Option<NetworkDefaults>,
+}
+
+/// 网络各项设置的默认值：新建网络时没写的那些取它。界面和命令行按它标出哪些设置改过；恢复默认就是把这里的值写回去。
+///
+/// 每个 controller 报它自己的：默认值以后可能变，按 controller 给的比，不按看的人手上的程序。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkDefaults {
+    pub routing: RoutingMode,
+    pub max_relay_hops: u8,
+    pub reach: Reach,
+    /// `null` 表示 `auto`。
+    pub class: Option<Class>,
+    pub ack_eliciting_threshold: u32,
+    pub max_ack_delay_ms: u32,
+}
+
+impl Default for NetworkDefaults {
+    fn default() -> Self {
+        Self {
+            routing: RoutingMode::default(),
+            max_relay_hops: crate::netmap::default_max_relay_hops(),
+            reach: Reach::default(),
+            class: None,
+            ack_eliciting_threshold: DEFAULT_ACK_ELICITING_THRESHOLD,
+            max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
+        }
+    }
 }
 
 /// [`Network::ack_eliciting_threshold`] 可以取的值。1 是 QUIC 库自己的做法（每两个包确认一次）。
@@ -244,7 +278,7 @@ pub struct CreateNetwork {
     pub reach: Option<Reach>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<Class>,
-    /// 省略时用默认值，见 [`Network::ack_eliciting_threshold`]。
+    /// 这一个和上面几个一样，省略时用默认值（[`NetworkDefaults`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_eliciting_threshold: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

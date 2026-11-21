@@ -283,6 +283,7 @@ const UI: Ui = Ui {
     class: "QoS",
     ack_eliciting_threshold: "ACK threshold",
     max_ack_delay: "Max ACK delay",
+    default_is: |default| format!(" (default {default})"),
 
     nodes_header: ["ID", "NAME", "VIRTUAL-IP", "STATE", "ROLES", "VERSION", "PLATFORM", "GROUPS"],
     no_nodes: "No nodes yet",

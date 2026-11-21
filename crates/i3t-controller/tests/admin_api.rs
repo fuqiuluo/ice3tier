@@ -212,6 +212,19 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
     assert_eq!((home.name.as_str(), home.domain.as_str(), home.nodes), ("home", "home.i3t", 0));
     assert_eq!(home.cidr, "10.66.0.0/16".parse().unwrap());
     assert_eq!((home.ack_eliciting_threshold, home.max_ack_delay_ms), (10, 2), "没写的设置用默认值");
+    let defaults = home.defaults.clone().expect("controller 报出各项设置的默认值");
+    assert_eq!(
+        (home.routing, home.max_relay_hops, home.reach, home.class, home.ack_eliciting_threshold, home.max_ack_delay_ms),
+        (
+            defaults.routing,
+            defaults.max_relay_hops,
+            defaults.reach,
+            defaults.class,
+            defaults.ack_eliciting_threshold,
+            defaults.max_ack_delay_ms
+        ),
+        "新建的网络每一项都是默认值"
+    );
     let explicit = json!({
         "name": "lab", "cidr": "10.99.3.4/24", "routing": "lowest_cost", "max_relay_hops": 3, "reach": "direct_only",
         "ack_eliciting_threshold": 4, "max_ack_delay_ms": 5
@@ -233,6 +246,7 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
     let quieter: model::Network =
         api.ok(Method::PATCH, &format!("/networks/{}", lab.id), Some(json!({ "ack_eliciting_threshold": 20 }))).await;
     assert_eq!((quieter.ack_eliciting_threshold, quieter.max_ack_delay_ms), (20, 5));
+    assert_eq!(quieter.defaults, Some(defaults), "默认值不跟着网络的设置变");
 
     let overlap = api.fails(Method::POST, "/networks", Some(json!({ "name": "x", "cidr": "10.66.1.0/24" })), StatusCode::CONFLICT).await;
     assert_eq!(overlap.code, model::ErrorCode::RangeOverlaps);

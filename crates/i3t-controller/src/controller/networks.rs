@@ -1,10 +1,9 @@
 //! 网络的增删改查。
 
 use i3t_model::admin::{
-    ACK_ELICITING_THRESHOLD, CreateNetwork, Direction, GroupRef, LogRef, MAX_ACK_DELAY_MS, Network, NetworkId, RefKind, Rule,
-    UpdateNetwork, action,
+    ACK_ELICITING_THRESHOLD, CreateNetwork, Direction, GroupRef, LogRef, MAX_ACK_DELAY_MS, Network, NetworkDefaults, NetworkId, RefKind,
+    Rule, UpdateNetwork, action,
 };
-use i3t_model::netmap::{DEFAULT_ACK_ELICITING_THRESHOLD, DEFAULT_MAX_ACK_DELAY_MS, Reach, RoutingMode};
 use ipnet::Ipv4Net;
 use serde_json::json;
 
@@ -12,8 +11,7 @@ use super::{Controller, Inner, Seeds, address, naming};
 use crate::error::{Entity, Error, InField};
 use crate::store::{BUILTIN_GROUP, NetworkRecord, NewNetwork};
 
-/// 一条路径最多经过几个 relay：默认值，和协议允许的范围。
-const DEFAULT_MAX_RELAY_HOPS: u8 = 2;
+/// 一条路径最多经过几个 relay：协议允许的范围。
 const MAX_RELAY_HOPS: std::ops::RangeInclusive<u8> = 1..=4;
 
 impl Controller {
@@ -40,10 +38,11 @@ impl Controller {
     /// 名字不合法或者已经有了；地址段和别的网络重叠；没指定地址段而默认的都被占了。
     pub fn create_network(&self, request: &CreateNetwork) -> Result<Network, Error> {
         let name = naming::label("网络", &request.name).in_field("name")?;
-        let max_relay_hops = check_max_relay_hops(request.max_relay_hops.unwrap_or(DEFAULT_MAX_RELAY_HOPS))?;
+        let defaults = NetworkDefaults::default();
+        let max_relay_hops = check_max_relay_hops(request.max_relay_hops.unwrap_or(defaults.max_relay_hops))?;
         let ack_eliciting_threshold =
-            check_ack_eliciting_threshold(request.ack_eliciting_threshold.unwrap_or(DEFAULT_ACK_ELICITING_THRESHOLD))?;
-        let max_ack_delay_ms = check_max_ack_delay_ms(request.max_ack_delay_ms.unwrap_or(DEFAULT_MAX_ACK_DELAY_MS))?;
+            check_ack_eliciting_threshold(request.ack_eliciting_threshold.unwrap_or(defaults.ack_eliciting_threshold))?;
+        let max_ack_delay_ms = check_max_ack_delay_ms(request.max_ack_delay_ms.unwrap_or(defaults.max_ack_delay_ms))?;
         let mut inner = self.lock();
         let now = inner.clock.now();
         let id = inner.store.atomically(|store| {
@@ -63,11 +62,11 @@ impl Controller {
             let id = store.insert_network(&NewNetwork {
                 name: name.clone(),
                 cidr,
-                routing: request.routing.unwrap_or(RoutingMode::DirectFirst),
+                routing: request.routing.unwrap_or(defaults.routing),
                 max_relay_hops,
-                reach: request.reach.unwrap_or(Reach::Any),
+                reach: request.reach.unwrap_or(defaults.reach),
                 created_at: now,
-                class: request.class,
+                class: request.class.or(defaults.class),
                 ack_eliciting_threshold,
                 max_ack_delay_ms,
             })?;
@@ -174,6 +173,7 @@ impl Inner {
             class: record.class,
             ack_eliciting_threshold: record.ack_eliciting_threshold,
             max_ack_delay_ms: record.max_ack_delay_ms,
+            defaults: Some(NetworkDefaults::default()),
         })
     }
 }

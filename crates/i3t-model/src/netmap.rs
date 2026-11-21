@@ -118,7 +118,7 @@ impl Network {
     }
 }
 
-const fn default_max_relay_hops() -> u8 {
+pub(crate) const fn default_max_relay_hops() -> u8 {
     2
 }
 

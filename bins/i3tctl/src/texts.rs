@@ -322,6 +322,8 @@ pub struct Ui {
     pub class: &'static str,
     pub ack_eliciting_threshold: &'static str,
     pub max_ack_delay: &'static str,
+    /// 写在一项改过的设置后面：它的默认值是什么。
+    pub default_is: fn(&str) -> String,
 
     pub nodes_header: [&'static str; 8],
     pub no_nodes: &'static str,

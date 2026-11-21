@@ -19,6 +19,7 @@ use i3t_model::control::{
 use i3t_model::netmap::{IpFamily, ListenerProtocol, Profile};
 use i3t_model::update::UpdateTiming;
 use i3t_proto::NodeId;
+use i3t_proto::flow::Class;
 
 use crate::texts::{Ui, texts};
 
@@ -311,16 +312,27 @@ pub fn networks(networks: &[Network]) {
 pub fn network(network: &Network) {
     let (t, _, codes) = context();
     println!("{} #{}", network.name, network.id);
+    let defaults = network.defaults.as_ref();
+    // 一项设置的值；和 controller 报的默认值不一样时，后面写上默认值，一眼看得出哪些改过。
+    let setting = |value: String, default: Option<String>| match default {
+        Some(default) if default != value => format!("{value}{}", (t.default_is)(&default)),
+        _ => value,
+    };
+    let class = |class: Option<Class>| (codes.class)(class.unwrap_or_default()).to_owned();
+    let millis = |ms: u32| format!("{ms} ms");
     let mut fields = Fields::new(2);
     fields.add(t.domain, network.domain.clone());
     fields.add(t.cidr, network.cidr.to_string());
     fields.add(t.nodes, network.nodes.to_string());
-    fields.add(t.routing, label(&network.routing));
-    fields.add(t.reach, label(&network.reach));
-    fields.add(t.max_relay_hops, network.max_relay_hops.to_string());
-    fields.add(t.class, (codes.class)(network.class.unwrap_or_default()).to_owned());
-    fields.add(t.ack_eliciting_threshold, network.ack_eliciting_threshold.to_string());
-    fields.add(t.max_ack_delay, format!("{} ms", network.max_ack_delay_ms));
+    fields.add(t.routing, setting(label(&network.routing), defaults.map(|defaults| label(&defaults.routing))));
+    fields.add(t.reach, setting(label(&network.reach), defaults.map(|defaults| label(&defaults.reach))));
+    fields.add(t.max_relay_hops, setting(network.max_relay_hops.to_string(), defaults.map(|defaults| defaults.max_relay_hops.to_string())));
+    fields.add(t.class, setting(class(network.class), defaults.map(|defaults| class(defaults.class))));
+    fields.add(
+        t.ack_eliciting_threshold,
+        setting(network.ack_eliciting_threshold.to_string(), defaults.map(|defaults| defaults.ack_eliciting_threshold.to_string())),
+    );
+    fields.add(t.max_ack_delay, setting(millis(network.max_ack_delay_ms), defaults.map(|defaults| millis(defaults.max_ack_delay_ms))));
     fields.print();
 }
 

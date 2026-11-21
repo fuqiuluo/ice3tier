@@ -283,6 +283,7 @@ const UI: Ui = Ui {
     class: "QoS",
     ack_eliciting_threshold: "确认阈值",
     max_ack_delay: "确认最长等待",
+    default_is: |default| format!("（默认 {default}）"),
 
     nodes_header: ["编号", "名字", "虚拟 IP", "状态", "角色", "版本", "平台", "分组"],
     no_nodes: "还没有节点",
