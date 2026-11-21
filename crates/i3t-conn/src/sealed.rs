@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use i3t_path::{Packets, Paths};
 use i3t_proto::NodeId;
 use i3t_proto::flow::Channel;
 use i3t_proto::sealed::{KIND_SEALED, SealedHeader};
@@ -62,6 +63,9 @@ const PROBE_EVERY: Duration = Duration::from_secs(1);
 /// 重放窗口记多少个序号。和 WireGuard 的取值在一个量级：路上乱序超过这么多个包的，当作丢了。
 const REPLAY_WORDS: usize = 32;
 const REPLAY_WORD_BITS: u64 = 64;
+
+/// 攒成一批一起交给内核的封好的包最多几个。一批最大的也就两万多字节，远在一次发送的上限（64 KB）之内。
+pub(crate) const BATCH_PACKETS: usize = 16;
 
 /// 认不出是哪条连接的包（连接标识还没有登记）先留这么多个、这么久。
 ///
@@ -194,7 +198,7 @@ impl Session {
         }
     }
 
-    /// 把一个网络包帧封进 `out`（原来的内容清掉）：头、密文、校验，就是线上的那个包。
+    /// 把一个网络包帧封好，接在 `out` 后面：头、密文、校验，就是线上的那个包。失败时 `out` 不变。
     ///
     /// # Errors
     ///
@@ -205,13 +209,16 @@ impl Session {
             return Err(Spent);
         }
         let header = SealedHeader { session: self.id, counter }.to_bytes();
-        out.clear();
+        let start = out.len();
         out.reserve(SealedHeader::OVERHEAD + frame.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(frame);
         // 只有内容长到算法处理不了（几百 GB）才会失败。
-        let tag =
-            self.sealing.seal_in_place_separate_tag(nonce(counter), Aad::from(header), &mut out[SealedHeader::LEN..]).map_err(|_| Spent)?;
+        let Ok(tag) = self.sealing.seal_in_place_separate_tag(nonce(counter), Aad::from(header), &mut out[start + SealedHeader::LEN..])
+        else {
+            out.truncate(start);
+            return Err(Spent);
+        };
         out.extend_from_slice(tag.as_ref());
         Ok(())
     }
@@ -249,14 +256,14 @@ impl Session {
         u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX - 1) + 1
     }
 
-    /// 一个封好的包发出去了，`len` 是它在线上的字节数。
+    /// 几个封好的包发出去了，`len` 是它们在线上一共的字节数。
     pub(crate) fn sent(&self, len: usize) {
         self.sent_bytes.fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
-    /// 一个封好的包因为端口忙着没有发出去。
-    pub(crate) fn not_sent(&self) {
-        self.unsent.fetch_add(1, Ordering::Relaxed);
+    /// `packets` 个封好的包因为端口忙着没有发出去。
+    pub(crate) fn not_sent(&self, packets: usize) {
+        self.unsent.fetch_add(u64::try_from(packets).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// 发出、收下的封好的包在线上一共多少字节。
@@ -286,6 +293,68 @@ impl Session {
     /// 密钥是不是用到头了。到头了的连接该关掉，重建之后是新的密钥。
     pub(crate) fn is_spent(&self) -> bool {
         self.next.load(Ordering::Relaxed) >= COUNTER_LIMIT || self.forged.load(Ordering::Relaxed) >= FORGERY_LIMIT
+    }
+}
+
+/// 攒着等一起交给路径层的封好的包：发给同一个对端，首尾相接，等长，只有最后一个可以短。
+/// 这正是一次系统调用发得出去的样子（内核按固定的长度切开）。
+///
+/// 虚拟网卡一口气读出来的几个包多半是同一条流的，一样长；一个一个地发，每个包一次系统调用，大流量时一半的 CPU 花在这上面。
+#[derive(Debug, Default)]
+pub(crate) struct Batch {
+    /// 发给谁、用的哪个会话。空着的时候是 `None`。
+    to: Option<(NodeId, Arc<Session>)>,
+    contents: Vec<u8>,
+    /// 第一个包的长度，后面的不能比它长。
+    stride: usize,
+    packets: usize,
+    /// 最后一个比前面的短：这一批到此为止。
+    ended: bool,
+}
+
+impl Batch {
+    /// 再放一个封好之后 `len` 字节、发给 `peer` 的包之前，要不要先把攒着的发掉：换了对端或者会话，
+    /// 攒够了 `limit` 个，上一个是短的，或者这一个比前面的长。
+    pub(crate) fn must_send_before(&self, peer: NodeId, session: &Arc<Session>, len: usize, limit: usize) -> bool {
+        self.to.as_ref().is_some_and(|(to, with)| {
+            *to != peer || !Arc::ptr_eq(with, session) || self.ended || self.packets >= limit || len > self.stride
+        })
+    }
+
+    /// 把一个网络包帧封好接在后面。调用之前要先问过 [`must_send_before`](Self::must_send_before)。
+    ///
+    /// # Errors
+    ///
+    /// 这个会话的序号发完了。这一批不变。
+    pub(crate) fn push(&mut self, peer: NodeId, session: &Arc<Session>, frame: &[u8]) -> Result<(), Spent> {
+        let before = self.contents.len();
+        session.seal(frame, &mut self.contents)?;
+        let len = self.contents.len() - before;
+        if self.to.is_none() {
+            self.to = Some((peer, Arc::clone(session)));
+            self.stride = len;
+        }
+        self.ended = len < self.stride;
+        self.packets += 1;
+        Ok(())
+    }
+
+    /// 攒着的不能再加了：到了 `limit` 个，或者最后一个是短的。
+    pub(crate) fn is_full(&self, limit: usize) -> bool {
+        self.ended || self.packets >= limit
+    }
+
+    /// 把攒着的交给路径层，然后清空。端口忙着发不出去时这一批就丢了：这里没有队列可排，包里面的协议自己会重传、会降速。
+    pub(crate) fn send(&mut self, paths: &Paths) {
+        let Some((peer, session)) = self.to.take() else { return };
+        let segment_size = (self.packets > 1).then_some(self.stride);
+        match paths.try_send(peer, &Packets { contents: &self.contents, segment_size, ecn: None }) {
+            Ok(()) => session.sent(self.contents.len()),
+            Err(_) => session.not_sent(self.packets),
+        }
+        self.contents.clear();
+        self.packets = 0;
+        self.ended = false;
     }
 }
 
@@ -542,6 +611,21 @@ mod tests {
     }
 
     #[test]
+    fn packets_sealed_one_after_another_into_one_buffer_open_separately() {
+        let (dialer, acceptor) = pair();
+        let bodies = [&b"\x45 one"[..], b"\x45 two", b"\x45 six"];
+        let mut batch = Vec::new();
+        for body in bodies {
+            dialer.seal(&frame(body), &mut batch).unwrap();
+        }
+        let stride = frame(bodies[0]).len() + SealedHeader::OVERHEAD;
+        assert_eq!(batch.len(), 3 * stride);
+        for (packet, body) in batch.chunks(stride).zip(bodies) {
+            assert_eq!(opened(&acceptor, packet), Ok(frame(body)));
+        }
+    }
+
+    #[test]
     fn any_changed_byte_fails_the_check_and_leaves_the_window_alone() {
         let (dialer, acceptor) = pair();
         let packet = sealed(&dialer, &frame(b"\x45 payload"));
@@ -609,10 +693,12 @@ mod tests {
     fn the_sender_stops_when_its_numbers_run_out() {
         let (dialer, _acceptor) = pair();
         dialer.next.store(COUNTER_LIMIT - 1, Ordering::Relaxed);
-        let mut packet = Vec::new();
-        assert_eq!(dialer.seal(&frame(b"last"), &mut packet), Ok(()));
+        let mut packets = Vec::new();
+        assert_eq!(dialer.seal(&frame(b"last"), &mut packets), Ok(()));
         assert!(dialer.is_spent());
-        assert_eq!(dialer.seal(&frame(b"one too many"), &mut packet), Err(Spent));
+        let one = packets.clone();
+        assert_eq!(dialer.seal(&frame(b"one too many"), &mut packets), Err(Spent));
+        assert_eq!(packets, one, "封不成的不留半截在缓冲区里");
     }
 
     #[test]

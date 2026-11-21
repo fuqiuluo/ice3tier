@@ -437,6 +437,21 @@ pub trait PacketSender: Clone + Send + Sync + 'static {
     /// （[`DatagramSendError::TooLarge`] 带着现在的上限：调用方切开再发）。
     fn send_packet(&self, peer: NodeId, frame: Bytes) -> Result<(), DatagramSendError>;
 
+    /// 和 [`send_packet`](Self::send_packet) 一样把一帧交给 `peer`，只是允许实现先攒着，和紧接着交下来的几帧凑成一批一起发
+    /// （少几次系统调用）。调用方在这一轮交完、要去等别的事之前必须调用 [`flush`](Self::flush)，不然攒着的发不出去。
+    ///
+    /// 默认就是 `send_packet`，不攒。
+    ///
+    /// # Errors
+    ///
+    /// 和 [`send_packet`](Self::send_packet) 一样，当场就知道。
+    fn queue_packet(&self, peer: NodeId, frame: Bytes) -> Result<(), DatagramSendError> {
+        self.send_packet(peer, frame)
+    }
+
+    /// 把 [`queue_packet`](Self::queue_packet) 攒着的都发出去。
+    fn flush(&self) {}
+
     /// 和 `peer` 之间还没有连接时建一条；已经有了就立刻返回。
     ///
     /// # Errors

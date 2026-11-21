@@ -1,6 +1,5 @@
 //! 按对端管理连接：一对节点一条连接，按需建立，空闲回收，对端从 netmap 里消失就立刻关闭。
 
-use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,8 +12,9 @@ use i3t_crypto::tls;
 use i3t_model::Netmap;
 use i3t_model::control::{PeerUse, Signal};
 use i3t_model::netmap::Congestion;
-use i3t_path::{Packets, Paths};
+use i3t_path::Paths;
 use i3t_proto::flow::{Channel, DatagramHeader, MAX_DATAGRAM_BODY_LEN, Recipient};
+use i3t_proto::sealed::SealedHeader;
 use i3t_proto::{NodeId, PublicKey};
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::{ConnectError, SendDatagramError, TransportConfig, VarInt};
@@ -23,7 +23,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use crate::congestion::Algorithm;
 use crate::contract::{Datagram, DatagramSendError, DatagramSender, Incoming, OpenError, PacketSender};
 use crate::quic::{self, AckFrequency, SERVER_NAME};
-use crate::sealed::{self, Inbox, PacketTransport, Role, Session};
+use crate::sealed::{self, Batch, Inbox, PacketTransport, Role, Session};
 use crate::socket;
 use crate::stream::{self, RecvHalf, SendHalf, StreamCount};
 use crate::tuning::Tuning;
@@ -260,6 +260,8 @@ pub(crate) struct Manager {
     packets: PacketTransport,
     /// 收到的封好的包在这里按连接的密钥解开。连接登记时把密钥交给它，结束时收回。
     inbox: Arc<Inbox>,
+    /// 封好了、还没有交给路径层的包（见 [`PacketSender::queue_packet`]）。
+    batch: Mutex<Batch>,
     closed: watch::Sender<bool>,
 }
 
@@ -295,6 +297,7 @@ impl Manager {
             datagrams,
             packets: packets.transport,
             inbox: packets.inbox,
+            batch: Mutex::default(),
             closed: watch::Sender::new(false),
         })
     }
@@ -691,38 +694,58 @@ impl Manager {
         permit.send(Datagram { peer, payload: payload.freeze() });
     }
 
-    /// 把一个网络包帧用这条连接的密钥封好，直接交给路径层，不进 QUIC。
-    ///
-    /// 端口忙着发不出去时这个包就丢了，照样算发过：这里没有队列可排，包里面的协议自己会重传、会降速。
-    fn send_sealed(&self, peer: NodeId, conn: &Conn, session: &Session, frame: &[u8]) -> Result<(), DatagramSendError> {
-        thread_local! {
-            /// 封包用的缓冲区，每个线程一个，不用每个包分配一次。
-            static SEALED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-        }
+    fn batch(&self) -> std::sync::MutexGuard<'_, Batch> {
+        self.batch.lock().expect("sealed packet batch mutex poisoned")
+    }
+
+    /// 把一个网络包帧用这条连接的密钥封好，交给路径层，不进 QUIC。`hold` 说它可不可以先攒着等后面的一起发。
+    fn send_sealed(&self, peer: NodeId, conn: &Conn, session: &Arc<Session>, frame: &[u8], hold: Hold) -> Result<(), DatagramSendError> {
         // 上限和走数据报时是同一个数，上层切片的办法不用变。封好之后多出 29 个字节，比 QUIC 的包头加数据报帧头
         // （至少 30 个）还少，所以装得进连接现在探测到的包长。
         let max = conn.quic.max_datagram_size().ok_or(DatagramSendError::Unsupported(peer))?;
         if frame.len() > max {
             return Err(DatagramSendError::TooLarge { len: frame.len(), max });
         }
-        SEALED.with_borrow_mut(|packet| {
-            if let Err(spent) = session.seal(frame, packet) {
-                // 关掉之后上层会重建，新的连接是新的密钥。
-                conn.quic.close(VarInt::from_u32(CLOSE_KEYS_SPENT), b"sealed packet keys spent");
-                return Err(DatagramSendError::ConnectionLost { peer, reason: spent.to_string() });
-            }
-            match self.paths.try_send(peer, &Packets { contents: packet, segment_size: None, ecn: None }) {
-                Ok(()) => session.sent(packet.len()),
-                Err(_) => session.not_sent(),
-            }
-            Ok(())
-        })?;
+        // 内核一次收不了几个包的平台上（没有分段卸载）上限是 1，每个包各发各的。
+        let limit = self.paths.max_transmit_segments().clamp(1, sealed::BATCH_PACKETS);
+        let mut batch = self.batch();
+        if batch.must_send_before(peer, session, frame.len() + SealedHeader::OVERHEAD, limit) {
+            batch.send(&self.paths);
+        }
+        if let Err(spent) = batch.push(peer, session, frame) {
+            // 关掉之后上层会重建，新的连接是新的密钥。
+            conn.quic.close(VarInt::from_u32(CLOSE_KEYS_SPENT), b"sealed packet keys spent");
+            return Err(DatagramSendError::ConnectionLost { peer, reason: spent.to_string() });
+        }
+        if hold == Hold::No || batch.is_full(limit) {
+            batch.send(&self.paths);
+        }
+        drop(batch);
         // 空的数据报对端收到就丢，要的只是连接为它走一个来回：对端的进程换过的话，回来的是重置。
         if session.probe_due()
             && let Err(error) = conn.quic.send_datagram(Bytes::new())
         {
             tracing::trace!(%peer, %error, "没能让连接去问对端还在不在");
         }
+        Ok(())
+    }
+
+    /// 把一个网络包帧发给 `peer`：这条连接上包是封好了直接走路径层的就那样走，不然作为连接的数据报。
+    fn send_packet(&self, peer: NodeId, frame: Bytes, hold: Hold) -> Result<(), DatagramSendError> {
+        let conn = self.preferred(peer).ok_or(DatagramSendError::NotConnected(peer))?;
+        match &conn.sealed {
+            Some(session) => self.send_sealed(peer, &conn, session, &frame, hold)?,
+            // 连接的数据报由 QUIC 库自己成批地发，这里不用攒。
+            None => {
+                let len = frame.len();
+                conn.quic.send_datagram(frame).map_err(|error| match error {
+                    SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled => DatagramSendError::Unsupported(peer),
+                    SendDatagramError::TooLarge => DatagramSendError::TooLarge { len, max: conn.quic.max_datagram_size().unwrap_or(0) },
+                    SendDatagramError::ConnectionLost(reason) => DatagramSendError::ConnectionLost { peer, reason: reason.to_string() },
+                })?;
+            }
+        }
+        conn.packets.touch(conn.established);
         Ok(())
     }
 
@@ -901,6 +924,14 @@ impl Manager {
         self.closed.send_replace(true);
         self.quic.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"shutdown");
     }
+}
+
+/// 一个封好的包可不可以先攒着，等紧接着交下来的几个一起发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    No,
+    /// 调用方保证之后会 [`PacketSender::flush`]。
+    UntilFlush,
 }
 
 /// 一条连接是谁拨的、对端握手时的公钥、用的拥塞控制。
@@ -1123,20 +1154,18 @@ impl DatagramHandle {
 impl PacketSender for DatagramHandle {
     fn send_packet(&self, peer: NodeId, frame: Bytes) -> Result<(), DatagramSendError> {
         let manager = self.manager.upgrade().ok_or(DatagramSendError::NotConnected(peer))?;
-        let conn = manager.preferred(peer).ok_or(DatagramSendError::NotConnected(peer))?;
-        match &conn.sealed {
-            Some(session) => manager.send_sealed(peer, &conn, session, &frame)?,
-            None => {
-                let len = frame.len();
-                conn.quic.send_datagram(frame).map_err(|error| match error {
-                    SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled => DatagramSendError::Unsupported(peer),
-                    SendDatagramError::TooLarge => DatagramSendError::TooLarge { len, max: conn.quic.max_datagram_size().unwrap_or(0) },
-                    SendDatagramError::ConnectionLost(reason) => DatagramSendError::ConnectionLost { peer, reason: reason.to_string() },
-                })?;
-            }
+        manager.send_packet(peer, frame, Hold::No)
+    }
+
+    fn queue_packet(&self, peer: NodeId, frame: Bytes) -> Result<(), DatagramSendError> {
+        let manager = self.manager.upgrade().ok_or(DatagramSendError::NotConnected(peer))?;
+        manager.send_packet(peer, frame, Hold::UntilFlush)
+    }
+
+    fn flush(&self) {
+        if let Some(manager) = self.manager.upgrade() {
+            manager.batch().send(&manager.paths);
         }
-        conn.packets.touch(conn.established);
-        Ok(())
     }
 
     async fn connect(&self, peer: NodeId) -> Result<(), OpenError> {

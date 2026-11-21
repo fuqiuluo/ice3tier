@@ -48,6 +48,9 @@ struct NetState {
     refuse: std::sync::Mutex<HashSet<NodeId>>,
     dial_delay: Duration,
     sent: mpsc::UnboundedSender<(NodeId, Bytes)>,
+    /// 每次"把攒着的发出去"时，到那时为止一共交下来多少帧。
+    flushed_at: std::sync::Mutex<Vec<usize>>,
+    queued: AtomicUsize,
     inbox: AsyncMutex<mpsc::UnboundedReceiver<Datagram>>,
 }
 
@@ -73,7 +76,12 @@ impl PacketSender for FakeNet {
             return Err(DatagramSendError::TooLarge { len: frame.len(), max });
         }
         self.0.sent.send((peer, frame)).unwrap();
+        self.0.queued.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn flush(&self) {
+        self.0.flushed_at.lock().unwrap().push(self.0.queued.load(Ordering::Relaxed));
     }
 
     async fn connect(&self, peer: NodeId) -> Result<(), OpenError> {
@@ -131,6 +139,8 @@ fn world(map: Netmap, connected: &[u32], dial_delay: Duration) -> World {
         refuse: std::sync::Mutex::default(),
         dial_delay,
         sent,
+        flushed_at: std::sync::Mutex::default(),
+        queued: AtomicUsize::new(0),
         inbox: AsyncMutex::new(inbox),
     }));
     let device = Arc::new(FakeDevice { from_kernel: AsyncMutex::new(from_kernel), to_kernel });
@@ -182,6 +192,25 @@ fn icmp_answer(packet: &[u8]) -> (u8, u8, Vec<u8>) {
     let ip = Ipv4::parse(packet).unwrap();
     let payload = ip.payload();
     (payload[0], payload[1], payload[8..].to_vec())
+}
+
+#[tokio::test]
+async fn packets_already_waiting_on_the_device_are_handed_down_together_and_then_flushed() {
+    let mut world = world(netmap(&serde_json::json!([peer(2, true, true)]), &[]), &[2], Duration::ZERO);
+    // 引擎还没有轮到跑，五个包已经都在网卡上了。
+    for _ in 0..5 {
+        world.app_sends(icmp(ME, B, 8));
+    }
+    for _ in 0..5 {
+        world.on_wire().await;
+    }
+    let flushed = || world.net.0.flushed_at.lock().unwrap().clone();
+    let deadline = tokio::time::Instant::now() + SOON;
+    while flushed().last() != Some(&5) {
+        assert!(tokio::time::Instant::now() < deadline, "交下去的包一直没有被发掉：{:?}", flushed());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(flushed(), [5], "五个现成的包一口气交下去，然后发一次，不是每个包发一次");
 }
 
 #[tokio::test]
