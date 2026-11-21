@@ -717,8 +717,16 @@ test('有数据时：管理区和设置', async () => {
   await shot('pairs')
 
   await goToAdmin(page, t.nav.network)
-  await expect(page.getByRole('heading', { name: t.networks.routing })).toBeVisible()
+  await expect(page.getByRole('heading', { name: t.networks.basics })).toBeVisible()
   await shot('network')
+  // 设置按分区排：左边点一个分区，右边换成它的设置。
+  const sections = page.getByRole('navigation', { name: t.networks.sectionsLabel })
+  await sections.getByRole('link', { name: t.networks.routing }).click()
+  await expect(page.getByRole('form', { name: t.networks.routing })).toBeVisible()
+  await shot('network-routing')
+  await sections.getByRole('link', { name: t.networks.connection }).click()
+  await expect(page.getByRole('form', { name: t.networks.connection })).toBeVisible()
+  await shot('network-connection')
   await page.getByRole('button', { name: t.networks.create }).click()
   await expect(page.getByRole('dialog', { name: t.networks.createTitle })).toBeVisible()
   await shot('network-create-dialog', { fullPage: false })

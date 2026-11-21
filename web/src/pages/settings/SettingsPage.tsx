@@ -1,12 +1,12 @@
 import { useQuery } from '@tanstack/react-query'
-import { Navigate, NavLink, useParams } from 'react-router'
+import { Navigate, useParams } from 'react-router'
 
 import { q } from '@/api/queries'
 import { Page, PageHeader } from '@/components/page'
+import { Sectioned } from '@/components/sectioned'
 import { StatusDot } from '@/components/status'
 import { t } from '@/i18n'
 import { useDocumentTitle } from '@/lib/useDocumentTitle'
-import { cn } from '@/lib/utils'
 
 import { AboutTab } from './AboutTab'
 import { LogTab } from './LogTab'
@@ -32,7 +32,7 @@ function tabLabel(id: TabId): string {
   }
 }
 
-/** 全局设置。左侧竖排的分区（窄的时候是上面的一行），每个分区有自己的地址。 */
+/** 全局设置。分区的排法见 `Sectioned`：左侧竖排的分区，每个分区有自己的地址。 */
 export function SettingsPage() {
   const params = useParams()
   const tab = TAB_IDS.find((candidate) => candidate === params.tab)
@@ -46,37 +46,19 @@ export function SettingsPage() {
   return (
     <Page>
       <PageHeader title={s.title} description={s.subtitle} />
-      {/* 窄的时候分区排成上面的一行（放不下就横向滑动），内容占满宽度。 */}
-      <div className="grid grid-cols-1 items-start gap-5 @2xl:grid-cols-[10rem_minmax(0,1fr)] @2xl:gap-12">
-        <nav aria-label={s.tabsLabel} className="min-w-0">
-          <ul className="-mx-4 flex [scrollbar-width:none] gap-1 overflow-x-auto px-4 @2xl:mx-0 @2xl:block @2xl:space-y-0.5 @2xl:px-0 [&::-webkit-scrollbar]:hidden">
-            {TAB_IDS.map((candidate) => (
-              <li key={candidate} className="shrink-0">
-                <NavLink
-                  to={`/settings/${candidate}`}
-                  className={({ isActive }) =>
-                    cn(
-                      'flex h-8 items-center justify-between gap-2 rounded-md px-2.5 text-sm whitespace-nowrap transition-colors',
-                      isActive
-                        ? 'bg-foreground/[0.06] font-medium text-foreground'
-                        : 'text-foreground/80 hover:bg-foreground/[0.04] hover:text-foreground',
-                    )
-                  }
-                >
-                  {tabLabel(candidate)}
-                  {candidate === 'updates' && paused ? <StatusDot tone="danger" label={t.updates.pausedDot} /> : null}
-                </NavLink>
-              </li>
-            ))}
-          </ul>
-        </nav>
-        <div className="min-w-0">
-          {active === 'session' ? <SessionTab /> : null}
-          {active === 'updates' ? <UpdatesTab /> : null}
-          {active === 'log' ? <LogTab /> : null}
-          {active === 'about' ? <AboutTab /> : null}
-        </div>
-      </div>
+      <Sectioned
+        label={s.tabsLabel}
+        sections={TAB_IDS.map((candidate) => ({
+          to: `/settings/${candidate}`,
+          label: tabLabel(candidate),
+          mark: candidate === 'updates' && paused ? <StatusDot tone="danger" label={t.updates.pausedDot} /> : undefined,
+        }))}
+      >
+        {active === 'session' ? <SessionTab /> : null}
+        {active === 'updates' ? <UpdatesTab /> : null}
+        {active === 'log' ? <LogTab /> : null}
+        {active === 'about' ? <AboutTab /> : null}
+      </Sectioned>
     </Page>
   )
 }

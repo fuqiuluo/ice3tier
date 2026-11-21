@@ -91,6 +91,7 @@ export function AppRoutes() {
             <Route path="tokens" element={<Navigate to="../nodes" replace />} />
             <Route path="pairs" element={<PairsPage />} />
             <Route path="network" element={<NetworkPage />} />
+            <Route path="network/:section" element={<NetworkPage />} />
             <Route path="*" element={<NotFoundPage />} />
           </Route>
           <Route path="settings" element={<Lazy page={SettingsPage} />} />

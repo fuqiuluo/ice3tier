@@ -1,7 +1,15 @@
 import { type ReactNode } from 'react'
 
 import { InfoTip } from '@/components/info-tip'
+import { Badge } from '@/components/ui/badge'
+import { t } from '@/i18n'
 import { cn } from '@/lib/utils'
+
+/** 一项设置现在的值和默认值不一样：默认值怎么写，恢复默认时做什么。 */
+export interface ModifiedSetting {
+  defaultLabel: string
+  onRestore: () => void
+}
 
 interface SettingRowProps {
   label: string
@@ -17,6 +25,8 @@ interface SettingRowProps {
   stacked?: boolean
   /** 这一项的值不对：写在这一行的最下面。 */
   error?: string | null
+  /** 值和默认值不一样时给：名字旁边标"已修改"，说明下面写默认值和"恢复默认"。一样、或者说不出默认值时不给。 */
+  modified?: ModifiedSetting | null
   /** 外边距另给（嵌在别的行下面时去掉左右的留白）。 */
   className?: string
   children: ReactNode
@@ -32,6 +42,7 @@ export function SettingRow({
   labelId,
   stacked = false,
   error,
+  modified = null,
   className,
   children,
 }: SettingRowProps) {
@@ -46,10 +57,25 @@ export function SettingRow({
       <div className="flex items-center gap-1.5 text-sm">
         {htmlFor !== undefined ? <label htmlFor={htmlFor}>{label}</label> : <span id={labelId}>{label}</span>}
         {hint !== undefined ? <InfoTip>{hint}</InfoTip> : null}
+        {modified !== null ? <Badge tone="accent">{t.common.modified}</Badge> : null}
       </div>
       {description !== undefined ? (
         <p id={descriptionId} className="mt-0.5 text-[13px] text-muted-foreground">
           {description}
+        </p>
+      ) : null}
+      {modified !== null ? (
+        <p className="mt-0.5 text-[13px] text-muted-foreground">
+          {t.common.defaultIs(modified.defaultLabel)}
+          {' · '}
+          <button
+            type="button"
+            aria-label={t.common.restoreDefaultOf(label)}
+            onClick={modified.onRestore}
+            className="rounded-sm text-primary underline-offset-4 hover:underline"
+          >
+            {t.common.restoreDefault}
+          </button>
         </p>
       ) : null}
     </div>

@@ -102,6 +102,14 @@ export const NETWORK: Network = {
   class: null,
   ack_eliciting_threshold: 10,
   max_ack_delay_ms: 2,
+  defaults: {
+    routing: 'direct_first',
+    max_relay_hops: 2,
+    reach: 'any',
+    class: null,
+    ack_eliciting_threshold: 10,
+    max_ack_delay_ms: 2,
+  },
 }
 
 interface RenderOptions {

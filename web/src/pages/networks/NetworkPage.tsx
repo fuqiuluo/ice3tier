@@ -1,532 +1,70 @@
-import { useQuery } from '@tanstack/react-query'
-import { CalendarDays, ChevronRight, Globe, Network as NetworkIcon, Plus, Server, Tag } from 'lucide-react'
-import { useId, useState } from 'react'
-import { Link, useNavigate } from 'react-router'
+import { Plus } from 'lucide-react'
+import { useState } from 'react'
+import { Navigate, useParams } from 'react-router'
 
-import { fieldError, formError, formErrorDetail, formFailure } from '@/api/formErrors'
-import { api } from '@/api/endpoints'
-import { q, useAction } from '@/api/queries'
-import { type Network, type Reach, type RoutingMode, type ServiceClass, type UpdateNetwork } from '@/api/types'
-import { useConfirm } from '@/components/confirm'
-import { DateTimeValue, DetailList, DetailRow } from '@/components/detail-list'
-import { FormDialog } from '@/components/form-dialog'
+import { type Network } from '@/api/types'
 import { Page, PageHeader } from '@/components/page'
-import { SettingRow } from '@/components/setting-row'
+import { Sectioned } from '@/components/sectioned'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { BoxCard, BoxCardHeader } from '@/components/ui/card'
-import { Field, FormError } from '@/components/ui/field'
-import { Input, NativeSelect } from '@/components/ui/input'
-import { ClassSelect } from '@/components/usage'
 import { t } from '@/i18n'
-import { cidrContains, formatCidr, parseCidr } from '@/lib/cidr'
-import { ACK_ELICITING_THRESHOLD, MAX_ACK_DELAY_MS, MAX_RELAY_HOPS } from '@/lib/product'
 import { useDocumentTitle } from '@/lib/useDocumentTitle'
-import { validateNetworkCidr } from '@/lib/validate'
 
+import { BasicsSection } from './BasicsSection'
+import { ConnectionSection } from './ConnectionSection'
 import { networkPath, useNetwork } from './context'
 import { CreateNetworkDialog } from './CreateNetworkDialog'
+import { DangerSection } from './DangerSection'
+import { RoutingSection } from './RoutingSection'
+import { modifiedCount, SECTION_SETTINGS, type SettingsSection } from './settings'
 
 const n = t.networks
 
-/** 扩大地址段。有节点之后地址段只能扩大：新的必须把原来的完整地包含在内。 */
-function ExpandDialog({ network, open, onClose }: { network: Network; open: boolean; onClose: () => void }) {
-  const [value, setValue] = useState(network.cidr)
-  const [touched, setTouched] = useState(false)
-  const expand = useAction(network.id, {
-    mutationFn: () => api.updateNetwork(network.id, { cidr: value.trim() }),
-    success: (updated) => n.expanded(updated.cidr),
-    toastError: false,
-  })
-  const failure = formFailure(expand.error, { range_overlaps: 'cidr', range_not_superset: 'cidr' } as const)
+/** 分区，按左边那一列的顺序。加一类设置就是在这里加一个分区、写它的那个文件。 */
+const SECTION_IDS = ['basics', 'routing', 'connection', 'danger'] as const
+type SectionId = (typeof SECTION_IDS)[number]
 
-  const current = parseCidr(network.cidr)
-  const next = parseCidr(value)
-  const dirty = next !== null && current !== null && formatCidr(next) !== formatCidr(current)
-  let problem = validateNetworkCidr(value)
-  if (problem === null && next !== null && current !== null && !cidrContains(next, current))
-    problem = n.expandNotSuperset(network.cidr)
-
-  return (
-    <FormDialog
-      open={open}
-      onClose={onClose}
-      title={n.expandTitle(network.name)}
-      description={n.expandLead(network.cidr)}
-      size="sm"
-      dirty={dirty}
-      requireDirty
-      submitLabel={n.expandSubmit}
-      pending={expand.isPending}
-      error={formError(failure)}
-      errorDetail={formErrorDetail(failure)}
-      onSubmit={() => {
-        setTouched(true)
-        if (problem === null) expand.mutate(undefined, { onSuccess: onClose })
-      }}
-    >
-      <Field label={n.expandLabel} error={(touched || dirty ? problem : null) ?? fieldError(failure, 'cidr')}>
-        {(props) => (
-          <Input
-            {...props}
-            className="font-mono"
-            value={value}
-            autoFocus
-            onChange={(event) => {
-              setValue(event.target.value)
-              expand.reset()
-            }}
-          />
-        )}
-      </Field>
-    </FormDialog>
-  )
-}
-
-const ROUTING_DESC: Record<RoutingMode, () => string> = {
-  direct_first: () => n.routingDirectFirstDesc,
-  lowest_cost: () => n.routingLowestCostDesc,
-}
-const REACH_DESC: Record<Reach, () => string> = {
-  any: () => n.reachAnyDesc,
-  direct_only: () => n.reachDirectOnlyDesc,
-  relay_only: () => n.reachRelayOnlyDesc,
-}
-
-/** 设置卡片的底边：保存出的错，左边一句这张卡片的设置什么时候生效之类的话，右边取消和保存。 */
-function SaveBar({
-  error,
-  note,
-  canSave,
-  dirty,
-  pending,
-  onReset,
-}: {
-  error: unknown
-  note?: string
-  canSave: boolean
-  dirty: boolean
-  pending: boolean
-  onReset: () => void
-}) {
-  const failure = formFailure(error, {})
-  return (
-    <>
-      {failure !== null ? (
-        <div className="px-5 pb-1">
-          <FormError message={formError(failure)} detail={formErrorDetail(failure)} />
-        </div>
-      ) : null}
-      <footer className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2 border-t px-5 py-3">
-        {note !== undefined ? <p className="mr-auto text-[13px] text-muted-foreground">{note}</p> : null}
-        <div className="flex items-center gap-2">
-          <Button size="sm" onClick={onReset} disabled={!dirty || pending}>
-            {t.common.cancel}
-          </Button>
-          <Button size="sm" type="submit" variant="primary" disabled={!canSave} pending={pending}>
-            {n.saveSettings}
-          </Button>
-        </div>
-      </footer>
-    </>
-  )
-}
-
-/**
- * 网络的选路设置：一张卡片，一项一行（名字和说明在左，下拉在右，说明跟着选的那一项变），底边是取消和保存。
- * 几项一起改，所以是整站少数显式保存的表单：点"保存"才生效，没有改动时按钮是灰的。
- */
-function RoutingCard({ network }: { network: Network }) {
-  const nodes = useQuery(q.nodes(network.id))
-  const [routing, setRouting] = useState<RoutingMode>(network.routing)
-  const [hops, setHops] = useState(network.max_relay_hops)
-  const [reach, setReach] = useState<Reach>(network.reach)
-  // `null` 和 `auto` 是一回事；表单里一律写成 `auto`。
-  const [serviceClass, setServiceClass] = useState<ServiceClass>(network.class ?? 'auto')
-  const routingId = useId()
-  const hopsId = useId()
-  const reachId = useId()
-  const classId = useId()
-
-  const save = useAction(network.id, {
-    mutationFn: (body: UpdateNetwork) => api.updateNetwork(network.id, body),
-    success: n.settingsSaved,
-    toastError: false,
-  })
-
-  const dirty =
-    routing !== network.routing ||
-    hops !== network.max_relay_hops ||
-    reach !== network.reach ||
-    serviceClass !== (network.class ?? 'auto')
-  const overriding = (nodes.data ?? []).filter((node) => node.routing !== null).length
-  const reset = () => {
-    setRouting(network.routing)
-    setHops(network.max_relay_hops)
-    setReach(network.reach)
-    setServiceClass(network.class ?? 'auto')
-    save.reset()
+/** 分区的名字在渲染时现取，换了语言就是新的。 */
+function sectionLabel(id: SectionId): string {
+  switch (id) {
+    case 'basics':
+      return n.basics
+    case 'routing':
+      return n.routing
+    case 'connection':
+      return n.connection
+    case 'danger':
+      return n.danger
   }
-
-  return (
-    <BoxCard>
-      <BoxCardHeader title={n.routing} />
-      <form
-        noValidate
-        aria-label={n.routing}
-        onSubmit={(event) => {
-          event.preventDefault()
-          if (dirty) save.mutate({ routing, max_relay_hops: hops, reach, class: serviceClass })
-        }}
-      >
-        <div className="divide-y">
-          <SettingRow
-            label={n.routingLabel}
-            htmlFor={routingId}
-            description={
-              <>
-                {ROUTING_DESC[routing]()}
-                {overriding > 0 ? (
-                  <Link
-                    to={networkPath(network.id, 'nodes')}
-                    className="block w-fit rounded-sm text-primary underline-offset-4 hover:underline"
-                  >
-                    {n.routingOverridden(overriding)}
-                  </Link>
-                ) : null}
-              </>
-            }
-          >
-            <NativeSelect
-              id={routingId}
-              className="w-48"
-              value={routing}
-              onChange={(event) => setRouting(event.target.value as RoutingMode)}
-            >
-              <option value="direct_first">{n.routingDirectFirst}</option>
-              <option value="lowest_cost">{n.routingLowestCost}</option>
-            </NativeSelect>
-          </SettingRow>
-          <SettingRow label={n.hopsLabel} htmlFor={hopsId} description={n.hopsDesc}>
-            <NativeSelect
-              id={hopsId}
-              className="w-48"
-              value={hops}
-              onChange={(event) => setHops(Number(event.target.value))}
-            >
-              {Array.from(
-                { length: MAX_RELAY_HOPS.max - MAX_RELAY_HOPS.min + 1 },
-                (_, index) => MAX_RELAY_HOPS.min + index,
-              ).map((value) => (
-                <option key={value} value={value}>
-                  {n.hops(value)}
-                </option>
-              ))}
-            </NativeSelect>
-          </SettingRow>
-          <SettingRow label={n.reachLabel} htmlFor={reachId} description={REACH_DESC[reach]()}>
-            <NativeSelect
-              id={reachId}
-              className="w-48"
-              value={reach}
-              onChange={(event) => setReach(event.target.value as Reach)}
-            >
-              <option value="any">{n.reachAny}</option>
-              <option value="direct_only">{n.reachDirectOnly}</option>
-              <option value="relay_only">{n.reachRelayOnly}</option>
-            </NativeSelect>
-          </SettingRow>
-          <SettingRow
-            label={n.classLabel}
-            hint={n.classHint}
-            htmlFor={classId}
-            description={t.serviceClass[`${serviceClass}Desc`]}
-          >
-            <ClassSelect
-              id={classId}
-              compact
-              className="w-48"
-              value={serviceClass}
-              inheritLabel={null}
-              onChange={(value) => setServiceClass(value ?? 'auto')}
-            />
-          </SettingRow>
-        </div>
-        <SaveBar error={save.error} canSave={dirty} dirty={dirty} pending={save.isPending} onReset={reset} />
-      </form>
-    </BoxCard>
-  )
 }
 
-/** 输入框里写的是不是 `range` 里的一个整数；不是的话是 `null`。 */
-function wholeNumberWithin(raw: string, range: { min: number; max: number }): number | null {
-  const text = raw.trim()
-  if (!/^\d{1,4}$/.test(text)) return null
-  const value = Number(text)
-  return value >= range.min && value <= range.max ? value : null
+function isSettingsSection(id: SectionId): id is SettingsSection {
+  return id in SECTION_SETTINGS
 }
 
-/** 一个整数和它的单位：设置卡片里一行右边的控件。 */
-function NumberWithUnit({
-  id,
-  value,
-  unit,
-  invalid,
-  onChange,
-}: {
-  id: string
-  value: string
-  unit: string
-  invalid: boolean
-  onChange: (value: string) => void
-}) {
-  return (
-    // 和选路那张卡片的下拉一样宽，两张卡片的控件左右对齐。
-    <span className="flex w-48 items-center gap-2">
-      <Input
-        id={id}
-        inputMode="numeric"
-        className="min-w-0 flex-1 tabular"
-        aria-invalid={invalid ? true : undefined}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-      {/* 单位留一样宽，两行的输入框对齐。 */}
-      <span className="w-14 shrink-0 text-[13px] text-muted-foreground">{unit}</span>
-    </span>
+/** 分区名右边：这个分区里有几项设置和默认值不一样。都是默认值时什么都没有。 */
+function modifiedMark(network: Network, id: SectionId) {
+  const count = isSettingsSection(id) ? modifiedCount(network, id) : 0
+  return count === 0 ? undefined : (
+    <Badge tone="accent" aria-label={n.modifiedCount(count)}>
+      {count}
+    </Badge>
   )
 }
 
 /**
- * 节点之间的连接的设置，和选路那张卡片一个样子：一项一行，底边取消和保存。现在只有请对端怎样确认的两项，
- * 以后别的连接参数接着往下加行。节点只在建连接时用这些值，所以底边写着"只对之后新建的连接生效"。
- */
-function ConnectionCard({ network }: { network: Network }) {
-  const [threshold, setThreshold] = useState(String(network.ack_eliciting_threshold))
-  const [delay, setDelay] = useState(String(network.max_ack_delay_ms))
-  const thresholdId = useId()
-  const delayId = useId()
-
-  const save = useAction(network.id, {
-    mutationFn: (body: UpdateNetwork) => api.updateNetwork(network.id, body),
-    success: n.settingsSaved,
-    toastError: false,
-  })
-
-  const nextThreshold = wholeNumberWithin(threshold, ACK_ELICITING_THRESHOLD)
-  const nextDelay = wholeNumberWithin(delay, MAX_ACK_DELAY_MS)
-  const dirty = nextThreshold !== network.ack_eliciting_threshold || nextDelay !== network.max_ack_delay_ms
-  const reset = () => {
-    setThreshold(String(network.ack_eliciting_threshold))
-    setDelay(String(network.max_ack_delay_ms))
-    save.reset()
-  }
-
-  return (
-    <BoxCard>
-      <BoxCardHeader title={n.connection} />
-      <form
-        noValidate
-        aria-label={n.connection}
-        onSubmit={(event) => {
-          event.preventDefault()
-          if (dirty && nextThreshold !== null && nextDelay !== null)
-            save.mutate({ ack_eliciting_threshold: nextThreshold, max_ack_delay_ms: nextDelay })
-        }}
-      >
-        <div className="divide-y">
-          <SettingRow
-            label={n.ackThresholdLabel}
-            hint={n.ackThresholdHint}
-            htmlFor={thresholdId}
-            description={n.ackThresholdDesc}
-            error={
-              nextThreshold === null
-                ? n.wholeNumberBetween(ACK_ELICITING_THRESHOLD.min, ACK_ELICITING_THRESHOLD.max)
-                : null
-            }
-          >
-            <NumberWithUnit
-              id={thresholdId}
-              value={threshold}
-              unit={n.ackThresholdUnit}
-              invalid={nextThreshold === null}
-              onChange={(value) => {
-                setThreshold(value)
-                save.reset()
-              }}
-            />
-          </SettingRow>
-          <SettingRow
-            label={n.ackDelayLabel}
-            hint={n.ackDelayHint}
-            htmlFor={delayId}
-            description={n.ackDelayDesc}
-            error={nextDelay === null ? n.wholeNumberBetween(MAX_ACK_DELAY_MS.min, MAX_ACK_DELAY_MS.max) : null}
-          >
-            <NumberWithUnit
-              id={delayId}
-              value={delay}
-              unit={n.ackDelayUnit}
-              invalid={nextDelay === null}
-              onChange={(value) => {
-                setDelay(value)
-                save.reset()
-              }}
-            />
-          </SettingRow>
-        </div>
-        <SaveBar
-          error={save.error}
-          note={n.connectionNote}
-          canSave={dirty && nextThreshold !== null && nextDelay !== null}
-          dirty={dirty}
-          pending={save.isPending}
-          onReset={reset}
-        />
-      </form>
-    </BoxCard>
-  )
-}
-
-/** 基本信息：名字、域名后缀、地址段（可以扩大）、节点、创建时间，和节点详情的信息卡一个样子。 */
-function BasicsCard({ network, onExpand }: { network: Network; onExpand: () => void }) {
-  return (
-    <BoxCard>
-      <BoxCardHeader title={n.basics} />
-      <DetailList>
-        <DetailRow icon={<Tag />} label={n.nameLabel} copy={network.name}>
-          <span className="text-foreground">{network.name}</span>
-        </DetailRow>
-        <DetailRow icon={<Globe />} label={n.domainLabel} copy={network.domain}>
-          <span className="font-mono text-[13px] text-foreground">{network.domain}</span>
-        </DetailRow>
-        <DetailRow
-          icon={<NetworkIcon />}
-          label={n.cidrLabel}
-          copy={network.cidr}
-          actions={
-            <Button size="sm" variant="ghost" className="h-7 px-2 text-primary" onClick={onExpand}>
-              {n.expand}
-            </Button>
-          }
-        >
-          <span className="font-mono text-[13px] text-foreground">{network.cidr}</span>
-        </DetailRow>
-        <DetailRow icon={<Server />} label={n.nodesLabel}>
-          <Link
-            to={networkPath(network.id, 'nodes')}
-            className="rounded-sm text-foreground underline-offset-4 hover:text-primary hover:underline"
-          >
-            {n.nodes(network.nodes)}
-          </Link>
-        </DetailRow>
-        <DetailRow icon={<CalendarDays />} label={n.createdAt}>
-          <DateTimeValue at={network.created_at} />
-        </DetailRow>
-      </DetailList>
-    </BoxCard>
-  )
-}
-
-/** 其他网络：点一行切过去（顶栏的切换器也能切）。只有这一个网络时没有这张卡片。 */
-function OthersCard({ networks, current }: { networks: readonly Network[]; current: Network }) {
-  const others = networks.filter((other) => other.id !== current.id)
-  if (others.length === 0) return null
-  return (
-    <BoxCard>
-      <BoxCardHeader title={n.othersTitle} />
-      <ul className="divide-y">
-        {others.map((other) => (
-          <li key={other.id}>
-            <Link
-              to={networkPath(other.id, 'network')}
-              aria-label={n.switchTo(other.name)}
-              className="grid min-h-11 grid-cols-[minmax(0,1fr)_auto_auto_1rem] items-center gap-4 px-5 py-2 text-sm transition-colors last:rounded-b-xl hover:bg-muted/50"
-            >
-              <span className="truncate font-medium">{other.name}</span>
-              <span className="font-mono text-[13px] text-muted-foreground">{other.cidr}</span>
-              <span className="w-16 text-right text-[13px] text-muted-foreground tabular">{n.nodes(other.nodes)}</span>
-              <ChevronRight className="size-4 text-faint" aria-hidden />
-            </Link>
-          </li>
-        ))}
-      </ul>
-    </BoxCard>
-  )
-}
-
-/**
- * 删除网络：整站唯一需要输入名字的确认，因为它一次毁掉一批东西且无法撤回。
- * controller 只删空的网络，所以网络里还有节点时按钮是灰的，旁边写明要先做什么，不等提交了再报错。
- */
-function DangerCard({ network }: { network: Network }) {
-  const confirm = useConfirm()
-  const navigate = useNavigate()
-  const overview = useQuery(q.overview(network.id))
-  const remove = useAction(null, {
-    mutationFn: () => api.deleteNetwork(network.id),
-    success: n.deleted(network.name),
-  })
-
-  const onDelete = async () => {
-    const counts = overview.data
-    const confirmed = await confirm({
-      tone: 'danger',
-      title: n.deleteTitle(network.name),
-      body: counts === undefined ? n.dangerBody : n.deleteBody(counts.rules, counts.proxies, counts.pending_tokens),
-      confirmLabel: n.deleteConfirm,
-      typeToConfirm: network.name,
-    })
-    if (!confirmed) return
-    remove.mutate(undefined, { onSuccess: () => void navigate('/', { replace: true }) })
-  }
-
-  return (
-    <BoxCard aria-labelledby="network-danger-title">
-      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 px-5 py-4">
-        <div className="min-w-0">
-          <h2 id="network-danger-title" className="text-[15px] leading-6 font-semibold">
-            {n.dangerTitle}
-          </h2>
-          <p className="mt-0.5 text-[13px] text-muted-foreground">
-            {network.nodes > 0 ? n.dangerNotEmpty(network.nodes) : n.dangerBody}
-            {network.nodes > 0 ? (
-              <>
-                {' · '}
-                <Link
-                  to={networkPath(network.id, 'nodes')}
-                  className="rounded-sm text-primary underline-offset-4 hover:underline"
-                >
-                  {n.viewNodes}
-                </Link>
-              </>
-            ) : null}
-          </p>
-        </div>
-        <Button
-          size="sm"
-          variant="danger-outline"
-          disabled={network.nodes > 0}
-          pending={remove.isPending}
-          onClick={() => void onDelete()}
-        >
-          {n.deleteButton}
-        </Button>
-      </div>
-    </BoxCard>
-  )
-}
-
-/**
- * 网络页：和节点详情的概览一个样子，两栏卡片。左边基本信息、其他网络、删除网络；右边是设置：选路、连接。
- * 窄的时候一栏，设置排在左边那几张后面。
+ * 网络页：这个网络的信息和全部设置，排法和全局的「设置」一样（`Sectioned`）：左边一列分区，右边是选中的那个，
+ * 每个分区有自己的地址（`/n/1/network/connection`）。设置会越加越多，所以按分区排，不往下叠卡片。
+ * 右边的内容不跟着面板拉宽：一行设置的名字和它的控件不能隔得太远。
  */
 export function NetworkPage() {
-  useDocumentTitle(n.title)
   const network = useNetwork()
-  const networks = useQuery(q.networks())
+  const params = useParams()
+  const section = SECTION_IDS.find((candidate) => candidate === params.section)
+  useDocumentTitle(section === undefined ? n.title : `${sectionLabel(section)} · ${n.title}`)
   const [creating, setCreating] = useState(false)
-  const [expanding, setExpanding] = useState(false)
+  if (section === undefined) return <Navigate to={networkPath(network.id, 'network/basics')} replace />
+  const active: SectionId = section
 
   return (
     <Page>
@@ -541,27 +79,34 @@ export function NetworkPage() {
         }
       />
 
-      <div className="grid grid-cols-1 items-start gap-x-8 gap-y-6 @4xl:grid-cols-2">
-        <div className="space-y-6">
-          <BasicsCard network={network} onExpand={() => setExpanding(true)} />
-          <OthersCard networks={networks.data ?? []} current={network} />
-          <DangerCard network={network} />
-        </div>
-        <div className="space-y-6">
+      <Sectioned
+        label={n.sectionsLabel}
+        sections={SECTION_IDS.map((id) => ({
+          to: networkPath(network.id, `network/${id}`),
+          label: sectionLabel(id),
+          mark: modifiedMark(network, id),
+        }))}
+      >
+        <div className="max-w-4xl">
+          {active === 'basics' ? <BasicsSection network={network} /> : null}
           {/* key：切换网络或者保存之后，表单从最新的设置重新开始。 */}
-          <RoutingCard
-            key={`${network.id}:${network.routing}:${network.max_relay_hops}:${network.reach}:${network.class ?? 'auto'}`}
-            network={network}
-          />
-          <ConnectionCard
-            key={`${network.id}:${network.ack_eliciting_threshold}:${network.max_ack_delay_ms}`}
-            network={network}
-          />
+          {active === 'routing' ? (
+            <RoutingSection
+              key={`${network.id}:${network.routing}:${network.max_relay_hops}:${network.reach}:${network.class ?? 'auto'}`}
+              network={network}
+            />
+          ) : null}
+          {active === 'connection' ? (
+            <ConnectionSection
+              key={`${network.id}:${network.ack_eliciting_threshold}:${network.max_ack_delay_ms}`}
+              network={network}
+            />
+          ) : null}
+          {active === 'danger' ? <DangerSection network={network} /> : null}
         </div>
-      </div>
+      </Sectioned>
 
       <CreateNetworkDialog open={creating} onClose={() => setCreating(false)} />
-      {expanding ? <ExpandDialog network={network} open onClose={() => setExpanding(false)} /> : null}
     </Page>
   )
 }

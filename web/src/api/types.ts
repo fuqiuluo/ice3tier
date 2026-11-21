@@ -152,6 +152,19 @@ export interface Network {
   ack_eliciting_threshold: number
   /** 没攒够时，对端最多等多少毫秒就发确认。 */
   max_ack_delay_ms: number
+  /** 各项设置的默认值；比这个字段旧的 controller 不给，这时说不出哪些设置改过。 */
+  defaults?: NetworkDefaults | null
+}
+
+/** 网络各项设置的默认值：按它标出哪些设置改过，恢复默认就是把它写回去。 */
+export interface NetworkDefaults {
+  routing: RoutingMode
+  max_relay_hops: number
+  reach: Reach
+  /** `null` 表示 `auto`。 */
+  class: ServiceClass | null
+  ack_eliciting_threshold: number
+  max_ack_delay_ms: number
 }
 
 export interface CreateNetwork {
