@@ -133,6 +133,8 @@ pub(crate) enum Rejected {
     Replayed,
     #[error("校验对不上")]
     Forged,
+    #[error("序号超出了发的一方会用的范围")]
+    OutOfRange,
 }
 
 /// 一条连接上封包用的东西：两个方向的密钥、发的序号、收的重放窗口，和几个计数。
@@ -227,8 +229,13 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// 重放的，或者校验对不上的。
+    /// 序号是发的一方不会用的，重放的，或者校验对不上的。
     pub(crate) fn open<'a>(&self, header: SealedHeader, packet: &'a mut [u8]) -> Result<&'a [u8], Rejected> {
+        // 守规矩的对端发不出这么大的序号（[`seal`](Self::seal) 到这里就停了）。校验对得上也不收：拿着密钥的对端要是故意发一个
+        // 最大的序号，重放窗口记"下一个"时就没有数可记了。
+        if header.counter >= COUNTER_LIMIT {
+            return Err(Rejected::OutOfRange);
+        }
         // 先看一眼窗口，重放的包不值得解；认证通过之后才记进去。
         if !self.replay().admits(header.counter) {
             return Err(Rejected::Replayed);
@@ -411,6 +418,9 @@ impl Replay {
             return false;
         }
         if counter >= self.next {
+            // 最大的那个数后面没有"下一个"可记，不收。用这个窗口的一方本来就不该把它交进来（见 [`Session::open`]），
+            // 这里再挡一次，窗口自己就不会算溢出。
+            let Some(next) = counter.checked_add(1) else { return false };
             // 一个都没见过时整圈本来就是空的，从块 0 算起也只是把空的再清一遍。
             let newest = Self::block(self.next.saturating_sub(1));
             let skipped = (Self::block(counter) - newest).min(REPLAY_WORDS as u64);
@@ -418,7 +428,7 @@ impl Replay {
                 let (word, _) = Self::place((newest + step) * REPLAY_WORD_BITS);
                 self.seen[word] = 0;
             }
-            self.next = counter + 1;
+            self.next = next;
         }
         let (word, bit) = Self::place(counter);
         self.seen[word] |= bit;
@@ -692,6 +702,39 @@ mod tests {
             }
             assert_eq!(taken, count, "第 {round} 遍之后一共收下的个数");
         }
+    }
+
+    /// 用 `from` 的密钥封一个序号是 `counter` 的包，不管这个序号它自己肯不肯用：拿着密钥、不守规矩的对端做得出来。
+    fn sealed_as(from: &Session, counter: u64, frame: &[u8]) -> Vec<u8> {
+        let header = SealedHeader { session: from.id, counter }.to_bytes();
+        let mut body = frame.to_vec();
+        let tag = from.sealing.seal_in_place_separate_tag(nonce(counter), Aad::from(header), &mut body).unwrap();
+        [&header[..], &body, tag.as_ref()].concat()
+    }
+
+    #[test]
+    fn a_number_no_sender_would_use_is_refused_even_with_the_right_key_and_the_window_is_untouched() {
+        let (dialer, acceptor) = pair();
+        let earlier = sealed(&dialer, &frame(b"earlier"));
+        assert!(opened(&acceptor, &earlier).is_ok());
+        for counter in [COUNTER_LIMIT, u64::MAX - 1, u64::MAX] {
+            let packet = sealed_as(&dialer, counter, &frame(b"from a peer that does not keep to the rules"));
+            assert_eq!(opened(&acceptor, &packet), Err(Rejected::OutOfRange), "序号 {counter:#x}");
+        }
+        assert!(!acceptor.is_spent(), "这不算认证失败");
+        assert_eq!(opened(&acceptor, &earlier), Err(Rejected::Replayed), "窗口没有被冲掉：收过的还是不收");
+        assert!(opened(&acceptor, &sealed(&dialer, &frame(b"next"))).is_ok(), "正常的包照收");
+        let last = sealed_as(&dialer, COUNTER_LIMIT - 1, &frame(b"the last number a sender uses"));
+        assert!(opened(&acceptor, &last).is_ok(), "发的一方用得到的最后一个序号还是收的");
+    }
+
+    #[test]
+    fn the_window_itself_refuses_the_largest_number_instead_of_overflowing() {
+        let mut replay = Replay::default();
+        assert!(replay.accept(7));
+        assert!(!replay.accept(u64::MAX));
+        assert!(!replay.accept(7), "之前记下的还在");
+        assert!(replay.accept(8));
     }
 
     #[test]
