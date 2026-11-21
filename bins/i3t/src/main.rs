@@ -199,12 +199,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Join { can_exit, can_relay, can_forward } => {
             let mut token = String::new();
             std::io::stdin().read_to_string(&mut token).context(t.read_token)?;
+            // Windows PowerShell 在控制台代码页是 UTF-8 时，经管道交给程序的文字最前面带着一个字节序标记。
+            let token = token.trim_start_matches('\u{feff}');
             if can_forward {
                 println!("{}", t.forward_by_admin);
             }
             let options = JoinOptions { can_exit, can_relay };
             let program = Program::detect(version)?;
-            let netmap = current_thread()?.block_on(join(&state, &token, options, &program))?;
+            let netmap = current_thread()?.block_on(join(&state, token, options, &program))?;
             println!("{}", (t.joined)(&netmap.network.name));
             let mut fields = Fields::new(2);
             fields.add(t.node, netmap.me.name.clone());

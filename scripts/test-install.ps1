@@ -101,13 +101,7 @@ try {
     if ($run.Text -notmatch 'Start-Service i3t') { Fail "i3t run: unexpected answer: $($run.Text)" }
 
     Step 'i3t join joins and starts the service'
-    $probe = Join-Path $work 'stdin-hex.ps1'
-    Set-Content -LiteralPath $probe -Value '$stdin = [Console]::OpenStandardInput(); $bytes = New-Object byte[] 64; $read = $stdin.Read($bytes, 0, 64); Write-Output ("read=" + $read + " " + [BitConverter]::ToString($bytes, 0, $read))'
-    $head = $token.Substring(0, 8)
-    Write-Host ('diag: piped to powershell.exe: ' + ($head | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe))
-    Write-Host ('diag: piped to findstr: ' + ($head | & findstr.exe /N .))
-    Write-Host ('diag: i3t on the PATH: ' + (Get-Command i3t).Source)
-    Write-Host ('diag: echo through cmd: ' + (& cmd.exe /c "echo $head| findstr /N ."))
+    # Piped the way a user does it. Windows PowerShell puts a byte order mark in front when the console code page is UTF-8.
     $token | & i3t join --can-relay
     if ($LASTEXITCODE -ne 0) { Fail 'i3t join failed' }
     Wait-Online
