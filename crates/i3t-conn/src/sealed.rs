@@ -88,7 +88,7 @@ pub enum PacketTransport {
 }
 
 impl PacketTransport {
-    /// 指定走哪一种的环境变量，取值 `on`（默认）或 `off`。做对比测试时用。
+    /// 指定走哪一种的环境变量，取值 `on`（默认）、`unbundled`（封好的包照旧，不认识合在一起的小包）或 `off`。做对比测试时用。
     pub const ENV: &str = "I3T_SEALED_PACKETS";
 
     /// 环境变量 [`Self::ENV`] 指定的那一种；没有设置或者值看不懂时用默认的。
@@ -100,9 +100,10 @@ impl PacketTransport {
     fn from_env_value(value: &str) -> Self {
         match value {
             "on" => Self::Sealed,
+            "unbundled" => Self::SealedOneByOne,
             "off" => Self::Datagram,
             _ => {
-                tracing::warn!(%value, "环境变量 {} 的值不是 on 或 off，照默认的来（on）", Self::ENV);
+                tracing::warn!(%value, "环境变量 {} 的值不是 on、unbundled 或 off，照默认的来（on）", Self::ENV);
                 Self::default()
             }
         }
@@ -807,6 +808,7 @@ mod tests {
     fn the_switch_reads_on_and_off_and_falls_back_on_anything_else() {
         assert_eq!(PacketTransport::from_env_value("on"), PacketTransport::Sealed);
         assert_eq!(PacketTransport::from_env_value("off"), PacketTransport::Datagram);
+        assert_eq!(PacketTransport::from_env_value("unbundled"), PacketTransport::SealedOneByOne);
         assert_eq!(PacketTransport::from_env_value("maybe"), PacketTransport::Sealed);
     }
 

@@ -16,6 +16,7 @@
 - tcp_relay_flood：同上，那一端的线路只有 2 Mbit/s：两个方向各灌 20 Mbit/s 的 UDP 时，到 relay 的那条 TCP 不被当作断了，
   灌完之后两秒之内 ping 又通。
 - nat：两端都在 NAT 后面：ping 和 20MB。
+- bundling：直连的两个节点之间一串很密的小包合起来发，线上的包数只有几分之一，一个不丢；网络的开关关着时一个包一个包地发。
 - firewall：开关开着时，默认拒绝入站的防火墙（iptables 的 INPUT 策略是 DROP）也让别的节点进来；从真网卡来、冒充虚拟 IP 的包被丢掉。
   开关关着时 `nft list ruleset` 和 `iptables-save` 装之前、装着、拆之后都一样，冒充的包照样进来（防火墙由这台机器自己管）。
 - privilege：没有 CAP_NET_ADMIN、没有 /dev/net/tun：不装，状态说为什么，代理照常。
@@ -297,6 +298,70 @@ def tcp_relay_flood(lab: Lab, work: Path, t: Checks) -> None:
         while not (back := received(ping(b, a.virtual_ip, "-W", "1", count=1)) == 1) and time.monotonic() < deadline:
             pass
         t.check("灌完之后两秒之内 ping 又通", back)
+    if t.failures:
+        print(tail(a.read_log(), 20), tail(b.read_log()), sep="\n  ---\n")
+
+
+# 一个接一个地发小的 UDP 包（IP 包 48 字节）。参数：目的地址、个数、每秒几个。
+SMALL_PACKETS = r'''
+import socket, sys, time
+target, count, rate = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+start, sent = time.monotonic(), 0
+while sent < count:
+    due = min(count, int((time.monotonic() - start) * rate) + 1)
+    while sent < due:
+        sock.sendto(bytes(20), (target, 9))
+        sent += 1
+    time.sleep(0.0002)
+'''
+
+
+def device_counter(node: Node, device: str, name: str) -> int:
+    return int(node.host.run("sh", "-c", f"cat /sys/class/net/{device}/statistics/{name}").stdout.split()[0])
+
+
+def small_packets(a: Node, b: Node, count: int) -> tuple[int, int]:
+    """a 往 b 的虚拟 IP 发 `count` 个小 UDP 包，每秒四千个。返回（a 的真网卡因此发出去多少个包，b 的节点写进虚拟网卡多少个）。"""
+    ping(a, b.virtual_ip, count=2)
+    time.sleep(0.5)
+    before = device_counter(a, "up0", "tx_packets"), device_counter(b, "i3t*", "rx_packets")
+    a.host.run(sys.executable, "-c", SMALL_PACKETS, b.virtual_ip, str(count), "4000")
+    time.sleep(0.5)
+    return device_counter(a, "up0", "tx_packets") - before[0], device_counter(b, "i3t*", "rx_packets") - before[1]
+
+
+def bundling(lab: Lab, work: Path, t: Checks) -> None:
+    """直连的两个节点之间一串很密的小包：合起来发，线上的包数少得多；网络的开关关着时一个包一个包地发。"""
+    a, b = pair(lab, work)
+    # 真网卡上关掉分段卸载：不关的话内核把一次交下去的几个包记成一个，数不出线上到底走了几个。
+    offload = a.host.run("ethtool", "-K", "up0", "tx-udp-segmentation", "off", "gso", "off", check=False)
+    if offload.returncode != 0:
+        print(f"  跳过：这台机器上关不掉分段卸载，数不了线上的包（{offload.stderr.strip() or '没有 ethtool'}）")
+        return
+    count = 2000
+    start_pair(a, b)
+    if installed(t, a, b):
+        wait_until(lambda: current_route(a, b).startswith("直连"), timeout=20, what="a 到 b 直连")
+        on_wire, delivered = small_packets(a, b, count)
+        print(f"  开关开着：{count} 个小包，线上 {on_wire} 个包，对面收到 {delivered} 个")
+        t.check("合起来发：一个不丢", delivered >= count, f"对面的虚拟网卡收到 {delivered} 个")
+        t.check("合起来发：线上的包不到小包数的一半", on_wire < count // 2, f"线上 {on_wire} 个")
+        idle = ping(a, b.virtual_ip, count=5)
+        t.check("稀的包照旧：ping 不丢", received(idle) == 5, idle.stdout)
+
+    # 同一对节点换一份开关关着的 netmap 重新起来。
+    for node in (a, b):
+        node.stop()
+    off = lambda netmap: {**netmap, "network": {**netmap["network"], "bundle_small_packets": False}}  # noqa: E731
+    a.start_static(off(a.netmap(peers=[b.as_peer()])))
+    b.start_static(off(b.netmap(peers=[a.as_peer()])))
+    if installed(t, a, b):
+        wait_until(lambda: current_route(a, b).startswith("直连"), timeout=20, what="a 到 b 直连")
+        on_wire, delivered = small_packets(a, b, count)
+        print(f"  开关关着：{count} 个小包，线上 {on_wire} 个包，对面收到 {delivered} 个")
+        t.check("开关关着：一个包一个包地发", on_wire >= count, f"线上 {on_wire} 个")
+        t.check("开关关着：一个不丢", delivered >= count, f"对面的虚拟网卡收到 {delivered} 个")
     if t.failures:
         print(tail(a.read_log(), 20), tail(b.read_log()), sep="\n  ---\n")
 
@@ -901,7 +966,7 @@ def legacy(lab: Lab, work: Path, t: Checks) -> None:
 
 
 SCENARIOS = {
-    "basics": basics, "rules": rules, "relay": relay, "tcp_relay": tcp_relay, "tcp_relay_flood": tcp_relay_flood, "nat": nat, "firewall": firewall, "privilege": privilege,
+    "basics": basics, "rules": rules, "relay": relay, "tcp_relay": tcp_relay, "tcp_relay_flood": tcp_relay_flood, "nat": nat, "bundling": bundling, "firewall": firewall, "privilege": privilege,
     "overlap": overlap, "appears": appears, "leftover": leftover, "restart": restart, "mtu": mtu, "forward": forward,
     "lan": lan, "lan_iptables": lan_iptables, "hostile": hostile, "managed": managed, "legacy": legacy,
 }
