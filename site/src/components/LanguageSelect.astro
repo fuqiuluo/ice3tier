@@ -1,0 +1,54 @@
+---
+import Check from '@lucide/astro/icons/check'
+import ChevronDown from '@lucide/astro/icons/chevron-down'
+import Languages from '@lucide/astro/icons/languages'
+import { withBase, withoutBase } from '../lib/base'
+import './menu.css'
+
+// 语言菜单：换掉 Starlight 自带的 <select>。条目是指向另一种语言里同一页的链接。
+const LOCALES = [
+  { code: 'zh-CN', label: '简体中文', prefix: '' },
+  { code: 'en', label: 'English', prefix: '/en' },
+]
+
+const { lang, entry } = Astro.locals.starlightRoute
+const path = withoutBase(Astro.url.pathname)
+// 去掉当前语言的前缀，剩下的是两种语言共用的那一段路径。404 页没有“另一种语言里的同一页”，去首页。
+const notFound = entry.id === '404' || entry.id.endsWith('/404')
+const rest = notFound ? '/' : path === '/en' ? '/' : path.startsWith('/en/') ? path.slice(3) : path
+const current = LOCALES.find((locale) => locale.code === lang) ?? LOCALES[0]!
+---
+
+<i3t-menu>
+  <button
+    type="button"
+    class="i3t-menu-trigger"
+    aria-haspopup="menu"
+    aria-expanded="false"
+    aria-label={Astro.locals.t('languageSelect.accessibleLabel')}
+  >
+    <Languages size={16} />
+    <span>{current.label}</span>
+    <ChevronDown class="chevron" size={14} />
+  </button>
+  <div class="i3t-menu-popup" role="menu" hidden>
+    {
+      LOCALES.map((locale) => (
+        <a
+          class="i3t-menu-item"
+          role="menuitem"
+          href={withBase(`${locale.prefix}${rest}`)}
+          lang={locale.code}
+          aria-current={locale.code === current.code ? 'true' : undefined}
+        >
+          {locale.label}
+          <Check class="check" size={14} stroke-width={2.5} />
+        </a>
+      ))
+    }
+  </div>
+</i3t-menu>
+
+<script>
+  import './menu.ts'
+</script>

@@ -1,0 +1,18 @@
+---
+// 首页上的一组文档链接：每项是一个图标、标题和一句说明。
+---
+
+<ul class="not-content docs">
+  <slot />
+</ul>
+
+<style>
+  .docs {
+    display: flex;
+    flex-direction: column;
+    gap: 1.125rem;
+    margin: 1.25rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+</style>

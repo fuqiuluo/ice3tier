@@ -1,0 +1,71 @@
+---
+title: Set up a relay
+description: Nodes that cannot connect directly talk through a relay. You need at least one.
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+
+Two nodes connect directly when they can: on the same LAN, through an open port, or by hole punching. When they cannot, they talk through a relay.
+
+:::caution
+Without a relay, a pair that cannot connect directly has no connection.
+:::
+
+The server that runs the controller is usually the right place for one.
+
+<Steps>
+
+1. **Declare that the machine may relay.** Install a node on the server as in [Add nodes](../nodes/), with `--can-relay`:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+     sh -s -- --token <enrollment-token> --can-relay
+   ```
+
+   For a node that has already joined:
+
+   <Tabs syncKey="service">
+     <TabItem label="Linux">
+       ```sh
+       sudo i3t set can-relay on
+       sudo systemctl restart i3t
+       ```
+     </TabItem>
+     <TabItem label="macOS">
+       ```sh
+       sudo i3t set can-relay on
+       sudo launchctl kickstart -k system/com.github.fuqiuluo.ice3tier
+       ```
+     </TabItem>
+   </Tabs>
+
+2. **Open the ports.** Open UDP 20330 and TCP 20330 on the server.
+
+3. **Enable the relay.**
+
+   <Tabs syncKey="admin">
+     <TabItem label="Web UI">
+       Turn on the relay switch on the node's page.
+     </TabItem>
+     <TabItem label="Command line">
+       ```sh
+       i3tctl relay enable <node>
+       ```
+
+       The command lists the node's addresses and whether the controller can reach each of them.
+     </TabItem>
+   </Tabs>
+
+</Steps>
+
+Declaring and enabling are both needed: the machine says it may relay, and the admin turns it on.
+
+## Relay addresses
+
+Relay addresses are found automatically. Only when a provider or router maps a port on another IP address to the machine do you have to name it, then restart the node:
+
+```sh
+sudo i3t set relay-address <ip>:<port>
+```
+
+Next: [Check that it works](../verify/).

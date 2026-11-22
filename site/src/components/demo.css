@@ -1,0 +1,97 @@
+.i3t-demo {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-block: 1.5rem;
+  padding: 1.25rem;
+  border: 1px solid var(--doc-line);
+  border-radius: 0.25rem;
+  background: var(--doc-surface);
+  font-size: var(--sl-text-sm);
+}
+
+.i3t-demo-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+
+.i3t-demo-slider {
+  display: grid;
+  grid-template-columns: 12.5rem minmax(0, 1fr) 7rem;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--sl-color-gray-2);
+}
+
+.i3t-demo-slider input {
+  width: 100%;
+  accent-color: var(--sl-color-accent);
+}
+
+.i3t-demo-slider output {
+  color: var(--sl-color-white);
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.i3t-demo-lanes {
+  display: grid;
+  grid-template-columns: 12.5rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+.i3t-demo-lane-label {
+  color: var(--sl-color-gray-3);
+}
+
+.i3t-demo-lane {
+  display: flex;
+  gap: 2px;
+}
+
+.i3t-demo-lane i {
+  flex: 1;
+  height: 1rem;
+  border-radius: 2px;
+}
+
+.i3t-demo-packet {
+  background: var(--sl-color-gray-4);
+}
+
+.i3t-demo-ack {
+  background: var(--sl-color-accent);
+}
+
+.i3t-demo-gap {
+  background: transparent;
+}
+
+.i3t-demo-result {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  color: var(--sl-color-gray-2);
+}
+
+.i3t-demo-result strong {
+  color: var(--sl-color-white);
+}
+
+.i3t-demo-note {
+  color: var(--sl-color-gray-3);
+  font-size: var(--sl-text-xs);
+}
+
+@media (max-width: 40rem) {
+  .i3t-demo-slider,
+  .i3t-demo-lanes {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .i3t-demo-slider output {
+    text-align: start;
+  }
+}

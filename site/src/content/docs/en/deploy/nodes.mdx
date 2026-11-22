@@ -1,0 +1,99 @@
+---
+title: Add nodes
+description: Create an enrollment token, then install the node on each machine and join the network.
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+
+Each machine joins with its own enrollment token. A token works once and expires after 24 hours unless you choose otherwise.
+
+<Steps>
+
+1. **Create a token.**
+
+   <Tabs syncKey="admin">
+     <TabItem label="Web UI">
+       Open **Add node**, click **Create token**, then **Copy token only**.
+     </TabItem>
+     <TabItem label="Command line">
+       ```sh
+       i3tctl token create
+       ```
+     </TabItem>
+   </Tabs>
+
+2. **Install and join.** On the machine:
+
+   <Tabs syncKey="os">
+     <TabItem label="Linux / macOS">
+       ```sh
+       curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+         sh -s -- --token <enrollment-token>
+       ```
+
+       This installs the node as a service, joins the network and starts the node. The service starts at boot: a systemd unit `i3t` under its own system user on Linux, a launchd daemon on macOS.
+     </TabItem>
+     <TabItem label="Windows">
+       In a PowerShell window opened as administrator:
+
+       ```powershell
+       $env:I3T_TOKEN = '<enrollment-token>'
+       irm https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.ps1 | iex
+       ```
+
+       The node is installed as the system service `i3t`: it runs in the background and starts at boot.
+     </TabItem>
+     <TabItem label="Linux without systemd">
+       ```sh
+       curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+         sh -s -- --token <enrollment-token>
+       ```
+
+       The script installs `/usr/local/bin/i3t` and joins the network, without a service. Keep `sudo i3t run` running with your init system.
+     </TabItem>
+   </Tabs>
+
+3. **Check.** On the machine:
+
+   <Tabs syncKey="os">
+     <TabItem label="Linux / macOS">
+       ```sh
+       sudo i3t status
+       ```
+     </TabItem>
+     <TabItem label="Windows">
+       ```powershell
+       i3t status
+       ```
+     </TabItem>
+     <TabItem label="Linux without systemd">
+       ```sh
+       sudo i3t status
+       ```
+     </TabItem>
+   </Tabs>
+
+   The `controller` line should say `connected`, and the node shows as online in the web UI.
+
+</Steps>
+
+Repeat with a new token for every machine.
+
+## Installed without a token
+
+You can install without a token and join afterwards, which also starts the service:
+
+<Tabs syncKey="os">
+  <TabItem label="Linux / macOS">
+    ```sh
+    echo <enrollment-token> | sudo i3t join
+    ```
+  </TabItem>
+  <TabItem label="Windows">
+    ```powershell
+    echo <enrollment-token> | i3t join
+    ```
+  </TabItem>
+</Tabs>
+
+Next: [Set up a relay](../relay/).

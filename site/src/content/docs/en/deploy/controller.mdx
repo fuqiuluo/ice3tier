@@ -1,0 +1,61 @@
+---
+title: Install the controller
+description: Install the controller on a server, open the web UI and create the first network.
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+
+<Steps>
+
+1. **Install.** On the server:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+     sh -s -- --controller --public-addr <public-address>:20331
+   ```
+
+   `<public-address>` is the IP address or domain name nodes use to reach this machine. It is written into every enrollment token, so choose one that will not change. With a domain name you can move the controller to another machine later.
+
+   The script installs `i3t-controller` and `i3tctl` into `/usr/local/bin`, creates the systemd service `i3t-controller` (its own system user, started at boot) and starts it.
+
+2. **Save the admin token.** At the end the script prints the admin token:
+
+   ```
+   Admin token (shown only once):
+
+       <admin-token>
+   ```
+
+   The web UI and `i3tctl` sign in with it, and it is not shown again. If you lose it, see [Lost admin token](../../maintain/admin-token/).
+
+3. **Check the service.**
+
+   ```sh
+   systemctl status i3t-controller
+   ```
+
+4. **Create a network.**
+
+   <Tabs syncKey="admin">
+     <TabItem label="Web UI">
+       The web UI listens on `127.0.0.1:20332` of the server and speaks plain HTTP, so it cannot be opened from outside. Forward the port over SSH from your own computer:
+
+       ```sh
+       ssh -L 20332:127.0.0.1:20332 <user>@<server>
+       ```
+
+       Keep that session open, open [http://127.0.0.1:20332](http://127.0.0.1:20332), sign in with the admin token and create a network, for example `home`.
+     </TabItem>
+     <TabItem label="Command line">
+       On the server:
+
+       ```sh
+       export I3T_ADMIN_TOKEN=<admin-token>
+       i3tctl network create home
+       ```
+     </TabItem>
+   </Tabs>
+
+</Steps>
+
+Next: [Add nodes](../nodes/).

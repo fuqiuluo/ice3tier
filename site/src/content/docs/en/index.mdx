@@ -1,0 +1,80 @@
+---
+title: Docs
+description: Documentation for ice3tier, a self-hosted mesh network for your own machines.
+editUrl: false
+---
+
+import Doc from '../../../components/Doc.astro'
+import DocList from '../../../components/DocList.astro'
+
+ice3tier is a self-hosted mesh network: it connects the machines you own into one private network. Nodes talk to each other directly whenever they can, and through your own relays when they cannot. One controller with a web UI manages the network.
+
+## Start
+
+<DocList>
+  <Doc title="Introduction" href="/en/start/intro/">
+    What ice3tier is, what it does and how it works.
+  </Doc>
+  <Doc title="Before you start" href="/en/deploy/overview/">
+    What you deploy, what the machines need and which ports to open.
+  </Doc>
+</DocList>
+
+## Deployment
+
+<DocList>
+  <Doc title="Install the controller" href="/en/deploy/controller/">
+    Install the controller on a server, open the web UI and create the first network.
+  </Doc>
+  <Doc title="Add nodes" href="/en/deploy/nodes/">
+    Create an enrollment token, then install the node on each machine and join the network.
+  </Doc>
+  <Doc title="Set up a relay" href="/en/deploy/relay/">
+    Nodes that cannot connect directly talk through a relay. You need at least one.
+  </Doc>
+  <Doc title="Check that it works" href="/en/deploy/verify/">
+    Confirm that nodes reach the controller and each other.
+  </Doc>
+</DocList>
+
+## Maintenance
+
+<DocList>
+  <Doc title="Upgrading" href="/en/maintain/upgrade/">
+    Nodes update themselves. The controller is upgraded by hand.
+  </Doc>
+  <Doc title="Backup and restore" href="/en/maintain/backup/">
+    Back up the controller's data and restore it on the same server or a new one.
+  </Doc>
+  <Doc title="Lost admin token" href="/en/maintain/admin-token/">
+    Reset the admin token.
+  </Doc>
+  <Doc title="Uninstalling" href="/en/maintain/uninstall/">
+    Uninstall nodes and the controller.
+  </Doc>
+</DocList>
+
+## Switches and settings
+
+<DocList>
+  <Doc title="Bundle small packets" href="/en/switches/bundle-small-packets/">
+    What bundling small packets is, how it works, what turning it on buys and what it costs.
+  </Doc>
+  <Doc title="QUIC ACK frequency" href="/en/switches/ack-frequency/">
+    What the QUIC ACK threshold and QUIC max ACK delay are, which traffic they govern, how they work and when to change them.
+  </Doc>
+</DocList>
+
+## Reference
+
+<DocList>
+  <Doc title="Install script" href="/en/reference/install-script/">
+    The install script's options and the files it creates.
+  </Doc>
+  <Doc title="Other ways to install" href="/en/reference/other-install/">
+    Installing without access to GitHub, prebuilt binaries and building from source.
+  </Doc>
+  <Doc title="Troubleshooting" href="/en/reference/troubleshooting/">
+    Common symptoms and what to do.
+  </Doc>
+</DocList>

@@ -1,0 +1,131 @@
+/* 顶栏里的下拉菜单（语言、主题）：一个按钮，点开是一小块浮层。不用浏览器自带的 <select>。 */
+
+i3t-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.i3t-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  border: 0;
+  border-radius: 0.25rem;
+  padding: 0.5rem;
+  background: none;
+  color: var(--doc-meta);
+  font: inherit;
+  font-size: 0.875rem;
+  line-height: 1rem;
+  cursor: pointer;
+  transition:
+    background-color 0.15s,
+    color 0.15s;
+}
+
+.i3t-menu-trigger:hover,
+.i3t-menu-trigger[aria-expanded='true'] {
+  background-color: var(--doc-hover);
+  color: var(--doc-heading);
+}
+
+.i3t-menu-trigger:focus-visible {
+  outline: 2px solid var(--doc-primary);
+  outline-offset: 1px;
+}
+
+.i3t-menu-trigger .chevron {
+  color: var(--doc-faint);
+  transition: transform 0.15s;
+}
+
+.i3t-menu-trigger[aria-expanded='true'] .chevron {
+  transform: rotate(180deg);
+}
+
+.i3t-menu-popup {
+  position: absolute;
+  z-index: 30;
+  inset-block-start: calc(100% + 0.375rem);
+  inset-inline-end: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  border-radius: 0.5rem;
+  padding: 0.25rem;
+  min-width: 9.5rem;
+  background-color: var(--doc-bg);
+  box-shadow: var(--doc-shadow);
+  transform-origin: top right;
+  animation: i3t-menu-in 0.12s ease-out;
+}
+
+.i3t-menu-popup[hidden] {
+  display: none;
+}
+
+/* 手机上它在侧栏菜单的最下面：往上开。 */
+.mobile-preferences .i3t-menu-popup {
+  inset-block: auto calc(100% + 0.375rem);
+  transform-origin: bottom right;
+}
+
+.i3t-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  border: 0;
+  border-radius: 0.25rem;
+  padding: 0.4375rem 0.5rem;
+  background: none;
+  color: var(--doc-text);
+  font: inherit;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  text-align: start;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.i3t-menu-item:hover,
+.i3t-menu-item:focus-visible {
+  outline: none;
+  background-color: var(--doc-hover);
+  color: var(--doc-heading);
+}
+
+.i3t-menu-item > svg:first-child {
+  color: var(--doc-muted);
+}
+
+.i3t-menu-item .check {
+  flex-shrink: 0;
+  margin-inline-start: auto;
+  color: var(--doc-heading);
+  visibility: hidden;
+}
+
+.i3t-menu-item[aria-checked='true'],
+.i3t-menu-item[aria-current='true'] {
+  color: var(--doc-heading);
+  font-weight: 500;
+}
+
+.i3t-menu-item[aria-checked='true'] .check,
+.i3t-menu-item[aria-current='true'] .check {
+  visibility: visible;
+}
+
+@keyframes i3t-menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(-2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .i3t-menu-popup {
+    animation: none;
+  }
+}

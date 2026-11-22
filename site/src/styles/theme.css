@@ -1,0 +1,586 @@
+/*
+ * 文档站的外观：白底，不用卡片和面板；左边一棵带竖线的目录树，中间正文，右边“本页内容”。
+ * 16px 的正文，标题用中等字重（页面标题 36px/500），线和次要的字是暖灰。
+ * 西文用随站点一起发布的 Inter，中文落到系统字体；不写 system-ui：Linux 上它可能是等宽的。
+ */
+
+/* ---------- 颜色（暗色；Starlight 默认 data-theme='dark'）。照着亮色那一套配的。 ---------- */
+:root {
+  --doc-bg: #141312;
+  --doc-surface: #1c1b1a;
+  --doc-hover: #232120;
+  --doc-line: #2b2928;
+  --doc-line-strong: #3d3a38;
+  --doc-heading: #f5f4f2;
+  --doc-text: #d9d6d3;
+  --doc-nav: #e2dfdc;
+  --doc-meta: #b5b0ac;
+  --doc-muted: #9c9793;
+  --doc-faint: #6f6a66;
+  --doc-link: #8fb4ff;
+  --doc-link-line: rgb(143 180 255 / 0.35);
+  --doc-primary: #3d72ea;
+  --doc-ok: #4cc38a;
+  --doc-relay: #b5a6ff;
+  --doc-shadow: 0 12px 32px -8px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.06);
+
+  --doc-note-bg: #141c2b;
+  --doc-note-line: #23406f;
+  --doc-note-text: #9dbcf5;
+  --doc-tip-bg: #12211a;
+  --doc-tip-line: #1f5a3a;
+  --doc-tip-text: #7fd6a6;
+  --doc-caution-bg: #241d10;
+  --doc-caution-line: #5c4712;
+  --doc-caution-text: #f1c35b;
+  --doc-danger-bg: #2a1615;
+  --doc-danger-line: #6b2a27;
+  --doc-danger-text: #ff9a93;
+
+  /* Starlight 自己的变量，接到上面这套上。 */
+  --sl-color-white: var(--doc-heading);
+  --sl-color-gray-1: var(--doc-nav);
+  --sl-color-gray-2: var(--doc-text);
+  --sl-color-gray-3: var(--doc-muted);
+  --sl-color-gray-4: var(--doc-faint);
+  --sl-color-gray-5: var(--doc-line-strong);
+  --sl-color-gray-6: var(--doc-surface);
+  --sl-color-black: var(--doc-bg);
+  --sl-color-accent-low: #1b2643;
+  --sl-color-accent: var(--doc-primary);
+  --sl-color-accent-high: var(--doc-link);
+  --sl-color-text-accent: var(--doc-link);
+  --sl-color-bg: var(--doc-bg);
+  --sl-color-bg-nav: var(--doc-bg);
+  --sl-color-bg-sidebar: var(--doc-bg);
+  --sl-color-hairline: var(--doc-line);
+  --sl-color-hairline-light: var(--doc-line);
+  --sl-color-hairline-shade: var(--doc-line);
+}
+
+:root[data-theme='light'] {
+  --doc-bg: #ffffff;
+  --doc-surface: #faf9f8;
+  --doc-hover: #f7f5f4;
+  --doc-line: #eeebea;
+  --doc-line-strong: #dad6d5;
+  --doc-heading: #181717;
+  --doc-text: #2e2d2d;
+  --doc-nav: #292524;
+  --doc-meta: #444342;
+  --doc-muted: #706e6d;
+  --doc-faint: #a8a3a1;
+  --doc-link: #2a5bd7;
+  --doc-link-line: rgb(42 91 215 / 0.28);
+  --doc-primary: #2a5bd7;
+  --doc-ok: #1a7f4b;
+  --doc-relay: #5b45b5;
+  --doc-shadow: 0 12px 32px -8px rgb(24 23 23 / 0.16), 0 0 0 1px rgb(24 23 23 / 0.06);
+
+  --doc-note-bg: #eff6ff;
+  --doc-note-line: #bfdbfe;
+  --doc-note-text: #1d4ed8;
+  --doc-tip-bg: #f0fdf4;
+  --doc-tip-line: #86efac;
+  --doc-tip-text: #15803d;
+  --doc-caution-bg: #fffbeb;
+  --doc-caution-line: #fcd34d;
+  --doc-caution-text: #92400e;
+  --doc-danger-bg: #fef2f2;
+  --doc-danger-line: #fca5a5;
+  --doc-danger-text: #b91c1c;
+
+  --sl-color-accent-low: #eff3fe;
+  --sl-color-gray-7: var(--doc-surface);
+}
+
+/* ---------- 字和尺寸 ---------- */
+:root {
+  --sl-font:
+    'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei UI', 'Microsoft YaHei', 'Helvetica Neue', sans-serif;
+  --sl-font-mono:
+    'SF Mono', SFMono-Regular, ui-monospace, 'Cascadia Mono', 'JetBrains Mono', Menlo, Monaco, Consolas,
+    'Liberation Mono', monospace;
+
+  --sl-text-body: 1rem;
+  --sl-text-code: 0.875rem;
+  --sl-text-h1: 2.25rem;
+  --sl-text-h2: 1.6rem;
+  --sl-text-h3: 1.3125rem;
+  --sl-text-h4: 1.125rem;
+  --sl-text-h5: 1rem;
+  --sl-line-height: 1.7;
+  --sl-line-height-headings: 1.3;
+
+  --sl-nav-height: 4rem;
+  --sl-nav-pad-x: 1.25rem;
+  --sl-sidebar-width: 17.375rem;
+  --sl-sidebar-pad-x: 0rem;
+  --sl-content-width: 56.25rem;
+  --sl-content-pad-x: 1.25rem;
+
+  /* 三栏：侧栏 278、正文最宽 900、目录 278，中间各隔 32，两边各留 40；再宽就整体居中。 */
+  --doc-shell: 100rem;
+  --doc-pad: 2.5rem;
+  --doc-gap: 2rem;
+  --doc-toc: 17.375rem;
+  --doc-gutter: max(0px, (100vw - var(--doc-shell)) / 2);
+}
+
+/* 窗口不到 1600 宽时，两边的栏窄一点，把地方让给正文：两行的安装命令在 1440 宽的窗口里还放得下。 */
+@media (min-width: 50rem) and (max-width: 99.99rem) {
+  :root {
+    --sl-sidebar-width: 15rem;
+    --doc-toc: 13rem;
+    --doc-pad: 1.5rem;
+  }
+}
+
+body {
+  background-color: var(--doc-bg);
+  color: var(--doc-text);
+}
+
+/* ---------- 顶栏 ---------- */
+
+header.header {
+  border-bottom: 1px solid var(--doc-line);
+  background-color: var(--doc-bg);
+}
+
+.site-title {
+  gap: 0.625rem;
+  color: var(--doc-heading);
+  font-size: 1.1875rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.site-title img {
+  height: 1.625rem;
+}
+
+/* 搜索做成一个输入框的样子：38 高、4 的圆角、一圈线。 */
+site-search button[data-open-modal] {
+  color: var(--doc-muted);
+}
+
+@media (min-width: 50rem) {
+  site-search button[data-open-modal] {
+    border-color: var(--doc-line-strong);
+    border-radius: 0.25rem;
+    padding-inline: 0.75rem 0.5rem;
+    max-width: 32rem;
+    height: 2.375rem;
+    background-color: var(--doc-bg);
+    font-size: 1rem;
+  }
+
+  site-search button[data-open-modal]:hover {
+    border-color: var(--doc-muted);
+    color: var(--doc-text);
+  }
+}
+
+site-search button > kbd {
+  border: 1px solid var(--doc-line);
+  background-color: var(--doc-surface);
+  color: var(--doc-muted);
+}
+
+.right-group,
+.social-icons {
+  gap: 0.5rem;
+}
+
+.social-icons::after {
+  margin-inline: 0.25rem;
+  height: 1.25rem;
+  border-inline-end-color: var(--doc-line-strong);
+}
+
+.social-icons a {
+  display: inline-flex;
+  border-radius: 0.25rem;
+  padding: 0.5rem;
+  color: var(--doc-meta);
+}
+
+.social-icons a:hover {
+  background-color: var(--doc-hover);
+  color: var(--doc-heading);
+  opacity: 1;
+}
+
+/* ---------- 三栏（宽屏） ---------- */
+@media (min-width: 50rem) {
+  header.header {
+    padding-inline: calc(var(--doc-gutter) + var(--doc-pad));
+  }
+
+  .sidebar-pane {
+    inset-inline-start: calc(var(--doc-gutter) + var(--doc-pad));
+    border-inline-end: 0;
+    background-color: var(--doc-bg);
+    scrollbar-width: thin;
+    scrollbar-color: var(--doc-line-strong) transparent;
+  }
+
+  .main-frame {
+    padding-inline-start: calc(var(--doc-gutter) + var(--doc-pad) + var(--sl-content-inline-start, 0rem) + var(--doc-gap));
+    padding-inline-end: calc(var(--doc-gutter) + var(--doc-pad));
+  }
+
+  /* 没有侧栏的页面（404）：正文居中。 */
+  :root:not([data-has-sidebar]) .main-frame {
+    padding-inline: var(--doc-pad);
+  }
+
+  .content-panel {
+    padding-inline: 0;
+  }
+
+  /* 搜索框的左边对齐正文的左边。 */
+  :root[data-has-sidebar] header.header > .header {
+    grid-template-columns: calc(var(--sl-sidebar-width) + var(--doc-gap) - var(--sl-nav-gap)) 1fr auto;
+  }
+}
+
+@media (min-width: 72rem) {
+  .right-sidebar-container {
+    width: calc(var(--doc-toc) + var(--doc-gap));
+  }
+
+  .right-sidebar {
+    border-inline-start: 0;
+    width: calc(var(--doc-toc) + var(--doc-gap));
+  }
+
+  .right-sidebar-panel {
+    padding: 2rem 0 2rem var(--doc-gap);
+  }
+
+  .right-sidebar-panel .sl-container {
+    width: auto;
+    max-width: none;
+  }
+
+  :root[data-has-sidebar][data-has-toc] .main-pane {
+    --sl-content-margin-inline: 0;
+    width: calc(100% - var(--doc-toc) - var(--doc-gap));
+  }
+}
+
+/* ---------- 侧栏：一棵树。分组名加粗，下面的条目缩进，左边一条竖线；当前那一项是一块浅灰底 ---------- */
+
+.sidebar-content {
+  gap: 0;
+  padding: 2rem 0.5rem 2rem 0;
+}
+
+.sidebar-content .top-level > li + li {
+  margin-top: 0.5rem;
+}
+
+.sidebar-content summary {
+  flex-direction: row-reverse;
+  justify-content: flex-end;
+  gap: 0.6875rem;
+  margin-bottom: 0.125rem;
+  padding: 0.25rem 0.5rem 0.25rem 0.125rem;
+}
+
+.sidebar-content .large {
+  color: var(--doc-nav);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.sidebar-content summary .caret {
+  transform: rotateZ(0deg);
+  color: var(--doc-muted);
+  font-size: 1rem;
+}
+
+.sidebar-content details[open] > summary .caret {
+  transform: rotateZ(90deg);
+}
+
+.sidebar-content details > ul {
+  margin-inline-start: 0.625rem;
+  border-inline-start: 1px solid var(--doc-line);
+  padding-inline-start: 0.5rem;
+}
+
+.sidebar-content ul ul li {
+  margin-inline-start: 0;
+  margin-top: 0.125rem;
+  border-inline-start: 0;
+  padding-inline-start: 0;
+}
+
+.sidebar-content .top-level ul a {
+  margin-inline-start: 1.125rem;
+}
+
+.sidebar-content .top-level a {
+  display: inline-block;
+  border-radius: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  color: var(--doc-nav);
+  font-size: 0.875rem;
+  line-height: 1.2;
+}
+
+.sidebar-content .top-level a:hover,
+.sidebar-content .top-level a:focus-visible {
+  background-color: var(--doc-hover);
+  color: var(--doc-heading);
+}
+
+.sidebar-content .top-level a[aria-current='page'],
+.sidebar-content .top-level a[aria-current='page']:hover,
+.sidebar-content .top-level a[aria-current='page']:focus {
+  background-color: var(--doc-hover);
+  color: var(--doc-heading);
+  font-weight: 500;
+}
+
+/* ---------- 目录：小号的标题，灰色的链接 ---------- */
+
+.right-sidebar-panel h2 {
+  margin-bottom: 0.9375rem;
+  color: var(--doc-heading);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.right-sidebar-panel starlight-toc a {
+  padding-block: 0.225rem;
+  padding-inline: calc(1rem * var(--depth)) 0;
+  color: var(--doc-muted);
+  font-size: 0.875rem;
+  line-height: 1.2;
+}
+
+.right-sidebar-panel starlight-toc a:hover {
+  color: var(--doc-heading);
+}
+
+.right-sidebar-panel starlight-toc a[aria-current='true'] {
+  color: var(--doc-heading);
+}
+
+/* ---------- 正文 ---------- */
+
+.content-panel + .content-panel {
+  border-top: 0;
+}
+
+.main-pane > main > .content-panel:first-child {
+  padding-top: 2rem;
+  padding-bottom: 0;
+}
+
+main {
+  padding-bottom: 3rem;
+}
+
+.sl-markdown-content {
+  color: var(--doc-text);
+  container-type: inline-size;
+}
+
+.sl-markdown-content :is(p, li, td) {
+  text-wrap: pretty;
+}
+
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--doc-heading);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.sl-markdown-content :is(h2):not(:where(.not-content *)) {
+  margin-top: 2.5rem;
+}
+
+.sl-markdown-content :is(h3):not(:where(.not-content *)) {
+  margin-top: 2rem;
+}
+
+.sl-markdown-content strong {
+  color: var(--doc-heading);
+  font-weight: 600;
+}
+
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--doc-link);
+  text-decoration-color: var(--doc-link-line);
+  text-underline-offset: 0.1875em;
+}
+
+.sl-markdown-content a:not(:where(.not-content *)):hover {
+  text-decoration-color: currentColor;
+}
+
+.sl-markdown-content :is(ul, ol):not(:where(.not-content *)) > li::marker {
+  color: var(--doc-faint);
+}
+
+.sl-markdown-content code:not(:where(.not-content *)) {
+  border: 1px solid var(--doc-line);
+  border-radius: 0.25rem;
+  padding: 0.125rem 0.25rem;
+  background-color: var(--doc-surface);
+  color: var(--doc-text);
+  font-size: 0.825em;
+}
+
+/*
+ * 表格：正文够宽时撑满正文；窄的时候自己横向滚动。
+ * 中文在哪个字后面都能断行，表格一挤，“每台一个”这样的短格子会被拆成两行：格子里只在标点和空格处断。代码不拆行。
+ */
+.sl-markdown-content table:not(:where(.not-content *)) {
+  font-size: 0.9375rem;
+}
+
+@container (min-width: 36rem) {
+  .sl-markdown-content table:not(:where(.not-content *)) {
+    display: table;
+    width: 100%;
+  }
+}
+
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+  border-bottom: 1px solid var(--doc-line);
+  padding: 0.625rem 0.75rem;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+.sl-markdown-content :is(th, td):not(:where(.not-content *)):first-child {
+  padding-inline-start: 0;
+}
+
+.sl-markdown-content th:not(:where(.not-content *)) {
+  border-bottom-color: var(--doc-line-strong);
+  color: var(--doc-heading);
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sl-markdown-content td:not(:where(.not-content *)) code {
+  white-space: nowrap;
+}
+
+/* ---------- 标签页：下面一条线，当前那一个下面是深色的 ---------- */
+
+starlight-tabs [role='tablist'] {
+  gap: 1.5rem;
+  border-bottom: 1px solid var(--doc-line);
+}
+
+starlight-tabs .tab > [role='tab'] {
+  padding: 0.5rem 0;
+  box-shadow: none;
+  color: var(--doc-muted);
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.25rem;
+}
+
+starlight-tabs .tab > [role='tab']:hover {
+  color: var(--doc-heading);
+}
+
+starlight-tabs .tab > [role='tab'][aria-selected='true'] {
+  box-shadow: 0 1px 0 var(--doc-heading);
+  color: var(--doc-heading);
+  font-weight: 500;
+}
+
+/* ---------- 提示块：淡底，一圈同色的线，字小一号 ---------- */
+
+.starlight-aside {
+  border: 1px solid var(--i3t-aside-line);
+  border-radius: 0.25rem;
+  padding: 0.75rem;
+  background-color: var(--i3t-aside-bg);
+  color: var(--doc-heading);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.starlight-aside--note {
+  --i3t-aside-bg: var(--doc-note-bg);
+  --i3t-aside-line: var(--doc-note-line);
+  --sl-color-asides-text-accent: var(--doc-note-text);
+}
+
+.starlight-aside--tip {
+  --i3t-aside-bg: var(--doc-tip-bg);
+  --i3t-aside-line: var(--doc-tip-line);
+  --sl-color-asides-text-accent: var(--doc-tip-text);
+}
+
+.starlight-aside--caution {
+  --i3t-aside-bg: var(--doc-caution-bg);
+  --i3t-aside-line: var(--doc-caution-line);
+  --sl-color-asides-text-accent: var(--doc-caution-text);
+}
+
+.starlight-aside--danger {
+  --i3t-aside-bg: var(--doc-danger-bg);
+  --i3t-aside-line: var(--doc-danger-line);
+  --sl-color-asides-text-accent: var(--doc-danger-text);
+}
+
+.starlight-aside__title {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.starlight-aside__content code {
+  background-color: color-mix(in srgb, var(--doc-bg) 60%, transparent);
+}
+
+/* ---------- 上一页、下一页 ---------- */
+
+.pagination-links a {
+  border-color: var(--doc-line);
+  border-radius: 0.375rem;
+  padding: 0.75rem 1rem;
+  box-shadow: none;
+  color: var(--doc-muted);
+  font-size: 0.8125rem;
+  transition: border-color 0.15s;
+}
+
+.pagination-links a:hover {
+  border-color: var(--doc-line-strong);
+}
+
+.pagination-links .link-title {
+  color: var(--doc-heading);
+  font-size: 1rem;
+  font-weight: 500;
+}
+
+@media (max-width: 49.99rem) {
+  :root {
+    --sl-text-h1: 1.75rem;
+    --sl-text-h2: 1.375rem;
+    --sl-text-h3: 1.1875rem;
+  }
+
+  .sidebar-content {
+    padding: 1rem 1rem 2rem;
+  }
+}

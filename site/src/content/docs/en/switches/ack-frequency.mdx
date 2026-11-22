@@ -1,0 +1,69 @@
+---
+title: QUIC ACK frequency
+description: What the QUIC ACK threshold and QUIC max ACK delay are, which traffic they govern, how they work and when to change them.
+sidebar:
+  order: 2
+---
+
+import AckDemo from '../../../../components/AckDemo.tsx'
+
+Nodes talk to each other over QUIC. An end that receives data tells the sender it arrived: that is an ACK. Two settings decide how often a peer sends one.
+
+| Setting | Default | Range | Where |
+| --- | --- | --- | --- |
+| QUIC ACK threshold | 3 packets | 1 – 100 | Network → Connections |
+| QUIC max ACK delay | 2 ms | 1 – 25 | Network → Connections |
+
+With the command line:
+
+```sh
+i3tctl network set --ack-eliciting-threshold 3 --max-ack-delay-ms 2
+```
+
+Changes apply to connections made from now on.
+
+## Which traffic they govern
+
+The two settings govern only what travels inside QUIC:
+
+- Proxies and port forwards.
+- Packets of the virtual network adapter, when they go through a relay.
+
+On a direct route the adapter's packets do not enter QUIC: each one is encrypted on its own and sent straight out, with no QUIC ACKs, so these settings do nothing for it. There, [Bundle small packets](../bundle-small-packets/) is what cuts the small packets on the way back.
+
+## How it works
+
+A QUIC sender learns three things from its peer's ACKs: which packets arrived, which were lost, and how fast it may send.
+
+An ACK is a packet too. It takes bandwidth and has to be encrypted and decrypted. By default QUIC acknowledges every 2 packets, so a 1 GB download sends back roughly 400,000 ACK packets.
+
+ice3tier uses the QUIC ACK frequency extension, which lets the sender tell its peer how to acknowledge:
+
+- **QUIC ACK threshold**: the peer sends a separate ACK packet only after receiving more than this many packets.
+- **QUIC max ACK delay**: below the threshold, the peer waits at most this long.
+
+Whichever comes first triggers the ACK. If the peer has data of its own to send in the meantime, the ACK rides along in that packet and no extra packet is sent.
+
+It is a request from one end to the other: an end's setting decides how its peer acknowledges the packets that end sends, and the other direction follows the peer's setting. Within one network both ends have the same setting.
+
+<AckDemo client:visible lang="en" />
+
+## Why raise it
+
+- **Fewer packets on the way back.** Downloads get faster on a line with little upload, such as home broadband: ACKs no longer fill the uplink.
+- **Less CPU on both ends.** One ACK less is one encryption, one decryption and one system call less.
+- **Lighter relays.** On a relayed connection every ACK is forwarded by the relay as well.
+
+## What it costs
+
+With fewer ACKs the sender finds things out later:
+
+- **Loss is noticed later.** A lost packet is resent only after the next ACK arrives.
+- **Sending gets burstier.** Each ACK releases a batch of packets. The further apart the ACKs, the bigger the batch and the more likely part of it is dropped on the way. A high threshold with a long delay shows this most on one-way traffic such as a plain download.
+- **It depends on the peer's timer.** Above 3 the count is often not reached, so ACKs go out when the delay runs out. If the peer's timer is imprecise the ACK is late and the sender waits for it. Throughput drops sharply towards Windows peers.
+
+## What to pick
+
+The defaults suit nearly every line. Leave them.
+
+Raising the threshold is worth a try only when the line has very little upload and neither end runs Windows. Compare with the speed test on the node page afterwards, and restore the default if it got slower.

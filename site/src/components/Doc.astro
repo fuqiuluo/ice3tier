@@ -1,0 +1,51 @@
+---
+import FileText from '@lucide/astro/icons/file-text'
+import { withBase } from '../lib/base'
+
+interface Props {
+  title: string
+  href: string
+}
+
+const { title, href } = Astro.props
+---
+
+<li class="doc">
+  <FileText size={20} stroke-width={1.5} />
+  <div>
+    <a href={withBase(href)}>{title}</a>
+    <div class="text"><slot /></div>
+  </div>
+</li>
+
+<style>
+  .doc {
+    display: flex;
+    gap: 0.625rem;
+  }
+
+  .doc > :global(svg) {
+    flex-shrink: 0;
+    margin-top: 0.125rem;
+    color: var(--doc-link);
+  }
+
+  a {
+    color: var(--doc-link);
+    font-size: 1rem;
+    line-height: 1.5rem;
+    text-decoration: underline;
+    text-decoration-color: var(--doc-link-line);
+    text-underline-offset: 0.1875em;
+  }
+
+  a:hover {
+    text-decoration-color: currentColor;
+  }
+
+  .text {
+    color: var(--doc-text);
+    font-size: 1rem;
+    line-height: 1.5rem;
+  }
+</style>

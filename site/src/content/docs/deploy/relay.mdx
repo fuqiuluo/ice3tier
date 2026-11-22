@@ -1,0 +1,71 @@
+---
+title: 配置中继
+description: 连不通的节点之间经中继转发，至少要有一个。
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+
+两个节点能直连就直连：在同一个局域网里、有开放的端口，或者打洞成功。连不通时经中继转发。
+
+:::caution
+没有中继的话，连不通的一对节点之间就是不通的。
+:::
+
+中继通常就放在跑 controller 的那台服务器上。
+
+<Steps>
+
+1. **声明这台机器可以作为中继。** 按 [添加节点](../nodes/) 在服务器上也装一个节点，加上 `--can-relay`：
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+     sh -s -- --token <注册令牌> --can-relay
+   ```
+
+   已经加入的节点：
+
+   <Tabs syncKey="service">
+     <TabItem label="Linux">
+       ```sh
+       sudo i3t set can-relay on
+       sudo systemctl restart i3t
+       ```
+     </TabItem>
+     <TabItem label="macOS">
+       ```sh
+       sudo i3t set can-relay on
+       sudo launchctl kickstart -k system/com.github.fuqiuluo.ice3tier
+       ```
+     </TabItem>
+   </Tabs>
+
+2. **放行端口。** 在服务器上放行 UDP 20330 和 TCP 20330。
+
+3. **启用中继。**
+
+   <Tabs syncKey="admin">
+     <TabItem label="Web 界面">
+       在节点页打开中继开关。
+     </TabItem>
+     <TabItem label="命令行">
+       ```sh
+       i3tctl relay enable <节点>
+       ```
+
+       它会列出这个节点的各个地址，以及 controller 连不连得上。
+     </TabItem>
+   </Tabs>
+
+</Steps>
+
+声明和启用缺一不可：机器自己声明可以作为中继，管理员再把它打开。
+
+## 中继的地址
+
+中继的地址是自动找出来的。只有机房或路由器把另一个 IP 上的端口映射到这台机器时才需要写明，写完重启节点：
+
+```sh
+sudo i3t set relay-address <IP>:<端口>
+```
+
+下一步：[检查](../verify/)。

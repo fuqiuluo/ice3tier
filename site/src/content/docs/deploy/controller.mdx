@@ -1,0 +1,61 @@
+---
+title: 安装 controller
+description: 在服务器上装好 controller，打开 Web 界面，新建第一个网络。
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+
+<Steps>
+
+1. **安装。** 在服务器上：
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+     sh -s -- --controller --public-addr <公网地址>:20331
+   ```
+
+   `<公网地址>` 是节点连这台机器用的 IP 或域名。它会写进每一个注册令牌，所以要选一个不会变的。用域名的话，以后可以把 controller 搬到别的机器上。
+
+   脚本把 `i3t-controller` 和 `i3tctl` 装到 `/usr/local/bin`，建好 systemd 服务 `i3t-controller`（专用的系统用户，开机自启）并启动它。
+
+2. **存好管理令牌。** 脚本最后打印管理令牌：
+
+   ```
+   管理令牌（只显示这一次）：
+
+       <管理令牌>
+   ```
+
+   Web 界面和 `i3tctl` 都用它登录，之后不会再显示。丢了的话见 [管理令牌丢了](../../maintain/admin-token/)。
+
+3. **查看服务状态。**
+
+   ```sh
+   systemctl status i3t-controller
+   ```
+
+4. **新建网络。**
+
+   <Tabs syncKey="admin">
+     <TabItem label="Web 界面">
+       Web 界面只监听服务器的 `127.0.0.1:20332`，而且是明文 HTTP，从外面打不开。在你自己的电脑上用 SSH 转发端口：
+
+       ```sh
+       ssh -L 20332:127.0.0.1:20332 <用户>@<服务器>
+       ```
+
+       保持这个会话不断，打开 [http://127.0.0.1:20332](http://127.0.0.1:20332)，用管理令牌登录，新建一个网络，比如 `home`。
+     </TabItem>
+     <TabItem label="命令行">
+       在服务器上：
+
+       ```sh
+       export I3T_ADMIN_TOKEN=<管理令牌>
+       i3tctl network create home
+       ```
+     </TabItem>
+   </Tabs>
+
+</Steps>
+
+下一步：[添加节点](../nodes/)。

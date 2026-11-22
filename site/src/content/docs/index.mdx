@@ -1,0 +1,80 @@
+---
+title: 文档
+description: ice3tier 的文档。自己托管的组网工具，把你自己的机器连成一个网。
+editUrl: false
+---
+
+import Doc from '../../components/Doc.astro'
+import DocList from '../../components/DocList.astro'
+
+ice3tier 是自己托管的组网工具：把你自己的机器连成一个私有网络。节点之间能直连就直连，连不通就经你自己的中继转发。整个网络由一个带 Web 界面的 controller 管理。
+
+## 开始
+
+<DocList>
+  <Doc title="介绍" href="/start/intro/">
+    ice3tier 是什么、能做什么、怎么工作。
+  </Doc>
+  <Doc title="开始之前" href="/deploy/overview/">
+    要部署什么、机器要满足什么、要放行哪些端口。
+  </Doc>
+</DocList>
+
+## 部署
+
+<DocList>
+  <Doc title="安装 controller" href="/deploy/controller/">
+    在服务器上装好 controller，打开 Web 界面，新建第一个网络。
+  </Doc>
+  <Doc title="添加节点" href="/deploy/nodes/">
+    新建注册令牌，在每台机器上安装节点并加入网络。
+  </Doc>
+  <Doc title="配置中继" href="/deploy/relay/">
+    连不通的节点之间经中继转发，至少要有一个。
+  </Doc>
+  <Doc title="检查" href="/deploy/verify/">
+    确认节点连上了 controller，节点之间互相能通。
+  </Doc>
+</DocList>
+
+## 维护
+
+<DocList>
+  <Doc title="升级" href="/maintain/upgrade/">
+    节点自己更新，controller 手动升级。
+  </Doc>
+  <Doc title="备份和恢复" href="/maintain/backup/">
+    备份 controller 的数据，在原来的或新的服务器上恢复。
+  </Doc>
+  <Doc title="管理令牌丢了" href="/maintain/admin-token/">
+    重置管理令牌。
+  </Doc>
+  <Doc title="卸载" href="/maintain/uninstall/">
+    卸载节点和 controller。
+  </Doc>
+</DocList>
+
+## 开关与设置
+
+<DocList>
+  <Doc title="合并小包" href="/switches/bundle-small-packets/">
+    合并小包是什么、怎么起作用、打开有什么用、代价是什么。
+  </Doc>
+  <Doc title="QUIC 确认频率" href="/switches/ack-frequency/">
+    QUIC 确认阈值和 QUIC 确认最长等待是什么、管哪些流量、怎么起作用、什么时候该改。
+  </Doc>
+</DocList>
+
+## 参考
+
+<DocList>
+  <Doc title="安装脚本" href="/reference/install-script/">
+    安装脚本的选项，以及它建的文件。
+  </Doc>
+  <Doc title="其他安装方式" href="/reference/other-install/">
+    连不上 GitHub 时怎么装、手动下载、从源码构建。
+  </Doc>
+  <Doc title="常见问题" href="/reference/troubleshooting/">
+    常见的现象和处理办法。
+  </Doc>
+</DocList>

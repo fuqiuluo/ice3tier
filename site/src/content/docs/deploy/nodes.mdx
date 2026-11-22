@@ -1,0 +1,99 @@
+---
+title: 添加节点
+description: 新建注册令牌，在每台机器上安装节点并加入网络。
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
+
+每台机器用自己的注册令牌加入。一个令牌只能用一次，默认 24 小时后过期。
+
+<Steps>
+
+1. **新建令牌。**
+
+   <Tabs syncKey="admin">
+     <TabItem label="Web 界面">
+       点「添加节点」，点「新建令牌」，再点「仅复制令牌」。
+     </TabItem>
+     <TabItem label="命令行">
+       ```sh
+       i3tctl token create
+       ```
+     </TabItem>
+   </Tabs>
+
+2. **安装并加入。** 在要加入的机器上：
+
+   <Tabs syncKey="os">
+     <TabItem label="Linux / macOS">
+       ```sh
+       curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+         sh -s -- --token <注册令牌>
+       ```
+
+       它把节点装成系统服务、加入网络并启动，开机自启：Linux 上是以专用系统用户运行的 systemd 服务 `i3t`，macOS 上是 launchd 守护进程。
+     </TabItem>
+     <TabItem label="Windows">
+       以管理员身份打开 PowerShell，执行：
+
+       ```powershell
+       $env:I3T_TOKEN = '<注册令牌>'
+       irm https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.ps1 | iex
+       ```
+
+       节点装成系统服务 `i3t`：在后台运行，开机自动启动。
+     </TabItem>
+     <TabItem label="没有 systemd 的 Linux">
+       ```sh
+       curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+         sh -s -- --token <注册令牌>
+       ```
+
+       脚本只装 `/usr/local/bin/i3t` 并加入网络，不建服务。用你的 init 系统让 `sudo i3t run` 一直运行。
+     </TabItem>
+   </Tabs>
+
+3. **检查。** 在这台机器上：
+
+   <Tabs syncKey="os">
+     <TabItem label="Linux / macOS">
+       ```sh
+       sudo i3t status
+       ```
+     </TabItem>
+     <TabItem label="Windows">
+       ```powershell
+       i3t status
+       ```
+     </TabItem>
+     <TabItem label="没有 systemd 的 Linux">
+       ```sh
+       sudo i3t status
+       ```
+     </TabItem>
+   </Tabs>
+
+   `controller` 一行应该是「已连接」，Web 界面里这个节点显示在线。
+
+</Steps>
+
+每台机器用一个新的令牌，重复上面的步骤。
+
+## 安装时没有带令牌
+
+不带令牌也可以装。之后再加入，加入后服务会自动启动：
+
+<Tabs syncKey="os">
+  <TabItem label="Linux / macOS">
+    ```sh
+    echo <注册令牌> | sudo i3t join
+    ```
+  </TabItem>
+  <TabItem label="Windows">
+    ```powershell
+    echo <注册令牌> | i3t join
+    ```
+  </TabItem>
+</Tabs>
+
+下一步：[配置中继](../relay/)。

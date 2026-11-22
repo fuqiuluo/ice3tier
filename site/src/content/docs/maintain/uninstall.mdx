@@ -1,0 +1,44 @@
+---
+title: 卸载
+description: 卸载节点和 controller。
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components'
+
+## 节点
+
+<Tabs syncKey="os">
+  <TabItem label="Linux / macOS">
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+      sh -s -- --uninstall
+    ```
+
+    加 `--purge` 连它的身份和设置一起删。
+  </TabItem>
+  <TabItem label="Windows">
+    以管理员身份打开 PowerShell，执行：
+
+    ```powershell
+    $env:I3T_UNINSTALL = '1'
+    irm https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.ps1 | iex
+    ```
+
+    同时设 `$env:I3T_PURGE = '1'` 连它的身份和设置一起删。
+  </TabItem>
+</Tabs>
+
+卸载之后，在 Web 界面里把这个节点删掉，或者执行：
+
+```sh
+i3tctl node delete <节点>
+```
+
+## controller
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+  sh -s -- --uninstall --controller
+```
+
+加 `--purge` 连它的数据和配置一起删。

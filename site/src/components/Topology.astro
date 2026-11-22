@@ -1,0 +1,174 @@
+---
+import HardDrive from '@lucide/astro/icons/hard-drive'
+import Laptop from '@lucide/astro/icons/laptop'
+import LayoutDashboard from '@lucide/astro/icons/layout-dashboard'
+import Server from '@lucide/astro/icons/server'
+
+// “工作原理”的示意图：controller 下发配置，两个节点之间有直连和经中继两条路。
+// 画法照 Web 界面的总览图：灰底上的白色小卡片，虚线相连。不动。
+interface Props {
+  lang: string
+}
+
+const text =
+  Astro.props.lang === 'en'
+    ? {
+        label: 'The controller distributes configuration. Two nodes connect directly, or through a relay.',
+        direct: 'direct',
+        relay: 'relay',
+        viaRelay: 'via relay',
+        config: 'configuration',
+        controller: 'web UI · i3tctl',
+        node: 'node',
+      }
+    : {
+        label: 'controller 下发配置；两个节点之间直连，或者经中继。',
+        direct: '直连',
+        relay: '中继',
+        viaRelay: '经中继',
+        config: '配置',
+        controller: 'Web 界面 · i3tctl',
+        node: '节点',
+      }
+---
+
+<figure class="topology not-content">
+  <svg viewBox="0 0 600 372" role="img" aria-label={text.label}>
+    <g class="config">
+      <path d="M 300 72 L 300 160"></path>
+      <path d="M 216 50 C 130 60, 96 180, 96 300"></path>
+      <path d="M 384 50 C 470 60, 504 180, 504 300"></path>
+    </g>
+    <text class="note" x="310" y="121">{text.config}</text>
+
+    <path class="relay" d="M 150 300 C 150 232, 176 186, 216 186"></path>
+    <path class="relay" d="M 384 186 C 424 186, 450 232, 450 300"></path>
+    <path class="direct" d="M 192 326 L 408 326"></path>
+
+    <g class="tag direct">
+      <rect x="270" y="314" width="60" height="24" rx="12"></rect>
+      <text x="300" y="330.5" text-anchor="middle">{text.direct}</text>
+    </g>
+    <g class="tag relay">
+      <rect x="262" y="234" width="76" height="24" rx="12"></rect>
+      <text x="300" y="250.5" text-anchor="middle">{text.viaRelay}</text>
+    </g>
+
+    <g class="chip">
+      <rect class="box" x="216" y="20" width="168" height="52" rx="10"></rect>
+      <rect class="icon" x="226" y="32" width="28" height="28" rx="7"></rect>
+      <LayoutDashboard x="232" y="38" size={16} />
+      <text x="264" y="42">controller</text>
+      <text class="sub" x="264" y="59">{text.controller}</text>
+    </g>
+    <g class="chip">
+      <rect class="box" x="216" y="160" width="168" height="52" rx="10"></rect>
+      <rect class="icon" x="226" y="172" width="28" height="28" rx="7"></rect>
+      <Server x="232" y="178" size={16} />
+      <text x="264" y="182">vps</text>
+      <text class="sub" x="264" y="199">{text.relay}</text>
+    </g>
+    <g class="chip">
+      <rect class="box" x="24" y="300" width="168" height="52" rx="10"></rect>
+      <rect class="icon" x="34" y="312" width="28" height="28" rx="7"></rect>
+      <Laptop x="40" y="318" size={16} />
+      <text x="72" y="322">laptop</text>
+      <text class="sub" x="72" y="339">{text.node}</text>
+    </g>
+    <g class="chip">
+      <rect class="box" x="408" y="300" width="168" height="52" rx="10"></rect>
+      <rect class="icon" x="418" y="312" width="28" height="28" rx="7"></rect>
+      <HardDrive x="424" y="318" size={16} />
+      <text x="456" y="322">nas</text>
+      <text class="sub" x="456" y="339">{text.node}</text>
+    </g>
+  </svg>
+</figure>
+
+<style>
+  .topology {
+    margin-block: 1.25rem;
+    border: 1px solid var(--doc-line);
+    border-radius: 0.25rem;
+    max-width: 38rem;
+    background-color: var(--doc-surface);
+  }
+
+  svg[role='img'] {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+
+  path {
+    fill: none;
+    stroke-linecap: round;
+  }
+
+  .config path {
+    stroke: var(--doc-faint);
+    stroke-width: 1;
+    stroke-dasharray: 2 5;
+  }
+
+  .note {
+    fill: var(--doc-muted);
+    font-size: 11px;
+  }
+
+  path.direct {
+    stroke: var(--doc-ok);
+    stroke-width: 1.5;
+    stroke-dasharray: 6 4;
+  }
+
+  path.relay {
+    stroke: var(--doc-relay);
+    stroke-width: 1.5;
+    stroke-dasharray: 6 4;
+  }
+
+  .tag rect {
+    fill: var(--doc-bg);
+    stroke: var(--doc-line-strong);
+  }
+
+  .tag text {
+    font-size: 11.5px;
+    font-weight: 500;
+  }
+
+  .tag.direct text {
+    fill: var(--doc-ok);
+  }
+
+  .tag.relay text {
+    fill: var(--doc-relay);
+  }
+
+  .chip .box {
+    fill: var(--doc-bg);
+    stroke: var(--doc-line-strong);
+    stroke-width: 0.75;
+  }
+
+  .chip .icon {
+    fill: var(--doc-surface);
+  }
+
+  .chip :global(svg) {
+    color: var(--doc-muted);
+  }
+
+  .chip text {
+    fill: var(--doc-heading);
+    font-size: 13.5px;
+    font-weight: 500;
+  }
+
+  .chip .sub {
+    fill: var(--doc-muted);
+    font-size: 11px;
+    font-weight: 400;
+  }
+</style>

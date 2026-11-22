@@ -1,0 +1,54 @@
+---
+title: Introduction
+description: What ice3tier is, what it does and how it works.
+---
+
+import Topology from '../../../../components/Topology.astro'
+
+ice3tier connects the machines you own into one private network. Every node gets a virtual network adapter and a virtual IP. Nodes talk to each other directly whenever they can, and through your own relays when they cannot. One controller with a web UI manages the network.
+
+:::note
+ice3tier is under active development. Its APIs and protocols may still change between releases.
+:::
+
+## Features
+
+- **Virtual network.** Each node gets a virtual adapter and IP by default. Programs reach other nodes by IP or by name, for example `ssh nas.home.i3t`.
+- **Direct when possible.** Nodes connect directly on the same LAN, through an open port, or by hole punching. Otherwise traffic goes through a relay, over TCP when UDP is blocked. Relays forward encrypted data only.
+- **Exit proxies.** Open a SOCKS5/HTTP proxy on one node and send its traffic out through another node's network. Proxies support credentials and the optional ice3proxy transport; exits can have traffic quotas.
+- **Port forwarding.** Forward a port on one node to a service on another node or on that node's LAN.
+- **Group-based access control.** One kind of rule: nodes in group A may reach nodes in group B.
+- **Central management.** One controller with a web UI and a CLI. Run several isolated networks side by side.
+- **Signed self-updates.** Nodes fetch, verify, install and restart into new releases, and roll back if the new version fails to start.
+
+## How it works
+
+<Topology lang="en" />
+
+- Each pair of nodes shares a single end-to-end encrypted QUIC connection. Switching between the relay and a direct path does not break the connections on top of it.
+- Nodes authenticate each other and the controller by their Ed25519 public keys.
+- The controller only distributes configuration. Nodes that are already online keep working while it is down.
+
+## The three programs
+
+| Program | What it is | Where it goes |
+| --- | --- | --- |
+| `i3t-controller` | The controller, with the web UI and the admin API | A Linux machine every node can reach |
+| `i3tctl` | The admin command line, installed with the controller | The controller's machine |
+| `i3t` | The node | Every machine you want in the network |
+
+## Platform support
+
+Nodes:
+
+| Platform | Architectures |
+| --- | --- |
+| Linux | x86_64, aarch64 |
+| macOS | Apple silicon, Intel |
+| Windows | x86_64 |
+
+Installed with the install script, the controller needs a Linux machine with systemd (x86_64 or aarch64).
+
+## Next
+
+Follow [Deployment](../../deploy/overview/) to go from nothing to a working network.

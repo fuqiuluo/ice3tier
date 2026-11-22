@@ -1,0 +1,102 @@
+---
+import Check from '@lucide/astro/icons/check'
+import Monitor from '@lucide/astro/icons/monitor'
+import Moon from '@lucide/astro/icons/moon'
+import Sun from '@lucide/astro/icons/sun'
+import './menu.css'
+
+// 主题菜单：换掉 Starlight 自带的 <select>。按钮上只有一个图标（现在选的那一个），点开是三项。
+// 存的地方和 Starlight 一样（localStorage 的 starlight-theme），页面头部那段防闪烁的脚本照常起作用。
+const OPTIONS = [
+  { value: 'auto', label: Astro.locals.t('themeSelect.auto'), Icon: Monitor },
+  { value: 'light', label: Astro.locals.t('themeSelect.light'), Icon: Sun },
+  { value: 'dark', label: Astro.locals.t('themeSelect.dark'), Icon: Moon },
+]
+---
+
+<i3t-menu data-theme-menu data-value="auto">
+  <button
+    type="button"
+    class="i3t-menu-trigger"
+    aria-haspopup="menu"
+    aria-expanded="false"
+    aria-label={Astro.locals.t('themeSelect.accessibleLabel')}
+  >
+    {OPTIONS.map(({ value, Icon }) => <Icon class={`theme-icon theme-icon-${value}`} size={16} />)}
+  </button>
+  <div class="i3t-menu-popup" role="menu" hidden>
+    {
+      OPTIONS.map(({ value, label, Icon }) => (
+        <button type="button" class="i3t-menu-item" role="menuitemradio" aria-checked="false" data-theme-value={value}>
+          <Icon size={15} />
+          {label}
+          <Check class="check" size={14} stroke-width={2.5} />
+        </button>
+      ))
+    }
+  </div>
+</i3t-menu>
+
+{/* 内联：页面一出来就把按钮上的图标和菜单里的勾对上，不等脚本加载。 */}
+<script is:inline>
+  ;(() => {
+    const stored = typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme')
+    const theme = stored === 'light' || stored === 'dark' ? stored : 'auto'
+    document.querySelectorAll('[data-theme-menu]').forEach((menu) => {
+      menu.dataset.value = theme
+      menu.querySelectorAll('[data-theme-value]').forEach((item) => {
+        item.setAttribute('aria-checked', String(item.dataset.themeValue === theme))
+      })
+    })
+  })()
+</script>
+
+<style is:global>
+  [data-theme-menu] .theme-icon {
+    display: none;
+  }
+
+  [data-theme-menu][data-value='auto'] .theme-icon-auto,
+  [data-theme-menu][data-value='light'] .theme-icon-light,
+  [data-theme-menu][data-value='dark'] .theme-icon-dark {
+    display: block;
+  }
+</style>
+
+<script>
+  import './menu.ts'
+
+  type Theme = 'auto' | 'light' | 'dark'
+
+  const STORAGE_KEY = 'starlight-theme'
+  const parse = (value: unknown): Theme => (value === 'light' || value === 'dark' ? value : 'auto')
+  const preferred = (): 'light' | 'dark' => (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+  const stored = (): Theme => parse(typeof localStorage !== 'undefined' && localStorage.getItem(STORAGE_KEY))
+
+  function apply(theme: Theme): void {
+    document.documentElement.dataset.theme = theme === 'auto' ? preferred() : theme
+    document.querySelectorAll<HTMLElement>('[data-theme-menu]').forEach((menu) => {
+      menu.dataset.value = theme
+      menu.querySelectorAll<HTMLElement>('[data-theme-value]').forEach((item) => {
+        item.setAttribute('aria-checked', String(item.dataset.themeValue === theme))
+      })
+    })
+  }
+
+  document.addEventListener('click', (event) => {
+    const item = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-theme-value]') : null
+    if (!item) return
+    const theme = parse(item.dataset.themeValue)
+    // 和 Starlight 一样：跟随系统时存空串。
+    if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, theme === 'auto' ? '' : theme)
+    apply(theme)
+    item.closest<HTMLElement & { close?: () => void }>('i3t-menu')?.close?.()
+  })
+
+  // 跟随系统时，系统换了主题就跟着换。
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+    if (stored() === 'auto') apply('auto')
+  })
+
+  apply(stored())
+</script>

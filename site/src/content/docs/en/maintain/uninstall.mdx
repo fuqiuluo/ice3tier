@@ -1,0 +1,44 @@
+---
+title: Uninstalling
+description: Uninstall nodes and the controller.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components'
+
+## Node
+
+<Tabs syncKey="os">
+  <TabItem label="Linux / macOS">
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+      sh -s -- --uninstall
+    ```
+
+    Add `--purge` to delete its identity and settings as well.
+  </TabItem>
+  <TabItem label="Windows">
+    In a PowerShell window opened as administrator:
+
+    ```powershell
+    $env:I3T_UNINSTALL = '1'
+    irm https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.ps1 | iex
+    ```
+
+    Set `$env:I3T_PURGE = '1'` as well to delete its identity and settings.
+  </TabItem>
+</Tabs>
+
+After uninstalling, delete the node in the web UI, or run:
+
+```sh
+i3tctl node delete <node>
+```
+
+## Controller
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+  sh -s -- --uninstall --controller
+```
+
+Add `--purge` to delete its data and configuration as well.
