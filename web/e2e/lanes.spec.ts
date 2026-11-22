@@ -134,7 +134,7 @@ test.afterAll(async () => {
   hold?.kill('SIGKILL')
   for (const response of holding) response.destroy()
   await page.close()
-  controller.stop()
+  await controller.stop()
   http.close()
 })
 

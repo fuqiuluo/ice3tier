@@ -114,7 +114,7 @@ test.beforeAll(async ({ browser }) => {
 
 test.afterAll(async () => {
   await page.close()
-  controller.stop()
+  await controller.stop()
   http.close()
 })
 

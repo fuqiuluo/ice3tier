@@ -76,7 +76,7 @@ test.beforeAll(async ({ browser }) => {
 
 test.afterAll(async () => {
   await page.context().close()
-  controller.stop()
+  await controller.stop()
 })
 
 test('用管理令牌登录', async () => {

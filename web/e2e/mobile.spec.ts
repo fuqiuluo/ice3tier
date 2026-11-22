@@ -54,7 +54,7 @@ test.beforeAll(async ({ browser }) => {
 
 test.afterAll(async () => {
   await page.close()
-  controller.stop()
+  await controller.stop()
 })
 
 test('访问地图竖着排：看的那个节点和画布一样宽，按原大小画', async () => {

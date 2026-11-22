@@ -59,7 +59,7 @@ test.beforeAll(async ({ browser }) => {
 
 test.afterAll(async () => {
   await page.close()
-  controller.stop()
+  await controller.stop()
 })
 
 test('准备：三个节点，一个能自己更新、一个在容器里、一个程序目录不可写', async () => {

@@ -81,6 +81,35 @@ function freePort(): Promise<number> {
   })
 }
 
+function sendSignal(child: ChildProcess, group: boolean, signal: NodeJS.Signals): void {
+  try {
+    if (group && child.pid !== undefined) process.kill(-child.pid, signal)
+    else child.kill(signal)
+  } catch {
+    // 已经退出了。
+  }
+}
+
+/** 等子进程结束再删它的工作目录：直接 `rmSync` 会和正在写状态文件的退场流程撞出 ENOTEMPTY。 */
+async function terminate(child: ChildProcess, group: boolean, timeoutMs = 5_000): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolveExit) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(escalate)
+      clearTimeout(giveUp)
+      child.off('close', done)
+      resolveExit()
+    }
+    child.once('close', done)
+    sendSignal(child, group, 'SIGTERM')
+    const escalate = setTimeout(() => sendSignal(child, group, 'SIGKILL'), timeoutMs)
+    const giveUp = setTimeout(done, timeoutMs + 2_000)
+  })
+}
+
 async function waitFor<T>(
   what: string,
   probe: () => Promise<T | undefined> | T | undefined,
@@ -189,8 +218,8 @@ export class Controller {
       await controller.api('PATCH', '/update', { source: empty })
       return controller
     } catch (error) {
-      child.kill('SIGKILL')
-      rmSync(dir, { recursive: true, force: true })
+      await terminate(child, false, 1_000)
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
       throw error
     }
   }
@@ -333,19 +362,13 @@ export class Controller {
     })
   }
 
-  stop(): void {
-    for (const { child, group } of this.nodes) {
-      if (group && child.pid !== undefined) {
-        try {
-          process.kill(-child.pid, 'SIGTERM')
-        } catch {
-          // 已经退出了。
-        }
-      } else child.kill('SIGTERM')
-    }
-    this.process.kill('SIGTERM')
+  async stop(): Promise<void> {
+    await Promise.all([
+      ...this.nodes.map(({ child, group }) => terminate(child, group)),
+      terminate(this.process, false),
+    ])
     // 不可写的目录里的文件删不掉，先改回可写。
     for (const directory of this.readOnly) chmodSync(directory, 0o755)
-    rmSync(this.dir, { recursive: true, force: true })
+    rmSync(this.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
 }

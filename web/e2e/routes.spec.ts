@@ -44,7 +44,7 @@ test.beforeAll(async ({ browser }) => {
 
 test.afterAll(async () => {
   await page.close()
-  controller.stop()
+  await controller.stop()
 })
 
 test('准备：三个节点跑起来，互相连一下', async () => {

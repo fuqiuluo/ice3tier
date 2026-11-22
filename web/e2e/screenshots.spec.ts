@@ -116,7 +116,7 @@ test.afterAll(async () => {
   holder?.closeAllConnections()
   holder?.close()
   await page.close()
-  controller.stop()
+  await controller.stop()
   target.close()
   busy.close()
 })
