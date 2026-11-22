@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::Instrument;
 
-use crate::admission::{HandshakeLimits, Handshakes, Pass};
+use crate::admission::{HandshakeLimits, Handshakes, Pass, RefusalLog};
 use crate::entry::{Entry, LocalEntry};
 use crate::forward_health::{ForwardHealth, TargetFailure};
 use crate::routes::{NoRoutes, SharedRoutes};
@@ -648,14 +648,37 @@ fn free_bind(_socket: &socket2::SockRef<'_>) -> io::Result<()> {
 }
 
 async fn accept_loop<C: Connector + Datagrams>(shared: Arc<Shared<C>>, key: Key, listener: TcpListener, counters: Counters) {
+    // 来源不在白名单里的拒绝日志：有人一直往这个监听上连的时候不刷屏。
+    let mut refusals = RefusalLog::default();
     loop {
         match i3t_underlay::tcp_mss::accept(&listener).await {
             Ok((stream, from)) => {
-                // 代理和组网入口的连接先领握手的名额，领不到的在这里就关掉（`stream` 随之丢掉），不开任务。端口转发没有握手，不领。
+                // 先查来源，再领握手的名额、开任务：被拒绝的来源什么都不占。拒绝一律发 RST，内核也不用替这条连接收尾。
+                let netmap = Arc::clone(&shared.netmap.borrow());
+                if let Err(refusal) = key.admits(&netmap, &shared.local, from) {
+                    session::reset(stream);
+                    match refusal {
+                        // 防火墙开关关着时，局域网里一次端口扫描就是一串这样的连接：只记在 debug 里。
+                        Refusal::VirtualIp => tracing::debug!(
+                            listen = %key,
+                            %from,
+                            "拒绝了一条连接：监听在本节点的虚拟 IP 上，来源既不是本机，也不是可以访问本节点的节点（多半是从别的网卡进来的）"
+                        ),
+                        Refusal::AllowList => {
+                            if let Some(more) = refusals.due(time::Instant::now()) {
+                                tracing::info!(listen = %key, %from, more, "拒绝了一条连接：来源不在白名单里");
+                            }
+                        }
+                        Refusal::Gone => {}
+                    }
+                    continue;
+                }
+                // 代理和组网入口的连接要领握手的名额，领不到的在这里就关掉，不开任务。端口转发没有握手，不领。
                 let pass = match key {
                     Key::Proxy { .. } | Key::Local { .. } => match shared.handshakes.admit(from) {
                         Ok(pass) => Some(pass),
                         Err(full) => {
+                            session::reset(stream);
                             shared.handshakes.refused(&key, from, full);
                             continue;
                         }
@@ -664,7 +687,7 @@ async fn accept_loop<C: Connector + Datagrams>(shared: Arc<Shared<C>>, key: Key,
                 };
                 let connection = Connection::enter(&counters);
                 let span = tracing::info_span!("access", listen = %key, %from);
-                tokio::spawn(serve(Arc::clone(&shared), key.clone(), stream, from, connection, pass).instrument(span));
+                tokio::spawn(serve(Arc::clone(&shared), key.clone(), netmap, stream, from, connection, pass).instrument(span));
             }
             Err(error) => {
                 tracing::warn!(listen = %key, %error, "接受连接出错");
@@ -693,18 +716,19 @@ impl Drop for Connection {
     }
 }
 
-/// 处理一条刚接受的连接。代理的设置每次都从当前的 netmap 里取，所以改设置不需要重新绑定。
+/// 处理一条刚接受、来源已经查过的连接。
 ///
-/// `pass` 是代理和组网入口的连接领到的握手名额，被拒绝的连接在返回时还回去。
+/// 每条连接按接受它那一刻的 netmap（`netmap`，查来源用的也是这一份）里的设置处理，所以改设置不需要重新绑定。
+/// `pass` 是代理和组网入口的连接领到的握手名额。
 async fn serve<C: Connector + Datagrams>(
     shared: Arc<Shared<C>>,
     key: Key,
+    netmap: Arc<Netmap>,
     stream: TcpStream,
     from: SocketAddr,
     connection: Connection,
     pass: Option<Pass>,
 ) {
-    let netmap = Arc::clone(&shared.netmap.borrow());
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "设置不了 TCP_NODELAY");
     }
@@ -712,19 +736,10 @@ async fn serve<C: Connector + Datagrams>(
     if let Err(error) = i3t_flow::keep_alive(&stream) {
         tracing::debug!(%error, "客户端连接打不开内核保活，客户端悄悄消失时这条连接要等到有数据要发才会发现");
     }
-    // 防火墙开关关着时，局域网里一次端口扫描就是一串这样的连接：只记在 debug 里，不刷屏。
-    if !virtual_ip_admits(&netmap, key.bind(), from) {
-        return tracing::debug!(
-            "拒绝了一条连接：监听在本节点的虚拟 IP 上，来源既不是本机，也不是可以访问本节点的节点（多半是从别的网卡进来的）"
-        );
-    }
+    // 下面都找得到：接受连接时在同一份 netmap 里找过（[`Key::admits`]）。
     match key {
         Key::Proxy { id, bind } => {
-            // 找不到说明它刚从 netmap 里删掉，监听马上就会关。
             let Some(proxy) = netmap.me.proxies.iter().find(|proxy| proxy.id == id && proxy.bind == bind) else { return };
-            if !allowed(&proxy.allow_from, from) {
-                return tracing::info!("拒绝了一条连接：来源不在这个代理的白名单里");
-            }
             session::proxy(&shared, &netmap, Entry::proxy(proxy), stream, from, &connection, pass).await;
         }
         Key::Local { name, .. } => {
@@ -734,10 +749,45 @@ async fn serve<C: Connector + Datagrams>(
         }
         Key::Forward { id, bind, .. } => {
             let Some(forward) = netmap.me.forwards.iter().find(|forward| forward.id == id && forward.bind == bind) else { return };
-            if !allowed(&forward.allow_from, from) {
-                return tracing::info!("拒绝了一条连接：来源不在这条端口转发的白名单里");
-            }
             session::forward(&shared, &netmap, forward, stream, from, &connection).await;
+        }
+    }
+}
+
+/// 一条刚接受的连接为什么不能进来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// 监听在本节点的虚拟 IP 上，来源既不是本机，也不是可以访问本节点的节点（[`virtual_ip_admits`]）。
+    VirtualIp,
+    /// 来源不在这个代理或者这条端口转发的白名单里（[`allowed`]）。
+    AllowList,
+    /// 这个代理、组网入口或者端口转发刚从设置里删掉，监听马上就会关。
+    Gone,
+}
+
+impl Key {
+    /// 来自 `from` 的连接能不能进这个监听：它还在 `netmap`（组网入口是 `local`）里，来源过得了虚拟 IP 的限制和白名单。
+    fn admits(&self, netmap: &Netmap, local: &[LocalEntry], from: SocketAddr) -> Result<(), Refusal> {
+        if !virtual_ip_admits(netmap, self.bind(), from) {
+            return Err(Refusal::VirtualIp);
+        }
+        let allow_from = match self {
+            Self::Proxy { id, bind } => {
+                netmap.me.proxies.iter().find(|proxy| proxy.id == *id && proxy.bind == *bind).map(|proxy| proxy.allow_from.as_slice())
+            }
+            Self::Forward { id, bind, .. } => netmap
+                .me
+                .forwards
+                .iter()
+                .find(|forward| forward.id == *id && forward.bind == *bind)
+                .map(|forward| forward.allow_from.as_slice()),
+            // 组网入口没有白名单：它只在回环地址上。
+            Self::Local { name, .. } => local.iter().any(|entry| entry.name == *name).then_some(&[][..]),
+        };
+        match allow_from {
+            None => Err(Refusal::Gone),
+            Some(allow_from) if !allowed(allow_from, from) => Err(Refusal::AllowList),
+            Some(_) => Ok(()),
         }
     }
 }

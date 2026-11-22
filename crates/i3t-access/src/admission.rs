@@ -44,13 +44,20 @@ pub(crate) struct Handshakes(Arc<Inner>);
 struct Inner {
     limits: HandshakeLimits,
     counts: Mutex<Counts>,
-    refusals: Mutex<RefusalLog>,
+    refusals: Mutex<Refusals>,
 }
 
 #[derive(Debug, Default)]
 struct Counts {
     by_source: HashMap<SourceHost, usize>,
     total: usize,
+}
+
+/// 拒绝的日志，两种原因各自限速：一个来源一直撞上它自己的上限时，全节点满了的那一条照样记得下来。
+#[derive(Debug, Default)]
+struct Refusals {
+    node: RefusalLog,
+    source: RefusalLog,
 }
 
 /// 领不到名额的原因。
@@ -96,9 +103,17 @@ impl Handshakes {
         Ok(Pass { handshakes: Arc::clone(&self.0), source })
     }
 
-    /// 记一次拒绝。日志限速：有人一直往上连的时候不刷屏。
+    /// 记一次拒绝。日志按原因限速：有人一直往上连的时候不刷屏。
     pub(crate) fn refused(&self, listen: &impl fmt::Display, from: SocketAddr, full: Full) {
-        let Some(more) = self.0.refusals.lock().expect("handshake refusal log mutex poisoned").due(Instant::now()) else { return };
+        let due = {
+            let mut refusals = self.0.refusals.lock().expect("handshake refusal log mutex poisoned");
+            let log = match full {
+                Full::Node => &mut refusals.node,
+                Full::Source => &mut refusals.source,
+            };
+            log.due(Instant::now())
+        };
+        let Some(more) = due else { return };
         let HandshakeLimits { total, per_source } = self.0.limits;
         tracing::warn!(%listen, %from, more, total, per_source, "{full}");
     }
@@ -127,18 +142,18 @@ impl Drop for Pass {
     }
 }
 
-/// 拒绝日志的限速。
+/// 拒绝日志的限速：最多每 [`REFUSAL_LOG_INTERVAL`] 记一条。
 #[derive(Debug, Default)]
-struct RefusalLog {
+pub(crate) struct RefusalLog {
     logged: Option<Instant>,
     skipped: u64,
 }
 
 impl RefusalLog {
     /// 这一次拒绝要不要记日志。要的话返回上一条之后又悄悄拒绝了多少条。
-    fn due(&mut self, now: Instant) -> Option<u64> {
+    pub(crate) fn due(&mut self, now: Instant) -> Option<u64> {
         if self.logged.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_LOG_INTERVAL) {
-            self.skipped += 1;
+            self.skipped = self.skipped.saturating_add(1);
             return None;
         }
         self.logged = Some(now);
@@ -213,6 +228,27 @@ mod tests {
         assert_eq!(counted(&handshakes), (0, 0));
         let none = Handshakes::new(HandshakeLimits { total: 0, per_source: 4 });
         assert_eq!(none.admit(at("127.0.0.1:1000")).unwrap_err(), Full::Node);
+    }
+
+    #[test]
+    fn a_source_hitting_its_own_limit_does_not_hide_a_full_node() {
+        let handshakes = Handshakes::new(HandshakeLimits::default());
+        let due = |full: Full| {
+            let mut refusals = handshakes.0.refusals.lock().unwrap();
+            let log = match full {
+                Full::Node => &mut refusals.node,
+                Full::Source => &mut refusals.source,
+            };
+            log.logged.is_none()
+        };
+        let from = at("192.0.2.1:1000");
+        handshakes.refused(&"代理 1", from, Full::Source);
+        handshakes.refused(&"代理 1", from, Full::Source);
+        assert!(!due(Full::Source), "这个来源的那一条刚记过");
+        assert!(due(Full::Node), "全节点满了的那一条还没记过，照样会记");
+        handshakes.refused(&"代理 1", from, Full::Node);
+        assert_eq!(handshakes.0.refusals.lock().unwrap().source.skipped, 1);
+        assert_eq!(handshakes.0.refusals.lock().unwrap().node.skipped, 0);
     }
 
     #[test]

@@ -34,5 +34,6 @@ mod tests {
         assert_eq!(of("[::ffff:203.0.113.7]:1000"), of("203.0.113.7:1"), "双栈 socket 上的 IPv4 客户端按 IPv4 算");
         assert_eq!(of("127.0.0.1:1000"), None);
         assert_eq!(of("[::1]:1000"), None);
+        assert_eq!(of("[::ffff:127.0.0.1]:1000"), None, "双栈 socket 上的本机程序");
     }
 }

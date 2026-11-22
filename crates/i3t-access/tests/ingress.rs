@@ -348,11 +348,7 @@ async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStr
 
 /// 用户名密码认证的 SOCKS5 握手。认证通过时接着 CONNECT 一个域名，返回应答码；没通过时返回 `None`（代理随后关掉连接）。
 async fn socks5_login(proxy: SocketAddr, username: &str, password: &str, host: &str, port: u16) -> Option<(u8, TcpStream)> {
-    socks5_login_over(TcpStream::connect(proxy).await.unwrap(), username, password, host, port).await
-}
-
-/// 同 [`socks5_login`]，在已经连上代理的 `stream` 上做。
-async fn socks5_login_over(mut stream: TcpStream, username: &str, password: &str, host: &str, port: u16) -> Option<(u8, TcpStream)> {
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
     exchange(&mut stream, &[5, 1, 2], &[5, 2]).await;
     let auth = [
         &[1, u8::try_from(username.len()).unwrap()][..],
@@ -501,41 +497,76 @@ i3t_lane::on_both_transports! {
     }
 }
 
-i3t_lane::on_both_transports! {
-    async fn a_source_at_its_limit_leaves_the_remaining_places_to_other_sources() {
-        let Some(lan_ip) = non_loopback_address() else {
-            eprintln!("跳过：这台机器只有回环网卡");
-            return;
-        };
-        let mut netmap = netmap();
-        netmap.me.proxies = vec![guarded(1, ListenerProtocol::Socks5, "0.0.0.0:0", "alice", "s3cret")];
-        let limits = HandshakeLimits { total: 5, per_source: 2 };
-        let mut world = World::start_with(netmap, |access| access.with_handshake_limits(limits)).await;
-        let port = world.proxy(1).await.port();
-        let (lan, loopback) = (SocketAddr::new(lan_ip, port), SocketAddr::new([127, 0, 0, 1].into(), port));
+#[tokio::test]
+async fn failed_and_http_handshakes_give_their_place_back_and_port_forwards_need_none() {
+    let mut netmap = netmap();
+    netmap.me.proxies = vec![guarded(1, ListenerProtocol::Http, "127.0.0.1:0", "alice", "s3cret")];
+    netmap.me.forwards = vec![forward(7, ForwardProtocol::Tcp, "127.0.0.1:0")];
+    let limits = HandshakeLimits { total: 1, ..HandshakeLimits::default() };
+    let mut world = World::start_with(netmap, |access| access.with_handshake_limits(limits)).await;
+    let (proxy, forwarded) = (world.proxy(1).await, world.forward(7).await);
+    let connect = |credentials: &str| format!("CONNECT example.com:443 HTTP/1.1\r\n{}\r\n", basic(credentials));
 
-        // 从局域网地址来的两条不说话的连接用完了这个来源的名额，它的第三条被立刻关掉。
-        let _quiet_lan = [TcpStream::connect(lan).await.unwrap(), TcpStream::connect(lan).await.unwrap()];
-        world.await_connections(1, 2).await;
-        assert_closed(&mut TcpStream::connect(lan).await.unwrap()).await;
-
-        // 别的来源（这里是本机的程序）用剩下的名额，照样做得完握手。
-        let (code, _connected) = socks5_login(loopback, "alice", "s3cret", "example.com", 443).await.unwrap();
-        assert_eq!(code, 0);
-        world.next_open().await;
-
-        // 本机的程序不按来源限制，只算在全节点的总数里：三条不说话的也接，占满剩下的名额之后，谁新来都被关掉。
-        let _quiet_here: Vec<TcpStream> = vec![
-            TcpStream::connect(loopback).await.unwrap(),
-            TcpStream::connect(loopback).await.unwrap(),
-            TcpStream::connect(loopback).await.unwrap(),
-        ];
-        world.await_connections(1, 6).await;
-        for proxy in [loopback, lan] {
-            assert_closed(&mut TcpStream::connect(proxy).await.unwrap()).await;
-        }
-        world.assert_no_open();
+    // 只有一个名额。密码不对的回 407、关掉连接，名额还回来，下一条才进得来。
+    for _ in 0..3 {
+        let answer = plain_http(proxy, connect("alice:wrong").as_bytes()).await;
+        assert!(answer.starts_with("HTTP/1.1 407 "), "{answer:?}");
+        world.await_connections(1, 0).await;
     }
+    // 对的密码：握手一完成名额就还了，隧道开着也不占。
+    let mut tunnel = TcpStream::connect(proxy).await.unwrap();
+    exchange(&mut tunnel, connect("alice:s3cret").as_bytes(), b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+    world.next_open().await;
+    let mut another = TcpStream::connect(proxy).await.unwrap();
+    exchange(&mut another, connect("alice:s3cret").as_bytes(), b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+    world.next_open().await;
+    assert_echo(&mut tunnel).await;
+
+    // 一条不说话的连接占着唯一的名额：代理上新来的被关掉，端口转发不领名额，照常。
+    let _quiet = TcpStream::connect(proxy).await.unwrap();
+    world.await_connections(1, 3).await;
+    assert_closed(&mut TcpStream::connect(proxy).await.unwrap()).await;
+    let mut stream = TcpStream::connect(forwarded).await.unwrap();
+    assert_echo(&mut stream).await;
+    assert_eq!(world.next_open().await.target, Target::Forward { id: 7 });
+    world.assert_no_open();
+}
+
+// 测的是接受连接时的名额，和流走哪种传输无关；跳过时也不能要求 lane 上有字节经过。
+#[tokio::test]
+async fn a_source_at_its_limit_leaves_the_remaining_places_to_other_sources() {
+    let Some(lan_ip) = non_loopback_address() else {
+        eprintln!("跳过：这台机器只有回环网卡");
+        return;
+    };
+    let mut netmap = netmap();
+    netmap.me.proxies = vec![guarded(1, ListenerProtocol::Socks5, "0.0.0.0:0", "alice", "s3cret")];
+    let limits = HandshakeLimits { total: 5, per_source: 2 };
+    let mut world = World::start_with(netmap, |access| access.with_handshake_limits(limits)).await;
+    let port = world.proxy(1).await.port();
+    let (lan, loopback) = (SocketAddr::new(lan_ip, port), SocketAddr::new([127, 0, 0, 1].into(), port));
+
+    // 从局域网地址来的两条不说话的连接用完了这个来源的名额，它的第三条被立刻关掉。
+    let _quiet_lan = [TcpStream::connect(lan).await.unwrap(), TcpStream::connect(lan).await.unwrap()];
+    world.await_connections(1, 2).await;
+    assert_closed(&mut TcpStream::connect(lan).await.unwrap()).await;
+
+    // 别的来源（这里是本机的程序）用剩下的名额，照样做得完握手。
+    let (code, _connected) = socks5_login(loopback, "alice", "s3cret", "example.com", 443).await.unwrap();
+    assert_eq!(code, 0);
+    world.next_open().await;
+
+    // 本机的程序不按来源限制，只算在全节点的总数里：三条不说话的也接，占满剩下的名额之后，谁新来都被关掉。
+    let _quiet_here: Vec<TcpStream> = vec![
+        TcpStream::connect(loopback).await.unwrap(),
+        TcpStream::connect(loopback).await.unwrap(),
+        TcpStream::connect(loopback).await.unwrap(),
+    ];
+    world.await_connections(1, 6).await;
+    for proxy in [loopback, lan] {
+        assert_closed(&mut TcpStream::connect(proxy).await.unwrap()).await;
+    }
+    world.assert_no_open();
 }
 
 #[tokio::test]
