@@ -6,18 +6,30 @@
 //! - 中转帧被 relay 原样转出去，所以解析出来的头重新编码、接上包，必须正好是原来的数据报；
 //!   `forwarding_header_len` 和 `relayed_dst` 必须和完整的解析说的一样。
 //! - 解析得出来的帧，编码之后再解析，得到的是同一帧。
+//! - 封好的网络包：分类和 [`SealedHeader::parse`] 说的一样，头重新编码之后是原来的开头，relay 不把它当成要转发的帧。
 
 #![no_main]
 
 use i3t_proto::backbone::Row;
 use i3t_proto::beacon::Beacon;
 use i3t_proto::datagram::{self, Datagram, RelayHeader};
+use i3t_proto::sealed::SealedHeader;
 use i3t_proto::{addr, probe, session};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    match Datagram::parse(data) {
+    let parsed = Datagram::parse(data);
+    assert_eq!(matches!(parsed, Ok(Datagram::Sealed(_))), SealedHeader::parse(data).is_some(), "是不是封好的网络包，两处说的不一样");
+    match parsed {
         Ok(Datagram::Conn(packet)) => assert_eq!(packet, data, "连接包就是整个数据报"),
+        Ok(Datagram::Sealed(packet)) => {
+            assert_eq!(packet, data, "封好的网络包就是整个数据报");
+            let header = SealedHeader::parse(data).expect("上面核对过：分类成封好的网络包的一定取得出头");
+            assert_eq!(header.to_bytes(), data[..SealedHeader::LEN], "头重新编码之后对不上原来的开头");
+            assert!(data.len() > SealedHeader::OVERHEAD, "头和校验之外至少还有一个字节");
+            assert_eq!(datagram::forwarding_header_len(data), None, "它不是要 relay 转发的帧");
+            assert_eq!(datagram::relayed_dst(data), None);
+        }
         Ok(Datagram::Relayed { header, packet }) => {
             assert_eq!([&header.to_bytes()[..], packet].concat(), data, "一级中转的头重新编码之后对不上原来的数据报");
             assert_eq!(datagram::forwarding_header_len(data), Some(RelayHeader::LEN));
