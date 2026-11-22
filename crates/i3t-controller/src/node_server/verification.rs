@@ -132,6 +132,8 @@ mod tests {
     #[test]
     fn full_quota_warnings_distinguish_source_and_global_limits_and_are_throttled() {
         let log = tempfile::NamedTempFile::new().unwrap();
+        // 其他测试线程也会触发这个日志点。显式登记静默和捕获两个订阅者，让 tracing 按当前线程选择。
+        let _silent = tracing::Dispatch::new(tracing_subscriber::fmt().with_max_level(tracing::level_filters::LevelFilter::OFF).finish());
         let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(Mutex::new(log.reopen().unwrap())).finish();
         tracing::subscriber::with_default(subscriber, || {
             let a = Source::from(IpAddr::from([192, 0, 2, 1]));
