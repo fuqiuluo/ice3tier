@@ -155,16 +155,27 @@ class SupervisedNode(Node):
     def stop(self) -> None:
         if self.proc is None:
             return
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        # 看护脚本收到 SIGTERM 会立刻退出，但它的子进程 i3t 还在做优雅停机、可能继续往工作目录写状态文件；
+        # 必须等到整个进程组清空，否则外层 TemporaryDirectory 删目录时会撞出 ENOTEMPTY。
+        pgid = self.proc.pid
+        for sig, timeout in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
             try:
-                os.killpg(self.proc.pid, sig)
+                os.killpg(pgid, sig)
             except ProcessLookupError:
                 break
-            try:
-                self.proc.wait(timeout=3)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+            if self.proc.poll() is None:
+                try:
+                    self.proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    continue
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    self.proc = None
+                    return
+                time.sleep(0.05)
         self.proc = None
 
     def pid(self) -> int:
