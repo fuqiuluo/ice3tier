@@ -7,16 +7,14 @@ import { t } from '@/i18n'
 interface SaveBarProps {
   /** 上一次保存出的错。 */
   error: unknown
-  /** 左边的一句话：这个分区的设置什么时候生效之类。 */
-  note?: string
   canSave: boolean
   dirty: boolean
   pending: boolean
   onReset: () => void
 }
 
-/** 设置分区的底边：保存出的错，左边一句话，右边取消和保存。一个分区的几项一起保存。 */
-export function SaveBar({ error, note, canSave, dirty, pending, onReset }: SaveBarProps) {
+/** 设置分区的底边：保存出的错，右边取消和保存。一个分区的几项一起保存。 */
+export function SaveBar({ error, canSave, dirty, pending, onReset }: SaveBarProps) {
   const failure = formFailure(error, {})
   return (
     <>
@@ -26,7 +24,6 @@ export function SaveBar({ error, note, canSave, dirty, pending, onReset }: SaveB
         </div>
       ) : null}
       <footer className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2 border-t px-5 py-3">
-        {note !== undefined ? <p className="mr-auto text-[13px] text-muted-foreground">{note}</p> : null}
         <div className="flex items-center gap-2">
           <Button size="sm" onClick={onReset} disabled={!dirty || pending}>
             {t.common.cancel}

@@ -59,7 +59,6 @@ export const networks: Messages['networks'] = {
   saveSettings: 'Save',
   settingsSaved: 'Settings saved',
   connection: 'Connections',
-  connectionNote: 'The two QUIC settings apply to connections made from now on',
   ackThresholdLabel: 'QUIC ACK threshold',
   ackThresholdDesc:
     'A peer sends an ACK only after more than this many packets. Higher: fewer packets on the way back, so downloads get faster on a line with little upload',

@@ -16,7 +16,7 @@ const n = t.networks
 
 /**
  * 「连接」分区：节点之间的连接的参数，和选路那个分区一个样子。请对端怎样确认的两项，和合并小包的开关；别的连接参数接着往下加行。
- * 确认的两项节点只在建连接时用，所以底边写着它们"只对之后新建的连接生效"；合并小包节点收到就生效。
+ * 确认的两项节点只在建连接时用，改了之后对新建的连接生效；合并小包节点收到就生效。
  * 比合并小包旧的 controller 不报这一项：那时不显示这一行，也不提交它。
  */
 export function ConnectionSection({ network }: { network: Network }) {
@@ -144,7 +144,6 @@ export function ConnectionSection({ network }: { network: Network }) {
         </div>
         <SaveBar
           error={save.error}
-          note={n.connectionNote}
           canSave={dirty && nextThreshold !== null && nextDelay !== null}
           dirty={dirty}
           pending={save.isPending}

@@ -56,7 +56,6 @@ export const networks = {
   saveSettings: '保存',
   settingsSaved: '设置已保存',
   connection: '连接',
-  connectionNote: 'QUIC 的两项只对之后新建的连接生效',
   ackThresholdLabel: 'QUIC 确认阈值',
   ackThresholdDesc: '对端收到的包超过这个数才回一次确认。调大：回程的包更少，上传带宽小的线路下载更快',
   ackThresholdHint:

@@ -141,7 +141,7 @@ describe('网络', () => {
     expect(api.callsTo('PATCH /networks/1')[0]?.body).toMatchObject({ max_relay_hops: 2, class: 'bulk' })
   })
 
-  it('连接：两项确认设置一起保存，只提交这两项；写着只对新建的连接生效', async () => {
+  it('连接：两项确认设置一起保存，只提交这两项', async () => {
     const user = userEvent.setup()
     const api = setup()
     open('connection')
@@ -151,7 +151,6 @@ describe('网络', () => {
     expect(threshold).toHaveValue('3')
     expect(delay).toHaveValue('2')
     expect(save).toBeDisabled()
-    expect(screen.getByText(n.connectionNote)).toBeVisible()
     expect(screen.queryByText(t.common.modified)).not.toBeInTheDocument()
 
     await user.clear(threshold)
