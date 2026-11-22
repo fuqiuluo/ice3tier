@@ -17,6 +17,7 @@ New-Item -ItemType Directory -Path $work | Out-Null
 $installed = Join-Path $env:ProgramFiles 'ice3tier'
 $state = Join-Path $env:ProgramData 'i3t'
 $controller = $null
+$fileServer = $null
 
 function Step([string]$text) {
     Write-Host "`n=== $text"
@@ -51,6 +52,42 @@ function Wait-Online {
         Start-Sleep -Seconds 1
     }
     Fail 'the node did not come online within 60 s'
+}
+
+function Wait-Vnet {
+    $last = $null
+    for ($i = 0; $i -lt 45; $i++) {
+        try {
+            $nodes = @(Ctl node list)
+            if ($nodes.Count -gt 0) {
+                $detail = Ctl node show $nodes[0].id
+                $last = $detail.vnet
+                if (($null -ne $last) -and ($last.state -eq 'installed') -and ($last.firewall.accept.state -eq 'on')) {
+                    $ruleName = "ice3tier-$($last.device)"
+                    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+                    if ($null -ne $rule) {
+                        Write-Host "vnet ok: device=$($last.device) mtu=$($last.mtu) firewall=$($last.firewall.accept.state)"
+                        return
+                    }
+                }
+            }
+        } catch {
+            # Wait for the service and controller state to settle.
+        }
+        Start-Sleep -Seconds 1
+    }
+    $summary = if ($null -ne $last) { $last | ConvertTo-Json -Compress } else { 'null' }
+    Fail "virtual adapter and Windows Firewall rule did not become ready within 45 s (last vnet: $summary)"
+}
+
+function Get-FreeLoopbackPort {
+    $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return $listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
 }
 
 # Runs i3t with its two output streams merged into text. cmd does the merging: Windows PowerShell turns a program's
@@ -107,6 +144,7 @@ try {
     $token | & i3t join --can-relay
     if ($LASTEXITCODE -ne 0) { Fail 'i3t join failed' }
     Wait-Online
+    Wait-Vnet
     & i3t status
     if ($LASTEXITCODE -ne 0) { Fail 'i3t status failed' }
     $node = Get-CimInstance Win32_Service -Filter "Name='i3t'"
@@ -122,11 +160,52 @@ try {
     }
     if (($revived -eq 0) -or ($revived -eq $killed)) { Fail 'the service did not come back within 30 s' }
     Wait-Online
+    Wait-Vnet
 
     Step 'install over the joined node, piped the way the one-line command does it'
     $env:I3T_FROM = $dir
     Get-Content -LiteralPath $installer -Raw | Invoke-Expression
     Wait-Online
+    Wait-Vnet
+
+    Step 'uninstall without purge keeps state, and reinstall from zip archive brings the node back'
+    $env:I3T_UNINSTALL = '1'
+    Get-Content -LiteralPath $installer -Raw | Invoke-Expression
+    if (Test-Path -LiteralPath $installed) { Fail "$installed is still there after uninstall" }
+    if (Get-Service -Name i3t -ErrorAction SilentlyContinue) { Fail 'the service is still registered after uninstall' }
+    if (-not (Test-Path -LiteralPath (Join-Path $state 'controller.json'))) { Fail 'enrollment state was deleted without I3T_PURGE' }
+    $leftRules = @(Get-NetFirewallRule -Group 'ice3tier' -ErrorAction SilentlyContinue)
+    if ($leftRules.Count -gt 0) { Fail "firewall rules left after uninstall: $($leftRules.Name -join ', ')" }
+
+    $releaseRoot = Join-Path $work 'releases'
+    $latestDir = Join-Path $releaseRoot 'latest\download'
+    New-Item -ItemType Directory -Path $latestDir -Force | Out-Null
+    $zipFiles = @((Join-Path $dir 'i3t.exe'), (Join-Path $dir 'wintun.dll'))
+    $licensePath = Join-Path $dir 'wintun-LICENSE.txt'
+    if (Test-Path -LiteralPath $licensePath) { $zipFiles += $licensePath }
+    Compress-Archive -Path $zipFiles -DestinationPath (Join-Path $latestDir 'i3t-windows-x86_64.zip') -Force
+    $httpPort = Get-FreeLoopbackPort
+    $python = (Get-Command python -ErrorAction Stop).Source
+    $fileServer = Start-Process -FilePath $python -PassThru -NoNewWindow `
+        -ArgumentList '-I', '-m', 'http.server', $httpPort, '--bind', '127.0.0.1', '--directory', $releaseRoot `
+        -RedirectStandardOutput (Join-Path $work 'http.out') -RedirectStandardError (Join-Path $work 'http.err')
+    $httpReady = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.Connect('127.0.0.1', $httpPort)
+            $client.Close()
+            $httpReady = $true
+            break
+        } catch {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if (-not $httpReady) { Fail 'local release HTTP server did not start' }
+    $env:I3T_RELEASE_BASE = "http://127.0.0.1:$httpPort"
+    Get-Content -LiteralPath $installer -Raw | Invoke-Expression
+    Wait-Online
+    Wait-Vnet
 
     Step 'uninstall and purge, piped too'
     $env:I3T_UNINSTALL = '1'
@@ -137,6 +216,8 @@ try {
     }
     if (Get-Service -Name i3t -ErrorAction SilentlyContinue) { Fail 'the service is still registered' }
     if (Get-Process -Name i3t -ErrorAction SilentlyContinue) { Fail 'an i3t process is still running' }
+    $leftRules = @(Get-NetFirewallRule -Group 'ice3tier' -ErrorAction SilentlyContinue)
+    if ($leftRules.Count -gt 0) { Fail "firewall rules left after purge: $($leftRules.Name -join ', ')" }
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     if (@($machinePath -split ';') -contains $installed) { Fail 'the install directory is still on the machine PATH' }
 
@@ -148,6 +229,7 @@ try {
     Get-Content -LiteralPath (Join-Path $work 'ctl.err') -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue
     throw
 } finally {
+    if ($fileServer -and (-not $fileServer.HasExited)) { Stop-Process -Id $fileServer.Id -Force -ErrorAction SilentlyContinue }
     if ($controller -and (-not $controller.HasExited)) { Stop-Process -Id $controller.Id -Force -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }

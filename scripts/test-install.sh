@@ -73,6 +73,51 @@ wait_online() {
     done
 }
 
+# Wait for the node to report a working virtual adapter (and firewall / resolved on Linux) to the controller.
+wait_vnet() {
+    require_resolved=0
+    if [ "$os" = "Linux" ] \
+        && systemctl is-active -q systemd-resolved 2>/dev/null \
+        && systemctl is-active -q polkit 2>/dev/null \
+        && [ -f /etc/polkit-1/rules.d/50-i3t-resolved.rules ]; then
+        require_resolved=1
+    fi
+    i=0
+    while [ "$i" -lt 45 ]; do
+        node_id=$(ctl node list | python3 -I -c 'import json, sys; nodes = json.load(sys.stdin); print(nodes[0]["id"] if nodes else "")' 2>/dev/null || true)
+        if [ -n "$node_id" ] && ctl node show "$node_id" >"$work/node.json" 2>/dev/null; then
+            if python3 -I - "$work/node.json" "$os" "$require_resolved" <<'PY'
+import json, sys
+path, os_name, req_resolved = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+try:
+    with open(path, encoding="utf-8") as fh:
+        detail = json.load(fh)
+except Exception:
+    sys.exit(1)
+vnet = detail.get("vnet") or {}
+if vnet.get("state") != "installed":
+    sys.exit(1)
+fw = vnet.get("firewall") or {}
+accept = (fw.get("accept") or {}).get("state")
+guard = (fw.get("guard") or {}).get("state")
+names = (vnet.get("names") or {}).get("state")
+if os_name == "Linux":
+    if accept not in ("on", "not_needed") or guard != "on":
+        sys.exit(1)
+    if req_resolved and names != "resolved":
+        sys.exit(1)
+print(f"vnet ok: device={vnet.get('device')} mtu={vnet.get('mtu')} accept={accept} guard={guard} names={names}")
+PY
+            then
+                return 0
+            fi
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    fail "virtual adapter did not report ready within 45 s; last node detail: $(cat "$work/node.json" 2>/dev/null || true)"
+}
+
 # `sudo ARGS` must point at the service instead of starting a node.
 points_at_service() {
     if sudo "$@" 2>"$work/run.err"; then fail "sudo $* started a node"; fi
@@ -111,6 +156,7 @@ points_at_service env I3T_STATE_DIR="$work/elsewhere" i3t --state-dir /var/lib/i
 step "sudo i3t join joins and starts the service"
 printf '%s\n' "$token" | sudo i3t join --can-relay
 wait_online
+wait_vnet
 sudo i3t status
 if [ "$os" = "Linux" ]; then
     pid=$(systemctl show -p MainPID --value i3t)
@@ -128,6 +174,7 @@ step "install over the joined node"
 sudo sh "$repo/deploy/install.sh" --from "$dir"
 sleep 3
 wait_online
+wait_vnet
 if [ "$os" = "Darwin" ]; then
     step "install over the joined node with a changed launchd plist"
     printf '<!-- old -->\n' | sudo tee -a "/Library/LaunchDaemons/$label.plist" >/dev/null
@@ -135,7 +182,20 @@ if [ "$os" = "Darwin" ]; then
     if grep -q '<!-- old -->' "/Library/LaunchDaemons/$label.plist"; then fail "launchd plist was not replaced"; fi
     sleep 3
     wait_online
+    wait_vnet
 fi
+
+step "uninstall without --purge keeps state, and reinstall brings the node back"
+sudo sh "$repo/deploy/install.sh" --uninstall
+for path in /usr/local/bin/i3t /etc/systemd/system/i3t.service "/Library/LaunchDaemons/$label.plist"; do
+    [ ! -e "$path" ] || fail "$path is still there after --uninstall"
+done
+if pgrep -x i3t >/dev/null; then fail "an i3t process is still running after --uninstall"; fi
+sudo test -f /var/lib/i3t/controller.json || fail "state was deleted without --purge"
+sudo sh "$repo/deploy/install.sh" --from "$dir"
+sleep 3
+wait_online
+wait_vnet
 
 step "uninstall --purge"
 sudo sh "$repo/deploy/install.sh" --uninstall --purge
@@ -143,6 +203,9 @@ for path in /usr/local/bin/i3t /var/lib/i3t /etc/systemd/system/i3t.service "/Li
     [ ! -e "$path" ] || fail "$path is still there"
 done
 if pgrep -x i3t >/dev/null; then fail "an i3t process is still running"; fi
+if [ "$os" = "Linux" ] && ip link show i3t0 >/dev/null 2>&1; then
+    fail "i3t0 virtual adapter is still present after uninstall"
+fi
 
 if [ "$os" = "Linux" ]; then
     step "install controller and print its first-start admin token across TZ"
@@ -151,8 +214,27 @@ if [ "$os" = "Linux" ]; then
     ctl_pid=""
     PATH=/usr/local/bin:/usr/bin:/bin TZ=Asia/Shanghai sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 >"$work/ctl-install.out"
     cat "$work/ctl-install.out"
-    grep -q '^    [^ ]' "$work/ctl-install.out" || fail "controller install did not print the initial admin token"
+    ctl_token=$(sed -n 's/^    \([^ ]*\)$/\1/p' "$work/ctl-install.out" | head -n 1)
+    [ -n "$ctl_token" ] || fail "controller install did not print the initial admin token"
     systemctl is-active -q i3t-controller || fail "i3t-controller.service is not active"
+
+    step "upgrade installed controller in place without losing state"
+    i=0
+    until I3T_ADMIN_TOKEN="$ctl_token" "$dir/i3tctl" --json status >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -lt 30 ] || fail "installed controller admin API did not respond within 30 s"
+        sleep 1
+    done
+    I3T_ADMIN_TOKEN="$ctl_token" "$dir/i3tctl" --json network create upgrade-check >/dev/null
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller
+    systemctl is-active -q i3t-controller || fail "i3t-controller.service is not active after upgrade"
+    i=0
+    until I3T_ADMIN_TOKEN="$ctl_token" "$dir/i3tctl" --json network list 2>/dev/null \
+        | python3 -I -c 'import json, sys; sys.exit(0 if any(n["name"] == "upgrade-check" for n in json.load(sys.stdin)) else 1)'; do
+        i=$((i + 1))
+        [ "$i" -lt 30 ] || fail "installed controller lost state or failed to restart after upgrade"
+        sleep 1
+    done
 
     step "uninstall controller --purge"
     sudo sh "$repo/deploy/install.sh" --uninstall --controller --purge

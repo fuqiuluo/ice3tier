@@ -124,6 +124,40 @@ jobs:
           cp "$OUT_DIR/i3t.exe" wintun/i3t.exe
           "$(command -v python3 || command -v python)" -I -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED); [z.write(f'wintun/{name}', name) for name in ('i3t.exe', 'wintun.dll', 'wintun-LICENSE.txt')]; z.close()" "dist/i3t-$PLATFORM.zip"
           ls -l dist
+      # 上传发布之前先对产物做冒烟：核对三个程序的版本号、确认 controller 确实嵌进了 WebUI（不是空占位页）、
+      # Linux 核对 GLIBC 符号版本不超过 2.28、Windows 核对 zip 归档内容完整。
+      - name: Smoke-test the built programs
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            py=$(command -v python)
+          else
+            py=$(command -v python3)
+          fi
+          case "$PLATFORM" in
+            linux-x86_64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --version "$VERSION" --check-webui --check-glibc 2.28
+              ;;
+            linux-aarch64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --no-run --check-glibc 2.28
+              ;;
+            windows-x86_64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --version "$VERSION" --check-webui --check-zip "dist/i3t-$PLATFORM.zip"
+              ;;
+            macos-aarch64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --version "$VERSION" --check-webui
+              ;;
+            macos-x86_64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --no-run
+              ;;
+            *)
+              echo "::error::未配置平台 $PLATFORM 的冒烟校验"
+              exit 1
+              ;;
+          esac
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.platform }}

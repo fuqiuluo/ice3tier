@@ -95,10 +95,7 @@ export function describeLeg(leg: PathLeg, name: (id: NodeId) => string): LegView
   const reason = leg.reason ?? null
   return {
     state,
-    mode:
-      mode === null
-        ? null
-        : { label: textFor(p.mode, mode) ?? mode, hint: textFor(p.modeHint, mode) ?? '' },
+    mode: mode === null ? null : { label: textFor(p.mode, mode) ?? mode, hint: textFor(p.modeHint, mode) ?? '' },
     reason: reason === null || reason === '' ? null : reason,
     sourceLabel: textFor(p.source, state) ?? p.source.unknown,
     sourceTone: SOURCE_TONE[state],

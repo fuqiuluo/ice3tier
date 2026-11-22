@@ -188,7 +188,8 @@ export const nodes: Messages['nodes'] = {
         malformed: 'malformed',
       },
       dropHint: {
-        bad_source: "A peer sent packets whose source isn't its own virtual IP, or ICMP errors about someone else's packets",
+        bad_source:
+          "A peer sent packets whose source isn't its own virtual IP, or ICMP errors about someone else's packets",
         bad_destination: 'Packets addressed to someone other than this node',
         not_allowed: "Peers tried to reach things they aren't allowed to",
         unreachable: 'Programs here tried nodes that are offline, have no virtual network, or cannot be reached',

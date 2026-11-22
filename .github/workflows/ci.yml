@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -34,6 +37,10 @@ jobs:
       - name: One version everywhere
         if: matrix.os == 'ubuntu-latest'
         run: scripts/bump-version.sh --check
+      # fuzz/ 自成一个 workspace，平时 cargo test 不碰它；这里只做编译检查，防止内部接口变动把 fuzz 目标改坏。
+      - name: Fuzz targets compile
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       # 一个测试程序失败了也把剩下的跑完：一次运行就看得到这个平台上全部的失败。
@@ -82,7 +89,7 @@ jobs:
           grep -q '网卡 ' device-test.txt
 
   # 安装脚本在真的 systemd（ubuntu）和 launchd（macOS）上装一遍：不带令牌装、sudo i3t join 加入并启动、
-  # 覆盖重装、卸载干净。controller 起在同一台机器的回环上。
+  # 校验虚拟网卡与防火墙状态、覆盖重装、保留状态卸载再装、彻底卸载；Linux 上还测 controller 首次安装与原位升级。
   installer:
     name: install.sh (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -98,7 +105,7 @@ jobs:
       - name: Lint, and the copies inside match deploy/
         if: runner.os == 'Linux'
         run: |
-          shellcheck -s sh -S warning deploy/install.sh scripts/test-install.sh
+          shellcheck -s sh -S warning deploy/install.sh scripts/test-install.sh scripts/setup-e2e-env.sh
           for pair in "write_node_service deploy/systemd/i3t.service" \
                       "write_controller_service deploy/systemd/i3t-controller.service" \
                       "write_polkit_rule deploy/polkit/50-i3t-resolved.rules"; do
@@ -110,8 +117,8 @@ jobs:
       - name: Install, join, reinstall, uninstall
         run: scripts/test-install.sh target/debug
 
-  # Windows 的安装脚本在真的 Windows 上装一遍：装成系统服务、i3t join 加入并启动、进程被杀之后服务自己回来、
-  # 覆盖重装、卸载干净。用 Windows 自带的 PowerShell 5.1 跑：用户机器上有的就是它。
+  # Windows 的安装脚本在真的 Windows 上装一遍：装成系统服务、i3t join 加入并启动、校验虚拟网卡与防火墙规则、
+  # 进程被杀之后服务自己回来、覆盖重装、从 zip 归档下载重装、卸载干净。用 Windows 自带的 PowerShell 5.1 跑。
   installer-windows:
     name: install.ps1 (windows-latest)
     runs-on: windows-latest
@@ -130,7 +137,7 @@ jobs:
         run: scripts\test-install.ps1 target\debug
 
   web:
-    name: web (lint, typecheck, test, build)
+    name: web (format, lint, typecheck, test, build)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -147,10 +154,186 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  # 一次编出 E2E、WebUI 联调和 resolved 测试共用的 release 二进制，同时验证 web/dist 正确嵌进了 i3t-controller。
+  # 紧接着复用同一份 target/ 依赖缓存生成带临时测试签名钥匙的 release-kit，供 test_update.py 和 Playwright 联调共用。
+  e2e-build:
+    name: build release binaries & kit for e2e
+    needs: [web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Build release binaries (with embedded WebUI)
+        run: cargo build --release --locked -p i3t -p i3t-controller-bin -p i3tctl -p i3t-release
+      - name: Smoke-test embedded WebUI and versions
+        run: python3 scripts/smoke-release.py --bin-dir target/release --check-webui
+      - name: Stage normal release binaries
+        run: |
+          mkdir -p e2e-bins
+          cp target/release/i3t target/release/i3t-controller target/release/i3tctl e2e-bins/
+      - name: Build update & web-e2e release kit
+        run: CARGO_TARGET_DIR="$PWD/target" I3T_RELEASE_KIT="$PWD/e2e-kit" sh web/e2e/release-kit.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-bins
+          path: e2e-bins/*
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-kit
+          path: e2e-kit
+          retention-days: 1
+          if-no-files-found: error
+
+  # 用网络命名空间跑完整多节点端到端场景（tests/e2e/）：NAT 打洞、中继/TCP 回退、虚拟网卡与防火墙、
+  # 代理与端口转发、UDP、配额限流、ice3proxy、断网恢复、主动探测、备份恢复、签名自动更新与回滚。
+  e2e:
+    name: e2e (${{ matrix.shard }})
+    needs: [e2e-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { shard: core, suites: "backup static paths mtu udp limits access" }
+          - { shard: vnet, suites: "vnet" }
+          - { shard: routing-probe, suites: "routing probe" }
+          - { shard: lane, suites: "lane" }
+          - { shard: managed, suites: "managed" }
+          - { shard: recovery, suites: "recovery" }
+          - { shard: update, suites: "update", kit: true }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: ${{ !matrix.kit }}
+        with:
+          name: e2e-bins
+          path: e2e-bins
+      - uses: actions/download-artifact@v4
+        if: ${{ matrix.kit }}
+        with:
+          name: e2e-kit
+          path: target/e2e-update/stage
+      - name: Prepare binaries
+        env:
+          USE_KIT: ${{ matrix.kit && '1' || '0' }}
+        run: |
+          if [ "$USE_KIT" = "1" ]; then
+            chmod +x target/e2e-update/stage/i3t-release target/e2e-update/stage/old/* target/e2e-update/stage/new/*
+            cp target/e2e-update/stage/versions target/e2e-update/stage/done
+            touch target/e2e-update/stage/done
+          else
+            chmod +x e2e-bins/*
+          fi
+      - name: Prepare Linux network namespace lab
+        run: scripts/setup-e2e-env.sh
+      - name: Run e2e suites
+        env:
+          SUITES: ${{ matrix.suites }}
+          USE_KIT: ${{ matrix.kit && '1' || '0' }}
+        run: |
+          if [ "$USE_KIT" != "1" ]; then
+            export I3T_BIN_DIR="$PWD/e2e-bins"
+          fi
+          failed=0
+          for suite in $SUITES; do
+            echo "::group::e2e $suite"
+            if ! python3 "tests/e2e/test_${suite}.py"; then
+              failed=$((failed + 1))
+              echo "::error::e2e suite '$suite' failed"
+            fi
+            echo "::endgroup::"
+          done
+          [ "$failed" = 0 ]
+
+  # WebUI 对着真实的 i3t-controller 和 i3t 节点跑完整个浏览器端到端套件（flows、routes、updates、limits、lanes、groups、mobile）。
+  web-e2e:
+    name: web e2e (Playwright)
+    needs: [e2e-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: e2e-kit
+          path: web/.e2e/release-kit
+      - name: Mark downloaded binaries executable
+        working-directory: .
+        run: chmod +x web/.e2e/release-kit/i3t-release web/.e2e/release-kit/old/* web/.e2e/release-kit/new/*
+      - run: pnpm install --frozen-lockfile
+      - name: Install Chromium for Playwright
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run Playwright e2e flows
+        run: pnpm exec playwright test --project=flows
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: web-e2e-results
+          path: web/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # 在带真实 systemd-resolved 和 polkitd 的特权容器里验证非 root i3t 服务的透明域名解析与关闭清理。
+  resolved:
+    name: systemd-resolved + polkit (Linux)
+    needs: [e2e-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: e2e-bins
+          path: e2e-bins
+      - name: Mark binaries executable
+        run: chmod +x e2e-bins/*
+      - name: Run systemd-resolved service-polkit test
+        run: |
+          version_id=$(. /etc/os-release && echo "$VERSION_ID")
+          I3T_RESOLVED_BASE="ubuntu:${version_id}" tests/platform/resolved/run.sh e2e-bins resolved-out service-polkit
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: resolved-logs
+          path: resolved-out
+          retention-days: 7
+          if-no-files-found: ignore
 
   site:
     name: site (check, build)

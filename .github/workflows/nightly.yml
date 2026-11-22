@@ -1,0 +1,199 @@
+name: Nightly
+
+# 每日定时和手动触发的深度检查：LLM 网关负载 E2E、跨架构发布干跑（glibc 2.28 / aarch64 / macos-x86_64 / dist LTO）、
+# fuzz 回归与种子样本 ASan 重放、MSRV（Cargo.toml 声明的 rust-version）兼容性检查、依赖安全审计。
+on:
+  schedule:
+    # 每天 03:00（Asia/Shanghai）
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  llm-e2e:
+    name: LLM gateway workload e2e (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build i3t and i3t-llmgw
+        run: cargo build --release --locked -p i3t -p i3t-llmgw
+      - name: Prepare Linux network namespace lab
+        run: scripts/setup-e2e-env.sh
+      - name: Run LLM workload e2e suite
+        env:
+          I3T_BIN_DIR: ${{ github.workspace }}/target/release
+        run: python3 tests/e2e/test_llm.py
+
+  # 提前演练 release.yml 的发布构型（dist profile + LTO + zigbuild glibc 2.28 + 跨架构目标 + 清单签名/校验），
+  # 不等到打 v* 标签时才暴露交叉编译或符号版本退化。
+  release-dryrun-linux:
+    name: release dry-run (Linux x86_64 & aarch64, glibc 2.28)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build WebUI
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Install zig and cargo-zigbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install -q ziglang cargo-zigbuild
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+      - name: Build Linux x86_64 and aarch64 (dist profile, glibc 2.28)
+        run: |
+          scripts/build-linux.sh x86_64
+          scripts/build-linux.sh aarch64
+      - name: Smoke-test binaries, embedded WebUI and glibc ceiling
+        run: |
+          version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "i3t") | .version')
+          python3 scripts/smoke-release.py \
+            --bin-dir target/dist/x86_64-unknown-linux-gnu/dist \
+            --version "$version" \
+            --check-webui \
+            --check-glibc 2.28
+          python3 scripts/smoke-release.py \
+            --bin-dir target/dist/aarch64-unknown-linux-gnu/dist \
+            --no-run \
+            --check-glibc 2.28
+      - name: Dry-run manifest signing and verification with a throwaway key
+        run: |
+          version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "i3t") | .version')
+          cargo build --release --locked -p i3t-release
+          mkdir -p dryrun-dist
+          cp target/dist/x86_64-unknown-linux-gnu/dist/i3t dryrun-dist/i3t-linux-x86_64
+          cp target/dist/aarch64-unknown-linux-gnu/dist/i3t dryrun-dist/i3t-linux-aarch64
+          key="$RUNNER_TEMP/dryrun.key"
+          trap 'rm -f "$key"' EXIT
+          pub=$(target/release/i3t-release keygen --out "$key" | tr -d '[:space:]')
+          target/release/i3t-release manifest --version "$version" --dir dryrun-dist --key "$key" --min-controller 0.1.0
+          target/release/i3t-release verify --dir dryrun-dist --key "$pub"
+          if target/release/i3t-release verify --dir dryrun-dist >/dev/null 2>&1; then
+            echo "::error::built-in project keys unexpectedly accepted a throwaway signature"
+            exit 1
+          fi
+
+  release-dryrun-macos-x64:
+    name: release dry-run (macOS x86_64 cross-build)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build WebUI
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Build macOS x86_64 (dist profile)
+        run: cargo build --profile dist --locked --target x86_64-apple-darwin -p i3t -p i3t-controller-bin -p i3tctl
+      - name: Verify cross-built binaries exist
+        run: python3 scripts/smoke-release.py --bin-dir target/x86_64-apple-darwin/dist --no-run
+
+  # 用 AddressSanitizer 重放所有 fuzz 目标的历史回归样本和种子，确保修过的问题不再复发。
+  fuzz-regressions:
+    name: fuzz regressions & seeds (ASan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Replay regressions and seeds for every fuzz target
+        working-directory: fuzz
+        run: |
+          failed=0
+          for target in $(cargo fuzz list); do
+            dirs=""
+            [ -d "regressions/$target" ] && dirs="$dirs regressions/$target"
+            [ -d "seeds/$target" ] && dirs="$dirs seeds/$target"
+            echo "::group::fuzz $target ($dirs)"
+            # shellcheck disable=SC2086
+            if ! cargo fuzz run "$target" $dirs -- -runs=0; then
+              failed=$((failed + 1))
+              echo "::error::fuzz target '$target' failed on regressions/seeds"
+            fi
+            echo "::endgroup::"
+          done
+          [ "$failed" = 0 ]
+
+  msrv:
+    name: MSRV check
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace builds on MSRV
+        run: cargo check --workspace --all-targets --locked
+
+  audit:
+    name: dependency security audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Cargo.lock and fuzz/Cargo.lock
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file fuzz/Cargo.lock
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Audit web dependencies
+        working-directory: web
+        run: pnpm audit --audit-level=high
+      - name: Audit site dependencies
+        working-directory: site
+        run: pnpm audit --audit-level=high
