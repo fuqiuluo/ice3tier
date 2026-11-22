@@ -38,7 +38,7 @@ type LocalDelivery = Box<dyn Fn(NodeId, Bytes) + Send + Sync>;
 /// 一个节点的 relay 角色。
 ///
 /// 只有 netmap 里 `me.relay` 有值时它才工作；没有值时交给它的东西一律丢掉，不回应。netmap 可以随时变：
-/// 启用、停用、允许的节点名单变化都立即生效，被去掉的节点的会话当场删除。
+/// 启用、停用、允许的节点名单变化都立即生效，被去掉的节点、换了公钥的节点的会话当场删除。
 ///
 /// UDP 上的数据报由收包的一方（路径层）交进来（[`handle_udp`](Self::handle_udp)）；同一个端口号上的 TCP 由它自己监听。
 ///
@@ -478,8 +478,8 @@ impl Inner {
             }
         }
         let State { clients, sessions, .. } = &mut *state;
-        for node in sessions.retain_clients(|node| clients.contains_key(&node)) {
-            tracing::info!(%node, "节点不在允许的名单里了，它的中转会话关闭");
+        for node in sessions.retain_clients(|node| clients.get(&node).copied()) {
+            tracing::info!(%node, "节点不在允许的名单里了，或者换了公钥：它的中转会话关闭");
         }
         let bandwidth_mbps = role.and_then(|role| role.bandwidth_mbps);
         if state.bandwidth_mbps != bandwidth_mbps {
@@ -740,11 +740,11 @@ impl Inner {
         }
         {
             let mut state = self.write();
-            // 验签名的这段时间里 netmap 可能变了。
-            if !state.enabled || !state.clients.contains_key(&node) {
+            // 验签名的这段时间里 netmap 可能变了：节点被去掉了，或者换了公钥，那签名就是照一把已经不作数的公钥验的。
+            if !state.enabled || state.clients.get(&node) != Some(&client_key) {
                 return None;
             }
-            state.sessions.open(node, source.binding(), auth.nonce, now);
+            state.sessions.open(node, client_key, source.binding(), auth.nonce, now);
         }
         self.counters.session_opened();
         let valid_for = u16::try_from(SESSION_TTL.as_secs()).unwrap_or(u16::MAX);
@@ -1059,5 +1059,54 @@ mod tests {
         let header_len = datagram::forwarding_header_len(&data).unwrap();
         assert_eq!(header_len, 18);
         assert_eq!(same_route_run(&data, stride, header_len, 64), 2 * stride, "同样的两个 relay 换了顺序就是另一条路径");
+    }
+
+    /// 本节点是 relay（编号 100）的 netmap，允许 `clients` 里的节点。
+    fn netmap(clients: &[(NodeId, PublicKey)]) -> Netmap {
+        let clients: Vec<_> = clients.iter().map(|(id, key)| serde_json::json!({ "id": id, "key": key })).collect();
+        let netmap = serde_json::json!({
+            "version": 1,
+            "network": { "name": "test", "domain": "test.i3t", "cidr": "10.66.0.0/16", "max_relay_hops": 2 },
+            "me": { "id": 100, "name": "relay", "virtual_ip": "10.66.0.100", "relay": {} },
+            "relays": [],
+            "relay_clients": clients,
+        });
+        serde_json::from_value(netmap).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_auth_checked_against_a_key_the_netmap_has_since_replaced_opens_no_session() {
+        let node = NodeId::new(1).unwrap();
+        let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+        let port = Arc::new(UdpPort::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let (_netmap, updates) = watch::channel(Arc::new(netmap(&[(node, old.public())])));
+        let relay = Relay::new(Arc::new(NodeKey::generate().unwrap()), port, updates);
+        let me = relay.inner.read().me;
+
+        // 一个样样都对的 AUTH：cookie 是发给这个地址的，签名是 netmap 里现在这把公钥的主人签的。
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let from = client.local_addr().unwrap();
+        let (now, nonce) = (Instant::now(), [7; 8]);
+        let cookie = relay.inner.cookies.issue(from, node, now);
+        let signature = *old.sign(Auth::PURPOSE, &Auth::signed_message(me, node, &nonce, &cookie)).as_bytes();
+        let auth = Auth { node, nonce, cookie, signature };
+
+        // 握手读了名单里的公钥之后、验签名之前要过限速：占着限速的锁，它就停在那里，手上拿的是旧公钥。
+        let limiter = relay.inner.handshakes.lock().unwrap();
+        let handshake = std::thread::spawn({
+            let inner = Arc::clone(&relay.inner);
+            move || inner.authenticate(&Source { addr: from, via: Via::Udp }, &auth, now)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!handshake.is_finished(), "握手应该停在限速那一步");
+        // 这期间 netmap 里这个节点换了公钥。然后放握手接着走：签名照它手上的旧公钥验得过。
+        relay.inner.apply(&netmap(&[(node, new.public())]));
+        drop(limiter);
+
+        assert_eq!(handshake.join().unwrap(), None, "签名是照已经换掉的公钥验的，不该建会话");
+        assert!(!relay.has_session(node));
+        assert_eq!(relay.counters().sessions_opened, 0);
+        // 握手要是没来得及在换公钥之前读名单，签名会对不上新公钥：那样测到的就不是验完签名之后的那一次核对了。
+        assert_eq!(relay.counters().dropped(DropReason::BadSignature), 0);
     }
 }

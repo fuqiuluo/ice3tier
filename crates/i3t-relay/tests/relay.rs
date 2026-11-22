@@ -379,6 +379,45 @@ async fn removing_a_client_from_the_netmap_closes_its_session_at_once() {
 }
 
 #[tokio::test]
+async fn a_new_key_for_a_client_in_the_netmap_closes_the_session_its_old_key_opened() {
+    let (a, b) = (Client::new(1).await, Client::new(2).await);
+    let relay = TestRelay::start(&[&a, &b]);
+    a.attach(&relay).await;
+    b.attach(&relay).await;
+
+    // 编号 1 还在名单里，公钥换了：旧钥匙握手建的会话不是新钥匙的主人的。
+    let successor = a.rekeyed().await;
+    relay.set_netmap(Role::On, &[&successor, &b]);
+    assert!(relay.session_closes(a.id).await, "公钥换了的节点，旧钥匙建的会话应该立刻关闭");
+
+    // 拿着旧钥匙的一方还在原来的地址上：它发的包不转发，它的保活也续不了期（PING 没有签名，只认会话）。
+    a.send(&relayed(b.id, a.id, b"sent under the old key"), &relay).await;
+    assert_eq!(Frame::parse(&a.recv().await), Some(Frame::Error(Refused { reason: RefusalReason::NoSession, node: a.id })));
+    a.send(&Ping { node: a.id, nonce: [2; 8] }.to_bytes(), &relay).await;
+    assert_eq!(Frame::parse(&a.recv().await), Some(Frame::Error(Refused { reason: RefusalReason::NoSession, node: a.id })));
+    // 发给这个编号的包也不往它那里送。
+    b.send(&relayed(a.id, b.id, b"for the holder of the new key"), &relay).await;
+    assert_eq!(Frame::parse(&b.recv().await), Some(Frame::Error(Refused { reason: RefusalReason::PeerUnattached, node: a.id })));
+    a.expect_silence().await;
+    b.expect_silence().await;
+    assert_eq!(relay.relay().counters().forwarded_packets, 0);
+
+    // 旧钥匙也握不上手了：INIT 照常回答（编号在名单里），AUTH 的签名对不上新公钥。
+    let challenge = a.challenge(&relay, [3; 8]).await;
+    a.send(&a.auth(node(RELAY_ID), [3; 8], challenge.cookie).to_bytes(), &relay).await;
+    a.expect_silence().await;
+    assert_eq!(relay.relay().counters().dropped(DropReason::BadSignature), 1);
+    assert!(!relay.relay().has_session(a.id));
+
+    // 新钥匙的主人握手之后，这个编号的包归它。
+    successor.attach(&relay).await;
+    let frame = relayed(a.id, b.id, b"to the new key");
+    b.send(&frame, &relay).await;
+    assert_eq!(successor.recv().await, frame);
+    a.expect_silence().await;
+}
+
+#[tokio::test]
 async fn the_bandwidth_cap_drops_what_exceeds_it() {
     let (a, b) = (Client::new(1).await, Client::new(2).await);
     let relay = TestRelay::start_with(Role::Capped(1), &[&a, &b]);

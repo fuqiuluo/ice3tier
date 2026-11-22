@@ -163,6 +163,16 @@ impl TestRelay {
     pub fn set_identities(&self, role: Role, clients: &[(NodeId, PublicKey)]) {
         self.netmap.send(build(role, clients, &[], 2)).unwrap();
     }
+
+    /// 等 `client` 的会话关闭，等不到返回 `false`。netmap 是 relay 的后台任务跟着换的，换过之后要等它一下。
+    pub async fn session_closes(&self, client: NodeId) -> bool {
+        let closed = async {
+            while self.relay().has_session(client) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, closed).await.is_ok()
+    }
 }
 
 /// 产品里这件事由路径层做：从端口收一批，把归 relay 管的交给它。这里全部都交。
@@ -204,6 +214,11 @@ pub struct Client {
 impl Client {
     pub async fn new(id: u32) -> Self {
         Self { id: node(id), key: NodeKey::generate().unwrap(), socket: UdpSocket::bind("127.0.0.1:0").await.unwrap() }
+    }
+
+    /// 同一个编号，另一把钥匙，另一个地址：netmap 里这个编号的公钥换了之后，拿着新钥匙的一方。
+    pub async fn rekeyed(&self) -> Self {
+        Self { id: self.id, key: NodeKey::generate().unwrap(), socket: UdpSocket::bind("127.0.0.1:0").await.unwrap() }
     }
 
     pub fn addr(&self) -> SocketAddr {
