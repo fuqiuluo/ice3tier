@@ -21,6 +21,9 @@ pub(crate) const ALPN: &[u8] = b"i3t/1";
 /// 同一个协议，外加"收得了封好的网络包"（见 [`crate::sealed`]）。两端都声明了才会协商出它；
 /// 对端是不认识它的旧程序时，握手落到 [`ALPN`]，那条连接上网络包照旧走数据报。
 pub(crate) const ALPN_SEALED: &[u8] = b"i3t/2";
+/// 再外加"认识一帧里合着好几个小网络包的"（`i3t_proto::flow::PacketHeader::Bundle`）。不认识的程序收到那样的帧只会丢掉，
+/// 所以要两端都声明了才发。
+pub(crate) const ALPN_BUNDLES: &[u8] = b"i3t/3";
 /// TLS 要一个服务器名字。校验只看公钥，这个名字没有人看。
 pub(crate) const SERVER_NAME: &str = "i3t";
 
@@ -132,7 +135,8 @@ pub(crate) fn endpoint(key: &NodeKey) -> Result<EndpointConfig, QuicConfigError>
 /// 握手时声明哪些协议名，最想要的在前。接受连接的一方按自己的顺序，挑第一个对端也声明了的。
 fn protocols(packets: PacketTransport) -> Vec<Vec<u8>> {
     match packets {
-        PacketTransport::Sealed => vec![ALPN_SEALED.to_vec(), ALPN.to_vec()],
+        PacketTransport::Sealed => vec![ALPN_BUNDLES.to_vec(), ALPN_SEALED.to_vec(), ALPN.to_vec()],
+        PacketTransport::SealedOneByOne => vec![ALPN_SEALED.to_vec(), ALPN.to_vec()],
         PacketTransport::Datagram => vec![ALPN.to_vec()],
     }
 }

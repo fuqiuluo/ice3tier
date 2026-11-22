@@ -43,7 +43,7 @@ use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundK
 use tokio::sync::mpsc;
 
 use crate::contract::Datagram;
-use crate::quic::ALPN_SEALED;
+use crate::quic::{ALPN_BUNDLES, ALPN_SEALED};
 
 /// 从握手里导出密钥时的标签。换格式或者换算法时要换一个，新旧两种包就互相解不开。
 const EXPORT_LABEL: &[u8] = b"EXPORTER-i3t-sealed-packets-1";
@@ -77,9 +77,12 @@ const EARLY_MAX_AGE: Duration = Duration::from_secs(2);
 /// 虚拟网卡的包在连接上怎么走。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PacketTransport {
-    /// 对端也这样声明的连接上，单独加密、直接走路径层；别的连接走数据报。
+    /// 对端也这样声明的连接上，单独加密、直接走路径层；别的连接走数据报。还认识一帧里合着好几个小包的。
     #[default]
     Sealed,
+    /// 和 [`Sealed`](Self::Sealed) 一样，只是不认识一帧里合着好几个包的：有合并小包之前的程序是这样的。
+    /// 测试新旧程序之间怎么来往时用。
+    SealedOneByOne,
     /// 一律走连接的数据报，和不认识封好的包的旧程序一样。做对比测试时用。
     Datagram,
 }
@@ -106,12 +109,27 @@ impl PacketTransport {
     }
 }
 
-/// 握手时两端是不是都声明了收得了封好的包。
-pub(crate) fn agreed(connection: &quinn::Connection) -> bool {
-    connection
-        .handshake_data()
-        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-        .is_some_and(|data| data.protocol.as_deref() == Some(ALPN_SEALED))
+/// 握手时两端说定的、这条连接上网络包能怎么走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Agreed {
+    /// 两端都收得了封好的包。
+    pub(crate) sealed: bool,
+    /// 两端都认识一帧里合着好几个小包的。
+    pub(crate) bundles: bool,
+}
+
+impl Agreed {
+    /// 握手协商出来的协议名说明了什么。
+    fn from_protocol(protocol: Option<&[u8]>) -> Self {
+        let bundles = protocol == Some(ALPN_BUNDLES);
+        Self { sealed: bundles || protocol == Some(ALPN_SEALED), bundles }
+    }
+}
+
+/// 握手时两端说定了什么。
+pub(crate) fn agreed(connection: &quinn::Connection) -> Agreed {
+    let data = connection.handshake_data().and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok());
+    Agreed::from_protocol(data.as_ref().and_then(|data| data.protocol.as_deref()))
 }
 
 /// 这条连接上本端是哪一方。两把密钥按它分：一方发的那个方向，就是另一方收的。
@@ -790,6 +808,14 @@ mod tests {
         assert_eq!(PacketTransport::from_env_value("on"), PacketTransport::Sealed);
         assert_eq!(PacketTransport::from_env_value("off"), PacketTransport::Datagram);
         assert_eq!(PacketTransport::from_env_value("maybe"), PacketTransport::Sealed);
+    }
+
+    #[test]
+    fn the_negotiated_protocol_name_says_what_both_ends_understand() {
+        assert_eq!(Agreed::from_protocol(Some(b"i3t/3")), Agreed { sealed: true, bundles: true });
+        assert_eq!(Agreed::from_protocol(Some(b"i3t/2")), Agreed { sealed: true, bundles: false });
+        assert_eq!(Agreed::from_protocol(Some(b"i3t/1")), Agreed::default());
+        assert_eq!(Agreed::from_protocol(None), Agreed::default());
     }
 
     fn inbox() -> (Arc<Inbox>, mpsc::Receiver<Datagram>) {

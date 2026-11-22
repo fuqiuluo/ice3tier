@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicUsize;
 
-use i3t_proto::flow::Fragment;
+use i3t_proto::flow::{Bundled, Fragment};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::*;
@@ -202,6 +202,16 @@ fn whole(packet: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// 合着 `packets` 的一帧。
+fn bundle(packets: &[&[u8]]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    PacketHeader::Bundle.encode(&mut frame);
+    for packet in packets {
+        Bundled::push(&mut frame, packet).unwrap();
+    }
+    frame
+}
+
 /// 一个"不可达"的 ICMP 包的类型、代码和它带回来的原包的开头。
 fn icmp_answer(packet: &[u8]) -> (u8, u8, Vec<u8>) {
     let ip = Ipv4::parse(packet).unwrap();
@@ -361,6 +371,34 @@ async fn a_packet_too_large_for_the_connection_goes_as_two_pieces_and_pieces_are
     world.peer_sends(2, pieces[1].clone());
     world.peer_sends(2, pieces[0].clone());
     assert_eq!(world.kernel_gets().await, reply);
+}
+
+#[tokio::test]
+async fn packets_that_arrive_in_one_frame_are_written_one_by_one_in_order_and_each_is_judged_on_its_own() {
+    let mut world = world(netmap(&serde_json::json!([peer(2, true, true), peer(3, true, true)]), &[]), &[], Duration::ZERO);
+    let (first, second, third) = (icmp(B, ME, 8), tcp(B, ME, (40000, 22), 0x10), icmp(B, ME, 0));
+    world.peer_sends(2, bundle(&[&first, &second, &third]));
+    for expected in [&first, &second, &third] {
+        assert_eq!(&world.kernel_gets().await, expected);
+    }
+    let traffic = world.snapshot();
+    assert_eq!(traffic.received_packets, 3, "按里面的包数算，不按帧数");
+    assert_eq!(traffic.dropped, VnetDrops::default());
+
+    // 中间夹着一个冒充别的节点的、一个不是发给本节点的：只丢这两个。
+    world.peer_sends(2, bundle(&[&first, &icmp(C, ME, 8), &icmp(B, [10, 66, 0, 7], 8), &third]));
+    assert_eq!(world.kernel_gets().await, first);
+    assert_eq!(world.kernel_gets().await, third);
+    let dropped = world.snapshot().dropped;
+    assert_eq!((dropped.bad_source, dropped.bad_destination, dropped.malformed), (1, 1, 0), "{dropped:?}");
+
+    // 帧本身坏了（最后一个包被截短了）：坏的地方之前的照收，坏的记一次。
+    let mut cut = bundle(&[&first, &second]);
+    cut.truncate(cut.len() - 3);
+    world.peer_sends(2, cut);
+    assert_eq!(world.kernel_gets().await, first);
+    world.nothing_to_kernel().await;
+    assert_eq!(world.snapshot().dropped.malformed, 1);
 }
 
 #[tokio::test]

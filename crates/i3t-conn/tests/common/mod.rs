@@ -116,6 +116,11 @@ impl Node {
         }
     }
 
+    /// 同 [`Node::start`]，只是不认识一帧里合着好几个网络包的：有合并小包之前的节点就是这样。
+    pub fn start_one_by_one(id: u32) -> Self {
+        Self::start_inner(id, Arc::new(NodeKey::generate().unwrap()), &[], PacketTransport::SealedOneByOne)
+    }
+
     /// 同 [`Node::start`]，只是网络包一律走连接的数据报：不认识封好的包的旧节点就是这样。
     pub fn start_datagram_only(id: u32) -> Self {
         Self::start_inner(id, Arc::new(NodeKey::generate().unwrap()), &[], PacketTransport::Datagram)

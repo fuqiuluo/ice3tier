@@ -111,7 +111,7 @@ mod tests {
             .unwrap()
             .map(|frame| match PacketHeader::decode(&frame).unwrap() {
                 (PacketHeader::Piece(fragment), piece) => (fragment, Bytes::copy_from_slice(piece)),
-                (PacketHeader::Whole, _) => panic!("切出来的都是片"),
+                (PacketHeader::Whole | PacketHeader::Bundle, _) => panic!("切出来的都是片"),
             })
             .collect()
     }

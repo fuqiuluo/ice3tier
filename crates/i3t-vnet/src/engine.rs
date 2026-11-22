@@ -39,7 +39,7 @@ use i3t_conn::contract::{Datagram, DatagramSendError, OpenError, PacketSender, P
 use i3t_model::Netmap;
 use i3t_model::control::VnetDrops;
 use i3t_proto::NodeId;
-use i3t_proto::flow::{PacketHeader, PacketPieces};
+use i3t_proto::flow::{Bundled, PacketHeader, PacketPieces};
 use ipnet::Ipv4Net;
 use tokio::sync::{mpsc, watch};
 
@@ -554,20 +554,33 @@ impl<D: Device, P: Packets> Inbound<D, P> {
         }
     }
 
-    /// 对端发来的一帧：拼好、核对，能写进网卡的包放进 `admitted`。一个 IP 分片的包齐了的时候是好几个（它的每一片）。
+    /// 对端发来的一帧：取出里面的包（切开的拼好，合在一起的拆开），逐个核对，能写进网卡的放进 `admitted`。
     fn admit(&mut self, datagram: Datagram, admitted: &mut Vec<Bytes>) {
         let Datagram { peer, payload } = datagram;
-        let packet = match PacketHeader::decode(&payload) {
-            Ok((PacketHeader::Whole, _)) => payload.slice(PacketHeader::WHOLE_LEN..),
+        match PacketHeader::decode(&payload) {
+            Ok((PacketHeader::Whole, _)) => self.admit_packet(peer, payload.slice(PacketHeader::WHOLE_LEN..), admitted),
             Ok((PacketHeader::Piece(fragment), _)) => {
                 match self.reassembly.accept(peer, fragment, payload.slice(PacketHeader::PIECE_LEN..), Instant::now()) {
-                    Assembled::Packet(packet) => packet,
-                    Assembled::Waiting => return,
-                    Assembled::Broken => return self.log.note(&self.counters, Loss::Malformed, &"片拼不起来"),
+                    Assembled::Packet(packet) => self.admit_packet(peer, packet, admitted),
+                    Assembled::Waiting => {}
+                    Assembled::Broken => self.log.note(&self.counters, Loss::Malformed, &"片拼不起来"),
                 }
             }
-            Err(error) => return self.log.note(&self.counters, Loss::Malformed, &error),
-        };
+            // 合在一帧里的几个包各是各的：一个一个地核对，哪个不合格丢哪个。帧本身坏了的话，坏的地方之前的照收。
+            Ok((PacketHeader::Bundle, body)) => {
+                for packet in Bundled::new(body) {
+                    match packet {
+                        Ok(packet) => self.admit_packet(peer, payload.slice_ref(packet), admitted),
+                        Err(error) => self.log.note(&self.counters, Loss::Malformed, &error),
+                    }
+                }
+            }
+            Err(error) => self.log.note(&self.counters, Loss::Malformed, &error),
+        }
+    }
+
+    /// 对端 `peer` 发来的一个完整的 IP 包：核对，能写进网卡的放进 `admitted`。一个 IP 分片的包齐了的时候是好几个（它的每一片）。
+    fn admit_packet(&mut self, peer: NodeId, packet: Bytes, admitted: &mut Vec<Bytes>) {
         let ip = match Ipv4::parse(&packet) {
             Ok(ip) => ip,
             Err(error) => return self.log.note(&self.counters, Loss::Malformed, &error),

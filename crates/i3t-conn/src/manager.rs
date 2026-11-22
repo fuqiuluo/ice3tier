@@ -150,6 +150,8 @@ struct Conn {
     quic: quinn::Connection,
     /// 握手时两端都声明了收得了封好的包：这条连接上网络包用它封了直接走路径层，不进 QUIC。
     sealed: Option<Arc<Session>>,
+    /// 握手时两端都声明了认识一帧里合着好几个小网络包的。
+    bundles: bool,
     /// 这条连接是谁拨的。两边同时拨号时，双方都留下编号小的那个节点拨的那一条。
     dialer: NodeId,
     /// 对端握手时用的公钥。netmap 里它的公钥变了，这条连接就不算数了。
@@ -502,10 +504,12 @@ impl Manager {
         let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
         let Origin { dialer, key, algorithm } = origin;
         let streams = StreamCount::new();
-        let sealed = self.sealed_session(peer, &quic, dialer);
+        let agreed = sealed::agreed(&quic);
+        let sealed = agreed.sealed.then(|| self.sealed_session(peer, &quic, dialer)).flatten();
         let conn = Arc::new(Conn {
             quic,
             sealed,
+            bundles: agreed.bundles,
             dialer,
             key,
             serial,
@@ -533,7 +537,14 @@ impl Manager {
         };
         // 对端握手完成得早的话，它的头几个封好的包已经到了，现在补收。要解密，所以放开锁之后做。
         self.inbox.deliver_early(peer, early);
-        tracing::info!(%peer, %dialer, congestion = %Congestion::from(algorithm), sealed_packets = conn.sealed.is_some(), "和对端的连接建立");
+        tracing::info!(
+            %peer,
+            %dialer,
+            congestion = %Congestion::from(algorithm),
+            sealed_packets = conn.sealed.is_some(),
+            bundles = conn.bundles,
+            "和对端的连接建立"
+        );
         for old in surplus {
             tracing::info!(%peer, dialer = %old.dialer, "和这个对端的连接超过了 {MAX_CONNS_PER_PEER} 条，关闭最旧的一条");
             old.quic.close(VarInt::from_u32(CLOSE_SURPLUS), b"too many connections");
@@ -542,11 +553,8 @@ impl Manager {
         Some(conn)
     }
 
-    /// 握手时两端都声明了收得了封好的包的话，从这次握手里导出这条连接封包用的密钥。
+    /// 从握手里导出这条连接封包用的密钥。握手时两端都声明了收得了封好的包才来这里。
     fn sealed_session(&self, peer: NodeId, quic: &quinn::Connection, dialer: NodeId) -> Option<Arc<Session>> {
-        if !sealed::agreed(quic) {
-            return None;
-        }
         let role = if dialer == self.me { Role::Dialer } else { Role::Acceptor };
         match Session::derive(quic, role) {
             Ok(session) => Some(Arc::new(session)),
@@ -1174,6 +1182,12 @@ impl PacketSender for DatagramHandle {
         }
     }
 
+    fn bundle_capacity(&self, peer: NodeId) -> Option<usize> {
+        let manager = self.manager.upgrade()?;
+        let conn = manager.preferred(peer)?;
+        (conn.bundles && conn.sealed.is_some() && manager.paths.is_direct(peer)).then(|| conn.quic.max_datagram_size()).flatten()
+    }
+
     async fn connect(&self, peer: NodeId) -> Result<(), OpenError> {
         let manager = self.manager.upgrade().ok_or(OpenError::Closed)?;
         if *manager.closed.borrow() {
@@ -1258,6 +1272,7 @@ mod tests {
             Arc::new(Conn {
                 quic: near.unwrap(),
                 sealed: None,
+                bundles: false,
                 dialer: NodeId::new(2).unwrap(),
                 key: self.peer_key,
                 serial,

@@ -127,6 +127,8 @@ pub enum FrameError {
     ReservedFlags(u8),
     #[error("分片头自相矛盾：一共 {count} 片，这是第 {index} 片（从 0 数）")]
     InvalidFragment { index: u8, count: u8 },
+    #[error("合在一帧里的第 {index} 个包（从 0 数）读不出来：一个都没有，长度是 0，或者写的长度比剩下的还长")]
+    BrokenBundle { index: usize },
 }
 
 /// 一个报文的内容切成的帧，按片序号的顺序。

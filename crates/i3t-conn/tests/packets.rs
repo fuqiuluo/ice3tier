@@ -16,7 +16,7 @@ use common::{Node, Peer, SOON, View, is_direct};
 use i3t_conn::ConnectionCounters;
 use i3t_conn::contract::{Datagram, DatagramSendError, DatagramSender, Datagrams, OpenError, PacketSender, Packets};
 use i3t_model::control::Route;
-use i3t_proto::flow::{DatagramHeader, PacketHeader, Recipient};
+use i3t_proto::flow::{Bundled, DatagramHeader, PacketHeader, Recipient};
 
 /// 一个网络包帧：头后面跟着 `packet`。连接层只看首字节。
 fn packet(body: &[u8]) -> Bytes {
@@ -217,6 +217,56 @@ async fn a_peer_that_does_not_know_sealed_packets_gets_them_as_datagrams_whoever
         let (back, _) = one_way(acceptor, dialer, PACKETS).await;
         assert!(back.sent_packets >= u64::try_from(PACKETS).unwrap(), "{back:?}");
     }
+}
+
+/// 合着两个小包的一帧。连接层不看里面。
+fn bundle(packets: &[&[u8]]) -> Bytes {
+    let mut frame = Vec::new();
+    PacketHeader::Bundle.encode(&mut frame);
+    for packet in packets {
+        Bundled::push(&mut frame, packet).unwrap();
+    }
+    frame.into()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn small_packets_may_be_bundled_only_towards_a_peer_that_said_it_understands_and_only_on_a_direct_route() {
+    let (a, b) = pair();
+    let sender = a.endpoint.packet_sender();
+    assert_eq!(sender.bundle_capacity(b.id), None, "还没有连接");
+    tokio::time::timeout(SOON, sender.connect(b.id)).await.expect("建连接超时").unwrap();
+    a.wait_route(&b, "直连", is_direct).await;
+    let capacity = sender.bundle_capacity(b.id).expect("两端都是现在的程序，直连");
+    assert!((1100..1500).contains(&capacity), "一帧最长和一个网络包帧一样：{capacity}");
+    // 合好的一帧原样送到，连接层不拆它。
+    let frame = bundle(&[b"\x45 one", b"\x45 two"]);
+    sender.send_packet(b.id, frame.clone()).unwrap();
+    assert_eq!(next(&b).await.payload, frame);
+
+    // 对端不认识合在一起的帧：包照样是封好了单独发的，只是不合。
+    let (new, old) = (Node::start(3), Node::start_one_by_one(4));
+    new.apply(&View { peers: &[Peer::direct(&old)], ..View::default() });
+    old.apply(&View { peers: &[Peer::direct(&new)], ..View::default() });
+    for (from, to) in [(&new, &old), (&old, &new)] {
+        let sender = from.endpoint.packet_sender();
+        tokio::time::timeout(SOON, sender.connect(to.id)).await.expect("建连接超时").unwrap();
+        from.wait_route(to, "直连", is_direct).await;
+        assert_eq!(sender.bundle_capacity(to.id), None, "节点 {} 到节点 {}", from.id, to.id);
+        sender.send_packet(to.id, packet(b"\x45 one by one")).unwrap();
+        assert_eq!(next(to).await.peer, from.id);
+    }
+
+    // 经 relay 的路上不合：那里包是连接的数据报。
+    let (c, r, d) = (Node::start(5), Node::start(9), Node::start(6));
+    c.block(&[&d]);
+    r.apply(&View { relay_clients: Some(&[&c, &d]), ..View::default() });
+    r.wait_tcp_listening().await;
+    c.apply(&View { peers: &[Peer::both(&d, &[&r])], relays: &[&r], ..View::default() });
+    d.apply(&View { peers: &[Peer::both(&c, &[&r])], relays: &[&r], ..View::default() });
+    let sender = c.endpoint.packet_sender();
+    tokio::time::timeout(3 * SOON, sender.connect(d.id)).await.expect("经 relay 建连接超时").unwrap();
+    assert_eq!(c.route_to(&d), Route::Relay { relays: vec![r.id] });
+    assert_eq!(sender.bundle_capacity(d.id), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

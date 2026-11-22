@@ -452,6 +452,16 @@ pub trait PacketSender: Clone + Send + Sync + 'static {
     /// 把 [`queue_packet`](Self::queue_packet) 攒着的都发出去。
     fn flush(&self) {}
 
+    /// 发给 `peer` 的几个小网络包现在能不能合成一帧发（`i3t_proto::flow::PacketHeader::Bundle`），能的话一帧最长多少字节。
+    ///
+    /// 能：和它之间有连接，它握手时说过认识这种帧，而且现在包是单独封好了直接发给它的（到它是直连）。经 relay 的路上不合：
+    /// 那里包是连接的数据报，排着的几个连接自己会装进一个包里。不认识这种帧的对端收到了只会丢掉。
+    ///
+    /// 默认是不能。
+    fn bundle_capacity(&self, _peer: NodeId) -> Option<usize> {
+        None
+    }
+
     /// 和 `peer` 之间还没有连接时建一条；已经有了就立刻返回。
     ///
     /// # Errors

@@ -119,16 +119,25 @@
 //! +------+--------+--------+------+==============+
 //!    1       2        1       1
 //!
+//! 合着好几个小包（只发给握手时说过自己认识这种帧的对端）
+//! +------+------+=======+------+=======+ ...
+//! | 0x0c | 长度 | IP 包 | 长度 | IP 包 |
+//! +------+------+=======+------+=======+ ...
+//!    1      2              2
+//!
 //! 标志        bit 1     这是一片
 //!             bit 2     网络包，必须是 1
-//!             bit 0、3～7  必须是 0
+//!             bit 3     合着好几个包；不能和 bit 1 同时有
+//!             bit 0、4～7  必须是 0
 //! IP 包       一个完整的 IPv4 包，原样，最长 [`MAX_PACKET_LEN`] 字节
+//! 长度        后面那个 IP 包的字节数，大端，不是 0。包一个挨一个，正好排到帧的末尾，至少有一个
 //! 包号        同一个包的各片相同。每个方向各自往上数，到头了回到 0
 //! 片序号      从 0 开始
 //! 片数        2～[`MAX_PACKET_PIECES`]
 //! ```
 //!
 //! 一个包装得进一个数据报就不切；装不下时切成两片，第一片把帧填满，收的一方拼回去再写进自己的网卡。
+//! 合在一起发的是同一时刻要发给同一个对端的小包（TCP 的确认之类）：少发几个包，线路按包数限速的方向上省得多。
 //! 包里写的来源和目的地址由收的一方核对，这一层只管怎么送。
 
 use std::fmt;
@@ -141,7 +150,7 @@ mod packet;
 
 pub use dgram::{DatagramHeader, Fragment, FrameError, Frames, MAX_DATAGRAM_BODY_LEN, Recipient, SplitError};
 pub use measure::{MeasureEnd, MeasureMode, MeasureSteady, MeasureSummary, OpenMeasure};
-pub use packet::{Channel, MAX_PACKET_LEN, MAX_PACKET_PIECES, PacketHeader, PacketPieces, PieceError};
+pub use packet::{Bundled, Channel, MAX_PACKET_LEN, MAX_PACKET_PIECES, PacketHeader, PacketPieces, PieceError};
 
 /// 域名最长多少字节。DNS 的名字写成文本最长就是这么多。
 pub const MAX_DOMAIN_LEN: usize = 253;
