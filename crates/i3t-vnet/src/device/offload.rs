@@ -14,38 +14,47 @@
 use std::io::{self, IoSlice};
 use std::ops::Range;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
-use tun_rs::{AsyncDevice, GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
+use tun_rs::{AsyncDevice, GROTable, VIRTIO_NET_HDR_LEN};
 
 use super::Unwritten;
 use crate::MTU_RANGE;
+use crate::ipv4::{Ipv4, TCP};
 
 /// 内核一次给的最多这么长：头，加一个 IPv4 的包能有的最大长度。
 const RAW_LEN: usize = VIRTIO_NET_HDR_LEN + u16::MAX as usize;
 
-/// 一大块最多切成多少个包。分段长度不小于 512 字节时够用，而网卡的 MTU 最小 576（[`MTU_RANGE`]），内核按它定的
-/// TCP 分段长度不小于 524。程序自己把分段长度设得更小、切出来比这还多的那一块丢掉（[`Segmented::try_recv`]），
-/// 它的 TCP 会重发，拥塞窗口小了之后内核给的块也就小了。
-const SEGMENTS: usize = IDEAL_BATCH_SIZE;
+/// 一大块最多切成多少个包：分段长度不小于 256 字节时够用。网卡的 MTU 最小 576（[`MTU_RANGE`]），内核按它定的 TCP 分段长度
+/// 是 536，带着时间戳 524，再带上几个 SACK 块 496，路径 MTU 被压到内核肯认的最小值（552）时还要再小几十，都在里面。
+/// 程序自己把分段长度设得更小、切出来比这还多的那一块丢掉（[`Segmented::try_recv`]）：它的 TCP 会重发，拥塞窗口小了之后
+/// 内核给的块也就小了，等窗口长回来又会丢一次。
+const SEGMENTS: usize = 256;
+
+/// 内核收一块合在一起的 UDP 时最多认多少段（它的 `UDP_MAX_SEGMENTS`）：6.9 之前是 64，之后是 128。多了那一次写就是 `EINVAL`。
+const KERNEL_UDP_SEGMENTS: usize = 64;
 
 /// 一次最多拿多少个包去合。对端来的包引擎一批取 64 帧；内核收的一大块在默认的 MTU 下是 53 个包。
+///
+/// 不能比 [`KERNEL_UDP_SEGMENTS`] 大。`tun-rs` 合 UDP 时不数段数，同一对端口的包有多少合多少，而对端合在一帧里发来的小包
+/// 一批可以有几百个：是这里一次只给它这么多，合出来的才不超过内核认的段数。超了内核拒绝那一次写，这块网卡往后就不合 UDP 了。
 const MERGE_BATCH: usize = 64;
+const _: () = assert!(MERGE_BATCH <= KERNEL_UDP_SEGMENTS, "一次拿去合的包不能比内核认的 UDP 段数多");
 
 /// 合包用的每一格留多大的地方：合好的一大块连头都装得下。合的时候后面的包接到前面那一格的末尾，`tun-rs` 不给格子扩容
-/// （地方不够就不合），所以每一格都要事先留够。只是留着：没写到的那些页不占内存。
+/// （地方不够就不合），所以每一格都要事先留够。
+///
+/// 没写到的页不占内存，写到过的就一直占着：哪一格都可能排在一条流的最前面、被接成一大块，跑久了 [`MERGE_BATCH`] 格
+/// 都写满过，一共四兆多，网卡在就留着（不合了的时候才放掉）。
 const BLOCK_CAPACITY: usize = 2 * VIRTIO_NET_HDR_LEN + u16::MAX as usize;
 
 /// 开了分段卸载的网卡：切好了还没交出去的包，和合包用的东西。
 pub(super) struct Segmented {
-    /// 内核给不给 UDP 的大块（Linux 6.2 起）。只用来说明状态：读和写的时候 `tun-rs` 自己知道。
+    /// 内核给不给 UDP 的大块（Linux 6.2 起）。读和写的时候 `tun-rs` 自己知道；这里用来说明状态，和决定被内核拒绝之后怎么退。
     pub(super) udp: bool,
     reading: Mutex<Reading>,
     /// 只有搬进来的包的那一个任务用，锁着等写完也不挡别人。
     writing: tokio::sync::Mutex<Writing>,
-    /// 写的时候还合不合：内核拒绝过一次合好的包之后不再合。
-    merging: AtomicBool,
 }
 
 struct Reading {
@@ -59,9 +68,44 @@ struct Reading {
 }
 
 struct Writing {
+    merging: Merging,
     table: GROTable,
     /// 要写的包，一个一格（最多 [`MERGE_BATCH`] 格，每格 [`BLOCK_CAPACITY`]），前面留着头的位置。
     buffers: Vec<Vec<u8>>,
+}
+
+/// 写的时候合哪些。只往少里变：内核拒绝过的，这块网卡不再试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Merging {
+    /// 内核给哪些大块就合哪些。
+    All,
+    /// 只合 TCP。内核对 UDP 的大块查得多（段数、校验和的位置），被拒绝的多半是它，所以先只停它：省下来的主要在 TCP 上。
+    TcpOnly,
+    /// 不合了。
+    Off,
+}
+
+impl Merging {
+    /// 内核拒绝了一次合好的包之后合哪些。`udp` 是这块网卡合不合 UDP。
+    const fn after_refusal(self, udp: bool) -> Self {
+        match self {
+            Self::All if udp => Self::TcpOnly,
+            Self::All | Self::TcpOnly | Self::Off => Self::Off,
+        }
+    }
+
+    /// 挨着的两个包能不能放在一起拿去合。只合 TCP 的时候，别的包把一批隔成几段，各段照原来的顺序写。
+    fn joins(self, earlier: &[u8], later: &[u8]) -> bool {
+        match self {
+            Self::All => true,
+            Self::TcpOnly => is_tcp(earlier) && is_tcp(later),
+            Self::Off => false,
+        }
+    }
+}
+
+fn is_tcp(packet: &[u8]) -> bool {
+    Ipv4::parse(packet).is_ok_and(|ip| ip.protocol() == TCP)
 }
 
 impl Segmented {
@@ -75,8 +119,7 @@ impl Segmented {
                 lens: vec![0; SEGMENTS],
                 pending: 0..0,
             }),
-            writing: tokio::sync::Mutex::new(Writing { table: GROTable::new(), buffers: Vec::new() }),
-            merging: AtomicBool::new(true),
+            writing: tokio::sync::Mutex::new(Writing { merging: Merging::All, table: GROTable::new(), buffers: Vec::new() }),
         }
     }
 
@@ -112,15 +155,19 @@ impl Segmented {
 
     /// 把一批包按顺序交给内核：每 [`MERGE_BATCH`] 个里能合的先合。
     pub(super) async fn send_many(&self, device: &AsyncDevice, packets: &[Bytes]) -> Result<(), Unwritten> {
+        let mut writing = self.writing.lock().await;
         let mut lost = None;
         for batch in packets.chunks(MERGE_BATCH) {
-            match self.send_merged(device, batch).await {
-                Some(Ok(())) => {}
-                Some(Err(error)) => Unwritten::add(&mut lost, batch.len(), batch.iter().map(Bytes::len).sum(), error),
-                None => {
-                    for packet in batch {
-                        if let Err(error) = send_plain(device, packet).await {
-                            Unwritten::add(&mut lost, 1, packet.len(), error);
+            let merging = writing.merging;
+            for run in batch.chunk_by(|earlier, later| merging.joins(earlier, later)) {
+                match writing.send_merged(device, self.udp, run).await {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => Unwritten::add(&mut lost, run.len(), run.iter().map(Bytes::len).sum(), error),
+                    None => {
+                        for packet in run {
+                            if let Err(error) = send_plain(device, packet).await {
+                                Unwritten::add(&mut lost, 1, packet.len(), error);
+                            }
                         }
                     }
                 }
@@ -128,28 +175,30 @@ impl Segmented {
         }
         lost.map_or(Ok(()), Err)
     }
+}
 
-    /// 把几个包合了再写。`None` 是没合：只有一个包，已经不合了，或者这一次合不成，调用方照一个一个地写。
+impl Writing {
+    /// 把几个包合了再写。`None` 是没合：只有一个包，不合了，或者这一次合不成，调用方照一个一个地写。
     ///
-    /// 内核不收合好的包（`EINVAL`）时这块网卡从此不再合，这几个也回去一个一个地写；其中已经写进去的那几个大的
-    /// 因此会重复一遍（TCP 不在乎，UDP 的程序会多收到几个一样的包），只有这一次。别的错误是网卡写不了了，
-    /// 这几个都算没写进去。
-    async fn send_merged(&self, device: &AsyncDevice, packets: &[Bytes]) -> Option<io::Result<()>> {
-        if packets.len() < 2 || !self.merging.load(Ordering::Relaxed) {
+    /// 内核不收合好的包（`EINVAL`）时往后少合一样（[`Merging::after_refusal`]），这几个也回去一个一个地写；其中已经
+    /// 写进去的那几个大的因此会重复一遍（TCP 不在乎，UDP 的程序会多收到几个一样的包），一块网卡最多两次。
+    ///
+    /// 别的错误是网卡写不了了。`tun-rs` 只说最后一个错误、不说哪几个写进去了，所以这几个都算没写进去：只是一时写不进
+    /// 其中一块的话（内存紧），丢掉的包会多数、收到的会少数。
+    async fn send_merged(&mut self, device: &AsyncDevice, udp: bool, packets: &[Bytes]) -> Option<io::Result<()>> {
+        if packets.len() < 2 || self.merging == Merging::Off {
             return None;
         }
-        let mut writing = self.writing.lock().await;
-        let Writing { table, buffers } = &mut *writing;
-        if buffers.len() < packets.len() {
-            buffers.resize_with(packets.len(), || Vec::with_capacity(BLOCK_CAPACITY));
+        if self.buffers.len() < packets.len() {
+            self.buffers.resize_with(packets.len(), || Vec::with_capacity(BLOCK_CAPACITY));
         }
-        let buffers = &mut buffers[..packets.len()];
+        let buffers = &mut self.buffers[..packets.len()];
         for (buffer, packet) in buffers.iter_mut().zip(packets) {
             buffer.clear();
             buffer.resize(VIRTIO_NET_HDR_LEN, 0);
             buffer.extend_from_slice(packet);
         }
-        let error = match device.send_multiple(table, buffers, VIRTIO_NET_HDR_LEN).await {
+        let error = match device.send_multiple(&mut self.table, buffers, VIRTIO_NET_HDR_LEN).await {
             Ok(_) => return Some(Ok(())),
             Err(error) => error,
         };
@@ -160,8 +209,14 @@ impl Segmented {
                 None
             }
             Some(libc::EINVAL) => {
-                self.merging.store(false, Ordering::Relaxed);
-                tracing::warn!(%error, "内核不收合起来的包：这块虚拟网卡往后一个一个地写");
+                self.merging = self.merging.after_refusal(udp);
+                if self.merging == Merging::TcpOnly {
+                    tracing::warn!(%error, "内核不收合起来的包：这块虚拟网卡往后只合 TCP 的");
+                } else {
+                    tracing::warn!(%error, "内核不收合起来的包：这块虚拟网卡往后一个一个地写");
+                    // 用不着了：格子和表都放掉。
+                    (self.table, self.buffers) = (GROTable::default(), Vec::new());
+                }
                 None
             }
             Some(_) => Some(Err(error)),

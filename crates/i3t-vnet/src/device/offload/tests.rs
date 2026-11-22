@@ -10,8 +10,9 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
+use super::Merging;
 use crate::device::{Device, DeviceSpec, Offload, Platform, Tun};
-use crate::ipv4::testing::{header_checksum, packet};
+use crate::ipv4::testing::{header_checksum, packet, tcp};
 use crate::ipv4::{Ipv4, TCP, UDP};
 
 const OWN: [u8; 4] = [10, 67, 0, 5];
@@ -136,6 +137,22 @@ impl Counted {
     }
 }
 
+#[test]
+fn a_refused_block_stops_udp_merging_first_and_all_merging_the_second_time() {
+    assert_eq!(Merging::All.after_refusal(true), Merging::TcpOnly);
+    assert_eq!(Merging::All.after_refusal(false), Merging::Off, "不合 UDP 的网卡上没有可以先停的");
+    assert_eq!(Merging::TcpOnly.after_refusal(true), Merging::Off);
+    assert_eq!(Merging::Off.after_refusal(true), Merging::Off);
+
+    // 一批里两个 TCP、两个 UDP、三个 TCP：只合 TCP 的时候 UDP 各自一段，两头的 TCP 各合各的，顺序不变。
+    let (stream, datagram) = (tcp(PEER, OWN, (PEER_PORT, 40000), ACK), udp_from_peer(40000, &[1; 20]).to_vec());
+    let batch = [&stream, &stream, &datagram, &datagram, &stream, &stream, &stream];
+    let runs = |merging: Merging| batch.chunk_by(|earlier, later| merging.joins(earlier, later)).map(<[_]>::len).collect::<Vec<_>>();
+    assert_eq!(runs(Merging::All), [7]);
+    assert_eq!(runs(Merging::TcpOnly), [2, 1, 1, 3]);
+    assert_eq!(runs(Merging::Off), [1; 7]);
+}
+
 #[tokio::test]
 async fn a_real_device_with_offload_gives_and_takes_plain_packets_while_the_kernel_sees_blocks() {
     if std::env::var_os("I3T_VNET_DEVICE_TEST").is_none() {
@@ -179,6 +196,26 @@ async fn a_real_device_with_offload_gives_and_takes_plain_packets_while_the_kern
     }
     let writes = Counted::on(tun.name()).written - before;
     assert_eq!(writes, if tun.offload() == Offload::TcpUdp { 1 } else { 10 }, "写了几次");
+
+    // UDP，一批 130 个小包（对端合在一帧里发来的小包，一批可以有这么多）：比内核一块里认的段数多，所以每 64 个合一次。
+    // 全合成一块的话内核拒绝那一次写，往后就不合 UDP 了：后面那十个还是只写一次，说明没有走到那一步。
+    let many: Vec<Bytes> = (0..130).map(|fill| udp_from_peer(port, &[fill; 20])).collect();
+    let before = Counted::on(tun.name()).written;
+    tun.send_many(&many).await.unwrap();
+    for fill in 0..130 {
+        let (len, _) = tokio::time::timeout(SOON, socket.recv_from(&mut got)).await.expect("分几次合起来写的 UDP 包没有到齐").unwrap();
+        assert_eq!(&got[..len], &[fill; 20][..], "顺序和内容不变");
+    }
+    let writes = Counted::on(tun.name()).written - before;
+    assert_eq!(writes, if tun.offload() == Offload::TcpUdp { 3 } else { 130 }, "130 个包每 64 个合一次");
+    let before = Counted::on(tun.name()).written;
+    tun.send_many(&batch).await.unwrap();
+    for fill in 2..12 {
+        let (len, _) = tokio::time::timeout(SOON, socket.recv_from(&mut got)).await.expect("之后的 UDP 包没有到齐").unwrap();
+        assert_eq!(&got[..len], &[fill; 200][..]);
+    }
+    let writes = Counted::on(tun.name()).written - before;
+    assert_eq!(writes, if tun.offload() == Offload::TcpUdp { 1 } else { 10 }, "之后照样合");
 
     // TCP：本机的程序连对端，先收后发。
     let app = tokio::spawn(async {

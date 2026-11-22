@@ -323,14 +323,21 @@ def device_counter(node: Node, device: str, name: str) -> int:
     return int(node.host.run("sh", "-c", f"cat /sys/class/net/{device}/statistics/{name}").stdout.split()[0])
 
 
-def small_packets(a: Node, b: Node, count: int) -> tuple[int, int]:
-    """a 往 b 的虚拟 IP 发 `count` 个小 UDP 包，每秒四千个。返回（a 的真网卡因此发出去多少个包，b 的节点写进虚拟网卡多少个）。"""
+def small_packets(a: Node, b: Node, count: int, work: Path) -> tuple[int, int]:
+    """a 往 b 的虚拟 IP 发 `count` 个小 UDP 包，每秒四千个。返回（a 的真网卡因此发出去多少个包，b 上的程序收到多少个）。
+
+    数的是 b 上的程序收到的，不是 b 的虚拟网卡被写了几次：节点把一批里同一对端口的包合成一个大的写进网卡时，
+    一次写里有好几个包。"""
     ping(a, b.virtual_ip, count=2)
     time.sleep(0.5)
-    before = device_counter(a, "up0", "tx_packets"), device_counter(b, "i3t*", "rx_packets")
+    out = work / "small-packets.json"
+    out.unlink(missing_ok=True)
+    sink = b.host.spawn(sys.executable, "-c", UDP_SERIES_SINK, "9", str(count), str(out))
+    wait_until(lambda: ":9 " in b.host.run("ss", "-lnu").stdout, what="b 上收小包的程序启动")
+    before = device_counter(a, "up0", "tx_packets")
     a.host.run(sys.executable, "-c", SMALL_PACKETS, b.virtual_ip, str(count), "4000")
-    time.sleep(0.5)
-    return device_counter(a, "up0", "tx_packets") - before[0], device_counter(b, "i3t*", "rx_packets") - before[1]
+    sink.wait(timeout=45)
+    return device_counter(a, "up0", "tx_packets") - before, len(json.loads(out.read_text()))
 
 
 def bundling(lab: Lab, work: Path, t: Checks) -> None:
@@ -345,9 +352,9 @@ def bundling(lab: Lab, work: Path, t: Checks) -> None:
     start_pair(a, b)
     if installed(t, a, b):
         wait_until(lambda: current_route(a, b).startswith("直连"), timeout=20, what="a 到 b 直连")
-        on_wire, delivered = small_packets(a, b, count)
+        on_wire, delivered = small_packets(a, b, count, work)
         print(f"  开关开着：{count} 个小包，线上 {on_wire} 个包，对面收到 {delivered} 个")
-        t.check("合起来发：一个不丢", delivered >= count, f"对面的虚拟网卡收到 {delivered} 个")
+        t.check("合起来发：一个不丢", delivered >= count, f"对面的程序收到 {delivered} 个")
         t.check("合起来发：线上的包不到小包数的一半", on_wire < count // 2, f"线上 {on_wire} 个")
         idle = ping(a, b.virtual_ip, count=5)
         t.check("稀的包照旧：ping 不丢", received(idle) == 5, idle.stdout)
@@ -360,10 +367,10 @@ def bundling(lab: Lab, work: Path, t: Checks) -> None:
     b.start_static(off(b.netmap(peers=[a.as_peer()])))
     if installed(t, a, b):
         wait_until(lambda: current_route(a, b).startswith("直连"), timeout=20, what="a 到 b 直连")
-        on_wire, delivered = small_packets(a, b, count)
+        on_wire, delivered = small_packets(a, b, count, work)
         print(f"  开关关着：{count} 个小包，线上 {on_wire} 个包，对面收到 {delivered} 个")
         t.check("开关关着：一个包一个包地发", on_wire >= count, f"线上 {on_wire} 个")
-        t.check("开关关着：一个不丢", delivered >= count, f"对面的虚拟网卡收到 {delivered} 个")
+        t.check("开关关着：一个不丢", delivered >= count, f"对面的程序收到 {delivered} 个")
     if t.failures:
         print(tail(a.read_log(), 20), tail(b.read_log()), sep="\n  ---\n")
 
@@ -379,11 +386,14 @@ sock.connect((target, port))
 packets = [bytes([index]) * SIZE for index in range(blocks + singles)]
 refused = None
 try:
+    # 很老的内核不认这个选项：那样连设都设不上，也就不用设回去。
     sock.setsockopt(socket.IPPROTO_UDP, UDP_SEGMENT, SIZE)
-    sock.send(b"".join(packets[:blocks]))
+    try:
+        sock.send(b"".join(packets[:blocks]))
+    finally:
+        sock.setsockopt(socket.IPPROTO_UDP, UDP_SEGMENT, 0)
 except OSError as error:
     refused = str(error)
-sock.setsockopt(socket.IPPROTO_UDP, UDP_SEGMENT, 0)
 for packet in packets[0 if refused else blocks:]:
     sock.send(packet)
 print(json.dumps({"refused": refused}))
