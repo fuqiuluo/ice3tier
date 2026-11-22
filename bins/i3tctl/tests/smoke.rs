@@ -181,6 +181,13 @@ async fn the_command_line_drives_a_running_controller() {
     let set = fixture.ok(&["network", "set", "--bundle-small-packets", "off"]).await;
     assert!(set.contains("合并小包") && set.contains("关（默认 开）"), "关掉之后写着默认值：{set}");
     assert_eq!(fixture.json(&["network", "show"]).await["bundle_small_packets"], false);
+    assert_eq!((&shown["vnet_offload"], &shown["vnet_mtu"]), (&true.into(), &1280.into()), "虚拟网卡的两项默认开着、1280");
+    let set = fixture.ok(&["network", "set", "--vnet-offload", "off", "--vnet-mtu", "1400"]).await;
+    assert!(set.contains("虚拟网卡分段卸载") && set.contains("1400（默认 1280）"), "改过的写着默认值：{set}");
+    let shown = fixture.json(&["network", "show"]).await;
+    assert_eq!((&shown["vnet_offload"], &shown["vnet_mtu"]), (&false.into(), &1400.into()));
+    let refused = fixture.fails(&["network", "set", "--vnet-mtu", "1501"]).await;
+    assert!(refused.contains("576 到 1500"), "{refused}");
 
     // 分组。
     assert!(fixture.ok(&["group", "list"]).await.contains("All（内置）"));

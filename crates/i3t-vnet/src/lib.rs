@@ -54,20 +54,21 @@ pub const DEVICE_PATTERN: &str = "i3t%d";
 /// 网卡名字的前缀。名字是它加上编号的网卡、表，和注释是 [`COMMENT`] 的规则，才是自己的。
 pub const DEVICE_PREFIX: &str = "i3t";
 
-/// 网卡的 MTU，没有另外设时用的（配置文件的 `[network] mtu`，`i3t set mtu`）。
+/// 网卡的 MTU，哪里都没有另外设时用的。网络可以定一个默认值（`i3t_model::netmap::Network::vnet_mtu`），
+/// 一台机器可以定自己的（配置文件的 `[network] mtu`，`i3t set mtu`）；两处的默认值和范围是同一份，定义在模型里。
 ///
 /// 一个 IP 包是连接上的一个数据报。连接刚建立时一个数据报只装得下一千一百多字节，路径 MTU 探测之后（最多 1400 字节的包）
 /// 是一千三百多：1280 的包在探测完之前切成两片（[`pieces`]），之后整个装得下。比它小的 MTU 不用切，但每个包少带一成的数据，
 /// 吞吐的量法和数在内部的测量记录里。取 1280 也因为 IPv6 要求链路至少送得了这么大的包：以后网卡上有 IPv6 的地址时不用改。
 /// 应用不用管：两端的内核按它定 TCP 的分段长度，比它大的包内核自己切或者回"太大"。
-pub const DEFAULT_MTU: u16 = 1280;
+pub const DEFAULT_MTU: u16 = i3t_model::netmap::DEFAULT_VNET_MTU;
 
 /// 网卡的 MTU 可以设成的值。两个节点设得不一样也通：TCP 按小的一头定分段长度。
 ///
 /// 下限是 IPv4 要求每台主机都收得了的包长（Windows 也不让 IPv4 的网卡比它小）。上限是以太网的 1500：一个包最多切成两片，
 /// 连接上最小的数据报装得下一千一百多字节，两片是两千三百多，1500 以内的包怎么都送得到；再大就有送不到的包，
 /// 而且超过一千三百多之后每个满包都要切，只会更慢。
-pub const MTU_RANGE: std::ops::RangeInclusive<u16> = 576..=1500;
+pub const MTU_RANGE: std::ops::RangeInclusive<u16> = i3t_model::netmap::VNET_MTU;
 
 /// 程序加的 iptables 规则的注释，认自己的规则靠它（加上 `-i <网卡>`，raw 表里防冒充的那条是 `! -i <网卡>`）。
 pub const COMMENT: &str = "ice3tier";

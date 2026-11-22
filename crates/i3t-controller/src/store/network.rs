@@ -25,6 +25,9 @@ pub struct NetworkRecord {
     pub max_ack_delay_ms: u32,
     /// 节点之间直连时把同一时刻要发的几个小网络包合成一个包发。
     pub bundle_small_packets: bool,
+    /// 节点的虚拟网卡：和内核之间是不是一大块一大块地交接，和默认的 MTU。
+    pub vnet_offload: bool,
+    pub vnet_mtu: u16,
 }
 
 impl NetworkRecord {
@@ -47,6 +50,8 @@ impl NetworkRecord {
             ack_eliciting_threshold: row.get("ack_eliciting_threshold")?,
             max_ack_delay_ms: row.get("max_ack_delay_ms")?,
             bundle_small_packets: row.get("bundle_small_packets")?,
+            vnet_offload: row.get("vnet_offload")?,
+            vnet_mtu: row.get("vnet_mtu")?,
         })
     }
 }
@@ -63,6 +68,8 @@ pub struct NewNetwork {
     pub ack_eliciting_threshold: u32,
     pub max_ack_delay_ms: u32,
     pub bundle_small_packets: bool,
+    pub vnet_offload: bool,
+    pub vnet_mtu: u16,
 }
 
 impl Store {
@@ -74,8 +81,8 @@ impl Store {
     pub fn insert_network(&self, new: &NewNetwork) -> Result<NetworkId, StoreError> {
         self.conn.execute(
             "INSERT INTO networks (name, cidr, routing, max_relay_hops, reach, created_at, class, ack_eliciting_threshold, max_ack_delay_ms,
-                                   bundle_small_packets)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                   bundle_small_packets, vnet_offload, vnet_mtu)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 new.name,
                 Text(new.cidr),
@@ -86,7 +93,9 @@ impl Store {
                 new.class.map(Json),
                 new.ack_eliciting_threshold,
                 new.max_ack_delay_ms,
-                new.bundle_small_packets
+                new.bundle_small_packets,
+                new.vnet_offload,
+                new.vnet_mtu
             ],
         )?;
         let id = NetworkId(row_id(self.conn.last_insert_rowid())?);
@@ -127,7 +136,8 @@ impl Store {
     pub fn update_network(&self, network: &NetworkRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE networks SET cidr = ?2, routing = ?3, max_relay_hops = ?4, reach = ?5, class = ?6,
-                                 ack_eliciting_threshold = ?7, max_ack_delay_ms = ?8, bundle_small_packets = ?9
+                                 ack_eliciting_threshold = ?7, max_ack_delay_ms = ?8, bundle_small_packets = ?9,
+                                 vnet_offload = ?10, vnet_mtu = ?11
              WHERE id = ?1",
             params![
                 SqlNetwork(network.id),
@@ -138,7 +148,9 @@ impl Store {
                 network.class.map(Json),
                 network.ack_eliciting_threshold,
                 network.max_ack_delay_ms,
-                network.bundle_small_packets
+                network.bundle_small_packets,
+                network.vnet_offload,
+                network.vnet_mtu
             ],
         )?;
         Ok(())
@@ -169,6 +181,7 @@ mod tests {
         assert_eq!(record.domain(), "home.i3t");
         assert_eq!(record.cidr, "10.66.0.0/16".parse().unwrap());
         assert_eq!((record.ack_eliciting_threshold, record.max_ack_delay_ms, record.bundle_small_packets), (3, 2, true));
+        assert_eq!((record.vnet_offload, record.vnet_mtu), (true, 1280));
         assert_eq!(store.network_by_name("home").unwrap(), Some(record.clone()));
         assert_eq!(store.networks().unwrap(), vec![record.clone()]);
 
@@ -180,6 +193,8 @@ mod tests {
             ack_eliciting_threshold: 4,
             max_ack_delay_ms: 5,
             bundle_small_packets: false,
+            vnet_offload: false,
+            vnet_mtu: 1400,
             ..record
         };
         store.update_network(&updated).unwrap();

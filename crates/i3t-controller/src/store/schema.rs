@@ -29,6 +29,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0016_proxy_lane.sql"),
     include_str!("migrations/0017_network_ack_frequency.sql"),
     include_str!("migrations/0018_network_bundle_small_packets.sql"),
+    include_str!("migrations/0019_network_vnet_settings.sql"),
 ];
 
 #[cfg(test)]
@@ -581,6 +582,7 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), u32::try_from(MIGRATIONS.len()).unwrap());
         let network = store.network_by_name("home").unwrap().unwrap();
         assert!(network.bundle_small_packets, "已有的网络取默认值：开着");
+        assert_eq!((network.vnet_offload, network.vnet_mtu), (true, 1280), "虚拟网卡的两项也是默认值");
         assert_eq!(network.ack_eliciting_threshold, 7, "别的设置不动");
     }
 }

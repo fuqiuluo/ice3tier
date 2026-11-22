@@ -212,6 +212,7 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
     assert_eq!((home.name.as_str(), home.domain.as_str(), home.nodes), ("home", "home.i3t", 0));
     assert_eq!(home.cidr, "10.66.0.0/16".parse().unwrap());
     assert_eq!((home.ack_eliciting_threshold, home.max_ack_delay_ms, home.bundle_small_packets), (3, 2, true), "没写的设置用默认值");
+    assert_eq!((home.vnet_offload, home.vnet_mtu), (true, 1280), "虚拟网卡的两项也是");
     let defaults = home.defaults.clone().expect("controller 报出各项设置的默认值");
     assert_eq!(
         (home.routing, home.max_relay_hops, home.reach, home.class, home.ack_eliciting_threshold, home.max_ack_delay_ms),
@@ -227,12 +228,13 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
     );
     let explicit = json!({
         "name": "lab", "cidr": "10.99.3.4/24", "routing": "lowest_cost", "max_relay_hops": 3, "reach": "direct_only",
-        "ack_eliciting_threshold": 4, "max_ack_delay_ms": 5, "bundle_small_packets": false
+        "ack_eliciting_threshold": 4, "max_ack_delay_ms": 5, "bundle_small_packets": false, "vnet_offload": false, "vnet_mtu": 1400
     });
     let lab: model::Network = api.ok(Method::POST, "/networks", Some(explicit)).await;
     assert_eq!(lab.cidr, "10.99.3.0/24".parse().unwrap());
     assert_eq!((lab.max_relay_hops, serde_json::to_value(lab.routing).unwrap()), (3, json!("lowest_cost")));
     assert_eq!((lab.ack_eliciting_threshold, lab.max_ack_delay_ms, lab.bundle_small_packets), (4, 5, false));
+    assert_eq!((lab.vnet_offload, lab.vnet_mtu), (false, 1400));
 
     let listed: Vec<model::Network> = api.ok(Method::GET, "/networks", None).await;
     assert_eq!(listed, vec![home.clone(), lab.clone()]);
@@ -251,6 +253,10 @@ async fn networks_can_be_created_listed_changed_and_deleted() {
         api.ok(Method::PATCH, &format!("/networks/{}", lab.id), Some(json!({ "bundle_small_packets": true }))).await;
     assert!(bundling.bundle_small_packets);
     assert_eq!(bundling.ack_eliciting_threshold, 20);
+    assert_eq!((bundling.vnet_offload, bundling.vnet_mtu), (false, 1400), "没提到的设置不变");
+    let adapter: model::Network =
+        api.ok(Method::PATCH, &format!("/networks/{}", lab.id), Some(json!({ "vnet_offload": true, "vnet_mtu": 576 }))).await;
+    assert_eq!((adapter.vnet_offload, adapter.vnet_mtu, adapter.bundle_small_packets), (true, 576, true));
     assert_eq!(quieter.defaults, Some(defaults), "默认值不跟着网络的设置变");
 
     let overlap = api.fails(Method::POST, "/networks", Some(json!({ "name": "x", "cidr": "10.66.1.0/24" })), StatusCode::CONFLICT).await;
@@ -1054,9 +1060,14 @@ async fn vague_errors_say_what_was_wrong_and_which_field() {
     let hops = json!({ "max_relay_hops": 9 });
     let hops = api.fails(Method::PATCH, &format!("/networks/{}", network.id), Some(hops), StatusCode::BAD_REQUEST).await;
     assert_eq!((hops.what.as_deref(), hops.field.as_deref()), (Some("out_of_range"), Some("max_relay_hops")));
-    for (field, value) in
-        [("ack_eliciting_threshold", 0), ("ack_eliciting_threshold", 101), ("max_ack_delay_ms", 0), ("max_ack_delay_ms", 26)]
-    {
+    for (field, value) in [
+        ("ack_eliciting_threshold", 0),
+        ("ack_eliciting_threshold", 101),
+        ("max_ack_delay_ms", 0),
+        ("max_ack_delay_ms", 26),
+        ("vnet_mtu", 575),
+        ("vnet_mtu", 1501),
+    ] {
         let refused =
             api.fails(Method::PATCH, &format!("/networks/{}", network.id), Some(json!({ field: value })), StatusCode::BAD_REQUEST).await;
         assert_eq!((refused.what.as_deref(), refused.field.as_deref()), (Some("out_of_range"), Some(field)), "{field} = {value}");

@@ -27,8 +27,8 @@ use crate::control::{
     RouteSince, SelfUpdate, TargetCause, TryOutcome, VnetReport,
 };
 use crate::netmap::{
-    Attachment, Congestion, DEFAULT_ACK_ELICITING_THRESHOLD, DEFAULT_BUNDLE_SMALL_PACKETS, DEFAULT_MAX_ACK_DELAY_MS, ExitRole,
-    ForwardProtocol, ListenerProtocol, Profile, ProxyProtocol, Reach, RoutingMode,
+    Attachment, Congestion, DEFAULT_ACK_ELICITING_THRESHOLD, DEFAULT_BUNDLE_SMALL_PACKETS, DEFAULT_MAX_ACK_DELAY_MS, DEFAULT_VNET_MTU,
+    DEFAULT_VNET_OFFLOAD, ExitRole, ForwardProtocol, ListenerProtocol, Profile, ProxyProtocol, Reach, RoutingMode,
 };
 use crate::update::{FailureKind, SelfUpdateBlocker, UpdateCause, UpdateStatus, UpdateTiming, Version};
 
@@ -225,6 +225,13 @@ pub struct Network {
     /// 节点之间直连时，同一时刻要发给同一个节点的几个小网络包合成一个包发。比这个字段旧的 controller 不给，读成默认值。
     #[serde(default = "crate::netmap::default_bundle_small_packets")]
     pub bundle_small_packets: bool,
+    /// 节点的虚拟网卡和内核之间是不是一大块一大块地交接数据（Linux 的分段卸载）。比这个字段旧的 controller 不给，读成默认值。
+    #[serde(default = "crate::netmap::default_vnet_offload")]
+    pub vnet_offload: bool,
+    /// 节点的虚拟网卡默认的 MTU（字节，[`VNET_MTU`](crate::netmap::VNET_MTU) 之内）；本机另外设了的节点用本机的。
+    /// 比这个字段旧的 controller 不给，读成默认值。
+    #[serde(default = "crate::netmap::default_vnet_mtu")]
+    pub vnet_mtu: u16,
     /// 各项设置的默认值。比这个字段旧的 controller 不给，是 `null`：这时说不出哪些设置改过。
     #[serde(default)]
     pub defaults: Option<NetworkDefaults>,
@@ -244,6 +251,8 @@ pub struct NetworkDefaults {
     pub ack_eliciting_threshold: u32,
     pub max_ack_delay_ms: u32,
     pub bundle_small_packets: bool,
+    pub vnet_offload: bool,
+    pub vnet_mtu: u16,
 }
 
 impl Default for NetworkDefaults {
@@ -256,6 +265,8 @@ impl Default for NetworkDefaults {
             ack_eliciting_threshold: DEFAULT_ACK_ELICITING_THRESHOLD,
             max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
             bundle_small_packets: DEFAULT_BUNDLE_SMALL_PACKETS,
+            vnet_offload: DEFAULT_VNET_OFFLOAD,
+            vnet_mtu: DEFAULT_VNET_MTU,
         }
     }
 }
@@ -290,6 +301,11 @@ pub struct CreateNetwork {
     pub max_ack_delay_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_small_packets: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnet_offload: Option<bool>,
+    /// 字节，576 到 1500。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnet_mtu: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -314,6 +330,12 @@ pub struct UpdateNetwork {
     /// 节点收到新的 netmap 就生效，不用重建连接。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_small_packets: Option<bool>,
+    /// 这一项和下面一项，节点收到新的 netmap、算出来的结果和现在不一样时，把虚拟网卡重装一遍，不用重启。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnet_offload: Option<bool>,
+    /// 字节，576 到 1500。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnet_mtu: Option<u16>,
 }
 
 /// 一个网络的总览。

@@ -251,6 +251,32 @@ fn the_networks_small_packet_bundling_switch_reaches_every_node() {
 }
 
 #[test]
+fn the_networks_adapter_settings_reach_every_node_and_a_wrong_mtu_is_refused() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let (mut laptop, mut nas) = (lab.join(network.id, &[]), lab.join(network.id, &[]));
+    lab.settle(&mut [&mut laptop, &mut nas]);
+    let sent = |netmap: &netmap::Netmap| (netmap.network.vnet_offload, netmap.network.vnet_mtu);
+    assert_eq!((sent(laptop.netmap()), sent(nas.netmap())), ((true, 1280), (true, 1280)), "新建的网络：开着，1280");
+
+    let change = UpdateNetwork { vnet_offload: Some(false), vnet_mtu: Some(1400), ..UpdateNetwork::default() };
+    let changed = lab.controller.update_network(network.id, &change).unwrap();
+    assert_eq!((changed.vnet_offload, changed.vnet_mtu), (false, 1400));
+    assert_eq!(changed.defaults.map(|defaults| (defaults.vnet_offload, defaults.vnet_mtu)), Some((true, 1280)), "默认值不跟着变");
+    lab.settle(&mut [&mut laptop, &mut nas]);
+    assert_eq!((sent(laptop.netmap()), sent(nas.netmap())), ((false, 1400), (false, 1400)), "改了之后每个节点都收到");
+
+    for wrong in [575, 1501] {
+        let refused = lab.controller.update_network(network.id, &UpdateNetwork { vnet_mtu: Some(wrong), ..UpdateNetwork::default() });
+        assert!(refused.is_err(), "{wrong} 不在 576 到 1500 里");
+    }
+    // 改别的设置不动它们，被拒绝的改动什么都不留下。
+    lab.controller.update_network(network.id, &UpdateNetwork { max_relay_hops: Some(3), ..UpdateNetwork::default() }).unwrap();
+    let kept = lab.controller.network(network.id).unwrap();
+    assert_eq!((kept.vnet_offload, kept.vnet_mtu), (false, 1400));
+}
+
+#[test]
 fn classes_and_the_optimistic_reply_set_on_the_network_proxy_forward_and_exit_reach_the_netmaps() {
     let mut lab = Lab::new();
     let network = lab.network("home");

@@ -4,6 +4,7 @@ use i3t_model::admin::{
     ACK_ELICITING_THRESHOLD, CreateNetwork, Direction, GroupRef, LogRef, MAX_ACK_DELAY_MS, Network, NetworkDefaults, NetworkId, RefKind,
     Rule, UpdateNetwork, action,
 };
+use i3t_model::netmap::VNET_MTU;
 use ipnet::Ipv4Net;
 use serde_json::json;
 
@@ -43,6 +44,7 @@ impl Controller {
         let ack_eliciting_threshold =
             check_ack_eliciting_threshold(request.ack_eliciting_threshold.unwrap_or(defaults.ack_eliciting_threshold))?;
         let max_ack_delay_ms = check_max_ack_delay_ms(request.max_ack_delay_ms.unwrap_or(defaults.max_ack_delay_ms))?;
+        let vnet_mtu = check_vnet_mtu(request.vnet_mtu.unwrap_or(defaults.vnet_mtu))?;
         let mut inner = self.lock();
         let now = inner.clock.now();
         let id = inner.store.atomically(|store| {
@@ -70,6 +72,8 @@ impl Controller {
                 ack_eliciting_threshold,
                 max_ack_delay_ms,
                 bundle_small_packets: request.bundle_small_packets.unwrap_or(defaults.bundle_small_packets),
+                vnet_offload: request.vnet_offload.unwrap_or(defaults.vnet_offload),
+                vnet_mtu,
             })?;
             let all = store.builtin_group(id)?.ok_or(Error::NotFound(Entity::Group))?;
             let all = GroupRef { id: all, name: BUILTIN_GROUP.to_owned(), builtin: true };
@@ -115,6 +119,10 @@ impl Controller {
             if let Some(bundle) = request.bundle_small_packets {
                 network.bundle_small_packets = bundle;
             }
+            if let Some(mtu) = request.vnet_mtu {
+                network.vnet_mtu = check_vnet_mtu(mtu)?;
+            }
+            network.vnet_offload = request.vnet_offload.unwrap_or(network.vnet_offload);
             network.routing = request.routing.unwrap_or(network.routing);
             network.reach = request.reach.unwrap_or(network.reach);
             network.class = request.class.unwrap_or(network.class);
@@ -131,6 +139,8 @@ impl Controller {
                 "ack_eliciting_threshold": network.ack_eliciting_threshold,
                 "max_ack_delay_ms": network.max_ack_delay_ms,
                 "bundle_small_packets": network.bundle_small_packets,
+                "vnet_offload": network.vnet_offload,
+                "vnet_mtu": network.vnet_mtu,
             });
             store.log_refs(now, Some(id), action::NETWORK_UPDATE, &format!("修改网络 {} 的设置", network.name), &refs, params)?;
             Ok::<_, Error>(network)
@@ -179,6 +189,8 @@ impl Inner {
             ack_eliciting_threshold: record.ack_eliciting_threshold,
             max_ack_delay_ms: record.max_ack_delay_ms,
             bundle_small_packets: record.bundle_small_packets,
+            vnet_offload: record.vnet_offload,
+            vnet_mtu: record.vnet_mtu,
             defaults: Some(NetworkDefaults::default()),
         })
     }
@@ -216,6 +228,18 @@ fn check_max_ack_delay_ms(delay: u32) -> Result<u32, Error> {
             "max_ack_delay_ms",
             "out_of_range",
             format!("确认的最长等待要在 {} 到 {} 毫秒之间", MAX_ACK_DELAY_MS.start(), MAX_ACK_DELAY_MS.end()),
+        ))
+    }
+}
+
+fn check_vnet_mtu(mtu: u16) -> Result<u16, Error> {
+    if VNET_MTU.contains(&mtu) {
+        Ok(mtu)
+    } else {
+        Err(Error::invalid_field(
+            "vnet_mtu",
+            "out_of_range",
+            format!("虚拟网卡的 MTU 要在 {} 到 {} 字节之间", VNET_MTU.start(), VNET_MTU.end()),
         ))
     }
 }

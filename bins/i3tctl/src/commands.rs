@@ -347,6 +347,8 @@ impl Session {
                     ack_eliciting_threshold,
                     max_ack_delay_ms,
                     bundle_small_packets,
+                    vnet_offload,
+                    vnet_mtu,
                 } = settings;
                 let request = CreateNetwork {
                     name,
@@ -358,6 +360,8 @@ impl Session {
                     ack_eliciting_threshold,
                     max_ack_delay_ms,
                     bundle_small_packets: bundle_small_packets.map(|switch| switch.0),
+                    vnet_offload: vnet_offload.map(|switch| switch.0),
+                    vnet_mtu,
                 };
                 self.show(self.send(Method::POST, "/networks", &request).await?, render::network)
             }
@@ -376,6 +380,8 @@ impl Session {
                     ack_eliciting_threshold,
                     max_ack_delay_ms,
                     bundle_small_packets,
+                    vnet_offload,
+                    vnet_mtu,
                 } = settings;
                 let request = UpdateNetwork {
                     cidr,
@@ -386,6 +392,8 @@ impl Session {
                     ack_eliciting_threshold,
                     max_ack_delay_ms,
                     bundle_small_packets: bundle_small_packets.map(|switch| switch.0),
+                    vnet_offload: vnet_offload.map(|switch| switch.0),
+                    vnet_mtu,
                 };
                 self.show(self.send(Method::PATCH, &format!("/networks/{}", network.id), &request).await?, render::network)
             }

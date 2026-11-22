@@ -179,6 +179,8 @@ mod tests {
                 ack_eliciting_threshold: 3,
                 max_ack_delay_ms: 2,
                 bundle_small_packets: true,
+                vnet_offload: true,
+                vnet_mtu: 1280,
             },
             me: LocalNode {
                 id: node(1),

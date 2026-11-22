@@ -595,12 +595,12 @@ pub struct Network {
     /// 程序加不加那两条防火墙规则（像 Tailscale 的 `--netfilter-mode`）。关着时一条规则也不碰。
     #[serde(default = "default_true")]
     pub firewall: bool,
-    /// 网卡的 MTU，字节（`i3t set mtu`）。默认 [`i3t_vnet::DEFAULT_MTU`]，要在 [`i3t_vnet::MTU_RANGE`] 里。
-    /// 只管这台机器的网卡：别的节点设得不一样也通。重启之后生效。
+    /// 这台机器的网卡的 MTU，字节（`i3t set mtu`），要在 [`i3t_vnet::MTU_RANGE`] 里。还是 [`i3t_vnet::DEFAULT_MTU`]（没有另外设）
+    /// 时用网络的默认值；设了别的值就用它，只管这台机器：别的节点设得不一样也通。重启之后生效。
     #[serde(default = "default_mtu")]
     pub mtu: u16,
     /// Linux：网卡和内核之间一大块一大块地交接数据，不是一个个的包（`i3t set offload`）。默认打开，内核不给时自己退回去；
-    /// 关掉是为了排查：经网卡的传输出了怪事时看是不是它。别的平台上没有这回事。重启之后生效。
+    /// 关掉是为了排查：经网卡的传输出了怪事时看是不是它。网络的开关关着时这里开着也不用。别的平台上没有这回事。重启之后生效。
     #[serde(default = "default_true")]
     pub offload: bool,
 }

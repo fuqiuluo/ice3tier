@@ -730,6 +730,8 @@ mod tests {
             ack_eliciting_threshold: 3,
             max_ack_delay_ms: 2,
             bundle_small_packets: true,
+            vnet_offload: true,
+            vnet_mtu: 1280,
         };
         let interfaces: Vec<IpNet> =
             vec!["127.0.0.1/8".parse().unwrap(), "198.20.0.5/24".parse().unwrap(), "2400:db00::5/64".parse().unwrap()];

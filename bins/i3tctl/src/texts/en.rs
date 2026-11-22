@@ -34,6 +34,8 @@ const HELP: Help = Help {
     network_ack_eliciting_threshold: "ACK threshold, 1 to 100, default 3: a peer sends an ACK of its own only after more than this many packets. Above 3, throughput depends on how precise the peer's timer is. Applies to new connections",
     network_max_ack_delay_ms: "Max ACK delay, 1 to 25 ms: how long a peer waits below the threshold. Applies to new connections",
     network_bundle_small_packets: "Bundle small packets, default on: on a direct route, small packets going to the same node at the same moment leave in one packet, so far fewer packets are sent. When small packets come thick, one may wait a millisecond or two",
+    network_vnet_offload: "Segmentation offload on the virtual adapter, default on: Linux nodes exchange large blocks with the kernel, which saves CPU under load. off turns it off for the whole network; nodes reinstall their adapter by themselves",
+    network_vnet_mtu: "Default MTU of the virtual adapter, 576 to 1500 bytes, default 1280: used by nodes that set none of their own; they reinstall their adapter by themselves",
     routing: "Routing mode",
     reach: "Path restriction",
     class: "QoS: auto (Auto), interactive (Low latency), reliable (No loss), bulk (Background)",
@@ -285,6 +287,8 @@ const UI: Ui = Ui {
     ack_eliciting_threshold: "ACK threshold",
     max_ack_delay: "Max ACK delay",
     bundle_small_packets: "Bundle small packets",
+    vnet_offload: "Adapter segmentation offload",
+    vnet_mtu: "Adapter default MTU",
     default_is: |default| format!(" (default {default})"),
 
     nodes_header: ["ID", "NAME", "VIRTUAL-IP", "STATE", "ROLES", "VERSION", "PLATFORM", "GROUPS"],

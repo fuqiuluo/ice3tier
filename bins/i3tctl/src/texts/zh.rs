@@ -34,6 +34,8 @@ const HELP: Help = Help {
     network_ack_eliciting_threshold: "确认阈值，1 到 100，默认 3：对端攒到多于这么多个包才单独发确认。超过 3 时吞吐要看对端的定时器准不准。只对新建的连接生效",
     network_max_ack_delay_ms: "确认最长等待，1 到 25 毫秒：没攒够时对端最多等这么久。只对新建的连接生效",
     network_bundle_small_packets: "合并小包，默认 on：节点直连时把同时要发给同一个节点的几个小包装进一个包发，包数少得多。小包很密时一个小包最多多等一两毫秒",
+    network_vnet_offload: "虚拟网卡的分段卸载，默认 on：Linux 节点和内核一次交接一大块数据，流量大时省 CPU。off 时整个网络都不用；节点收到后自己重装网卡",
+    network_vnet_mtu: "虚拟网卡的默认 MTU，576 到 1500 字节，默认 1280：本机没有另外设的节点用它，收到后自己重装网卡",
     routing: "选路模式",
     reach: "路径限制",
     class: "QoS：auto 自动、interactive 低延迟、reliable 不丢包、bulk 后台",
@@ -285,6 +287,8 @@ const UI: Ui = Ui {
     ack_eliciting_threshold: "确认阈值",
     max_ack_delay: "确认最长等待",
     bundle_small_packets: "合并小包",
+    vnet_offload: "虚拟网卡分段卸载",
+    vnet_mtu: "虚拟网卡默认 MTU",
     default_is: |default| format!("（默认 {default}）"),
 
     nodes_header: ["编号", "名字", "虚拟 IP", "状态", "角色", "版本", "平台", "分组"],

@@ -172,6 +172,27 @@ struct Parts {
     offload: bool,
 }
 
+impl Parts {
+    fn shape(&self, netmap: &Netmap) -> Shape {
+        Shape::of(Platform::CURRENT, self.mtu, self.offload, &netmap.network)
+    }
+}
+
+/// 网卡照什么建：本机的配置和网络的设置合起来算出来的。netmap 换了、算出来的不一样了，网卡就重装一遍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shape {
+    mtu: u16,
+    offload: bool,
+}
+
+impl Shape {
+    /// MTU：本机另外设了就用本机的，没有就用网络的默认值。分段卸载：网络和本机都开着才用，而且只有 Linux 上有这回事，
+    /// 别的平台上网络的开关怎么变都不用重装。
+    fn of(platform: Platform, local_mtu: u16, local_offload: bool, network: &i3t_model::netmap::Network) -> Self {
+        Self { mtu: network.adapter_mtu(local_mtu), offload: platform == Platform::Linux && local_offload && network.vnet_offload }
+    }
+}
+
 /// 装上、跟着 netmap 改、隔一阵再查地址段的重叠、收到停止就拆掉。
 async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: oneshot::Receiver<()>) {
     if !parts.firewall {
@@ -222,6 +243,11 @@ async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: onesho
                     let next = Arc::clone(&netmap.borrow_and_update());
                     if next.me.virtual_ip != current.me.virtual_ip || next.network.cidr != current.network.cidr {
                         tracing::info!("本节点的虚拟 IP 或者网络的地址段变了，虚拟网卡整个重装");
+                        break true;
+                    }
+                    let (was, now) = (parts.shape(&current), parts.shape(&next));
+                    if was != now {
+                        tracing::info!(?was, ?now, "网络给虚拟网卡定的 MTU 或者分段卸载的开关变了，虚拟网卡整个重装");
                         break true;
                     }
                     if let Some(session) = session.as_mut()
@@ -308,8 +334,9 @@ impl Session {
             Ok(None) => {}
             Err(error) => return Err(setup::cause(error)),
         }
+        let shape = parts.shape(netmap);
         let spec =
-            DeviceSpec::new(platform, own, cidr, std::env::current_exe().ok().as_deref()).with_mtu(parts.mtu).with_offload(parts.offload);
+            DeviceSpec::new(platform, own, cidr, std::env::current_exe().ok().as_deref()).with_mtu(shape.mtu).with_offload(shape.offload);
         let mtu = spec.mtu;
         let tun = tokio::task::spawn_blocking(move || Tun::create(&spec))
             .await
@@ -532,6 +559,24 @@ mod tests {
         assert_eq!(names.lookup(&format!("nas.{}", map.network.domain)), Some(map.peers[0].virtual_ip));
         assert_eq!(names.lookup(&format!("hidden.{}", map.network.domain)), None);
         assert_eq!(names.lookup(&format!("{}.{}", map.me.name, map.network.domain)), Some(map.me.virtual_ip), "自己的名字也答");
+    }
+
+    #[test]
+    fn the_adapter_follows_the_network_unless_this_machine_set_its_own() {
+        let mut network = netmap(1).network;
+        let linux = |mtu, offload, network: &i3t_model::netmap::Network| Shape::of(Platform::Linux, mtu, offload, network);
+        assert_eq!(linux(1280, true, &network), Shape { mtu: 1280, offload: true }, "都是默认值");
+
+        (network.vnet_mtu, network.vnet_offload) = (1400, false);
+        assert_eq!(linux(1280, true, &network), Shape { mtu: 1400, offload: false }, "本机没有另外设：跟着网络");
+        assert_eq!(linux(1200, true, &network).mtu, 1200, "本机另外设了 MTU：用本机的");
+
+        network.vnet_offload = true;
+        assert!(!linux(1280, false, &network).offload, "本机关了分段卸载：网络开着也不用");
+        assert!(!Shape::of(Platform::Windows, 1280, true, &network).offload, "别的平台上没有这回事，网络的开关变了也不用重装");
+
+        network.vnet_mtu = 9000;
+        assert_eq!(linux(1280, true, &network).mtu, 1280, "controller 发来的值不在范围里：不用它");
     }
 
     #[test]

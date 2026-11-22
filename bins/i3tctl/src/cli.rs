@@ -182,6 +182,10 @@ pub struct NetworkSettings {
     pub max_ack_delay_ms: Option<u32>,
     #[arg(long)]
     pub bundle_small_packets: Option<OnOff>,
+    #[arg(long)]
+    pub vnet_offload: Option<OnOff>,
+    #[arg(long)]
+    pub vnet_mtu: Option<u16>,
 }
 
 #[derive(Subcommand)]
@@ -798,6 +802,8 @@ fn describe(command: clap::Command, h: &Help, v: &Values) -> clap::Command {
             .mut_arg("ack_eliciting_threshold", |arg| arg.help(h.network_ack_eliciting_threshold).value_name(v.count))
             .mut_arg("max_ack_delay_ms", |arg| arg.help(h.network_max_ack_delay_ms).value_name("ms"))
             .mut_arg("bundle_small_packets", |arg| on_off(arg.help(h.network_bundle_small_packets)))
+            .mut_arg("vnet_offload", |arg| on_off(arg.help(h.network_vnet_offload)))
+            .mut_arg("vnet_mtu", |arg| arg.help(h.network_vnet_mtu).value_name("576-1500"))
     };
     command
         .about(h.about)

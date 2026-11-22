@@ -337,6 +337,8 @@ pub fn network(network: &Network) {
         t.bundle_small_packets,
         setting(on_off(network.bundle_small_packets), defaults.map(|defaults| on_off(defaults.bundle_small_packets))),
     );
+    fields.add(t.vnet_offload, setting(on_off(network.vnet_offload), defaults.map(|defaults| on_off(defaults.vnet_offload))));
+    fields.add(t.vnet_mtu, setting(network.vnet_mtu.to_string(), defaults.map(|defaults| defaults.vnet_mtu.to_string())));
     fields.print();
 }
 

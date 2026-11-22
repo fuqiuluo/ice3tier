@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use i3t_proto::flow::Class;
@@ -98,9 +99,32 @@ pub struct Network {
     /// 旧的 controller 不发这一项，读成默认值。
     #[serde(default = "default_bundle_small_packets")]
     pub bundle_small_packets: bool,
+    /// 节点的虚拟网卡和内核之间是不是一大块一大块地交接数据（Linux 的分段卸载，见 [`DEFAULT_VNET_OFFLOAD`]）。
+    /// 关着时网络里的节点都一个包一个包地交接；开着时每台机器自己还可以关。旧的 controller 不发这一项，读成默认值。
+    #[serde(default = "default_vnet_offload")]
+    pub vnet_offload: bool,
+    /// 节点的虚拟网卡默认的 MTU（字节）：本机没有另外设的节点用它，见 [`Network::adapter_mtu`]。
+    /// 旧的 controller 不发这一项，读成 [`DEFAULT_VNET_MTU`]。
+    #[serde(default = "default_vnet_mtu")]
+    pub vnet_mtu: u16,
 }
 
 impl Network {
+    /// 节点的虚拟网卡该用的 MTU：本机另外设了（`local` 不是 [`DEFAULT_VNET_MTU`]）就用本机的，没有就用网络的。
+    ///
+    /// 本机的配置里一向写着默认值那一行，所以"还是默认值"就是"没有另外设"：这样的节点跟着网络走。
+    /// controller 发来的值不在 [`VNET_MTU`] 里（不该有）时不用它，用默认值。
+    #[must_use]
+    pub fn adapter_mtu(&self, local: u16) -> u16 {
+        if local != DEFAULT_VNET_MTU {
+            local
+        } else if VNET_MTU.contains(&self.vnet_mtu) {
+            self.vnet_mtu
+        } else {
+            DEFAULT_VNET_MTU
+        }
+    }
+
     /// 去掉全名里的域名后缀；本来就是短名字时原样返回。
     #[must_use]
     pub fn short_name<'a>(&self, name: &'a str) -> &'a str {
@@ -161,6 +185,29 @@ pub const DEFAULT_BUNDLE_SMALL_PACKETS: bool = true;
 
 pub(crate) const fn default_bundle_small_packets() -> bool {
     DEFAULT_BUNDLE_SMALL_PACKETS
+}
+
+/// [`Network::vnet_offload`] 的默认值：开。
+///
+/// Linux 的节点和内核之间一次交接最长 64 KB 的一大块，不是一个个的包：每个包一次系统调用变成几十个包一次，CPU 是瓶颈的
+/// 路径上吞吐翻倍。内核不给的机器自己退回去，别的系统上没有这回事。关掉是为了排查：经虚拟网卡的传输出了怪事时看是不是它。
+pub const DEFAULT_VNET_OFFLOAD: bool = true;
+
+pub(crate) const fn default_vnet_offload() -> bool {
+    DEFAULT_VNET_OFFLOAD
+}
+
+/// [`Network::vnet_mtu`] 的默认值。
+///
+/// 一个 IP 包是节点之间连接上的一个数据报：路径 MTU 探测完之后一个数据报装得下一千三百多字节，1280 的包整个装得下；
+/// 再大就要切成两片发。它也是 IPv6 要求链路至少送得了的包长。
+pub const DEFAULT_VNET_MTU: u16 = 1280;
+
+/// [`Network::vnet_mtu`] 可以取的值。下限是 IPv4 要求每台主机都收得了的包长，上限是以太网的 1500：再大就有送不到的包。
+pub const VNET_MTU: RangeInclusive<u16> = 576..=1500;
+
+pub(crate) const fn default_vnet_mtu() -> u16 {
+    DEFAULT_VNET_MTU
 }
 
 /// 选路模式。
@@ -868,6 +915,32 @@ mod tests {
         assert_eq!(json["network"]["bundle_small_packets"], true);
         json["network"]["bundle_small_packets"] = false.into();
         assert!(!serde_json::from_value::<Netmap>(json).unwrap().network.bundle_small_packets);
+    }
+
+    #[test]
+    fn a_netmap_from_a_controller_without_the_adapter_settings_reads_as_the_defaults() {
+        let network = minimal().network;
+        assert_eq!((network.vnet_offload, network.vnet_mtu), (true, 1280), "旧的 controller 不发：用默认值");
+        let mut json = serde_json::to_value(minimal()).unwrap();
+        assert_eq!((&json["network"]["vnet_offload"], &json["network"]["vnet_mtu"]), (&true.into(), &1280.into()));
+        json["network"]["vnet_offload"] = false.into();
+        json["network"]["vnet_mtu"] = 1400.into();
+        let network = serde_json::from_value::<Netmap>(json).unwrap().network;
+        assert_eq!((network.vnet_offload, network.vnet_mtu), (false, 1400));
+    }
+
+    #[test]
+    fn a_nodes_adapter_takes_the_networks_mtu_unless_the_machine_set_its_own() {
+        let mut network = minimal().network;
+        assert_eq!(network.adapter_mtu(1280), 1280);
+        network.vnet_mtu = 1400;
+        assert_eq!(network.adapter_mtu(1280), 1400, "本机还是默认值：跟着网络");
+        assert_eq!(network.adapter_mtu(1200), 1200, "本机另外设了：用本机的");
+        for wrong in [575, 1501, 0, 9000] {
+            network.vnet_mtu = wrong;
+            assert_eq!(network.adapter_mtu(1280), DEFAULT_VNET_MTU, "controller 发来的 {wrong} 不在范围里：不用");
+        }
+        assert!(VNET_MTU.contains(&DEFAULT_VNET_MTU));
     }
 
     #[test]
