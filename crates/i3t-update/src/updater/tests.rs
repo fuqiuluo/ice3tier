@@ -72,6 +72,7 @@ fn signed_manifest(key: &NodeKey, version: &str, platform: &Platform, package: &
         published: 1_763_200_000,
         artifacts: BTreeMap::from([(platform.to_string(), artifact)]),
         security_floor: None,
+        files: BTreeMap::new(),
     };
     sign_manifest(key, serde_json::to_string_pretty(&manifest).unwrap())
 }

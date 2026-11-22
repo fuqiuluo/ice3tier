@@ -19,7 +19,8 @@
 #   --no-polkit               Do not install the systemd-resolved polkit rule
 #   --no-vnet                 Disable the virtual network adapter and drop its Linux capabilities
 #   --version TAG             Install a specific release tag (e.g. v0.1.31) instead of latest
-#   --release-base URL        Release base URL (or set I3T_RELEASE_BASE; default: GitHub Releases)
+#   --release-base URL        Release base URL (or set I3T_RELEASE_BASE; must use https://; default: GitHub Releases)
+#   --release-key PUBKEY      Additional/custom Ed25519 release signing public key (or set I3T_RELEASE_KEY)
 #   --from DIR                Install binaries from a local directory instead of downloading
 #   --uninstall               Stop and remove installed service, wrapper, and unit files
 #   --purge                   With --uninstall, also delete /var/lib/i3t (or /var/lib/i3t-controller) and /etc/i3t
@@ -33,6 +34,9 @@ export PATH
 
 REPO="fuqiuluo/ice3tier"
 RELEASE_BASE="${I3T_RELEASE_BASE:-https://github.com/${REPO}/releases}"
+# Pinned release signing public key (must match PROJECT_KEYS in crates/i3t-update/src/trust.rs).
+RELEASE_PUBLIC_KEY="kWB8NBoJtLGX7mZwXgMSZ1C8RkUDpkdOphusy_JhEk0"
+RELEASE_KEY="${I3T_RELEASE_KEY:-}"
 VERSION="${I3T_VERSION:-}"
 TOKEN="${I3T_TOKEN:-}"
 MODE="node"
@@ -47,9 +51,13 @@ PURGE=0
 SUDO=""
 # Scratch directory for downloads. Not called TMPDIR: that one is exported on macOS and read by mktemp and others.
 WORK=""
+MANIFEST_VERIFIED=0
+MANIFEST_VERSION=""
 
 STATE_DIR="/var/lib/i3t"
 NODE_BIN_DIR="${STATE_DIR}/bin"
+ROOT_BIN_DIR="/usr/local/libexec/i3t"
+ROOT_BIN="${ROOT_BIN_DIR}/i3t"
 LAUNCHD_LABEL="com.github.fuqiuluo.ice3tier"
 LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
 LAUNCHD_LOG="/var/log/i3t.log"
@@ -75,7 +83,8 @@ Controller options:
 
 Common options:
   --version TAG             Install a specific release tag (e.g. v0.1.31; default: latest)
-  --release-base URL        Override release base URL (or set I3T_RELEASE_BASE)
+  --release-base URL        Override release base URL (https:// required; or set I3T_RELEASE_BASE)
+  --release-key PUBKEY      Trust an extra/custom Ed25519 release public key (or set I3T_RELEASE_KEY)
   --from DIR                Install binaries from a local directory (e.g. target/release)
   --uninstall               Remove the installed service, binaries, and polkit rule
   --purge                   With --uninstall, also delete state and config directories
@@ -152,6 +161,14 @@ parse_args() {
             --release-base=*)
                 RELEASE_BASE="${1#*=}"
                 ;;
+            --release-key)
+                [ "$#" -ge 2 ] || die "--release-key requires an argument"
+                RELEASE_KEY="$2"
+                shift
+                ;;
+            --release-key=*)
+                RELEASE_KEY="${1#*=}"
+                ;;
             --from)
                 [ "$#" -ge 2 ] || die "--from requires a directory"
                 FROM_DIR="$2"
@@ -182,6 +199,21 @@ parse_args() {
             v*) ;;
             *) VERSION="v$VERSION" ;;
         esac
+        case "${VERSION#v}" in
+            *[!0-9A-Za-z.-]* | *..* | .* | *. | *- | -* | "")
+                die "invalid --version value: ${VERSION}"
+                ;;
+        esac
+    fi
+    if [ -n "$RELEASE_KEY" ]; then
+        case "$RELEASE_KEY" in
+            *[!0-9A-Za-z_-]*)
+                die "invalid --release-key value (must be 43-character base64url)"
+                ;;
+        esac
+        if [ "${#RELEASE_KEY}" -ne 43 ]; then
+            die "invalid --release-key length (must be 43-character base64url)"
+        fi
     fi
     if [ "$PURGE" -eq 1 ] && [ "$UNINSTALL" -ne 1 ]; then
         die "--purge can only be used with --uninstall"
@@ -226,25 +258,336 @@ has_systemd() {
     [ "$OS" = "linux" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
 }
 
+validate_https_url() {
+    case "$1" in
+        https://?*) ;;
+        *) die "release URL must use https:// (got: $1)" ;;
+    esac
+    case "$1" in
+        *[[:space:]]*) die "release URL must not contain whitespace: $1" ;;
+    esac
+}
+
 download() {
-    url="$1"
-    dest="$2"
+    _d_url="$1"
+    _d_dest="$2"
+    validate_https_url "$_d_url"
     if command -v curl >/dev/null 2>&1; then
-        curl -fLsS --retry 3 -o "$dest" "$url"
+        curl -fLsS --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 300 --retry 3 -o "$_d_dest" "$_d_url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$dest" "$url"
+        wget -q --https-only --secure-protocol=TLSv1_2 --timeout=30 --tries=3 -O "$_d_dest" "$_d_url"
     else
         die "neither curl nor wget is installed"
     fi
 }
 
-asset_url() {
-    asset="$1"
-    if [ -n "$VERSION" ]; then
-        printf '%s/download/%s/%s\n' "$RELEASE_BASE" "$VERSION" "$asset"
+file_size() {
+    wc -c < "$1" | tr -d ' \t\r\n'
+}
+
+file_sha256() {
+    _h_path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$_h_path" | awk '{print tolower($1)}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$_h_path" | awk '{print tolower($1)}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 -r "$_h_path" | awk '{print tolower($1)}'
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -I - "$_h_path" <<'PY'
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as fh:
+    for chunk in iter(lambda: fh.read(65536), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
     else
-        printf '%s/latest/download/%s\n' "$RELEASE_BASE" "$asset"
+        die "cannot compute SHA-256: install sha256sum, shasum, openssl, or python3"
     fi
+}
+
+# Verifies manifest.json against manifest.json.sig with one 43-char base64url Ed25519 public key.
+# Returns 0 if valid, 1 if invalid signature, 2 if OpenSSL lacks Ed25519 -rawin support.
+verify_sig_openssl() {
+    _o_manifest="$1"
+    _o_sig="$2"
+    _o_pub="$3"
+    command -v openssl >/dev/null 2>&1 || return 2
+    _o_pub_pem="${WORK}/release.pub.pem"
+    _o_sig_bin="${WORK}/manifest.sig.bin"
+    _o_payload="${WORK}/manifest.payload"
+    _o_pub_std=$(printf '%s' "$_o_pub" | tr -- '-_' '+/')
+    printf -- '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA%s=\n-----END PUBLIC KEY-----\n' "$_o_pub_std" > "$_o_pub_pem"
+    if ! openssl pkey -pubin -in "$_o_pub_pem" -noout >/dev/null 2>&1; then
+        return 2
+    fi
+    if ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+        return 2
+    fi
+    _o_sig_clean=$(tr -d ' \t\r\n' < "$_o_sig")
+    case "$_o_sig_clean" in
+        *[!0-9A-Za-z_-]*) return 1 ;;
+    esac
+    [ "${#_o_sig_clean}" -eq 86 ] || return 1
+    _o_sig_std=$(printf '%s' "$_o_sig_clean" | tr -- '-_' '+/')
+    printf '%s==' "$_o_sig_std" | openssl base64 -d -A > "$_o_sig_bin" 2>/dev/null || return 1
+    [ "$(file_size "$_o_sig_bin")" -eq 64 ] || return 1
+    printf 'i3t-signature-v1\020release-manifest' > "$_o_payload"
+    cat "$_o_manifest" >> "$_o_payload"
+    openssl pkeyutl -verify -pubin -inkey "$_o_pub_pem" -rawin -in "$_o_payload" -sigfile "$_o_sig_bin" >/dev/null 2>&1
+}
+
+# Pure-stdlib Python 3 RFC 8032 Ed25519 verifier (fallback for macOS LibreSSL and systems without OpenSSL 1.1.1+).
+verify_sig_python() {
+    _p_manifest="$1"
+    _p_sig="$2"
+    _p_pub="$3"
+    command -v python3 >/dev/null 2>&1 || return 2
+    python3 -I - "$_p_manifest" "$_p_sig" "$_p_pub" <<'PY'
+import base64, hashlib, sys
+
+manifest_path, sig_path, pub_b64 = sys.argv[1:4]
+
+def b64url_decode_exact(text, expected_len):
+    if any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for c in text):
+        return None
+    pad = "=" * ((4 - len(text) % 4) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(text + pad)
+    except Exception:
+        return None
+    return raw if len(raw) == expected_len else None
+
+pub_bytes = b64url_decode_exact(pub_b64.strip(), 32)
+with open(sig_path, "r", encoding="ascii", errors="strict") as fh:
+    sig_text = fh.read().strip()
+sig_bytes = b64url_decode_exact(sig_text, 64)
+if pub_bytes is None or sig_bytes is None:
+    sys.exit(1)
+
+with open(manifest_path, "rb") as fh:
+    msg = b"i3t-signature-v1\x10release-manifest" + fh.read()
+
+P = (1 << 255) - 19
+L = (1 << 252) + 27742317777372353535851937790883648493
+D = (-121665 * pow(121666, P - 2, P)) % P
+D2 = (2 * D) % P
+I = pow(2, (P - 1) // 4, P)
+BY = (4 * pow(5, P - 2, P)) % P
+BX = 15112221349535400772501151409588531511454012693041857206046113283949847762202
+B = (BX, BY, 1, (BX * BY) % P)
+
+def decode_point(buf):
+    sign = buf[31] >> 7
+    y_bytes = bytearray(buf)
+    y_bytes[31] &= 0x7F
+    y = int.from_bytes(y_bytes, "little")
+    if y >= P:
+        return None
+    y2 = (y * y) % P
+    u = (y2 - 1) % P
+    v = (D * y2 + 1) % P
+    v3 = pow(v, 3, P)
+    v7 = (v3 * v3 % P) * v % P
+    x = (u * v3 % P) * pow((u * v7) % P, (P - 5) // 8, P) % P
+    vx2 = (v * x * x) % P
+    if vx2 == (-u) % P:
+        x = (x * I) % P
+    elif vx2 != u:
+        return None
+    if x == 0 and sign == 1:
+        return None
+    if (x & 1) != sign:
+        x = P - x
+    return (x, y, 1, (x * y) % P)
+
+def point_add(p1, p2):
+    x1, y1, z1, t1 = p1
+    x2, y2, z2, t2 = p2
+    a = ((y1 - x1) * (y2 - x2)) % P
+    b = ((y1 + x1) * (y2 + x2)) % P
+    c = (t1 * D2 * t2) % P
+    d = (z1 * 2 * z2) % P
+    e = (b - a) % P
+    f = (d - c) % P
+    g = (d + c) % P
+    h = (b + a) % P
+    return ((e * f) % P, (g * h) % P, (f * g) % P, (e * h) % P)
+
+def scalar_mult(pt, s):
+    res = (0, 1, 1, 0)
+    addend = pt
+    while s > 0:
+        if s & 1:
+            res = point_add(res, addend)
+        addend = point_add(addend, addend)
+        s >>= 1
+    return res
+
+R_bytes = sig_bytes[:32]
+S = int.from_bytes(sig_bytes[32:], "little")
+if S >= L:
+    sys.exit(1)
+A = decode_point(pub_bytes)
+R = decode_point(R_bytes)
+if A is None or R is None:
+    sys.exit(1)
+
+k = int.from_bytes(hashlib.sha512(R_bytes + pub_bytes + msg).digest(), "little") % L
+lhs = scalar_mult(B, S)
+rhs = point_add(R, scalar_mult(A, k))
+if (lhs[0] * rhs[2] - rhs[0] * lhs[2]) % P == 0 and (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % P == 0:
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+verify_manifest_with_key() {
+    _k_manifest="$1"
+    _k_sig="$2"
+    _k_pub="$3"
+    _k_rc=0
+    verify_sig_openssl "$_k_manifest" "$_k_sig" "$_k_pub" || _k_rc=$?
+    if [ "$_k_rc" -eq 0 ]; then
+        return 0
+    fi
+    if [ "$_k_rc" -eq 2 ]; then
+        _k_rc=0
+        verify_sig_python "$_k_manifest" "$_k_sig" "$_k_pub" || _k_rc=$?
+        if [ "$_k_rc" -eq 0 ]; then
+            return 0
+        fi
+        if [ "$_k_rc" -eq 2 ]; then
+            die "cannot verify release manifest signature: install openssl (1.1.1+) or python3"
+        fi
+    fi
+    return 1
+}
+
+verify_manifest_signature() {
+    _v_manifest="$1"
+    _v_sig="$2"
+    if verify_manifest_with_key "$_v_manifest" "$_v_sig" "$RELEASE_PUBLIC_KEY"; then
+        return 0
+    fi
+    if [ -n "$RELEASE_KEY" ] && verify_manifest_with_key "$_v_manifest" "$_v_sig" "$RELEASE_KEY"; then
+        return 0
+    fi
+    die "release manifest signature verification failed"
+}
+
+manifest_url() {
+    _m_file="$1"
+    if [ -n "$VERSION" ]; then
+        printf '%s/download/%s/%s\n' "$RELEASE_BASE" "$VERSION" "$_m_file"
+    else
+        printf '%s/latest/download/%s\n' "$RELEASE_BASE" "$_m_file"
+    fi
+}
+
+# Reads version, size, and sha256 for an exact asset filename from an already signature-verified manifest.json.
+manifest_lookup() {
+    _l_manifest="$1"
+    _l_asset="$2"
+    _l_want_ver="${VERSION#v}"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I - "$_l_manifest" "$_l_asset" "$_l_want_ver" <<'PY'
+import json, re, sys
+
+manifest_path, asset, want_ver = sys.argv[1:4]
+with open(manifest_path, "r", encoding="utf-8") as fh:
+    m = json.load(fh)
+ver = m.get("version")
+if not isinstance(ver, str) or not re.fullmatch(r"[0-9A-Za-z.-]+", ver) or ".." in ver:
+    sys.exit("invalid version in manifest")
+if want_ver and ver != want_ver:
+    sys.exit(f"manifest version mismatch: expected {want_ver}, got {ver}")
+found = None
+for section in ("artifacts", "files"):
+    table = m.get(section)
+    if not isinstance(table, dict):
+        continue
+    for entry in table.values():
+        if isinstance(entry, dict) and entry.get("file") == asset:
+            found = entry
+            break
+    if found is not None:
+        break
+if found is None:
+    sys.exit(f"asset {asset} is not covered by the signed manifest")
+size = found.get("size")
+sha = found.get("sha256")
+if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+    sys.exit(f"invalid size for {asset} in manifest")
+if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+    sys.exit(f"invalid sha256 for {asset} in manifest")
+print(f"{ver} {size} {sha.lower()}")
+PY
+    elif command -v jq >/dev/null 2>&1; then
+        _l_out=$(jq -r --arg asset "$_l_asset" --arg want "$_l_want_ver" '
+            (.version // "") as $ver |
+            if ($ver | test("^[0-9A-Za-z.-]+$") | not) or ($ver | contains("..")) then error("invalid version in manifest")
+            elif ($want != "" and $ver != $want) then error("manifest version mismatch")
+            else
+                ([(.artifacts // {} | .[]), (.files // {} | .[])] | map(select(.file == $asset)) | .[0]) as $a |
+                if $a == null then error("asset not covered by manifest")
+                elif (($a.size | type) != "number" or $a.size <= 0) then error("invalid size in manifest")
+                elif (($a.sha256 | type) != "string" or ($a.sha256 | test("^[0-9a-fA-F]{64}$") | not)) then error("invalid sha256 in manifest")
+                else "\($ver) \($a.size) \($a.sha256 | ascii_downcase)"
+                end
+            end
+        ' "$_l_manifest") || die "failed to parse asset ${_l_asset} from manifest"
+        printf '%s\n' "$_l_out"
+    else
+        awk -v asset="$_l_asset" -v want="$_l_want_ver" '
+            /"version"[[:space:]]*:/ && ver == "" {
+                v = $0; sub(/.*"version"[[:space:]]*:[[:space:]]*"/, "", v); sub(/".*/, "", v); ver = v
+            }
+            /"file"[[:space:]]*:/ {
+                f = $0; sub(/.*"file"[[:space:]]*:[[:space:]]*"/, "", f); sub(/".*/, "", f)
+                in_target = (f == asset)
+                if (in_target) { size = ""; sha = "" }
+            }
+            in_target && /"size"[[:space:]]*:/ {
+                s = $0; sub(/.*"size"[[:space:]]*:[[:space:]]*/, "", s); sub(/[^0-9].*/, "", s); size = s
+            }
+            in_target && /"sha256"[[:space:]]*:/ {
+                h = $0; sub(/.*"sha256"[[:space:]]*:[[:space:]]*"/, "", h); sub(/".*/, "", h); sha = tolower(h)
+                in_target = 0
+            }
+            END {
+                if (ver == "" || (want != "" && ver != want)) exit 1
+                if (size == "" || size + 0 <= 0 || length(sha) != 64) exit 1
+                printf "%s %s %s\n", ver, size, sha
+            }
+        ' "$_l_manifest" || die "asset ${_l_asset} not found or invalid in signed manifest"
+    fi
+}
+
+ensure_verified_manifest() {
+    if [ "$MANIFEST_VERIFIED" -eq 1 ]; then
+        return 0
+    fi
+    validate_https_url "$RELEASE_BASE"
+    _m_path="${WORK}/manifest.json"
+    _s_path="${WORK}/manifest.json.sig"
+    _m_url=$(manifest_url "manifest.json")
+    _s_url=$(manifest_url "manifest.json.sig")
+    log "Downloading and verifying release manifest"
+    download "$_m_url" "$_m_path" || die "failed to download ${_m_url}"
+    download "$_s_url" "$_s_path" || die "failed to download ${_s_url}"
+    _m_len=$(file_size "$_m_path")
+    _s_len=$(file_size "$_s_path")
+    if [ "$_m_len" -le 0 ] || [ "$_m_len" -gt 1048576 ]; then
+        die "release manifest has unexpected size (${_m_len} bytes)"
+    fi
+    if [ "$_s_len" -le 0 ] || [ "$_s_len" -gt 4096 ]; then
+        die "release manifest signature has unexpected size (${_s_len} bytes)"
+    fi
+    verify_manifest_signature "$_m_path" "$_s_path"
+    MANIFEST_VERIFIED=1
 }
 
 fetch_binary() {
@@ -260,9 +603,25 @@ fetch_binary() {
             die "binary not found in ${FROM_DIR} (looked for ${name} and ${asset})"
         fi
     else
-        url=$(asset_url "$asset")
-        log "Downloading ${asset}"
+        ensure_verified_manifest
+        _f_meta=$(manifest_lookup "${WORK}/manifest.json" "$asset") || die "failed to resolve ${asset} in signed manifest"
+        IFS=' ' read -r MANIFEST_VERSION _f_exp_size _f_exp_sha <<EOF
+${_f_meta}
+EOF
+        url="${RELEASE_BASE}/download/v${MANIFEST_VERSION}/${asset}"
+        log "Downloading ${asset} (v${MANIFEST_VERSION})"
         download "$url" "$dest" || die "failed to download ${url}"
+        _f_act_size=$(file_size "$dest")
+        if [ "$_f_act_size" -ne "$_f_exp_size" ]; then
+            rm -f "$dest"
+            die "size mismatch for ${asset}: expected ${_f_exp_size} bytes, got ${_f_act_size}"
+        fi
+        _f_act_sha=$(file_sha256 "$dest")
+        if [ "$_f_act_sha" != "$_f_exp_sha" ]; then
+            rm -f "$dest"
+            die "SHA-256 mismatch for ${asset}: expected ${_f_exp_sha}, got ${_f_act_sha}"
+        fi
+        log "Verified ${asset} (SHA-256 matches signed manifest)"
     fi
     chmod 0755 "$dest"
 }
@@ -275,9 +634,35 @@ install_binary_atomic() {
     group="$4"
     dir=$(dirname "$dest")
     base=$(basename "$dest")
-    stage="${dir}/.${base}.install.$$"
-    $SUDO install -o "$owner" -g "$group" -m 0755 "$src" "$stage"
-    $SUDO mv -f "$stage" "$dest"
+    if [ -L "$dir" ]; then
+        die "refusing to install into symbolic link directory: ${dir}"
+    fi
+    stage=$($SUDO mktemp "${dir}/.${base}.install.XXXXXX")
+    if ! $SUDO install -o "$owner" -g "$group" -m 0755 "$src" "$stage" || ! $SUDO mv -f "$stage" "$dest"; then
+        $SUDO rm -f "$stage" 2>/dev/null || true
+        die "failed to install ${dest}"
+    fi
+}
+
+# Install the self-updating binary into the i3t-owned bin directory AS user i3t, so root never writes into an
+# unprivileged-owned directory (preventing symlink-following hazards during upgrades).
+install_binary_as_i3t() {
+    _ia_src="$1"
+    _ia_dest="$2"
+    _ia_dir=$(dirname "$_ia_dest")
+    _ia_base=$(basename "$_ia_dest")
+    if $SUDO test -L "$_ia_dir" || $SUDO test -L "$_ia_dest"; then
+        die "refusing to install through symbolic link: ${_ia_dest}"
+    fi
+    # shellcheck disable=SC2016
+    _ia_script='dir=$1; base=$2; src=$3; dest=$4; stage=$(mktemp "$dir/.$base.install.XXXXXX") || exit 1; if cp "$src" "$stage" && chmod 0755 "$stage" && mv -f "$stage" "$dest"; then exit 0; else rm -f "$stage"; exit 1; fi'
+    if command -v runuser >/dev/null 2>&1; then
+        $SUDO runuser -u i3t -- /bin/sh -c "$_ia_script" sh "$_ia_dir" "$_ia_base" "$_ia_src" "$_ia_dest"
+    elif command -v sudo >/dev/null 2>&1; then
+        $SUDO sudo -u i3t -- /bin/sh -c "$_ia_script" sh "$_ia_dir" "$_ia_base" "$_ia_src" "$_ia_dest"
+    else
+        $SUDO su -s /bin/sh -c "$_ia_script" i3t -- sh "$_ia_dir" "$_ia_base" "$_ia_src" "$_ia_dest"
+    fi
 }
 
 nologin_shell() {
@@ -325,6 +710,9 @@ is_mount_noexec() {
 
 relabel_selinux_bin() {
     dir="$1"
+    if $SUDO test -L "$dir"; then
+        die "refusing to relabel symbolic link: ${dir}"
+    fi
     if command -v getenforce >/dev/null 2>&1; then
         state=$(getenforce 2>/dev/null || true)
         if [ "$state" = "Enforcing" ] || [ "$state" = "Permissive" ]; then
@@ -333,7 +721,7 @@ relabel_selinux_bin() {
                     $SUDO semanage fcontext -m -t bin_t "${dir}(/.*)?" 2>/dev/null || true
                 $SUDO restorecon -RF "$dir" 2>/dev/null || true
             elif command -v chcon >/dev/null 2>&1; then
-                $SUDO chcon -R -t bin_t "$dir" 2>/dev/null || true
+                $SUDO chcon -hR -t bin_t "$dir" 2>/dev/null || true
             else
                 warn "SELinux is ${state} and semanage/chcon were not found; label ${dir} as bin_t if systemd fails with 203/EXEC"
             fi
@@ -508,20 +896,22 @@ write_launchd_plist() {
 EOF
 }
 
-# The `i3t` command for service installs (systemd or launchd): runs the self-updating program in the state directory.
+# The `i3t` command for service installs (systemd or launchd): runs the self-updating program in the state directory
+# as the unprivileged service user, while privileged / custom-state-dir commands run the root-owned immutable binary.
 write_cli_wrapper() {
     dest="$1"
     service="$2"
     bin_dir="$3"
+    root_bin="$4"
     cat <<EOF > "$dest"
 #!/bin/sh
-# Installed by ice3tier's deploy/install.sh. Runs the self-updating program at ${bin_dir}/i3t.
-# As root it switches to the service's user for commands that touch the state directory, so its files keep their
-# owner; \`i3t join\` restarts the service afterwards, and \`i3t run\` points at the service instead of starting a
-# second node.
+# Installed by ice3tier's deploy/install.sh. Runs the self-updating program at ${bin_dir}/i3t as the service user.
+# On systemd installs, root NEVER executes the i3t-writable binary: privileged subcommands (hosts/tune/network) and
+# custom --state-dir invocations run the root-owned immutable binary at ${root_bin}.
 set -eu
 
 BIN="${bin_dir}/i3t"
+ROOT_BIN="${root_bin}"
 STATE="${STATE_DIR}"
 SERVICE="${service}"
 LABEL="${LAUNCHD_LABEL}"
@@ -531,15 +921,6 @@ EOF
 
 PATH="${PATH:+${PATH}:}/usr/sbin:/sbin"
 export PATH
-
-if [ ! -x "$BIN" ]; then
-    if [ "$(id -u)" -ne 0 ]; then
-        printf 'i3t: cannot run %s as this user (try: sudo i3t ...)\n' "$BIN" >&2
-        exit 1
-    fi
-    printf 'i3t: program not found at %s\n' "$BIN" >&2
-    exit 1
-fi
 
 sub=""
 info=0
@@ -582,17 +963,61 @@ if [ -n "$dir" ] && [ "$(real_dir "$dir")" != "$(real_dir "$STATE")" ]; then
     custom_dir=1
 fi
 
-case "$sub" in
-    hosts | tune | network | "")
-        exec "$BIN" "$@"
-        ;;
-esac
+exec_root_bin() {
+    if [ -L "$ROOT_BIN" ] || [ ! -f "$ROOT_BIN" ] || [ ! -x "$ROOT_BIN" ]; then
+        printf 'i3t: program not found at %s\n' "$ROOT_BIN" >&2
+        exit 1
+    fi
+    exec "$ROOT_BIN" "$@"
+}
 
-# Runs the program; the first argument is "exec" or "". On systemd installs root runs it as user i3t.
+if [ "$SERVICE" = "systemd" ]; then
+    # Never execute the i3t-writable binary as root: privileged subcommands and custom --state-dir invocations
+    # always run the root-owned immutable binary.
+    case "$sub" in
+        hosts | tune | network)
+            exec_root_bin "$@"
+            ;;
+    esac
+    if [ "$custom_dir" -eq 1 ]; then
+        exec_root_bin "$@"
+    fi
+    if [ "$(id -u)" -ne 0 ] && [ ! -x "$BIN" ]; then
+        if [ -z "$sub" ]; then
+            exec_root_bin "$@"
+        fi
+        printf 'i3t: cannot run %s as this user (try: sudo i3t ...)\n' "$BIN" >&2
+        exit 1
+    fi
+    if [ ! -x "$BIN" ]; then
+        printf 'i3t: program not found at %s\n' "$BIN" >&2
+        exit 1
+    fi
+else
+    if [ ! -x "$BIN" ]; then
+        if [ "$(id -u)" -ne 0 ]; then
+            printf 'i3t: cannot run %s as this user (try: sudo i3t ...)\n' "$BIN" >&2
+            exit 1
+        fi
+        printf 'i3t: program not found at %s\n' "$BIN" >&2
+        exit 1
+    fi
+    case "$sub" in
+        hosts | tune | network | "")
+            exec "$BIN" "$@"
+            ;;
+    esac
+fi
+
+# Runs the program; the first argument is "exec" or "". On systemd installs root ALWAYS drops to user i3t.
 as_node() {
     how="$1"
     shift
-    if [ "$SERVICE" = "systemd" ] && [ "$(id -u)" -eq 0 ] && [ "$custom_dir" -eq 0 ] && id i3t >/dev/null 2>&1; then
+    if [ "$SERVICE" = "systemd" ] && [ "$(id -u)" -eq 0 ]; then
+        if ! id i3t >/dev/null 2>&1; then
+            printf 'i3t: system user i3t does not exist; refusing to execute %s as root\n' "$BIN" >&2
+            exit 1
+        fi
         if command -v runuser >/dev/null 2>&1; then
             $how runuser -u i3t -- env I3T_STATE_DIR="$STATE" ${I3T_LANG:+"I3T_LANG=$I3T_LANG"} ${I3T_LOG:+"I3T_LOG=$I3T_LOG"} ${I3T_SERVICE:+"I3T_SERVICE=$I3T_SERVICE"} "$BIN" "$@"
         elif command -v sudo >/dev/null 2>&1; then
@@ -743,7 +1168,7 @@ install_node_launchd() {
     $SUDO install -d -o 0 -g 0 -m 0700 "$STATE_DIR" "$NODE_BIN_DIR"
     install_binary_atomic "${WORK}/i3t" "${NODE_BIN_DIR}/i3t" 0 0
 
-    write_cli_wrapper "${WORK}/i3t-wrapper" launchd "$NODE_BIN_DIR"
+    write_cli_wrapper "${WORK}/i3t-wrapper" launchd "$NODE_BIN_DIR" "${NODE_BIN_DIR}/i3t"
     $SUDO install -d -m 0755 /usr/local/bin
     install_binary_atomic "${WORK}/i3t-wrapper" /usr/local/bin/i3t 0 0
 
@@ -786,6 +1211,12 @@ install_node_launchd() {
 install_node_systemd() {
     log "Setting up system user i3t and ${STATE_DIR}"
     ensure_system_user "i3t" "$STATE_DIR"
+    if $SUDO test -L "$STATE_DIR"; then
+        die "refusing to use symbolic link as state directory: ${STATE_DIR}"
+    fi
+    if $SUDO test -e "$STATE_DIR" && ! $SUDO test -d "$STATE_DIR"; then
+        die "state path exists and is not a directory: ${STATE_DIR}"
+    fi
     $SUDO install -d -o i3t -g i3t -m 0700 "$STATE_DIR"
 
     # /var mounted noexec cannot execute /var/lib/i3t/bin/i3t; relocate to /opt/i3t/bin with a systemd drop-in.
@@ -796,14 +1227,35 @@ install_node_systemd() {
         node_bin_dir="/opt/i3t/bin"
         custom_bin_dir=1
     fi
+    if $SUDO test -L "$node_bin_dir"; then
+        die "refusing to use symbolic link as node binary directory: ${node_bin_dir}"
+    fi
+    if $SUDO test -e "$node_bin_dir" && ! $SUDO test -d "$node_bin_dir"; then
+        die "node binary path exists and is not a directory: ${node_bin_dir}"
+    fi
     node_bin="${node_bin_dir}/i3t"
-    $SUDO install -d -o i3t -g i3t -m 0700 "$node_bin_dir"
+    if [ "$custom_bin_dir" -eq 0 ]; then
+        if command -v runuser >/dev/null 2>&1; then
+            $SUDO runuser -u i3t -- mkdir -p -m 0700 "$node_bin_dir"
+        elif command -v sudo >/dev/null 2>&1; then
+            $SUDO sudo -u i3t -- mkdir -p -m 0700 "$node_bin_dir"
+        else
+            $SUDO su -s /bin/sh -c 'mkdir -p -m 0700 "$1"' i3t -- sh "$node_bin_dir"
+        fi
+    else
+        $SUDO install -d -o 0 -g 0 -m 0755 "$(dirname "$node_bin_dir")"
+        $SUDO install -d -o i3t -g i3t -m 0700 "$node_bin_dir"
+    fi
+
+    log "Installing root-owned admin binary to ${ROOT_BIN}"
+    $SUDO install -d -o 0 -g 0 -m 0755 "$ROOT_BIN_DIR"
+    install_binary_atomic "${WORK}/i3t" "$ROOT_BIN" 0 0
 
     log "Installing i3t binary to ${node_bin} (writable by user i3t for self-updates)"
-    install_binary_atomic "${WORK}/i3t" "$node_bin" i3t i3t
+    install_binary_as_i3t "$ROOT_BIN" "$node_bin"
     relabel_selinux_bin "$node_bin_dir"
 
-    write_cli_wrapper "${WORK}/i3t-wrapper" systemd "$node_bin_dir"
+    write_cli_wrapper "${WORK}/i3t-wrapper" systemd "$node_bin_dir" "$ROOT_BIN"
     $SUDO install -d -m 0755 /usr/local/bin
     install_binary_atomic "${WORK}/i3t-wrapper" /usr/local/bin/i3t 0 0
 
@@ -1004,11 +1456,17 @@ uninstall_node() {
         $SUDO rm -f /etc/polkit-1/rules.d/50-i3t-resolved.rules
         $SUDO systemctl daemon-reload
     fi
-    if [ -x /usr/local/bin/i3t ]; then
+    if [ "$OS" = "linux" ] && has_systemd; then
+        # On systemd installs, `systemctl disable --now i3t` above already ran ExecStopPost as user i3t.
+        # Only run the root-owned immutable binary for fallback cleanup — never the i3t-writable binary.
+        if ! $SUDO test -L "$ROOT_BIN_DIR" && ! $SUDO test -L "$ROOT_BIN" && $SUDO test -f "$ROOT_BIN" && $SUDO test -x "$ROOT_BIN"; then
+            $SUDO "$ROOT_BIN" network cleanup >/dev/null 2>&1 || true
+        fi
+    elif [ -x /usr/local/bin/i3t ]; then
         $SUDO /usr/local/bin/i3t network cleanup >/dev/null 2>&1 || true
     fi
     $SUDO rm -f /usr/local/bin/i3t
-    $SUDO rm -rf "$NODE_BIN_DIR" /opt/i3t/bin
+    $SUDO rm -rf "$ROOT_BIN_DIR" "$NODE_BIN_DIR" /opt/i3t/bin
     if [ "$PURGE" -eq 1 ]; then
         log "Purging ${STATE_DIR}"
         $SUDO rm -rf "$STATE_DIR" /opt/i3t

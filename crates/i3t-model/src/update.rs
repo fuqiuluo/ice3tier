@@ -285,6 +285,11 @@ pub struct Manifest {
     /// 比这个字段旧的程序照样认这份清单：签名盖的是原文的字节，解析时不认识的字段忽略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_floor: Option<Version>,
+    /// 节点自更新清单之外的发布文件（`i3t-controller-*`、`i3tctl-*`、Windows 压缩包等），键是文件名。
+    ///
+    /// 旧版本的节点和 controller 不认识这个字段会直接忽略；安装脚本用它核对下载的每个非自更新发布产物。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, Artifact>,
 }
 
 impl Manifest {
@@ -292,6 +297,12 @@ impl Manifest {
     #[must_use]
     pub fn artifact(&self, platform: &Platform) -> Option<&Artifact> {
         self.artifacts.get(platform.as_str())
+    }
+
+    /// 按文件名查找清单里的发布产物（先查节点程序，再查其余发布文件）。
+    #[must_use]
+    pub fn file(&self, name: &str) -> Option<&Artifact> {
+        self.artifacts.values().find(|artifact| artifact.file == name).or_else(|| self.files.get(name))
     }
 
     /// 运行着 `running` 的节点有没有已知的安全问题：比 [`Manifest::security_floor`] 旧。清单没有写下限时总是 `false`。
@@ -660,6 +671,7 @@ mod tests {
                 ("windows-x86_64".to_owned(), artifact("i3t-windows-x86_64.exe")),
             ]),
             security_floor: None,
+            files: BTreeMap::new(),
         }
     }
 

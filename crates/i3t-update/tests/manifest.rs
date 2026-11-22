@@ -26,6 +26,7 @@ fn manifest(version: &str) -> Manifest {
             artifact("macos-x86_64", 5),
         ]),
         security_floor: None,
+        files: BTreeMap::new(),
     }
 }
 
@@ -201,8 +202,39 @@ fn a_manifest_without_a_security_floor_verifies_for_new_and_older_readers() {
         published: 1_763_200_000,
         artifacts,
         security_floor: None,
+        files: BTreeMap::new(),
     };
     assert_eq!(serde_json::to_string_pretty(&written).unwrap() + "\n", MANIFEST_WITHOUT_FLOOR);
+}
+
+#[test]
+fn a_manifest_with_extra_files_verifies_for_new_and_older_readers() {
+    let key = NodeKey::generate().unwrap();
+    let mut with_files = manifest("0.3.0");
+    let extra = Artifact { file: "i3t-windows-x86_64.zip".to_owned(), size: 987_654, sha256: Sha256::from_bytes([0xaa; 32]) };
+    with_files.files.insert(extra.file.clone(), extra.clone());
+    let text = serde_json::to_string_pretty(&with_files).unwrap() + "\n";
+    assert!(text.contains("\"files\""), "{text}");
+    let signed = sign_manifest(&key, text);
+
+    let verified = TrustedKeys::from(key.public()).verify(&signed).unwrap();
+    assert_eq!(verified, with_files);
+    assert_eq!(verified.file("i3t-windows-x86_64.zip"), Some(&extra));
+    assert_eq!(verified.file("i3t-linux-x86_64").map(|a| a.file.as_str()), Some("i3t-linux-x86_64"));
+
+    // 旧版节点和 controller 不认识 files 字段，照常验签并解析出节点程序列表。
+    let before = verify_like_before(&key, &signed);
+    assert_eq!(before.artifacts, with_files.artifacts);
+}
+
+#[test]
+fn installer_scripts_pin_the_same_release_public_key_as_nodes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let project_key = TrustedKeys::compiled_in().iter().next().expect("至少有一把内置发布公钥").to_string();
+    for rel in ["deploy/install.sh", "deploy/install.ps1"] {
+        let script = std::fs::read_to_string(root.join(rel)).unwrap();
+        assert!(script.contains(&project_key), "{rel} 中固定的发布公钥应与 crates/i3t-update/src/trust.rs 一致（缺少 {project_key}）");
+    }
 }
 
 #[test]

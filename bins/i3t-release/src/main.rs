@@ -5,12 +5,15 @@
 //! ```text
 //! i3t-linux-x86_64            各个平台的节点程序，名字是 i3t-<平台>，Windows 上加 .exe
 //! i3t-windows-x86_64.exe
+//! i3t-windows-x86_64.zip      Windows 节点安装包（含 wintun.dll）
+//! i3t-controller-linux-x86_64 controller 与命令行工具
+//! i3tctl-linux-x86_64
 //! …
-//! manifest.json               清单：版本号，上面每个文件的大小和 SHA-256，修了安全问题时还有安全下限
+//! manifest.json               清单：版本号，节点程序（artifacts）与其余发布产物（files）的大小和 SHA-256，修了安全问题时还有安全下限
 //! manifest.json.sig           清单的签名
 //! ```
 //!
-//! 目录里别的文件（controller、命令行工具）不进清单：它们不走节点的自动更新。
+//! 节点自动更新只看 `artifacts`（节点程序）；安装脚本同时核对 `artifacts` 与 `files` 里的所有发布产物。
 //!
 //! 终端上的文字跟着系统的语言（见 `i3t_lang`，可以用 `I3T_LANG` 指定）。标准输出上 `keygen` 只有公钥那一行，给脚本接。
 
@@ -147,10 +150,10 @@ fn manifest(version: Version, min_controller: Version, security_floor: Option<Ve
         ensure!(!path.exists(), (t.already_signed)(&path.display().to_string()));
     }
 
-    let artifacts = node_programs(dir)?;
+    let (artifacts, files) = collect_release_files(dir)?;
     ensure!(!artifacts.is_empty(), (t.no_programs)(&dir.display().to_string(), NODE_PROGRAM));
     let published = SystemTime::now().duration_since(UNIX_EPOCH).context(t.clock_before_1970)?.as_secs();
-    let manifest = Manifest { version, min_controller, published, artifacts, security_floor };
+    let manifest = Manifest { version, min_controller, published, artifacts, security_floor, files };
     let text = serde_json::to_string_pretty(&manifest).context(t.encode_manifest)? + "\n";
     let signed = sign_manifest(&key, text);
 
@@ -162,6 +165,9 @@ fn manifest(version: Version, min_controller: Version, security_floor: Option<Ve
     for (platform, artifact) in &manifest.artifacts {
         println!("{}", (t.artifact)(platform, &artifact.file, artifact.size, &artifact.sha256.to_string()));
     }
+    for (name, artifact) in &manifest.files {
+        println!("{}", (t.artifact)("file", name, artifact.size, &artifact.sha256.to_string()));
+    }
     println!("{}", (t.written)(&manifest_path.display().to_string(), &signature_path.display().to_string()));
     if !TrustedKeys::compiled_in().iter().any(|trusted| *trusted == key.public()) {
         eprintln!("{}", t.untrusted_key);
@@ -169,23 +175,36 @@ fn manifest(version: Version, min_controller: Version, security_floor: Option<Ve
     Ok(())
 }
 
-/// 目录里各个平台的节点程序，以平台名为键。别的文件不管。
-fn node_programs(dir: &Path) -> anyhow::Result<BTreeMap<String, Artifact>> {
+/// 节点程序之外、需要收入 `manifest.files` 的可执行程序前缀。
+const EXTRA_PROGRAMS: [&str; 2] = ["i3t-controller", "i3tctl"];
+
+/// 目录里的发布产物：节点程序放进 `artifacts`（以平台名为键），controller、命令行工具与 Windows 压缩包放进 `files`（以文件名为键）。
+fn collect_release_files(dir: &Path) -> anyhow::Result<(BTreeMap<String, Artifact>, BTreeMap<String, Artifact>)> {
     let t = &texts().ui;
     let read_dir = || (t.read_dir)(&dir.display().to_string());
     let mut artifacts = BTreeMap::new();
+    let mut files = BTreeMap::new();
     for entry in fs::read_dir(dir).with_context(read_dir)? {
         let entry = entry.with_context(read_dir)?;
         let Some(file) = entry.file_name().to_str().map(str::to_owned) else { continue };
-        let Some(platform) = node_program_platform(&file) else { continue };
+        let platform = node_program_platform(&file);
+        let is_extra = platform.is_none() && is_extra_release_file(&file);
+        if platform.is_none() && !is_extra {
+            continue;
+        }
         let path = entry.path();
         let shown = path.display().to_string();
         ensure!(path.is_file(), (t.not_a_file)(&shown));
         let digest = FileDigest::of_file(&path).with_context(|| (t.read)(&shown))?;
         ensure!(digest.size > 0, (t.empty_file)(&shown));
-        artifacts.insert(platform.to_string(), Artifact { file, size: digest.size, sha256: digest.sha256 });
+        let artifact = Artifact { file: file.clone(), size: digest.size, sha256: digest.sha256 };
+        if let Some(platform) = platform {
+            artifacts.insert(platform.to_string(), artifact);
+        } else {
+            files.insert(file, artifact);
+        }
     }
-    Ok(artifacts)
+    Ok((artifacts, files))
 }
 
 /// 一个文件名是不是某个平台的节点程序；是的话是哪个平台。
@@ -195,6 +214,25 @@ fn node_program_platform(file: &str) -> Option<Platform> {
     let rest = file.strip_prefix(NODE_PROGRAM)?.strip_prefix('-')?;
     let platform: Platform = rest.strip_suffix(".exe").unwrap_or(rest).parse().ok()?;
     (platform.program_file(NODE_PROGRAM) == file).then_some(platform)
+}
+
+/// 一个文件名是不是节点程序之外的发布产物：`i3t-controller-<平台>[.exe]`、`i3tctl-<平台>[.exe]` 或 Windows 安装包 `i3t-windows-<架构>.zip`。
+fn is_extra_release_file(file: &str) -> bool {
+    for program in EXTRA_PROGRAMS {
+        if let Some(rest) = file.strip_prefix(program).and_then(|s| s.strip_prefix('-'))
+            && let Ok(platform) = rest.strip_suffix(".exe").unwrap_or(rest).parse::<Platform>()
+            && platform.program_file(program) == file
+        {
+            return true;
+        }
+    }
+    if let Some(rest) = file.strip_prefix(NODE_PROGRAM).and_then(|s| s.strip_prefix('-')).and_then(|s| s.strip_suffix(".zip"))
+        && let Ok(platform) = rest.parse::<Platform>()
+        && platform.as_str().starts_with("windows-")
+    {
+        return true;
+    }
+    false
 }
 
 /// 新建并写入。文件已经存在时失败。
@@ -238,8 +276,22 @@ fn verify(dir: &Path, key: Option<PublicKey>) -> anyhow::Result<()> {
             }
         }
     }
+    for (key, artifact) in &manifest.files {
+        let result = if key != &artifact.file {
+            Err(anyhow::anyhow!((t.key_file_mismatch)(key, &artifact.file)))
+        } else {
+            check_file(dir, artifact)
+        };
+        match result {
+            Ok(()) => println!("{}", (t.file_ok)("file", &artifact.file)),
+            Err(error) => {
+                println!("{}", (t.file_bad)("file", key, &lang.chain(error.chain())));
+                mismatched += 1;
+            }
+        }
+    }
     ensure!(mismatched == 0, (t.mismatched)(mismatched));
-    println!("{}", (t.all_match)(manifest.artifacts.len()));
+    println!("{}", (t.all_match)(manifest.artifacts.len() + manifest.files.len()));
     Ok(())
 }
 
@@ -306,6 +358,39 @@ mod tests {
     }
 
     #[test]
+    fn extra_release_files_cover_controller_cli_and_windows_zip_only() {
+        for expected in [
+            "i3t-controller-linux-x86_64",
+            "i3t-controller-linux-aarch64",
+            "i3t-controller-macos-aarch64",
+            "i3t-controller-windows-x86_64.exe",
+            "i3tctl-linux-x86_64",
+            "i3tctl-macos-x86_64",
+            "i3tctl-windows-x86_64.exe",
+            "i3t-windows-x86_64.zip",
+            "i3t-windows-aarch64.zip",
+        ] {
+            assert!(is_extra_release_file(expected), "{expected} 应该收入 manifest.files");
+            assert_eq!(node_program_platform(expected), None, "{expected} 不应该同时进入 artifacts");
+        }
+        for ignored in [
+            "i3t-linux-x86_64",
+            "i3t-windows-x86_64.exe",
+            "i3t-linux-x86_64.zip",
+            "i3t-controller-linux-x86_64.exe",
+            "i3t-controller-windows-x86_64",
+            "i3tctl-linux-x86_64.exe",
+            "i3tctl-windows-x86_64",
+            "i3t-windows-x86_64.zip.sig",
+            "manifest.json",
+            "manifest.json.sig",
+            "README.txt",
+        ] {
+            assert!(!is_extra_release_file(ignored), "{ignored} 不应该进入 manifest.files");
+        }
+    }
+
+    #[test]
     fn the_english_texts_have_no_chinese_and_read_right_for_one() {
         let ui = &texts::texts_in(Lang::English).ui;
         let said = [
@@ -321,6 +406,7 @@ mod tests {
             (ui.size_differs)(1, 1),
             (ui.security_floor)("0.3.0"),
             (ui.floor_above_version)("0.4.0", "0.3.0"),
+            (ui.key_file_mismatch)("a", "b"),
             ui.untrusted_key.to_owned(),
         ];
         for text in said {

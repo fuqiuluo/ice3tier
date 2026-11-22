@@ -176,12 +176,25 @@ fn reply(query: &[u8], flags: u16, code: u8, question: &[u8], address: Option<Ip
 pub const HOSTS_BEGIN: &str = "# BEGIN ice3tier (i3t hosts)";
 pub const HOSTS_END: &str = "# END ice3tier";
 
+/// `/etc/hosts` 里的一段名字必须只含合法主机名字符，防止异常或被篡改的 `netmap.json` 注入换行、空白或注释。
+fn is_safe_hosts_label(label: &str) -> bool {
+    !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn is_safe_hosts_domain(domain: &str) -> bool {
+    !domain.is_empty() && domain.split('.').all(is_safe_hosts_label)
+}
+
 /// `/etc/hosts` 的一段：每个节点一行，`<虚拟 IP>\t<全名>`，按名字排。前后带标记。
 #[must_use]
 pub fn hosts_block(names: &Names) -> String {
     let mut block = format!("{HOSTS_BEGIN}\n");
-    for (name, ip) in &names.nodes {
-        let _ = writeln!(block, "{ip}\t{name}.{}", names.domain);
+    if is_safe_hosts_domain(&names.domain) {
+        for (name, ip) in &names.nodes {
+            if is_safe_hosts_label(name) {
+                let _ = writeln!(block, "{ip}\t{name}.{}", names.domain);
+            }
+        }
     }
     block.push_str(HOSTS_END);
     block.push('\n');
@@ -311,6 +324,23 @@ mod tests {
         assert_eq!(second, format!("{original}{changed}192.168.1.1 router\n"), "只换那一段，后面别人的行留着");
         assert_eq!(replace_hosts_block(&second, &changed), second, "再写一次不变");
         assert_eq!(replace_hosts_block("127.0.0.1 localhost", &block), format!("127.0.0.1 localhost\n{block}"), "最后一行没有换行符");
+    }
+
+    #[test]
+    fn hosts_block_drops_entries_with_control_or_whitespace_characters() {
+        let poisoned = Names::new(
+            "home.i3t",
+            [
+                ("nas".to_owned(), [10, 66, 0, 5].into()),
+                ("evil\n127.0.0.1 bank.example".to_owned(), [10, 66, 0, 6].into()),
+                ("bad name".to_owned(), [10, 66, 0, 7].into()),
+            ],
+        );
+        let block = hosts_block(&poisoned);
+        assert_eq!(block, format!("{HOSTS_BEGIN}\n10.66.0.5\tnas.home.i3t\n{HOSTS_END}\n"));
+
+        let bad_domain = Names::new("home.i3t\n127.0.0.1 evil.com", [("nas".to_owned(), [10, 66, 0, 5].into())]);
+        assert_eq!(hosts_block(&bad_domain), format!("{HOSTS_BEGIN}\n{HOSTS_END}\n"));
     }
 
     #[test]

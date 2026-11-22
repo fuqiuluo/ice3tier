@@ -414,6 +414,7 @@ fn publish(root: &std::path::Path, key: &NodeKey, version: &str, security_floor:
         published: 1_763_200_000,
         artifacts: [("linux-x86_64".to_owned(), artifact)].into(),
         security_floor: security_floor.map(|floor| floor.parse().unwrap()),
+        files: std::collections::BTreeMap::new(),
     };
     let signed = sign_manifest(key, serde_json::to_string(&manifest).unwrap());
     let latest = root.join(LATEST_DIR);

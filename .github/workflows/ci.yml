@@ -113,7 +113,7 @@ jobs:
             awk -v f="$1() {" '$0 == f { getline; on = 1; next } on && /^EOF$/ { exit } on' deploy/install.sh | diff -u "$2" -
           done
       - name: Build
-        run: cargo build -p i3t -p i3t-controller-bin -p i3tctl
+        run: cargo build -p i3t -p i3t-controller-bin -p i3tctl -p i3t-release
       - name: Install, join, reinstall, uninstall
         run: scripts/test-install.sh target/debug
 
@@ -128,7 +128,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build -p i3t -p i3t-controller-bin -p i3tctl
+        run: cargo build -p i3t -p i3t-controller-bin -p i3tctl -p i3t-release
       - name: Wintun next to the program
         shell: bash
         run: scripts/fetch-wintun.sh amd64 target/debug

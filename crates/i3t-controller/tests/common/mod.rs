@@ -178,6 +178,7 @@ impl Publisher {
             published: 1_763_200_000,
             artifacts,
             security_floor: floor.map(|floor| floor.parse().unwrap()),
+            files: std::collections::BTreeMap::new(),
         };
         let signed = sign_manifest(&self.key, serde_json::to_string_pretty(&manifest).unwrap());
         let latest = self.root.path().join(LATEST_DIR);

@@ -55,8 +55,9 @@ impl Release {
             ("i3t-linux-x86_64", "linux 上的节点程序"),
             ("i3t-linux-aarch64", "arm 上的节点程序，内容不一样"),
             ("i3t-windows-x86_64.exe", "windows 上的节点程序"),
-            ("i3t-controller-linux-x86_64", "controller 不走自动更新"),
-            ("i3tctl-linux-x86_64", "命令行工具也不走"),
+            ("i3t-windows-x86_64.zip", "windows 安装包（含 wintun）"),
+            ("i3t-controller-linux-x86_64", "controller 发布程序"),
+            ("i3tctl-linux-x86_64", "命令行工具发布程序"),
             ("README.txt", "别的文件"),
         ];
         for (name, content) in files {
@@ -130,7 +131,15 @@ fn manifest_lists_the_node_programs_and_the_node_accepts_it() {
         assert_eq!(artifact.file, platform.program_file("i3t"));
         assert!(FileDigest::of_file(&release.dir.join(&artifact.file)).unwrap().matches(artifact), "{platform}");
         assert_eq!(manifest.artifact(&platform), Some(artifact));
+        assert_eq!(manifest.file(&artifact.file), Some(artifact));
     }
+    assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["i3t-controller-linux-x86_64", "i3t-windows-x86_64.zip", "i3tctl-linux-x86_64"]);
+    for (name, artifact) in &manifest.files {
+        assert_eq!(&artifact.file, name);
+        assert!(FileDigest::of_file(&release.dir.join(&artifact.file)).unwrap().matches(artifact), "{name}");
+        assert_eq!(manifest.file(name), Some(artifact));
+    }
+    assert!(manifest.file("README.txt").is_none());
     assert!(release.manifest_text().ends_with("}\n"));
 }
 
@@ -141,7 +150,7 @@ fn a_fresh_release_verifies() {
     assert!(output.status.success(), "{}", stderr(&output));
     let report = stdout(&output);
     assert!(report.contains("版本 0.3.0（正式版）"), "{report}");
-    assert_eq!(report.matches("通过").count(), 3, "{report}");
+    assert_eq!(report.matches("通过").count(), 6, "{report}");
 }
 
 #[test]
@@ -150,7 +159,7 @@ fn the_english_texts_follow_the_language() {
     fs::remove_file(release.dir.join("i3t-windows-x86_64.exe")).unwrap();
     let output = tool_in("en", &["verify", "--dir", text(&release.dir), "--key", &release.public_key]);
     let (report, error) = (stdout(&output), stderr(&output));
-    assert!(report.contains("Version 0.3.0 (release)") && report.matches("  ok  ").count() == 2, "{report}");
+    assert!(report.contains("Version 0.3.0 (release)") && report.matches("  ok  ").count() == 5, "{report}");
     assert!(report.contains("mismatch  windows-x86_64") && error.contains("don't match the manifest: 1"), "{report}{error}");
     let help = stdout(&tool_in("en", &["manifest", "--help"]));
     assert!(help.contains("Release directory") && !help.contains("发布"), "{help}");
@@ -246,8 +255,26 @@ fn a_changed_file_is_detected() {
     let output = release.verify();
     assert!(!output.status.success());
     let report = stdout(&output);
-    assert_eq!(report.matches("通过").count(), 2, "{report}");
+    assert_eq!(report.matches("通过").count(), 5, "{report}");
     assert!(report.contains("不符  linux-aarch64") && report.contains("SHA-256"), "{report}");
+}
+
+#[test]
+fn a_changed_extra_release_file_is_detected() {
+    let release = Release::signed("0.3.0");
+    for name in ["i3t-controller-linux-x86_64", "i3tctl-linux-x86_64", "i3t-windows-x86_64.zip"] {
+        let path = release.dir.join(name);
+        let original = fs::read(&path).unwrap();
+        let mut altered = original.clone();
+        altered[0] ^= 1;
+        fs::write(&path, altered).unwrap();
+        let output = release.verify();
+        assert!(!output.status.success(), "{name} 被改动后应该校验失败");
+        let report = stdout(&output);
+        assert!(report.contains(name) && report.contains("SHA-256"), "{report}");
+        fs::write(&path, original).unwrap();
+    }
+    assert!(release.verify().status.success());
 }
 
 #[test]

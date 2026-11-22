@@ -218,9 +218,24 @@ jobs:
             ${SECURITY_FLOOR:+--security-floor "$SECURITY_FLOOR"}
           echo "signed=true" >> "$GITHUB_OUTPUT"
       # 不带 --key：用的是编译进去的公钥。签名用错了钥匙的话在这里就失败，不会发出一个节点不认的版本。
+      # 同时检查 dist/ 里除清单与签名外的每一个发布产物都已经被签进清单，避免后续新增产物漏覆盖。
       - name: Verify with the keys the nodes trust
         if: steps.sign.outputs.signed == 'true'
-        run: tool/i3t-release verify --dir dist
+        run: |
+          tool/i3t-release verify --dir dist
+          covered=$(jq -r '[(.artifacts // {} | .[].file), (.files // {} | .[].file)] | unique | .[]' dist/manifest.json)
+          missing=0
+          for path in dist/*; do
+            name=$(basename "$path")
+            case "$name" in
+              manifest.json | manifest.json.sig) continue ;;
+            esac
+            if ! printf '%s\n' "$covered" | grep -Fqx -- "$name"; then
+              echo "::error::发布文件 $name 没有被签进 manifest.json"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
       - uses: actions/upload-artifact@v4
         if: steps.sign.outputs.signed == 'true'
         with:

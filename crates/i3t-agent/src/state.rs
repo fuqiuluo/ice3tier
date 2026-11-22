@@ -84,7 +84,9 @@ impl StateDir {
     /// 目录建不出来。
     pub fn open(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let root = root.into();
+        ensure_not_reparse_or_symlink(&root).with_context(|| (texts().create_state_dir)(&root))?;
         fs::create_dir_all(&root).with_context(|| (texts().create_state_dir)(&root))?;
+        ensure_real_directory(&root).with_context(|| (texts().restrict_state_dir)(&root))?;
         restrict_to_owner(&root, 0o700).with_context(|| (texts().restrict_state_dir)(&root))?;
         Ok(Self { root })
     }
@@ -179,6 +181,7 @@ impl StateDir {
     /// 文件在但是删不掉。
     pub fn remove_local(&self) -> anyhow::Result<()> {
         let path = self.root.join(LOCAL_FILE);
+        ensure_not_reparse_or_symlink(&path).with_context(|| format!("删除 {}", path.display()))?;
         match fs::remove_file(&path) {
             Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err).with_context(|| format!("删除 {}", path.display())),
             _ => Ok(()),
@@ -236,6 +239,14 @@ impl StateDir {
         let path = self.root.join(name);
         let temporary = self.root.join(format!("{name}.tmp"));
         let result = (|| -> io::Result<()> {
+            ensure_real_directory(&self.root)?;
+            ensure_not_reparse_or_symlink(&path)?;
+            ensure_not_reparse_or_symlink(&temporary)?;
+            match fs::remove_file(&temporary) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
             let mut file = create_owner_only(&temporary)?;
             file.write_all(bytes)?;
             file.sync_all()?;
@@ -245,16 +256,51 @@ impl StateDir {
     }
 }
 
+/// 拒绝符号链接以及 Windows 重解析点（含 NTFS Junction），防止被诱导跨目录读写或删改。
+fn ensure_not_reparse_or_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => check_not_reparse_or_symlink(&meta),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// 确认路径是真实目录（既不是符号链接也不是重解析点）。
+fn ensure_real_directory(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    check_not_reparse_or_symlink(&meta)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "状态目录路径不是目录"));
+    }
+    Ok(())
+}
+
+fn check_not_reparse_or_symlink(meta: &fs::Metadata) -> io::Result<()> {
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "拒绝跟随符号链接"));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "拒绝跟随重解析点"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn create_owner_only(path: &Path) -> io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)
+    fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
 }
 
-// Windows 上文件默认继承目录的访问控制，状态目录建在只有本用户可以访问的位置。
+// Windows 上文件默认继承目录的访问控制，状态目录由安装脚本原子创建并限制仅 SYSTEM / Administrators 可访问；
+// 这里使用 create_new 避免跟随竞态植入的重解析点。
 #[cfg(not(unix))]
 fn create_owner_only(path: &Path) -> io::Result<fs::File> {
-    fs::File::create(path)
+    fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(unix)]
@@ -356,5 +402,30 @@ mod tests {
         state.save_controller(&controller).unwrap();
         let names: Vec<_> = fs::read_dir(state.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(names, [CONTROLLER_FILE]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_dir_and_files_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link_dir = outer.path().join("link");
+        symlink(&real, &link_dir).unwrap();
+        assert!(StateDir::open(&link_dir).is_err(), "拒绝打开符号链接作为状态目录");
+
+        let (_dir, state) = state();
+        let decoy = outer.path().join("decoy");
+        fs::write(&decoy, "untouched").unwrap();
+        symlink(&decoy, state.path().join(format!("{CONTROLLER_FILE}.tmp"))).unwrap();
+        let controller = ControllerInfo { address: "c:1".to_owned(), key: PublicKey::from_bytes([5; 32]) };
+        assert!(state.save_controller(&controller).is_err(), "拒绝写入符号链接临时文件");
+        assert_eq!(fs::read_to_string(&decoy).unwrap(), "untouched");
+
+        symlink(&decoy, state.path().join(LOCAL_FILE)).unwrap();
+        assert!(state.remove_local().is_err(), "拒绝删除指向外部的符号链接");
+        assert!(decoy.exists());
     }
 }

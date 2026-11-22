@@ -61,6 +61,7 @@ impl Publisher {
             published: 1_763_200_000,
             artifacts,
             security_floor: None,
+            files: BTreeMap::new(),
         };
         self.sign_as_latest(key, &manifest);
     }
@@ -74,6 +75,7 @@ impl Publisher {
             published: 1_763_200_000,
             artifacts,
             security_floor: Some(version(floor)),
+            files: BTreeMap::new(),
         };
         self.sign_as_latest(&self.key, &manifest);
     }

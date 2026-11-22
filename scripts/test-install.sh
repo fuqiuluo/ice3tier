@@ -13,6 +13,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 os=$(uname -s)
 ctl_pid=""
+https_pid=""
 label="com.github.fuqiuluo.ice3tier"
 
 finish() {
@@ -30,6 +31,9 @@ finish() {
         else
             sudo journalctl -u i3t-controller --no-pager -n 40 || true
         fi
+    fi
+    if [ -n "$https_pid" ]; then
+        kill "$https_pid" 2>/dev/null || true
     fi
     if [ -n "$ctl_pid" ]; then
         kill "$ctl_pid" 2>/dev/null || true
@@ -186,13 +190,149 @@ if [ "$os" = "Darwin" ]; then
 fi
 
 step "uninstall without --purge keeps state, and reinstall brings the node back"
-sudo sh "$repo/deploy/install.sh" --uninstall
-for path in /usr/local/bin/i3t /etc/systemd/system/i3t.service "/Library/LaunchDaemons/$label.plist"; do
+if [ "$os" = "Linux" ]; then
+    step "verify Linux privilege boundary: i3t-writable binary is NEVER executed as root"
+    [ -f /usr/local/libexec/i3t/i3t ] || fail "root-owned /usr/local/libexec/i3t/i3t is missing"
+    if sudo -u i3t test -w /usr/local/libexec/i3t/i3t; then
+        fail "user i3t must not be able to write /usr/local/libexec/i3t/i3t"
+    fi
+    sudo systemctl stop i3t
+    canary_log="$work/canary.uid"
+    chmod 0755 "$work"
+    : > "$canary_log"
+    chmod 0666 "$canary_log"
+    canary_src="$work/canary-i3t.sh"
+    cat <<EOF > "$canary_src"
+#!/bin/sh
+uid=\$(id -u)
+printf '%s %s\n' "\$uid" "\$*" >> "$canary_log"
+if [ "\$uid" -eq 0 ]; then
+    exit 99
+fi
+exit 0
+EOF
+    chmod 0755 "$canary_src"
+    sudo -u i3t cp "$canary_src" /var/lib/i3t/bin/i3t
+    sudo -u i3t chmod 0755 /var/lib/i3t/bin/i3t
+
+    sudo i3t --version >/dev/null 2>&1 || true
+    sudo i3t --help >/dev/null 2>&1 || true
+    sudo i3t >/dev/null 2>&1 || true
+    sudo i3t hosts >/dev/null 2>&1 || true
+    sudo i3t tune >/dev/null 2>&1 || true
+    sudo i3t network status >/dev/null 2>&1 || true
+    sudo i3t --state-dir "$work/custom-state" --version >/dev/null 2>&1 || true
+    sudo sh "$repo/deploy/install.sh" --uninstall
+
+    if grep -q '^0 ' "$canary_log"; then
+        fail "i3t-writable binary was executed as root (uid=0): $(cat "$canary_log")"
+    fi
+    if ! grep -q ' --version$' "$canary_log"; then
+        fail "expected sudo i3t --version to invoke the node binary as non-root user i3t"
+    fi
+else
+    sudo sh "$repo/deploy/install.sh" --uninstall
+fi
+for path in /usr/local/bin/i3t /usr/local/libexec/i3t /etc/systemd/system/i3t.service "/Library/LaunchDaemons/$label.plist"; do
     [ ! -e "$path" ] || fail "$path is still there after --uninstall"
 done
 if pgrep -x i3t >/dev/null; then fail "an i3t process is still running after --uninstall"; fi
 sudo test -f /var/lib/i3t/controller.json || fail "state was deleted without --purge"
-sudo sh "$repo/deploy/install.sh" --from "$dir"
+
+if [ -x "$dir/i3t-release" ]; then
+    step "reinstall from a local signed HTTPS release and verify tamper/HTTP rejections"
+    case "$os" in
+        Linux) rel_os="linux" ;;
+        Darwin) rel_os="macos" ;;
+        *) fail "unsupported os for release test: $os" ;;
+    esac
+    case "$(uname -m)" in
+        x86_64 | amd64) rel_arch="x86_64" ;;
+        aarch64 | arm64) rel_arch="aarch64" ;;
+        *) fail "unsupported arch for release test: $(uname -m)" ;;
+    esac
+    rel_platform="${rel_os}-${rel_arch}"
+    rel_root="$work/releases"
+    rel_ver="0.9.9"
+    rel_ver_dir="$rel_root/download/v${rel_ver}"
+    rel_latest_dir="$rel_root/latest/download"
+    mkdir -p "$rel_ver_dir" "$rel_latest_dir"
+    cp "$dir/i3t" "$rel_ver_dir/i3t-${rel_platform}"
+    cp "$dir/i3t-controller" "$rel_ver_dir/i3t-controller-${rel_platform}"
+    cp "$dir/i3tctl" "$rel_ver_dir/i3tctl-${rel_platform}"
+    rel_key="$work/release.key"
+    rel_pub=$("$dir/i3t-release" keygen --out "$rel_key")
+    "$dir/i3t-release" manifest --version "$rel_ver" --dir "$rel_ver_dir" --key "$rel_key" --min-controller 0.1.0 >/dev/null
+    cp "$rel_ver_dir/manifest.json" "$rel_latest_dir/manifest.json"
+    cp "$rel_ver_dir/manifest.json.sig" "$rel_latest_dir/manifest.json.sig"
+
+    cat <<'EOF' > "$work/openssl.cnf"
+[req]
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+[dn]
+CN = 127.0.0.1
+[v3_req]
+subjectAltName = IP:127.0.0.1
+basicConstraints = CA:TRUE
+EOF
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/server.key" -out "$work/server.crt" \
+        -days 1 -config "$work/openssl.cnf" >/dev/null 2>&1
+    https_port=$(python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat <<'PY' > "$work/https_server.py"
+import http.server, ssl, sys
+port, directory, cert, key = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=directory, **kw)
+    def do_GET(self):
+        if self.path.startswith("/redirect-http/"):
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:1/manifest.json")
+            self.end_headers()
+            return
+        super().do_GET()
+    def log_message(self, *a):
+        pass
+httpd = http.server.HTTPServer(("127.0.0.1", port), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(certfile=cert, keyfile=key)
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PY
+    python3 -I "$work/https_server.py" "$https_port" "$rel_root" "$work/server.crt" "$work/server.key" >"$work/https.out" 2>"$work/https.err" &
+    https_pid=$!
+    i=0
+    until python3 -I -c "import socket; s=socket.create_connection(('127.0.0.1', ${https_port}), 0.5); s.close()" 2>/dev/null; do
+        i=$((i + 1))
+        [ "$i" -lt 15 ] || fail "local HTTPS release server did not start"
+        sleep 1
+    done
+
+    if sudo sh "$repo/deploy/install.sh" --release-base "http://127.0.0.1:${https_port}" --release-key "$rel_pub" >/dev/null 2>&1; then
+        fail "install.sh accepted plain http:// release URL"
+    fi
+    if sudo env CURL_CA_BUNDLE="$work/server.crt" sh "$repo/deploy/install.sh" --release-base "https://127.0.0.1:${https_port}/redirect-http" --release-key "$rel_pub" >/dev/null 2>&1; then
+        fail "install.sh followed HTTPS -> HTTP redirect"
+    fi
+    if sudo env CURL_CA_BUNDLE="$work/server.crt" sh "$repo/deploy/install.sh" --release-base "https://127.0.0.1:${https_port}" >/dev/null 2>&1; then
+        fail "install.sh accepted manifest signed with untrusted key"
+    fi
+
+    # Tampered binary must fail SHA-256 check
+    cp "$rel_ver_dir/i3t-${rel_platform}" "$work/i3t.good"
+    printf 'tampered' >> "$rel_ver_dir/i3t-${rel_platform}"
+    if sudo env CURL_CA_BUNDLE="$work/server.crt" sh "$repo/deploy/install.sh" --release-base "https://127.0.0.1:${https_port}" --release-key "$rel_pub" >/dev/null 2>&1; then
+        fail "install.sh accepted tampered binary"
+    fi
+    mv "$work/i3t.good" "$rel_ver_dir/i3t-${rel_platform}"
+
+    # Valid signed HTTPS release succeeds and brings the node back online
+    sudo env CURL_CA_BUNDLE="$work/server.crt" sh "$repo/deploy/install.sh" --release-base "https://127.0.0.1:${https_port}" --release-key "$rel_pub"
+else
+    sudo sh "$repo/deploy/install.sh" --from "$dir"
+fi
 sleep 3
 wait_online
 wait_vnet
@@ -226,7 +366,12 @@ if [ "$os" = "Linux" ]; then
         sleep 1
     done
     I3T_ADMIN_TOKEN="$ctl_token" "$dir/i3tctl" --json network create upgrade-check >/dev/null
-    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller
+    if [ -n "$https_pid" ]; then
+        sudo env CURL_CA_BUNDLE="$work/server.crt" sh "$repo/deploy/install.sh" --controller \
+            --release-base "https://127.0.0.1:${https_port}" --release-key "$rel_pub"
+    else
+        sudo sh "$repo/deploy/install.sh" --from "$dir" --controller
+    fi
     systemctl is-active -q i3t-controller || fail "i3t-controller.service is not active after upgrade"
     i=0
     until I3T_ADMIN_TOKEN="$ctl_token" "$dir/i3tctl" --json network list 2>/dev/null \

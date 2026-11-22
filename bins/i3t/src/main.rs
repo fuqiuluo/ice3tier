@@ -492,12 +492,30 @@ fn init_logging(level: &str, to: &LogTo) {
     }
 }
 
+/// 确认 Windows 日志路径本身不是符号链接或重解析点（如 NTFS Junction），避免 `LocalSystem` 被诱导跨目录写日志。
+#[cfg(windows)]
+fn reject_reparse_point(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 => {
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "拒绝跟随重解析点"))
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// 打开日志文件接着写；已经太大的先改名留作上一份。
 #[cfg(windows)]
 fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if std::fs::metadata(path).is_ok_and(|file| file.len() > SERVICE_LOG_MAX_BYTES) {
+    reject_reparse_point(path)?;
+    let backup = path.with_extension("log.old");
+    reject_reparse_point(&backup)?;
+    if std::fs::symlink_metadata(path).is_ok_and(|file| file.len() > SERVICE_LOG_MAX_BYTES) {
         // 改不了名就接着往原来的文件里写。
-        let _kept = std::fs::rename(path, path.with_extension("log.old"));
+        let _kept = std::fs::rename(path, &backup);
     }
     std::fs::OpenOptions::new().create(true).append(true).open(path)
 }
@@ -506,6 +524,9 @@ fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 #[cfg(windows)]
 fn append_line(path: &std::path::Path, line: &str) {
     use std::io::Write;
+    if reject_reparse_point(path).is_err() {
+        return;
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _written = writeln!(file, "{line}");
     }
