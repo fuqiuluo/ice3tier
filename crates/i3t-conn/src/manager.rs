@@ -496,7 +496,8 @@ impl Manager {
     ///
     /// 握手要花时间，这期间 netmap 可能变了：对端被删掉，或者换了公钥。所以拿着连接表的锁再核对一次，对不上的不登记，
     /// 关掉，返回 `None`。[`follow_netmap`](Self::follow_netmap) 清扫时也要这把锁：这里读到的还是旧的 netmap，
-    /// 清扫就排在登记之后，会看到这一条；读到的是新的，就在这里拦下。
+    /// 清扫就排在登记之后，会看到这一条；读到的是新的，就在这里拦下。这条连接封包用的密钥也在这把锁下面登记，
+    /// 道理一样。
     fn register(self: &Arc<Self>, peer: NodeId, quic: quinn::Connection, origin: Origin) -> Option<Arc<Conn>> {
         let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
         let Origin { dialer, key, algorithm } = origin;
@@ -514,7 +515,7 @@ impl Manager {
             algorithm,
             packets: PacketClock::default(),
         });
-        let surplus = {
+        let (surplus, early) = {
             let mut peers = self.peers();
             if self.netmap.borrow().peer(peer).map(|info| info.key) != Some(key) {
                 drop(peers);
@@ -525,12 +526,13 @@ impl Manager {
             let entry = peers.entry(peer).or_default();
             entry.conns.push(Arc::clone(&conn));
             entry.arrived.notify_waiters();
-            entry.take_surplus()
+            // 封包的密钥和连接在同一把锁下面登记，清扫要撤的也是这两样：放开锁之后才登记密钥的话，清扫正好插在中间时
+            // 撤不到它，被吊销的对端的包还能再收一小会儿（到这条连接的任务收场为止）。
+            let early = conn.sealed.as_ref().map(|session| self.inbox.admit(peer, session)).unwrap_or_default();
+            (entry.take_surplus(), early)
         };
-        // 对端握手完成得早的话，它的头几个封好的包已经到了：登记密钥时一并收下。
-        if let Some(session) = &conn.sealed {
-            self.inbox.admit(peer, session);
-        }
+        // 对端握手完成得早的话，它的头几个封好的包已经到了，现在补收。要解密，所以放开锁之后做。
+        self.inbox.deliver_early(peer, early);
         tracing::info!(%peer, %dialer, congestion = %Congestion::from(algorithm), sealed_packets = conn.sealed.is_some(), "和对端的连接建立");
         for old in surplus {
             tracing::info!(%peer, dialer = %old.dialer, "和这个对端的连接超过了 {MAX_CONNS_PER_PEER} 条，关闭最旧的一条");

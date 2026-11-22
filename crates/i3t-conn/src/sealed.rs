@@ -512,10 +512,18 @@ impl Inbox {
         self.early.lock().expect("early sealed packets mutex poisoned")
     }
 
-    /// 开始收 `peer` 用这个会话封的包。比它早到的那几个现在补上。
-    pub(crate) fn admit(&self, peer: NodeId, session: &Arc<Session>) {
+    /// 开始收 `peer` 用这个会话封的包。返回比它早到的那几个，交给 [`deliver_early`](Self::deliver_early) 补收。
+    ///
+    /// 分成两步：登记要和连接表的登记在同一把锁下面做（见 `Manager::register`），这样清扫被吊销的对端时不会漏掉
+    /// 一把登记到一半的密钥；补收要解密，不该占着那把锁。
+    #[must_use = "早到的包要交给 deliver_early 补收"]
+    pub(crate) fn admit(&self, peer: NodeId, session: &Arc<Session>) -> Vec<Vec<u8>> {
         self.sessions.write().expect("sealed session table lock poisoned").insert((peer, session.id), Arc::clone(session));
-        let early = self.early().take(peer, session.id);
+        self.early().take(peer, session.id)
+    }
+
+    /// 补收 [`admit`](Self::admit) 交出来的包。这期间那个会话要是已经撤掉了（对端被吊销），它们解不开，重新留着等到过期。
+    pub(crate) fn deliver_early(&self, peer: NodeId, early: Vec<Vec<u8>>) {
         for mut packet in early {
             self.receive(peer, &mut packet);
         }
@@ -791,12 +799,17 @@ mod tests {
         NodeId::new(2).unwrap()
     }
 
+    /// 登记，并且马上补收早到的包。
+    fn admit(inbox: &Inbox, session: &Arc<Session>) {
+        inbox.deliver_early(peer(), inbox.admit(peer(), session));
+    }
+
     #[test]
     fn the_inbox_queues_packets_of_admitted_sessions_only() {
         let (inbox, mut queue) = inbox();
         let (dialer, acceptor) = pair();
         let acceptor = Arc::new(acceptor);
-        inbox.admit(peer(), &acceptor);
+        admit(&inbox, &acceptor);
 
         inbox.receive(peer(), &mut sealed(&dialer, &frame(b"\x45 one")));
         let got = queue.try_recv().unwrap();
@@ -821,9 +834,28 @@ mod tests {
             inbox.receive(peer(), &mut sealed(&dialer, &frame(body)));
         }
         assert!(queue.try_recv().is_err(), "密钥还没有登记");
-        inbox.admit(peer(), &Arc::new(acceptor));
+        admit(&inbox, &Arc::new(acceptor));
         assert_eq!(&queue.try_recv().unwrap().payload[..], &frame(b"\x45 first")[..]);
         assert_eq!(&queue.try_recv().unwrap().payload[..], &frame(b"\x45 second")[..]);
+    }
+
+    #[test]
+    fn early_packets_are_not_delivered_if_the_session_is_dismissed_before_they_are_replayed() {
+        let (inbox, mut queue) = inbox();
+        let (dialer, acceptor) = pair();
+        let acceptor = Arc::new(acceptor);
+        for body in [&b"\x45 first"[..], b"\x45 second"] {
+            inbox.receive(peer(), &mut sealed(&dialer, &frame(body)));
+        }
+        // 登记和补收之间对端被吊销了：登记这一步自己不投递，撤掉之后补收的那几个也解不开。
+        let early = inbox.admit(peer(), &acceptor);
+        assert_eq!(early.len(), 2);
+        assert!(queue.try_recv().is_err(), "登记这一步不投递");
+        inbox.dismiss(peer(), &acceptor);
+        inbox.deliver_early(peer(), early);
+        assert!(queue.try_recv().is_err(), "会话已经撤掉了，早到的包不收");
+        inbox.receive(peer(), &mut sealed(&dialer, &frame(b"\x45 later")));
+        assert!(queue.try_recv().is_err(), "之后到的也不收");
     }
 
     #[test]
@@ -835,7 +867,7 @@ mod tests {
         for body in [&b"\x45 a"[..], b"\x45 b", b"\x45 c"] {
             inbox.receive(peer(), &mut sealed(&dialer, &frame(body)));
         }
-        inbox.admit(peer(), &Arc::new(acceptor));
+        admit(&inbox, &Arc::new(acceptor));
         for body in [&b"\x45 a"[..], b"\x45 b", b"\x45 c"] {
             assert_eq!(&queue.try_recv().unwrap().payload[..], &frame(body)[..], "按到的先后补上");
         }
@@ -865,7 +897,7 @@ mod tests {
     fn sealed_packets_are_picked_out_of_a_batch_and_the_rest_stays_in_order() {
         let (inbox, mut queue) = inbox();
         let (dialer, acceptor) = pair();
-        inbox.admit(peer(), &Arc::new(acceptor));
+        admit(&inbox, &Arc::new(acceptor));
         // 等长的一串：连接包、封好的、连接包、封好的，最后一个短的连接包。
         let body = [0x45; 40];
         let stride = sealed(&dialer, &frame(&body)).len();
@@ -897,8 +929,8 @@ mod tests {
         let (dialer, acceptor) = pair();
         let old = Arc::new(Session::from_material(&material(1), Role::Acceptor));
         let current = Arc::new(acceptor);
-        inbox.admit(peer(), &old);
-        inbox.admit(peer(), &current);
+        admit(&inbox, &old);
+        admit(&inbox, &current);
         inbox.dismiss(peer(), &old);
         inbox.receive(peer(), &mut sealed(&dialer, &frame(b"\x45 still here")));
         assert!(queue.try_recv().is_ok());
