@@ -412,6 +412,9 @@ mod tests {
         let mac = DeviceSpec::new(Platform::MacOs, Ipv4Addr::new(10, 67, 0, 5), "10.67.0.0/20".parse().unwrap(), None);
         assert_eq!((mac.name.as_deref(), mac.prefix), (None, 20), "macOS 上系统挑一个 utunN");
         assert_eq!(mac.route(), "10.67.0.0/20".parse::<Ipv4Net>().unwrap());
+
+        assert!(linux.offload && !linux.clone().with_offload(false).offload, "Linux 上默认和内核成块地交接，本机可以关");
+        assert!(!windows.offload && !mac.offload && !windows.with_offload(true).offload, "别的平台上没有这回事，设了也没有");
     }
 
     #[test]
