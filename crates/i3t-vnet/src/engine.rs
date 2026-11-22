@@ -431,9 +431,10 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
         if !self.icmp.take(Instant::now()) {
             return;
         }
-        if let Some(answer) = unreachable(ip, code)
-            && let Err(error) = self.device.send(&answer).await
-        {
+        let Some(answer) = unreachable(ip, code) else { return };
+        // 写网卡可能要等（它的队列满着的时候）。同一阵里排在前面、交下去还没发的包先发掉，不让它们陪着等。
+        self.sender.flush();
+        if let Err(error) = self.device.send(&answer).await {
             tracing::debug!(%error, "回给本机程序的不可达写不进网卡");
         }
     }

@@ -231,6 +231,26 @@ async fn packets_already_waiting_on_the_device_are_handed_down_together_and_then
 }
 
 #[tokio::test]
+async fn packets_handed_down_are_sent_before_the_engine_stops_to_answer_one_it_cannot_deliver() {
+    let mut world = world(netmap(&serde_json::json!([peer(2, true, true)]), &[]), &[2], Duration::ZERO);
+    // 同一阵里三个包：给 b 的，给一个不存在的节点的（要往网卡里写一个"不可达"，那可能要等），又一个给 b 的。
+    world.app_sends(icmp(ME, B, 8));
+    world.app_sends(tcp(ME, [10, 66, 0, 9], (40000, 22), 0x02));
+    world.app_sends(icmp(ME, B, 8));
+    world.kernel_gets().await;
+    for _ in 0..2 {
+        world.on_wire().await;
+    }
+    let flushed = || world.net.0.flushed_at.lock().unwrap().clone();
+    let deadline = tokio::time::Instant::now() + SOON;
+    while flushed().last() != Some(&2) {
+        assert!(tokio::time::Instant::now() < deadline, "交下去的包一直没有被发掉：{:?}", flushed());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(flushed(), [1, 2], "去写不可达之前，前面那个已经交下去的包先发掉了");
+}
+
+#[tokio::test]
 async fn a_packet_to_a_connected_peer_goes_out_as_one_frame_and_a_reply_comes_in() {
     let mut world = world(netmap(&serde_json::json!([peer(2, true, true)]), &[]), &[2], Duration::ZERO);
     let ping = icmp(ME, B, 8);
