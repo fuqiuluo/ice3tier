@@ -40,6 +40,8 @@ use i3t_model::Netmap;
 use i3t_model::control::VnetDrops;
 use i3t_proto::NodeId;
 use i3t_proto::flow::{Bundled, PacketHeader, PacketPieces};
+
+use crate::bundle::{Bundler, SMALL_PACKET};
 use ipnet::Ipv4Net;
 use tokio::sync::{mpsc, watch};
 
@@ -187,6 +189,8 @@ impl DropLog {
 struct Index {
     own: Ipv4Addr,
     cidr: Ipv4Net,
+    /// 网络的开关：小包合起来发（[`crate::bundle`]）。
+    bundle: bool,
     by_ip: HashMap<Ipv4Addr, PeerInfo>,
     by_id: HashMap<NodeId, PeerInfo>,
 }
@@ -219,6 +223,7 @@ impl Index {
         Self {
             own: netmap.me.virtual_ip,
             cidr: netmap.network.cidr,
+            bundle: netmap.network.bundle_small_packets,
             by_ip: peers.iter().map(|peer| (peer.ip, *peer)).collect(),
             by_id: peers.iter().map(|peer| (peer.id, *peer)).collect(),
         }
@@ -272,6 +277,8 @@ impl<D: Device, P: Packets> Engine<D, P> {
             message: 0,
             icmp: IcmpBudget::default(),
             log: DropLog::default(),
+            bundles: Bundler::default(),
+            answers: Vec::new(),
         };
         let mut inbound = Inbound {
             device: self.device,
@@ -335,12 +342,26 @@ struct Outbound<D, S> {
     message: u16,
     icmp: IcmpBudget,
     log: DropLog,
+    /// 攒着等合成一帧的小包。
+    bundles: Bundler,
+    /// 这一轮里要回给本机程序的"不可达"：等手上的包都发出去了再写进网卡，写网卡可能要等。
+    answers: Vec<Vec<u8>>,
 }
 
 /// 出去的方向这一轮等到了什么。
 enum Event {
     Read(io::Result<usize>),
     Dialed(NodeId, Result<(), OpenError>),
+    /// 攒着的小包里有等够了的。
+    BundlesDue,
+}
+
+/// 等到 `deadline`；没有的话一直等。
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl<D: Device, S: PacketSender> Outbound<D, S> {
@@ -350,28 +371,31 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
         let mut buf = vec![0u8; 1 + READ_BUFFER];
         buf[0] = PacketHeader::WHOLE_BYTE;
         loop {
+            let deadline = self.bundles.deadline();
             let event = tokio::select! {
                 read = self.device.recv(&mut buf[1..]) => Event::Read(read),
                 Some((peer, result)) = dialed.recv() => Event::Dialed(peer, result),
+                () = until(deadline) => Event::BundlesDue,
             };
+            let mut broken = None;
             match event {
                 Event::Read(read) => {
-                    // 网卡上紧跟着还有现成的包就接着读，一口气交下去：连接层把一样长的凑成一批发，少几次系统调用。
-                    // 只取现成的，不等：没有了就把手上的发掉。
+                    // 网卡上紧跟着还有现成的包就接着读，一口气交下去：连接层把一样长的凑成一批发，少几次系统调用，
+                    // 同一轮里的小包合成一帧。只取现成的，不等：没有了就把手上的发掉。
                     let mut read = Some(read);
                     let mut taken = 0;
                     while let Some(result) = read.take() {
                         match result {
                             Ok(len) => {
                                 let frame = Bytes::copy_from_slice(&buf[..=len]);
-                                if let Some(peer) = self.route(&frame).await {
-                                    self.send(peer, frame, &dialed_tx).await;
+                                if let Some(peer) = self.route(&frame) {
+                                    self.offer(peer, frame, &dialed_tx);
                                 }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                             Err(error) => {
-                                self.sender.flush();
-                                return Stopped::Device(error);
+                                broken = Some(error);
+                                break;
                             }
                         }
                         taken += 1;
@@ -380,14 +404,67 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                         }
                     }
                 }
-                Event::Dialed(peer, result) => self.dialed(peer, result).await,
+                Event::Dialed(peer, result) => self.dialed(peer, result),
+                Event::BundlesDue => {
+                    if let Some(deadline) = deadline {
+                        self.bundles.woke(deadline, tokio::time::Instant::now());
+                    }
+                }
+            }
+            // 这一轮完了：合好了、不用再等的帧交下去，连接层攒着的发出去。然后才去写网卡，那可能要等。
+            for (peer, frame) in self.bundles.due(tokio::time::Instant::now(), self.index.bundle && broken.is_none()) {
+                self.emit(peer, frame, &dialed_tx);
             }
             self.sender.flush();
+            for answer in std::mem::take(&mut self.answers) {
+                if let Err(error) = self.device.send(&answer).await {
+                    tracing::debug!(%error, "回给本机程序的不可达写不进网卡");
+                }
+            }
+            if let Some(error) = broken {
+                return Stopped::Device(error);
+            }
+        }
+    }
+
+    /// 本机发出的一个包，该发给 `peer`。小包、能合的时候先攒着（[`crate::bundle`]），别的照常发。
+    fn offer(&mut self, peer: NodeId, frame: Bytes, dialed: &mpsc::UnboundedSender<(NodeId, Result<(), OpenError>)>) {
+        let packet = &frame[PacketHeader::WHOLE_LEN..];
+        if self.index.bundle && packet.len() <= SMALL_PACKET && !self.waiting.contains_key(&peer) {
+            let sender = &self.sender;
+            let pushed = self.bundles.push(peer, packet, || sender.bundle_capacity(peer), tokio::time::Instant::now());
+            if let Some(full) = pushed.emit {
+                self.emit(peer, full, dialed);
+            }
+            if pushed.taken {
+                return;
+            }
+        } else if let Some(pending) = self.bundles.take(peer) {
+            // 攒着的小包先走，顺序不变。
+            self.emit(peer, pending, dialed);
+        }
+        self.send(peer, frame, dialed);
+    }
+
+    /// 把合好的一帧交给连接层。只有一个包的就是普通的一帧；合着好几个的发不了时（连接没了，帧的上限刚变小），
+    /// 里面的包各走各的：该建连接的建连接，该切片的切片。
+    fn emit(&mut self, peer: NodeId, frame: Bytes, dialed: &mpsc::UnboundedSender<(NodeId, Result<(), OpenError>)>) {
+        let Ok((PacketHeader::Bundle, body)) = PacketHeader::decode(&frame) else { return self.send(peer, frame, dialed) };
+        let packets = Bundled::new(body).flatten();
+        if self.sender.queue_packet(peer, frame.clone()).is_ok() {
+            packets.for_each(|packet| self.counters.sent(packet.len()));
+            return;
+        }
+        for packet in packets {
+            let mut whole = Vec::with_capacity(PacketHeader::WHOLE_LEN + packet.len());
+            PacketHeader::Whole.encode(&mut whole);
+            whole.extend_from_slice(packet);
+            self.send(peer, whole.into(), dialed);
         }
     }
 
     /// 本机发出的一个包该发给哪个对端；不该发的在这里处理掉（丢掉、回"不可达"），返回 `None`。
-    async fn route(&mut self, frame: &Bytes) -> Option<NodeId> {
+    fn route(&mut self, frame: &Bytes) -> Option<NodeId> {
         self.index.follow(&mut self.netmap);
         let packet = &frame[1..];
         let ip = match Ipv4::parse(packet) {
@@ -410,10 +487,10 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
         let peer = self.index.by_ip.get(&destination).copied();
         let refused = peer.and_then(|peer| self.refused.get(&peer.id)).is_some_and(|until| Instant::now() < *until);
         match peer {
-            None => self.unreachable(&ip, Unreachable::Host, Loss::Unreachable, &destination).await,
-            Some(peer) if peer.no_vnet || refused => self.unreachable(&ip, Unreachable::Host, Loss::Unreachable, &destination).await,
+            None => self.unreachable(&ip, Unreachable::Host, Loss::Unreachable, &destination),
+            Some(peer) if peer.no_vnet || refused => self.unreachable(&ip, Unreachable::Host, Loss::Unreachable, &destination),
             Some(peer) if !peer.outbound && matches!(ip.conversation(), Conversation::TcpOpen | Conversation::IcmpRequest) => {
-                self.unreachable(&ip, Unreachable::Prohibited, Loss::NotAllowed, &destination).await;
+                self.unreachable(&ip, Unreachable::Prohibited, Loss::NotAllowed, &destination);
             }
             Some(peer) => {
                 if !peer.inbound {
@@ -426,20 +503,19 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
     }
 
     /// 丢掉一个本机发出的包，给发它的程序回一个"不可达"。
-    async fn unreachable(&mut self, ip: &Ipv4<'_>, code: Unreachable, kind: Loss, detail: &Ipv4Addr) {
+    ///
+    /// 回的包先记着，这一轮手上的包都发出去之后才写进网卡（见 [`run`](Self::run)）：写网卡可能要等（它的队列满着的时候），
+    /// 同一阵里排在前面、交下去还没发的包不该陪着等。
+    fn unreachable(&mut self, ip: &Ipv4<'_>, code: Unreachable, kind: Loss, detail: &Ipv4Addr) {
         self.log.note(&self.counters, kind, detail);
-        if !self.icmp.take(Instant::now()) {
-            return;
-        }
-        let Some(answer) = unreachable(ip, code) else { return };
-        // 写网卡可能要等（它的队列满着的时候）。同一阵里排在前面、交下去还没发的包先发掉，不让它们陪着等。
-        self.sender.flush();
-        if let Err(error) = self.device.send(&answer).await {
-            tracing::debug!(%error, "回给本机程序的不可达写不进网卡");
+        if self.icmp.take(Instant::now())
+            && let Some(answer) = unreachable(ip, code)
+        {
+            self.answers.push(answer);
         }
     }
 
-    async fn send(&mut self, peer: NodeId, frame: Bytes, dialed: &mpsc::UnboundedSender<(NodeId, Result<(), OpenError>)>) {
+    fn send(&mut self, peer: NodeId, frame: Bytes, dialed: &mpsc::UnboundedSender<(NodeId, Result<(), OpenError>)>) {
         if let Some(waiting) = self.waiting.get_mut(&peer) {
             return Self::queue(waiting, frame, &self.counters, &mut self.log);
         }
@@ -490,7 +566,7 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
     }
 
     /// 到 `peer` 的连接建好了（或者没建成）：把排着的包发出去，或者给它们回"不可达"。
-    async fn dialed(&mut self, peer: NodeId, result: Result<(), OpenError>) {
+    fn dialed(&mut self, peer: NodeId, result: Result<(), OpenError>) {
         let Some(waiting) = self.waiting.remove(&peer) else { return };
         match result {
             Ok(()) => {
@@ -512,7 +588,7 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                 for frame in waiting.frames {
                     if let Ok(ip) = Ipv4::parse(&frame[1..]) {
                         let destination = ip.destination();
-                        self.unreachable(&ip, Unreachable::Host, Loss::Unreachable, &destination).await;
+                        self.unreachable(&ip, Unreachable::Host, Loss::Unreachable, &destination);
                     }
                 }
             }

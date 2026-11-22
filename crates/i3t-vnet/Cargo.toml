@@ -23,6 +23,10 @@ tracing.workspace = true
 tun-rs = { version = "2.8.18", default-features = false, features = ["async_tokio"] }
 if-addrs.workspace = true
 
+[dev-dependencies]
+# 合并小包的窗口按毫秒算：测试里时间要能停住、一步一步地走。
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
 

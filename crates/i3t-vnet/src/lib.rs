@@ -28,6 +28,7 @@
 //! - [`overlap`]：网络的地址段和这台机器所在的真实网络重不重叠（重叠时不装）；
 //! - [`names`]：名字服务的应答，和 `/etc/hosts` 里的一段。
 
+mod bundle;
 pub mod device;
 pub mod engine;
 pub mod filter;

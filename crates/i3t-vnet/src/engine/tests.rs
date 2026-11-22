@@ -24,6 +24,9 @@ struct FakeDevice {
     to_kernel: mpsc::UnboundedSender<Vec<u8>>,
     /// 引擎开始了几次"等下一个包"。真的网卡上每一次都不便宜（Windows：一个内核事件加一个阻塞线程的任务）。
     waits: AtomicUsize,
+    net: FakeNet,
+    /// 每次往网卡里写的时候，连接层已经"把攒着的发出去"过几次。
+    flushes_before_write: std::sync::Mutex<Vec<usize>>,
 }
 
 impl FakeDevice {
@@ -47,6 +50,7 @@ impl Device for FakeDevice {
     }
 
     async fn send(&self, packet: &[u8]) -> io::Result<()> {
+        self.flushes_before_write.lock().unwrap().push(self.net.0.flushed_at.lock().unwrap().len());
         let _ = self.to_kernel.send(packet.to_vec());
         Ok(())
     }
@@ -65,6 +69,8 @@ struct NetState {
     /// 每次"把攒着的发出去"时，到那时为止一共交下来多少帧。
     flushed_at: std::sync::Mutex<Vec<usize>>,
     queued: AtomicUsize,
+    /// 对端认识合在一起的帧时，一帧最长多少；0 是不认识（不能合）。
+    bundle: AtomicUsize,
     inbox: AsyncMutex<mpsc::UnboundedReceiver<Datagram>>,
 }
 
@@ -96,6 +102,11 @@ impl PacketSender for FakeNet {
 
     fn flush(&self) {
         self.0.flushed_at.lock().unwrap().push(self.0.queued.load(Ordering::Relaxed));
+    }
+
+    fn bundle_capacity(&self, peer: NodeId) -> Option<usize> {
+        let capacity = self.0.bundle.load(Ordering::Relaxed);
+        (capacity != 0 && self.0.connected.lock().unwrap().contains(&peer)).then_some(capacity)
     }
 
     async fn connect(&self, peer: NodeId) -> Result<(), OpenError> {
@@ -156,9 +167,16 @@ fn world(map: Netmap, connected: &[u32], dial_delay: Duration) -> World {
         sent,
         flushed_at: std::sync::Mutex::default(),
         queued: AtomicUsize::new(0),
+        bundle: AtomicUsize::new(0),
         inbox: AsyncMutex::new(inbox),
     }));
-    let device = Arc::new(FakeDevice { from_kernel: AsyncMutex::new(from_kernel), to_kernel, waits: AtomicUsize::new(0) });
+    let device = Arc::new(FakeDevice {
+        from_kernel: AsyncMutex::new(from_kernel),
+        to_kernel,
+        waits: AtomicUsize::new(0),
+        net: net.clone(),
+        flushes_before_write: std::sync::Mutex::default(),
+    });
     let (netmap, netmap_rx) = watch::channel(Arc::new(map));
     let counters = Arc::new(Counters::default());
     let engine = tokio::spawn(Engine::new(Arc::clone(&device), Arc::new(net.clone()), netmap_rx, Arc::clone(&counters)).run());
@@ -251,13 +269,148 @@ async fn packets_handed_down_are_sent_before_the_engine_stops_to_answer_one_it_c
     for _ in 0..2 {
         world.on_wire().await;
     }
-    let flushed = || world.net.0.flushed_at.lock().unwrap().clone();
-    let deadline = tokio::time::Instant::now() + SOON;
-    while flushed().last() != Some(&2) {
-        assert!(tokio::time::Instant::now() < deadline, "交下去的包一直没有被发掉：{:?}", flushed());
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(world.net.0.flushed_at.lock().unwrap().clone(), [2], "给 b 的两个包一起交下去，发一次");
+    assert_eq!(world.device.flushes_before_write.lock().unwrap().clone(), [1], "它们发出去了，才去往网卡里写不可达");
+}
+
+/// 让引擎把手上的事做完：时间不走，只让出执行权。让得够多，到点的定时器也轮得到（运行时隔几十步才看一次定时器）。
+async fn settle() {
+    for _ in 0..300 {
+        tokio::task::yield_now().await;
     }
-    assert_eq!(flushed(), [1, 2], "去写不可达之前，前面那个已经交下去的包先发掉了");
+}
+
+/// 发给 b 的一个小包，内容各不相同。
+fn small(fill: u8) -> Vec<u8> {
+    udp(ME, B, (40000, 53), &[fill; 20])
+}
+
+/// 发给 b 的一个大包（超过合包的上限）。
+fn large(fill: u8) -> Vec<u8> {
+    udp(ME, B, (40000, 53), &[fill; 600])
+}
+
+fn bundling_world(capacity: usize) -> World {
+    let world = world(netmap(&serde_json::json!([peer(2, true, true), peer(3, true, true)]), &[]), &[2, 3], Duration::ZERO);
+    world.net.0.bundle.store(capacity, Ordering::Relaxed);
+    world
+}
+
+#[tokio::test]
+async fn small_packets_read_in_one_round_leave_in_one_frame_at_once() {
+    let mut world = bundling_world(1200);
+    // 引擎还没有轮到跑，这些已经都在网卡上了：五个给 b 的小包，一个给 c 的。
+    let to_c = icmp(ME, C, 8);
+    for packet in [small(1), small(2), small(3), small(4), small(5), to_c.clone()] {
+        world.app_sends(packet);
+    }
+    let frames = [world.on_wire().await, world.on_wire().await];
+    world.nothing_on_wire().await;
+    let all: Vec<Vec<u8>> = (1..=5).map(small).collect();
+    let all: Vec<&[u8]> = all.iter().map(Vec::as_slice).collect();
+    assert!(frames.contains(&(node(2), bundle(&all).into())), "给 b 的五个合成一帧：{frames:?}");
+    assert!(frames.contains(&(node(3), whole(&to_c).into())), "给 c 的只有一个：就是普通的一帧");
+    assert_eq!(world.snapshot().sent_packets, 6, "按包数算，不按帧数");
+    assert_eq!(world.net.0.flushed_at.lock().unwrap().clone(), [2], "这一轮读完就发，不等");
+}
+
+#[tokio::test]
+async fn a_large_packet_does_not_overtake_the_small_ones_that_came_before_it() {
+    let mut world = bundling_world(1200);
+    for packet in [small(1), small(2), large(3), small(4), small(5)] {
+        world.app_sends(packet);
+    }
+    assert_eq!(world.on_wire().await.1, bundle(&[&small(1), &small(2)]), "大包之前的两个小包合成一帧，先走");
+    assert_eq!(world.on_wire().await.1, whole(&large(3)), "大包不合，也不等");
+    assert_eq!(world.on_wire().await.1, bundle(&[&small(4), &small(5)]), "之后的两个另成一帧");
+    world.nothing_on_wire().await;
+    assert_eq!(world.snapshot().sent_packets, 5);
+}
+
+#[tokio::test]
+async fn nothing_is_bundled_with_the_switch_off_or_for_a_peer_that_does_not_understand() {
+    // 对端不认识合在一起的帧。
+    let mut world = bundling_world(0);
+    for fill in 1..=3 {
+        world.app_sends(small(fill));
+    }
+    for fill in 1..=3 {
+        assert_eq!(world.on_wire().await, (node(2), whole(&small(fill)).into()));
+    }
+
+    // 网络的开关关着。
+    let mut map = serde_json::to_value(netmap(&serde_json::json!([peer(2, true, true)]), &[])).unwrap();
+    map["network"]["bundle_small_packets"] = false.into();
+    let mut world = self::world(serde_json::from_value(map).unwrap(), &[2], Duration::ZERO);
+    world.net.0.bundle.store(1200, Ordering::Relaxed);
+    for fill in 1..=3 {
+        world.app_sends(small(fill));
+    }
+    for fill in 1..=3 {
+        assert_eq!(world.on_wire().await, (node(2), whole(&small(fill)).into()));
+    }
+    world.nothing_on_wire().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn small_packets_that_come_thick_wait_a_millisecond_for_company_and_sparse_ones_never_wait() {
+    let mut world = bundling_world(1200);
+    let step = Duration::from_micros(400);
+    // 稀的：到了就走。
+    world.app_sends(small(1));
+    settle().await;
+    assert_eq!(world.wire.try_recv().unwrap(), (node(2), whole(&small(1)).into()));
+
+    // 0.4 毫秒之后又来一个：来得密，攒着。再过 0.4 毫秒又一个，放进同一帧。
+    tokio::time::advance(step).await;
+    world.app_sends(small(2));
+    settle().await;
+    assert!(world.wire.try_recv().is_err(), "离上一个小包不到两毫秒：等一会儿");
+    tokio::time::advance(step).await;
+    world.app_sends(small(3));
+    settle().await;
+    assert!(world.wire.try_recv().is_err());
+    // 从攒下第一个算起一毫秒多一点（定时器的刻度是一毫秒，往上取整）：两个一起走。
+    tokio::time::advance(Duration::from_millis(2)).await;
+    settle().await;
+    assert_eq!(world.wire.try_recv().unwrap(), (node(2), bundle(&[&small(2), &small(3)]).into()));
+
+    // 离上一个小包已经两毫秒了：又算稀的，到了就走。
+    world.app_sends(small(4));
+    settle().await;
+    assert_eq!(world.wire.try_recv().unwrap(), (node(2), whole(&small(4)).into()));
+
+    // 攒着的时候来了大包：攒着的先走，大包跟上，都不等。
+    tokio::time::advance(step).await;
+    world.app_sends(small(5));
+    settle().await;
+    assert!(world.wire.try_recv().is_err());
+    world.app_sends(large(6));
+    settle().await;
+    assert_eq!(world.wire.try_recv().unwrap(), (node(2), whole(&small(5)).into()));
+    assert_eq!(world.wire.try_recv().unwrap(), (node(2), whole(&large(6)).into()));
+
+    // 隔了很久的小包又是到了就走。
+    tokio::time::advance(Duration::from_millis(50)).await;
+    world.app_sends(small(7));
+    settle().await;
+    assert_eq!(world.wire.try_recv().unwrap(), (node(2), whole(&small(7)).into()));
+    assert_eq!(world.snapshot().sent_packets, 7);
+}
+
+#[tokio::test]
+async fn a_bundle_the_connection_cannot_take_is_sent_packet_by_packet() {
+    // 连接层说一帧能到 1200 字节，真去发的时候上限已经变成了 150（路径上的包长刚变小）：合好的那一帧发不了。
+    let mut world = bundling_world(1200);
+    world.net.0.max.store(150, Ordering::Relaxed);
+    for fill in 1..=3 {
+        world.app_sends(small(fill));
+    }
+    for fill in 1..=3 {
+        assert_eq!(world.on_wire().await, (node(2), whole(&small(fill)).into()), "里面的包各走各的，一个不少");
+    }
+    world.nothing_on_wire().await;
+    assert_eq!(world.snapshot().sent_packets, 3);
 }
 
 #[tokio::test]
