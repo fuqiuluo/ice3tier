@@ -55,6 +55,7 @@ impl Config {
     ///
     /// 文件读不了、语法不对、有不认识的配置项，或者某个值不合规矩。错误信息里有文件名和出错的位置。
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::state::ensure_not_reparse_or_symlink(path).with_context(|| (texts().read_config)(path))?;
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -79,6 +80,7 @@ impl Config {
     ///
     /// 写文件失败。
     pub fn write_template_if_missing(path: &Path) -> anyhow::Result<()> {
+        crate::state::ensure_not_reparse_or_symlink(path).with_context(|| (texts().create_config)(path))?;
         match fs::OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => io::Write::write_all(&mut file, texts().template.as_bytes()).with_context(|| (texts().write_config)(path)),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -104,6 +106,7 @@ impl Config {
         if let Change::CanForward(_) = change {
             return Ok(());
         }
+        crate::state::ensure_not_reparse_or_symlink(path).with_context(|| (texts().read_config)(path))?;
         Self::write_template_if_missing(path)?;
         let text = fs::read_to_string(path).with_context(|| (texts().read_config)(path))?;
         let mut document: toml_edit::DocumentMut =
@@ -941,5 +944,22 @@ mod tests {
         // 路径本身是目录时读文件会报 IO 错误，不是配置文件内容有错。
         let io_error = Config::load(dir.path()).unwrap_err();
         assert!(!io_error.chain().any(|cause| cause.is::<InvalidConfig>()), "IO 错误不应标为 InvalidConfig：{io_error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_load_and_set_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, "root:SECRET_HASH:0:0\n").unwrap();
+        let link = dir.path().join("config.toml");
+        symlink(&secret, &link).unwrap();
+
+        let err = Config::load(&link).unwrap_err();
+        assert!(!format!("{err:#}").contains("SECRET_HASH"), "错误信息不得泄露符号链接目标内容：{err:#}");
+        assert!(Config::set(&link, Change::Network(false)).is_err());
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "root:SECRET_HASH:0:0\n");
     }
 }

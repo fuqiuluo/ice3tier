@@ -361,8 +361,11 @@ def b64url_decode_exact(text, expected_len):
     return raw if len(raw) == expected_len else None
 
 pub_bytes = b64url_decode_exact(pub_b64.strip(), 32)
-with open(sig_path, "r", encoding="ascii", errors="strict") as fh:
-    sig_text = fh.read().strip()
+try:
+    with open(sig_path, "rb") as fh:
+        sig_text = fh.read().decode("ascii").strip()
+except UnicodeDecodeError:
+    sys.exit(1)
 sig_bytes = b64url_decode_exact(sig_text, 64)
 if pub_bytes is None or sig_bytes is None:
     sys.exit(1)
@@ -634,8 +637,8 @@ install_binary_atomic() {
     group="$4"
     dir=$(dirname "$dest")
     base=$(basename "$dest")
-    if [ -L "$dir" ]; then
-        die "refusing to install into symbolic link directory: ${dir}"
+    if $SUDO test -L "$dir" || $SUDO test -L "$dest"; then
+        die "refusing to install through symbolic link: ${dest}"
     fi
     stage=$($SUDO mktemp "${dir}/.${base}.install.XXXXXX")
     if ! $SUDO install -o "$owner" -g "$group" -m 0755 "$src" "$stage" || ! $SUDO mv -f "$stage" "$dest"; then
@@ -661,7 +664,7 @@ install_binary_as_i3t() {
     elif command -v sudo >/dev/null 2>&1; then
         $SUDO sudo -u i3t -- /bin/sh -c "$_ia_script" sh "$_ia_dir" "$_ia_base" "$_ia_src" "$_ia_dest"
     else
-        $SUDO su -s /bin/sh -c "$_ia_script" i3t -- sh "$_ia_dir" "$_ia_base" "$_ia_src" "$_ia_dest"
+        $SUDO su -s /bin/sh -c "$_ia_script" -- i3t sh "$_ia_dir" "$_ia_base" "$_ia_src" "$_ia_dest"
     fi
 }
 
@@ -1023,7 +1026,7 @@ as_node() {
         elif command -v sudo >/dev/null 2>&1; then
             $how sudo -u i3t -- env I3T_STATE_DIR="$STATE" ${I3T_LANG:+"I3T_LANG=$I3T_LANG"} ${I3T_LOG:+"I3T_LOG=$I3T_LOG"} ${I3T_SERVICE:+"I3T_SERVICE=$I3T_SERVICE"} "$BIN" "$@"
         else
-            $how su -s /bin/sh -c 'state=$1; service=$2; bin=$3; shift 3; exec env I3T_STATE_DIR="$state" I3T_SERVICE="$service" "$bin" "$@"' i3t -- sh "$STATE" "${I3T_SERVICE:-}" "$BIN" "$@"
+            $how su -s /bin/sh -c 'state=$1; service=$2; bin=$3; shift 3; exec env I3T_STATE_DIR="$state" I3T_SERVICE="$service" "$bin" "$@"' -- i3t sh "$STATE" "${I3T_SERVICE:-}" "$BIN" "$@"
         fi
     else
         $how "$BIN" "$@"
@@ -1087,7 +1090,7 @@ run_as_i3t() {
     elif command -v sudo >/dev/null 2>&1; then
         $SUDO sudo -u i3t -- env I3T_STATE_DIR="$STATE_DIR" ${I3T_LANG:+"I3T_LANG=$I3T_LANG"} ${I3T_SERVICE:+"I3T_SERVICE=$I3T_SERVICE"} "$node_bin" "$@"
     else
-        $SUDO su -s /bin/sh -c 'state=$1; service=$2; bin=$3; shift 3; exec env I3T_STATE_DIR="$state" I3T_SERVICE="$service" "$bin" "$@"' i3t -- sh "$STATE_DIR" "${I3T_SERVICE:-}" "$node_bin" "$@"
+        $SUDO su -s /bin/sh -c 'state=$1; service=$2; bin=$3; shift 3; exec env I3T_STATE_DIR="$state" I3T_SERVICE="$service" "$bin" "$@"' -- i3t sh "$STATE_DIR" "${I3T_SERVICE:-}" "$node_bin" "$@"
     fi
 }
 
@@ -1240,7 +1243,7 @@ install_node_systemd() {
         elif command -v sudo >/dev/null 2>&1; then
             $SUDO sudo -u i3t -- mkdir -p -m 0700 "$node_bin_dir"
         else
-            $SUDO su -s /bin/sh -c 'mkdir -p -m 0700 "$1"' i3t -- sh "$node_bin_dir"
+            $SUDO su -s /bin/sh -c 'mkdir -p -m 0700 "$1"' -- i3t sh "$node_bin_dir"
         fi
     else
         $SUDO install -d -o 0 -g 0 -m 0755 "$(dirname "$node_bin_dir")"

@@ -807,6 +807,7 @@ namespace Ice3tier.Installer
                 }
                 $inStream = $response.GetResponseStream()
                 $outStream = [IO.File]::Open($DestinationPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                $completed = $false
                 try {
                     $buffer = New-Object byte[] 65536
                     [long]$total = 0
@@ -817,9 +818,13 @@ namespace Ice3tier.Installer
                         }
                         $outStream.Write($buffer, 0, $read)
                     }
+                    $completed = $true
                 } finally {
                     $outStream.Dispose()
                     $inStream.Dispose()
+                    if (-not $completed) {
+                        Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
                 return
             } finally {
@@ -1061,15 +1066,15 @@ namespace Ice3tier.Installer
             }
         }
 
-        # Validate or atomically create %ProgramData%\i3t BEFORE touching Program Files or the service,
-        # rejecting reparse points / NTFS junctions and untrusted owners/write ACEs fail-closed.
-        [Ice3tier.Installer.Native]::EnsureSecureStateDirectory($state)
-
+        # Stop an already-running service first so it is not renaming files inside $state during upgrade,
+        # then validate or atomically create %ProgramData%\i3t BEFORE touching Program Files or registering the service.
         $registered = Get-Service -Name $service -ErrorAction SilentlyContinue
         if ($registered -and ($registered.Status -ne 'Stopped')) {
             Say "Stopping the $service service"
             Stop-Service -Name $service -Force
         }
+
+        [Ice3tier.Installer.Native]::EnsureSecureStateDirectory($state)
 
         Say "Installing i3t to $dir"
         New-Item -ItemType Directory -Path $dir -Force | Out-Null

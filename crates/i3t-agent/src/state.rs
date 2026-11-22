@@ -103,6 +103,7 @@ impl StateDir {
     /// 文件读不了，或者内容不是一把私钥。
     pub fn key(&self) -> anyhow::Result<Option<NodeKey>> {
         let path = self.root.join(KEY_FILE);
+        ensure_not_reparse_or_symlink(&path).with_context(|| (texts().read_key)(&path))?;
         match fs::read_to_string(&path) {
             Ok(pem) => Ok(Some(NodeKey::from_pem(&pem).with_context(|| (texts().parse_key)(&path))?)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -222,6 +223,7 @@ impl StateDir {
 
     fn read_json<T: DeserializeOwned>(&self, name: &str) -> anyhow::Result<Option<T>> {
         let path = self.root.join(name);
+        ensure_not_reparse_or_symlink(&path).with_context(|| format!("读 {}", path.display()))?;
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| format!("解析 {}", path.display()))?)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -257,7 +259,7 @@ impl StateDir {
 }
 
 /// 拒绝符号链接以及 Windows 重解析点（含 NTFS Junction），防止被诱导跨目录读写或删改。
-fn ensure_not_reparse_or_symlink(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_not_reparse_or_symlink(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) => check_not_reparse_or_symlink(&meta),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -425,7 +427,11 @@ mod tests {
         assert_eq!(fs::read_to_string(&decoy).unwrap(), "untouched");
 
         symlink(&decoy, state.path().join(LOCAL_FILE)).unwrap();
+        assert!(state.local().is_err(), "拒绝读取指向外部的符号链接");
         assert!(state.remove_local().is_err(), "拒绝删除指向外部的符号链接");
         assert!(decoy.exists());
+
+        symlink(&decoy, state.path().join(KEY_FILE)).unwrap();
+        assert!(state.key().is_err(), "拒绝读取符号链接私钥文件");
     }
 }

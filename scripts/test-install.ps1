@@ -218,11 +218,18 @@ CN = 127.0.0.1
 [v3_req]
 subjectAltName = IP:127.0.0.1
 basicConstraints = CA:TRUE
+keyUsage = critical, digitalSignature, keyEncipherment, keyCertSign
+extendedKeyUsage = serverAuth
 '@ | Set-Content -LiteralPath $opensslCnf -Encoding Ascii
     $certPem = Join-Path $work 'server.crt'
     $keyPem = Join-Path $work 'server.key'
-    & $opensslExe req -x509 -newkey rsa:2048 -nodes -keyout $keyPem -out $certPem -days 1 -config $opensslCnf 2>$null
-    if ($LASTEXITCODE -ne 0) { Fail 'openssl self-signed cert generation failed' }
+    $opensslProc = Start-Process -FilePath $opensslExe -PassThru -Wait -NoNewWindow `
+        -ArgumentList 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', $keyPem, '-out', $certPem, '-days', '1', '-config', $opensslCnf `
+        -RedirectStandardOutput (Join-Path $work 'openssl.out') -RedirectStandardError (Join-Path $work 'openssl.err')
+    if ($opensslProc.ExitCode -ne 0) {
+        $opensslErr = Get-Content -LiteralPath (Join-Path $work 'openssl.err') -Raw -ErrorAction SilentlyContinue
+        Fail "openssl self-signed cert generation failed (exit $($opensslProc.ExitCode)): $opensslErr"
+    }
     $importedCert = Import-Certificate -FilePath $certPem -CertStoreLocation 'Cert:\LocalMachine\Root'
     $certThumbprint = $importedCert.Thumbprint
 
@@ -249,7 +256,7 @@ ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(certfile=cert, keyfile=key)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
-'@ | Set-Content -LiteralPath $serverScript -Encoding UTF8
+'@ | Set-Content -LiteralPath $serverScript -Encoding Ascii
     $fileServer = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList '-I', $serverScript, $httpsPort, $releaseRoot, $certPem, $keyPem `
         -RedirectStandardOutput (Join-Path $work 'http.out') -RedirectStandardError (Join-Path $work 'http.err')
@@ -292,10 +299,12 @@ httpd.serve_forever()
         $env:I3T_RELEASE_BASE = "https://127.0.0.1:$httpsPort"
     }
 
-    # Tampered ZIP must fail SHA-256 verification
+    # Tampered ZIP (same byte length, flipped byte) must fail SHA-256 verification
     $goodZip = Join-Path $work 'good.zip'
     Copy-Item -LiteralPath $zipPath -Destination $goodZip
-    Add-Content -LiteralPath $zipPath -Value 'tampered' -NoNewline
+    $tamperedBytes = [IO.File]::ReadAllBytes($zipPath)
+    $tamperedBytes[$tamperedBytes.Length - 1] = $tamperedBytes[$tamperedBytes.Length - 1] -bxor 0x01
+    [IO.File]::WriteAllBytes($zipPath, $tamperedBytes)
     Assert-InstallRejected 'tampered ZIP SHA-256 mismatch' {
         $env:I3T_RELEASE_BASE = "https://127.0.0.1:$httpsPort"
         $env:I3T_RELEASE_KEY = $relPub
