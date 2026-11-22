@@ -1,6 +1,6 @@
 //! 还认不出是谁的连接占的名额。
 //!
-//! 节点协议的连接在报到之前、管理 API 的连接在整个存续期间，controller 都不知道对方是谁，只能按来源地址给它们记账：
+//! 节点协议在握手阶段（含首帧）、管理 API 在连接的整个存续期间，用 `Gate` 按来源地址给连接记账：
 //!
 //! - 每个来源最多 [`Limits::per_source`] 条，再来一条就挤掉这个来源最老的那条；
 //! - 全部加起来最多 [`Limits::total`] 条，再来一条就挤掉占得最多的那个来源最老的那条。
@@ -54,7 +54,7 @@ struct Slot {
 
 /// 记账用的来源：IPv4 地址，或者 IPv6 地址所在的 /64。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Source(IpAddr);
+pub(crate) struct Source(IpAddr);
 
 impl From<IpAddr> for Source {
     fn from(ip: IpAddr) -> Self {
@@ -87,6 +87,10 @@ pub(crate) struct Pass {
 }
 
 impl Pass {
+    pub(crate) fn source(&self) -> Source {
+        self.source
+    }
+
     /// 等到这条连接被挤掉。已经被挤掉的马上返回。
     pub(crate) async fn evicted(&mut self) {
         if let Some(evicted) = &mut self.evicted {
