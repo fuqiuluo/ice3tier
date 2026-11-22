@@ -1,6 +1,6 @@
 //! relay 上的会话表：哪个节点现在挂在哪个地址（或者哪条 TCP）上。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -61,19 +61,21 @@ struct Session {
 #[derive(Debug, Default)]
 pub(crate) struct Sessions {
     by_node: HashMap<NodeId, Session>,
-    /// 会话断过（TCP 断开，或者过期）的节点。它们下一次建立的会话算"重新建的"。
-    broke: HashSet<NodeId>,
+    /// 会话断过（TCP 断开，或者过期）的节点，和断掉的那个会话是哪把公钥建的。同一把公钥下一次建立的会话算"重新建的"；
+    /// 节点换了公钥就是换了主人，这条记录不作数。
+    broke: HashMap<NodeId, PublicKey>,
 }
 
 impl Sessions {
     /// 握手成功：给 `node` 建会话，或者把它已有的会话改绑到新的来源上。`key` 是验过这次握手的签名的公钥，`nonce` 是这次握手里节点给的随机数。
     pub(crate) fn open(&mut self, node: NodeId, key: PublicKey, binding: Binding, nonce: Nonce, now: Instant) {
-        let previous = self.by_node.get(&node);
+        // 同一把公钥建的才是这个节点原来的会话。别的公钥是另一个主人：它建过、断过会话，都和这一个无关。
+        let previous = self.by_node.get(&node).filter(|session| session.key == key);
         let reopened = match (previous.filter(|session| session.expires > now), &binding) {
             // 走着 TCP 的节点发现 UDP 通了，在 UDP 上再握一次手：会话没有断，只是换了个地方。
             (Some(Session { binding: Binding::Tcp { .. }, reopened, .. }), Binding::Udp(_)) => *reopened,
             // 别的情况下，节点重新握手是因为它认为原来的会话没了（保活没有回应，或者它重启了）。
-            _ if previous.is_some() || self.broke.remove(&node) => Some(now),
+            _ if previous.is_some() || self.broke.remove(&node) == Some(key) => Some(now),
             _ => None,
         };
         self.by_node.insert(node, Session { key, binding, nonce, reopened, expires: now + SESSION_TTL });
@@ -114,23 +116,19 @@ impl Sessions {
 
     /// 一条 TCP 断了：绑定在它上面的会话跟着没有。节点这期间已经换到别处的会话不受影响。
     pub(crate) fn close_tcp(&mut self, conn: TcpConn) -> Vec<NodeId> {
-        let removed = self.remove_where(|_, session| session.binding.is(Origin::Tcp(conn)));
-        self.broke.extend(&removed);
-        removed
+        self.remove_broken(|session| session.binding.is(Origin::Tcp(conn)))
     }
 
     /// 删掉过期的会话，返回是哪些节点的。
     pub(crate) fn sweep(&mut self, now: Instant) -> Vec<NodeId> {
-        let removed = self.remove_where(|_, session| session.expires <= now);
-        self.broke.extend(&removed);
-        removed
+        self.remove_broken(|session| session.expires <= now)
     }
 
     /// 删掉不再被允许的节点的会话（节点被吊销、从网络里删除，或者换了公钥：会话是旧公钥的主人建的），返回是哪些节点的。
     /// `key_of` 给出一个节点现在被允许用的公钥，不被允许的是 `None`。
     pub(crate) fn retain_clients(&mut self, key_of: impl Fn(NodeId) -> Option<PublicKey>) -> Vec<NodeId> {
-        self.broke.retain(|node| key_of(*node).is_some());
-        self.remove_where(|node, session| key_of(node) != Some(session.key))
+        self.broke.retain(|node, key| key_of(*node) == Some(*key));
+        self.remove_where(|node, session| key_of(node) != Some(session.key)).into_iter().map(|(node, _)| node).collect()
     }
 
     /// 现在所有会话绑定的地方。给全体会话发通知时用。
@@ -151,9 +149,19 @@ impl Sessions {
         self.by_node.get(&node).filter(|session| session.expires > now)
     }
 
-    fn remove_where(&mut self, doomed: impl Fn(NodeId, &Session) -> bool) -> Vec<NodeId> {
-        let removed: Vec<NodeId> = self.by_node.iter().filter(|&(&node, session)| doomed(node, session)).map(|(&node, _)| node).collect();
-        for node in &removed {
+    /// 删掉断了的会话，记下它们各是哪把公钥建的，返回是哪些节点的。
+    fn remove_broken(&mut self, broken: impl Fn(&Session) -> bool) -> Vec<NodeId> {
+        let removed = self.remove_where(|_, session| broken(session));
+        let nodes = removed.iter().map(|&(node, _)| node).collect();
+        self.broke.extend(removed);
+        nodes
+    }
+
+    /// 删掉 `doomed` 点到的会话，返回是哪些节点的、各是哪把公钥建的。
+    fn remove_where(&mut self, doomed: impl Fn(NodeId, &Session) -> bool) -> Vec<(NodeId, PublicKey)> {
+        let matching = self.by_node.iter().filter(|&(&node, session)| doomed(node, session));
+        let removed: Vec<_> = matching.map(|(&node, session)| (node, session.key)).collect();
+        for (node, _) in &removed {
             self.by_node.remove(node);
         }
         removed
@@ -324,5 +332,32 @@ mod tests {
         assert_eq!(sessions.reopened(node(1), now), None);
         assert_eq!(sessions.retain_clients(key_of), []);
         assert!(sessions.owned_by(node(1), Origin::Udp(udp(4002)), now));
+    }
+
+    #[test]
+    fn a_broken_session_counts_only_for_the_key_that_opened_it() {
+        const NEW_KEY: PublicKey = PublicKey::from_bytes([2; PublicKey::LEN]);
+        let start = Instant::now();
+        let mut sessions = Sessions::default();
+        // 两个节点的会话都断了（一个是 TCP 断开，一个是过期），然后节点 1 换了公钥，节点 2 没有换。
+        sessions.open(node(1), KEY, tcp(7), NONCE, start);
+        sessions.open(node(2), KEY, Binding::Udp(udp(4000)), NONCE, start);
+        assert_eq!(sessions.close_tcp(TcpConn::Accepted(7)), [node(1)]);
+        let expired = start + SESSION_TTL;
+        assert_eq!(sessions.sweep(expired), [node(2)]);
+        assert_eq!(sessions.retain_clients(|id| Some(if id == node(1) { NEW_KEY } else { KEY })), []);
+
+        sessions.open(node(1), NEW_KEY, tcp(8), NONCE, expired);
+        sessions.open(node(2), KEY, Binding::Udp(udp(4000)), NONCE, expired);
+        assert_eq!(sessions.reopened(node(1), expired), None, "断的是旧公钥的主人的会话，新公钥的主人是头一次来");
+        assert_eq!(sessions.reopened(node(2), expired), Some(expired));
+
+        // 会话表自己就认公钥，不靠名单先清过一遍：记下的是哪把公钥断的，换一把来握手不算重新建，那条记录也就此作废。
+        assert_eq!(sessions.close_tcp(TcpConn::Accepted(8)), [node(1)]);
+        sessions.open(node(1), KEY, tcp(9), NONCE, expired);
+        assert_eq!(sessions.reopened(node(1), expired), None);
+        // 顶掉另一把公钥建的会话也不算：那不是这个主人原来的会话。
+        sessions.open(node(1), NEW_KEY, tcp(10), NONCE, expired);
+        assert_eq!(sessions.reopened(node(1), expired), None);
     }
 }

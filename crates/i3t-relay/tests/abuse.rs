@@ -8,9 +8,9 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Client, TestRelay, WAIT};
+use common::{Client, RELAY_ID, Role, TestRelay, WAIT, node};
 use i3t_proto::addr::Query;
-use i3t_proto::session::{Auth, Frame, Init};
+use i3t_proto::session::{Auth, Frame, Init, Ping};
 use i3t_proto::{Datagram, tcp_frame};
 use i3t_relay::DropReason;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -116,6 +116,39 @@ async fn a_tcp_leg_must_finish_its_handshake_in_time_however_chatty_it_is() {
 }
 
 #[tokio::test]
+async fn a_tcp_leg_that_lost_its_session_must_handshake_again_in_time_however_chatty_it_is() {
+    let client = Client::new(1).await;
+    let relay = TestRelay::start(&[&client]);
+    let (read_half, mut write_half) = connect_from("127.0.0.1:0", &relay).await.into_split();
+    let mut reader = i3t_underlay::tcp_leg::FrameReader::new(read_half);
+    let mut next = async || tokio::time::timeout(WAIT, reader.next()).await.unwrap().unwrap().unwrap();
+    send_frame(&mut write_half, &Init { node: client.id, nonce: [3; 8] }.to_bytes()).await.unwrap();
+    let Some(Frame::Challenge(challenge)) = Frame::parse(&next().await) else { panic!("应该是 CHALLENGE") };
+    send_frame(&mut write_half, &client.auth(node(RELAY_ID), [3; 8], challenge.cookie).to_bytes()).await.unwrap();
+    assert!(matches!(Frame::parse(&next().await), Some(Frame::Ok(_))));
+
+    // netmap 里这个节点换了公钥：旧钥匙在这条 TCP 上建的会话没了，它也握不上新的。
+    relay.set_netmap(Role::On, &[&client.rekeyed().await]);
+    assert!(relay.session_closes(client.id).await, "公钥换了的节点，旧钥匙建的会话应该立刻关闭");
+
+    // 它照旧每秒发一个 PING。会话没了之后的时限从 relay 发现的那一刻算起，来多少帧都不延长。
+    let lost = Instant::now();
+    let ping = Ping { node: client.id, nonce: [4; 8] }.to_bytes();
+    let chatter = tokio::spawn(async move {
+        while send_frame(&mut write_half, &ping).await.is_ok() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    let closed = tokio::time::timeout(HANDSHAKE_TIMEOUT + Duration::from_secs(2), async {
+        while reader.next().await.is_ok_and(|frame| frame.is_some()) {}
+    })
+    .await;
+    chatter.abort();
+    assert!(closed.is_ok(), "会话没了之后重新握手的时限，来多少帧都不延长");
+    assert!(lost.elapsed() >= HANDSHAKE_TIMEOUT - Duration::from_millis(100), "时限之前不关，留给它重新握手：{:?}", lost.elapsed());
+}
+
+#[tokio::test]
 async fn a_tcp_leg_that_sends_anything_but_a_handshake_first_is_closed_at_once() {
     let client = Client::new(1).await;
     let relay = TestRelay::start(&[&client]);
@@ -164,7 +197,7 @@ async fn one_source_cannot_hold_more_than_a_few_tcp_legs_without_a_session() {
     send_frame(&mut write_half, &Init { node: honest.id, nonce: [3; 8] }.to_bytes()).await.unwrap();
     let reply = tokio::time::timeout(WAIT, reader.next()).await.unwrap().unwrap().unwrap();
     let Some(Frame::Challenge(challenge)) = Frame::parse(&reply) else { panic!("应该是 CHALLENGE：{reply:?}") };
-    let auth = honest.auth(common::node(common::RELAY_ID), [3; 8], challenge.cookie);
+    let auth = honest.auth(node(RELAY_ID), [3; 8], challenge.cookie);
     send_frame(&mut write_half, &auth.to_bytes()).await.unwrap();
     let reply = tokio::time::timeout(WAIT, reader.next()).await.unwrap().unwrap().unwrap();
     assert!(matches!(Frame::parse(&reply), Some(Frame::Ok(_))));

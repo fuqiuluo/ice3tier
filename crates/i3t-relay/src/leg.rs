@@ -8,6 +8,8 @@
 //! 谁都可以连上来，所以还没有会话的连接要尽快打发掉，不能让人占着位子把只能走 TCP 的节点挡在外面：
 //!
 //! - 从接受连接时算起 [`HANDSHAKE_TIMEOUT`] 之内必须握手成功，这期间来多少帧都不延长；
+//! - 握手成功之后会话又没了的（过期、节点在别处重新握了手、被从名单里去掉、换了公钥）也一样：从发现会话没了算起
+//!   [`HANDSHAKE_TIMEOUT`] 之内要重新握手成功，来多少帧都不延长；
 //! - 握手成功之前只收 INIT 和 AUTH，来了别的就断开；
 //! - 同一个来源（IPv4 地址，或者 IPv6 的 /64）同时最多有 [`MAX_PENDING_PER_SOURCE`] 条还没握手成功的连接。
 
@@ -292,16 +294,19 @@ async fn serve(inner: &Inner, stream: TcpStream, addr: SocketAddr, handshake: Ha
     let mut enabled = inner.subscribe_enabled();
     let source = Source { addr, via: Via::Tcp { conn, sender: &sender } };
     let mut owner: Option<NodeId> = None;
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    // 这条 TCP 上没有会话的时候，最晚到什么时候要握手成功。握手成功之前从接受连接时算起；之后会话又没了的，
+    // 从发现它没了的那一刻算起。来多少帧都不延长：不然占着连接的人隔几秒发一帧就能一直留着。
+    let mut handshake_by = Some(Instant::now() + HANDSHAKE_TIMEOUT);
     let mut handshake = Some(handshake);
 
     let reason = loop {
-        // 握手成功之前：从接受连接时算起的截止时间，来多少帧都不延长。之后按会话的有效期等，每一帧重新算：
-        // 节点的 PING 也从这条 TCP 来，这么久没有任何帧说明它不在了。
+        // 有会话的时候按会话的有效期等，每一帧重新算：节点的 PING 也从这条 TCP 来，这么久没有任何帧说明它不在了。
         let has_session = owner.is_some_and(|node| inner.tcp_session_alive(node, conn));
-        let until = match owner {
-            None => deadline,
-            Some(_) => Instant::now() + if has_session { SESSION_TTL } else { HANDSHAKE_TIMEOUT },
+        let until = if has_session {
+            handshake_by = None;
+            Instant::now() + SESSION_TTL
+        } else {
+            *handshake_by.get_or_insert_with(|| Instant::now() + HANDSHAKE_TIMEOUT)
         };
         tokio::select! {
             _ = enabled.wait_for(|enabled| !enabled) => break "relay 停用",
@@ -329,6 +334,7 @@ async fn serve(inner: &Inner, stream: TcpStream, addr: SocketAddr, handshake: Ha
                 Ok(Ok(None)) => break "对方关闭",
                 Ok(Err(_)) => break "读出错",
                 Err(_) if has_session => break "会话过期",
+                Err(_) if owner.is_some() => break "会话没了之后迟迟没有重新握手",
                 Err(_) => break "迟迟没有握手成功",
             },
         }

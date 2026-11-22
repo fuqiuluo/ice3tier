@@ -697,6 +697,15 @@ impl Inner {
     /// 别的 relay 经 UDP 来的，还要路径层同意它把会话搬到 UDP 上（[`BackboneInbox::admits_udp`]）：骨干上到它的那一段走着 TCP、
     /// 本节点又不知道自己的 UDP 到不到得了它时不建会话、不回答，只告诉路径层它敲了门。
     fn authenticate(&self, source: &Source<'_>, auth: &Auth, now: Instant) -> Option<NodeId> {
+        let key = self.check_auth(source, auth, now)?;
+        self.open_session(source, auth, key, now)
+    }
+
+    /// 握手的前一半：这个 AUTH 该不该建会话。该的话返回它的签名是照哪把公钥验过的。
+    ///
+    /// 验签名的时候不拿着状态的锁（它是收包的路径上最贵的一步），所以这里看到的名单到建会话时可能已经换了：
+    /// 后一半（[`open_session`](Self::open_session)）要照这把公钥再核对一次。
+    fn check_auth(&self, source: &Source<'_>, auth: &Auth, now: Instant) -> Option<PublicKey> {
         let node = auth.node;
         let (me, client_key, neighbour) = {
             let state = self.read();
@@ -738,14 +747,23 @@ impl Inner {
             inbox.knocked(node);
             return None;
         }
-        {
+        Some(client_key)
+    }
+
+    /// 握手的后一半：给签名照 `key` 验过的 AUTH（[`check_auth`](Self::check_auth)）建会话、回 OK。
+    ///
+    /// 验签名的那段时间里 netmap 可能变了，所以拿着写锁再看一次：relay 还启用着，这个节点在名单里的公钥还是 `key`。
+    /// 节点被去掉了，或者换了公钥（那签名就是照一把已经不作数的公钥验的），都不建会话。
+    fn open_session(&self, source: &Source<'_>, auth: &Auth, key: PublicKey, now: Instant) -> Option<NodeId> {
+        let node = auth.node;
+        let me = {
             let mut state = self.write();
-            // 验签名的这段时间里 netmap 可能变了：节点被去掉了，或者换了公钥，那签名就是照一把已经不作数的公钥验的。
-            if !state.enabled || state.clients.get(&node) != Some(&client_key) {
+            if !state.enabled || state.clients.get(&node) != Some(&key) {
                 return None;
             }
-            state.sessions.open(node, client_key, source.binding(), auth.nonce, now);
-        }
+            state.sessions.open(node, key, source.binding(), auth.nonce, now);
+            state.me
+        };
         self.counters.session_opened();
         let valid_for = u16::try_from(SESSION_TTL.as_secs()).unwrap_or(u16::MAX);
         let message = Accepted::signed_message(me, node, &auth.nonce, valid_for, source.addr);
@@ -1085,28 +1103,22 @@ mod tests {
 
         // 一个样样都对的 AUTH：cookie 是发给这个地址的，签名是 netmap 里现在这把公钥的主人签的。
         let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let from = client.local_addr().unwrap();
+        let source = Source { addr: client.local_addr().unwrap(), via: Via::Udp };
         let (now, nonce) = (Instant::now(), [7; 8]);
-        let cookie = relay.inner.cookies.issue(from, node, now);
+        let cookie = relay.inner.cookies.issue(source.addr, node, now);
         let signature = *old.sign(Auth::PURPOSE, &Auth::signed_message(me, node, &nonce, &cookie)).as_bytes();
         let auth = Auth { node, nonce, cookie, signature };
 
-        // 握手读了名单里的公钥之后、验签名之前要过限速：占着限速的锁，它就停在那里，手上拿的是旧公钥。
-        let limiter = relay.inner.handshakes.lock().unwrap();
-        let handshake = std::thread::spawn({
-            let inner = Arc::clone(&relay.inner);
-            move || inner.authenticate(&Source { addr: from, via: Via::Udp }, &auth, now)
-        });
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!handshake.is_finished(), "握手应该停在限速那一步");
-        // 这期间 netmap 里这个节点换了公钥。然后放握手接着走：签名照它手上的旧公钥验得过。
+        // 握手的前一半验过了签名，后一半还没有开始：这期间 netmap 里这个节点换了公钥。
+        assert_eq!(relay.inner.check_auth(&source, &auth, now), Some(old.public()));
         relay.inner.apply(&netmap(&[(node, new.public())]));
-        drop(limiter);
-
-        assert_eq!(handshake.join().unwrap(), None, "签名是照已经换掉的公钥验的，不该建会话");
+        assert_eq!(relay.inner.open_session(&source, &auth, old.public(), now), None, "签名是照已经换掉的公钥验的，不该建会话");
         assert!(!relay.has_session(node));
         assert_eq!(relay.counters().sessions_opened, 0);
-        // 握手要是没来得及在换公钥之前读名单，签名会对不上新公钥：那样测到的就不是验完签名之后的那一次核对了。
-        assert_eq!(relay.counters().dropped(DropReason::BadSignature), 0);
+
+        // 名单里还是那把公钥的话，同样的后一半是建得了会话的。
+        relay.inner.apply(&netmap(&[(node, old.public())]));
+        assert_eq!(relay.inner.open_session(&source, &auth, old.public(), now), Some(node));
+        assert!(relay.has_session(node));
     }
 }
