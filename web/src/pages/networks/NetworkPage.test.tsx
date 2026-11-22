@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Route, Routes } from 'react-router'
+import { useState } from 'react'
 import { describe, expect, it } from 'vitest'
 
 import { type Network } from '@/api/types'
@@ -8,6 +9,7 @@ import { t } from '@/i18n'
 import { makeNode } from '@/test/fixtures'
 import { fakeApi, NETWORK, renderWithApp } from '@/test/harness'
 
+import { NetworkContext } from './context'
 import { NetworkPage } from './NetworkPage'
 
 const n = t.networks
@@ -229,6 +231,31 @@ describe('网络', () => {
     await user.click(screen.getByRole('button', { name: n.saveSettings }))
     await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
     expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ ack_eliciting_threshold: 4, max_ack_delay_ms: 2 })
+  })
+
+  it('连接：别处改了合并小包，开关跟着变，不算有没保存的改动', async () => {
+    const user = userEvent.setup()
+    setup()
+    // 网络的设置是从外面给进来的：别的标签页或者 i3tctl 改了之后，重新取到的就是新的。按钮代替"重新取到了"。
+    function Page() {
+      const [network, setNetwork] = useState(NETWORK)
+      return (
+        <NetworkContext value={network}>
+          <button type="button" onClick={() => setNetwork({ ...NETWORK, bundle_small_packets: false })}>
+            changed elsewhere
+          </button>
+          <Routes>
+            <Route path="/n/:network/network/:section" element={<NetworkPage />} />
+          </Routes>
+        </NetworkContext>
+      )
+    }
+    renderWithApp(<Page />, { route: '/n/1/network/connection' })
+    expect(screen.getByRole('switch', { name: n.bundleLabel })).toBeChecked()
+
+    await user.click(screen.getByRole('button', { name: 'changed elsewhere' }))
+    expect(screen.getByRole('switch', { name: n.bundleLabel })).not.toBeChecked()
+    expect(screen.getByRole('button', { name: n.saveSettings })).toBeDisabled()
   })
 
   it('危险操作：网络里还有节点时删除是灰的，写着要先删节点', () => {

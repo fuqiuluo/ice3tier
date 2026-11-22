@@ -98,7 +98,7 @@ export function NetworkPage() {
           ) : null}
           {active === 'connection' ? (
             <ConnectionSection
-              key={`${network.id}:${network.ack_eliciting_threshold}:${network.max_ack_delay_ms}`}
+              key={`${network.id}:${network.ack_eliciting_threshold}:${network.max_ack_delay_ms}:${network.bundle_small_packets ?? ''}`}
               network={network}
             />
           ) : null}
