@@ -21,6 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time;
 
+use crate::admission::{Handshakes, Pass};
 use crate::entry::{Entry, Gate, LocalEntry};
 use crate::failure::Failure;
 use crate::first_data::{self, FIRST_BYTE_WAIT};
@@ -66,6 +67,8 @@ pub(crate) struct Shared<C: Datagrams> {
     pub forward_health: ForwardHealth,
     /// 到各个对端现在走哪条路，写进每条流结束时的摘要。
     pub routes: SharedRoutes,
+    /// 代理连接在完成握手之前占的名额。
+    pub handshakes: Handshakes,
 }
 
 impl<C: Datagrams> Shared<C> {
@@ -298,7 +301,8 @@ fn give_up<E: std::fmt::Display>(stage: &str, broken: &Broken<E>) -> Option<Ask>
     None
 }
 
-/// 处理代理端口上的一条连接。`entry` 是这个端口在连接进来那一刻的设置。
+/// 处理代理端口上的一条连接。`entry` 是这个端口在连接进来那一刻的设置，`pass` 是这条连接占着的握手名额（有的话）：
+/// 握手完成时还回去，没完成的在这里返回时还。
 pub(crate) async fn proxy<C: Connector + Datagrams>(
     shared: &Arc<Shared<C>>,
     netmap: &Netmap,
@@ -306,6 +310,7 @@ pub(crate) async fn proxy<C: Connector + Datagrams>(
     stream: TcpStream,
     from: SocketAddr,
     connection: &Connection,
+    pass: Option<Pass>,
 ) {
     let mut client = Client { stream, buffer: Vec::new() };
     let handshake = async {
@@ -331,6 +336,8 @@ pub(crate) async fn proxy<C: Connector + Datagrams>(
             return;
         }
     };
+    // 握手完成了：认证已经过了，之后的连接不再占握手的名额。
+    drop(pass);
     // 排空时也先把握手做完：客户端要拿到一个看得懂的拒绝，而不是连接莫名其妙地断了。认证在拒绝之前，
     // 没有用户名和密码的人看不出节点在排空。
     if shared.refuse_while_draining("代理请求") {

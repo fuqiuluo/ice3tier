@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::Instrument;
 
+use crate::admission::{HandshakeLimits, Handshakes, Pass};
 use crate::entry::{Entry, LocalEntry};
 use crate::forward_health::{ForwardHealth, TargetFailure};
 use crate::routes::{NoRoutes, SharedRoutes};
@@ -91,6 +92,7 @@ impl<C: Connector + Datagrams> Access<C> {
             udp_idle_timeout: UDP_IDLE_TIMEOUT,
             forward_health: ForwardHealth::default(),
             routes: Arc::new(NoRoutes),
+            handshakes: Handshakes::new(HandshakeLimits::default()),
         };
         Self { shared: Arc::new(shared), published: Mutex::default() }
     }
@@ -103,6 +105,17 @@ impl<C: Connector + Datagrams> Access<C> {
     #[must_use]
     pub fn with_udp_idle_timeout(mut self, timeout: Duration) -> Self {
         self.shared_mut("with_udp_idle_timeout").udp_idle_timeout = timeout;
+        self
+    }
+
+    /// 同时最多有多少条代理连接还没完成握手。默认的（[`HandshakeLimits::default`]）够个人用；测试里调小，不用真的开上千条连接。
+    ///
+    /// # Panics
+    ///
+    /// 在 [`run`](Self::run) 已经开始之后调用。
+    #[must_use]
+    pub fn with_handshake_limits(mut self, limits: HandshakeLimits) -> Self {
+        self.shared_mut("with_handshake_limits").handshakes = Handshakes::new(limits);
         self
     }
 
@@ -638,9 +651,20 @@ async fn accept_loop<C: Connector + Datagrams>(shared: Arc<Shared<C>>, key: Key,
     loop {
         match i3t_underlay::tcp_mss::accept(&listener).await {
             Ok((stream, from)) => {
+                // 代理和组网入口的连接先领握手的名额，领不到的在这里就关掉（`stream` 随之丢掉），不开任务。端口转发没有握手，不领。
+                let pass = match key {
+                    Key::Proxy { .. } | Key::Local { .. } => match shared.handshakes.admit(from) {
+                        Ok(pass) => Some(pass),
+                        Err(full) => {
+                            shared.handshakes.refused(&key, from, full);
+                            continue;
+                        }
+                    },
+                    Key::Forward { .. } => None,
+                };
                 let connection = Connection::enter(&counters);
                 let span = tracing::info_span!("access", listen = %key, %from);
-                tokio::spawn(serve(Arc::clone(&shared), key.clone(), stream, from, connection).instrument(span));
+                tokio::spawn(serve(Arc::clone(&shared), key.clone(), stream, from, connection, pass).instrument(span));
             }
             Err(error) => {
                 tracing::warn!(listen = %key, %error, "接受连接出错");
@@ -670,7 +694,16 @@ impl Drop for Connection {
 }
 
 /// 处理一条刚接受的连接。代理的设置每次都从当前的 netmap 里取，所以改设置不需要重新绑定。
-async fn serve<C: Connector + Datagrams>(shared: Arc<Shared<C>>, key: Key, stream: TcpStream, from: SocketAddr, connection: Connection) {
+///
+/// `pass` 是代理和组网入口的连接领到的握手名额，被拒绝的连接在返回时还回去。
+async fn serve<C: Connector + Datagrams>(
+    shared: Arc<Shared<C>>,
+    key: Key,
+    stream: TcpStream,
+    from: SocketAddr,
+    connection: Connection,
+    pass: Option<Pass>,
+) {
     let netmap = Arc::clone(&shared.netmap.borrow());
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "设置不了 TCP_NODELAY");
@@ -692,12 +725,12 @@ async fn serve<C: Connector + Datagrams>(shared: Arc<Shared<C>>, key: Key, strea
             if !allowed(&proxy.allow_from, from) {
                 return tracing::info!("拒绝了一条连接：来源不在这个代理的白名单里");
             }
-            session::proxy(&shared, &netmap, Entry::proxy(proxy), stream, from, &connection).await;
+            session::proxy(&shared, &netmap, Entry::proxy(proxy), stream, from, &connection, pass).await;
         }
         Key::Local { name, .. } => {
             let Some(local) = shared.local.iter().find(|entry| entry.name == name) else { return };
             let entry = Entry::local(local);
-            session::proxy(&shared, &netmap, entry, stream, from, &connection).await;
+            session::proxy(&shared, &netmap, entry, stream, from, &connection, pass).await;
         }
         Key::Forward { id, bind, .. } => {
             let Some(forward) = netmap.me.forwards.iter().find(|forward| forward.id == id && forward.bind == bind) else { return };

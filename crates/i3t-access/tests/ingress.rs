@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use i3t_access::{Access, AccessStatus, ListenCause, ListenState, LocalEntry, PortBook, TargetCause};
+use i3t_access::{Access, AccessStatus, HandshakeLimits, ListenCause, ListenState, LocalEntry, PortBook, TargetCause};
 use i3t_conn::{RecvStream, SendStream};
 use i3t_flow::memory::{MemoryAcceptor, MemoryConnector, MemoryMesh};
 use i3t_flow::{Handler, Request};
@@ -294,6 +294,19 @@ impl World {
     fn assert_no_open(&mut self) {
         assert!(self.opens.try_recv().is_err(), "对端不应该收到建流请求");
     }
+
+    /// 等到代理 `id` 上正好有 `count` 条连接。连上了不等于入口已经接受了它、领到了握手的名额：接受连接的是另一个任务。
+    async fn await_connections(&self, id: u32, count: usize) {
+        let status = self.access.status();
+        let active = status.proxies.iter().find(|proxy| proxy.id == id).unwrap().active.clone();
+        timeout(PATIENCE, async {
+            while active.get() != count {
+                sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("代理 {id} 上应该有 {count} 条连接，现在是 {}", active.get()));
+    }
 }
 
 fn local(state: &ListenState) -> SocketAddr {
@@ -335,7 +348,11 @@ async fn socks5_connect(proxy: SocketAddr, host: &str, port: u16) -> (u8, TcpStr
 
 /// 用户名密码认证的 SOCKS5 握手。认证通过时接着 CONNECT 一个域名，返回应答码；没通过时返回 `None`（代理随后关掉连接）。
 async fn socks5_login(proxy: SocketAddr, username: &str, password: &str, host: &str, port: u16) -> Option<(u8, TcpStream)> {
-    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    socks5_login_over(TcpStream::connect(proxy).await.unwrap(), username, password, host, port).await
+}
+
+/// 同 [`socks5_login`]，在已经连上代理的 `stream` 上做。
+async fn socks5_login_over(mut stream: TcpStream, username: &str, password: &str, host: &str, port: u16) -> Option<(u8, TcpStream)> {
     exchange(&mut stream, &[5, 1, 2], &[5, 2]).await;
     let auth = [
         &[1, u8::try_from(username.len()).unwrap()][..],
@@ -448,6 +465,77 @@ fn non_loopback_address() -> Option<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("192.0.2.1:9").ok()?;
     socket.local_addr().ok().map(|addr| addr.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+}
+
+i3t_lane::on_both_transports! {
+    async fn all_proxies_share_one_node_wide_limit_on_connections_still_in_their_handshake() {
+        let mut netmap = netmap();
+        netmap.me.proxies = vec![
+            guarded(1, ListenerProtocol::Socks5, "127.0.0.1:0", "alice", "s3cret"),
+            guarded(2, ListenerProtocol::Mixed, "127.0.0.1:0", "alice", "s3cret"),
+        ];
+        let limits = HandshakeLimits { total: 2, per_source: 8 };
+        let mut world = World::start_with(netmap, |access| access.with_handshake_limits(limits)).await;
+        let (first, second) = (world.proxy(1).await, world.proxy(2).await);
+
+        // 两个代理上各有一条连上来不说话的连接，全节点的两个名额就用完了：哪个代理上新来的连接都被立刻关掉。
+        let quiet = TcpStream::connect(first).await.unwrap();
+        let _quiet = TcpStream::connect(second).await.unwrap();
+        world.await_connections(1, 1).await;
+        world.await_connections(2, 1).await;
+        for proxy in [first, second] {
+            assert_closed(&mut TcpStream::connect(proxy).await.unwrap()).await;
+        }
+
+        // 不说话的那条走了，它的名额就还回来了。
+        drop(quiet);
+        world.await_connections(1, 0).await;
+        let (code, _connected) = socks5_login(first, "alice", "s3cret", "example.com", 443).await.unwrap();
+        assert_eq!(code, 0);
+        world.next_open().await;
+        // 做完握手的连接还开着，但不再占名额：下一条照样做得完。
+        let (code, mut connected) = socks5_login(first, "alice", "s3cret", "example.com", 443).await.unwrap();
+        assert_eq!(code, 0);
+        world.next_open().await;
+        assert_echo(&mut connected).await;
+    }
+}
+
+i3t_lane::on_both_transports! {
+    async fn a_source_at_its_limit_leaves_the_remaining_places_to_other_sources() {
+        let Some(lan_ip) = non_loopback_address() else {
+            eprintln!("跳过：这台机器只有回环网卡");
+            return;
+        };
+        let mut netmap = netmap();
+        netmap.me.proxies = vec![guarded(1, ListenerProtocol::Socks5, "0.0.0.0:0", "alice", "s3cret")];
+        let limits = HandshakeLimits { total: 5, per_source: 2 };
+        let mut world = World::start_with(netmap, |access| access.with_handshake_limits(limits)).await;
+        let port = world.proxy(1).await.port();
+        let (lan, loopback) = (SocketAddr::new(lan_ip, port), SocketAddr::new([127, 0, 0, 1].into(), port));
+
+        // 从局域网地址来的两条不说话的连接用完了这个来源的名额，它的第三条被立刻关掉。
+        let _quiet_lan = [TcpStream::connect(lan).await.unwrap(), TcpStream::connect(lan).await.unwrap()];
+        world.await_connections(1, 2).await;
+        assert_closed(&mut TcpStream::connect(lan).await.unwrap()).await;
+
+        // 别的来源（这里是本机的程序）用剩下的名额，照样做得完握手。
+        let (code, _connected) = socks5_login(loopback, "alice", "s3cret", "example.com", 443).await.unwrap();
+        assert_eq!(code, 0);
+        world.next_open().await;
+
+        // 本机的程序不按来源限制，只算在全节点的总数里：三条不说话的也接，占满剩下的名额之后，谁新来都被关掉。
+        let _quiet_here: Vec<TcpStream> = vec![
+            TcpStream::connect(loopback).await.unwrap(),
+            TcpStream::connect(loopback).await.unwrap(),
+            TcpStream::connect(loopback).await.unwrap(),
+        ];
+        world.await_connections(1, 6).await;
+        for proxy in [loopback, lan] {
+            assert_closed(&mut TcpStream::connect(proxy).await.unwrap()).await;
+        }
+        world.assert_no_open();
+    }
 }
 
 #[tokio::test]
