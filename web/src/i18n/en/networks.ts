@@ -70,12 +70,23 @@ export const networks: Messages['networks'] = {
     'Below the threshold, a peer waits at most this long. Higher: fewer packets on the way back, but loss is noticed later',
   ackDelayHint: 'A high threshold with a long delay tends to drop one-way traffic.',
   ackDelayUnit: 'ms',
+  adapter: 'Virtual adapter',
+  adapterUnsupported: 'This controller version has no virtual adapter settings yet',
+  offloadLabel: 'Segmentation offload',
+  offloadDesc: 'Linux nodes exchange large blocks with the kernel, which saves CPU under load',
+  offloadHint:
+    'Linux only; a node whose kernel refuses falls back by itself. Turn it off to rule it out when transfers over the adapter misbehave. Nodes reinstall their adapter after you save.',
+  mtuLabel: 'Default MTU',
+  mtuDesc: "Used by a node's virtual adapter unless the node sets its own",
+  mtuHint:
+    'Above 1280 most packets go as two pieces and get slower; go lower only on lines with very small packets. Nodes reinstall their adapter after you save.',
+  mtuUnit: 'bytes',
   bundleLabel: 'Bundle small packets',
   bundleDesc: 'On a direct route, small packets going to the same node at the same moment leave in one packet',
   bundleHint:
     'A download then sends far fewer ACK packets back, which helps a lot on a line that limits packets per second. When small packets come thick, each may wait a millisecond or two; sparse ones never wait. Nodes apply it as soon as they get the setting.',
-  bundleOn: 'On',
-  bundleOff: 'Off',
+  switchOn: 'On',
+  switchOff: 'Off',
   wholeNumberBetween: (min, max) => `Must be a whole number from ${min} to ${max}`,
 
   danger: 'Danger zone',

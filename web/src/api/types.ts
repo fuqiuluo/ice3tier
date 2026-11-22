@@ -154,6 +154,10 @@ export interface Network {
   max_ack_delay_ms: number
   /** 节点直连时把同时要发给同一个节点的几个小包合成一个包发。比这个字段旧的 controller 不给：那时没有这项设置。 */
   bundle_small_packets?: boolean
+  /** 节点的虚拟网卡和内核之间一大块一大块地交接数据（Linux 的分段卸载）。比这个字段旧的 controller 不给。 */
+  vnet_offload?: boolean
+  /** 节点的虚拟网卡默认的 MTU（字节）；本机另外设了的节点用本机的。比这个字段旧的 controller 不给。 */
+  vnet_mtu?: number
   /** 各项设置的默认值；比这个字段旧的 controller 不给，这时说不出哪些设置改过。 */
   defaults?: NetworkDefaults | null
 }
@@ -168,6 +172,8 @@ export interface NetworkDefaults {
   ack_eliciting_threshold: number
   max_ack_delay_ms: number
   bundle_small_packets?: boolean
+  vnet_offload?: boolean
+  vnet_mtu?: number
 }
 
 export interface CreateNetwork {
@@ -180,6 +186,8 @@ export interface CreateNetwork {
   ack_eliciting_threshold?: number
   max_ack_delay_ms?: number
   bundle_small_packets?: boolean
+  vnet_offload?: boolean
+  vnet_mtu?: number
 }
 
 export interface UpdateNetwork {
@@ -194,6 +202,9 @@ export interface UpdateNetwork {
   max_ack_delay_ms?: number
   /** 节点收到新的设置就生效。 */
   bundle_small_packets?: boolean
+  /** 这两项节点收到之后自己把虚拟网卡重装一遍。 */
+  vnet_offload?: boolean
+  vnet_mtu?: number
 }
 
 export interface NodePair {

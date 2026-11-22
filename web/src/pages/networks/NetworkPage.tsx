@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { t } from '@/i18n'
 import { useDocumentTitle } from '@/lib/useDocumentTitle'
 
+import { AdapterSection } from './AdapterSection'
 import { BasicsSection } from './BasicsSection'
 import { ConnectionSection } from './ConnectionSection'
 import { networkPath, useNetwork } from './context'
@@ -21,7 +22,7 @@ import { modifiedCount, SECTION_SETTINGS, type SettingsSection } from './setting
 const n = t.networks
 
 /** 分区，按左边那一列的顺序。加一类设置就是在这里加一个分区、写它的那个文件。 */
-const SECTION_IDS = ['basics', 'routing', 'connection', 'danger'] as const
+const SECTION_IDS = ['basics', 'routing', 'connection', 'adapter', 'danger'] as const
 type SectionId = (typeof SECTION_IDS)[number]
 
 /** 分区的名字在渲染时现取，换了语言就是新的。 */
@@ -33,6 +34,8 @@ function sectionLabel(id: SectionId): string {
       return n.routing
     case 'connection':
       return n.connection
+    case 'adapter':
+      return n.adapter
     case 'danger':
       return n.danger
   }
@@ -98,7 +101,13 @@ export function NetworkPage() {
           ) : null}
           {active === 'connection' ? (
             <ConnectionSection
-              key={`${network.id}:${network.ack_eliciting_threshold}:${network.max_ack_delay_ms}:${network.bundle_small_packets ?? ''}`}
+              key={`${network.id}:${network.ack_eliciting_threshold}:${network.max_ack_delay_ms}`}
+              network={network}
+            />
+          ) : null}
+          {active === 'adapter' ? (
+            <AdapterSection
+              key={`${network.id}:${network.vnet_offload ?? ''}:${network.vnet_mtu ?? ''}:${network.bundle_small_packets ?? ''}`}
               network={network}
             />
           ) : null}

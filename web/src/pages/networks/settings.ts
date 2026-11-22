@@ -7,7 +7,8 @@ import { type ModifiedSetting } from '@/components/setting-row'
  */
 export const SECTION_SETTINGS = {
   routing: ['routing', 'max_relay_hops', 'reach', 'class'],
-  connection: ['ack_eliciting_threshold', 'max_ack_delay_ms', 'bundle_small_packets'],
+  connection: ['ack_eliciting_threshold', 'max_ack_delay_ms'],
+  adapter: ['vnet_offload', 'vnet_mtu', 'bundle_small_packets'],
 } as const satisfies Record<string, readonly (keyof NetworkDefaults)[]>
 
 export type SettingsSection = keyof typeof SECTION_SETTINGS

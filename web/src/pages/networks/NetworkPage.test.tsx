@@ -2,7 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Route, Routes } from 'react-router'
 import { useState } from 'react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { type Network } from '@/api/types'
 import { t } from '@/i18n'
@@ -45,6 +45,7 @@ describe('网络', () => {
       '/n/1/network/basics',
       '/n/1/network/routing',
       '/n/1/network/connection',
+      '/n/1/network/adapter',
       '/n/1/network/danger',
     ])
     expect(sections.getByRole('link', { name: n.basics })).toHaveAttribute('aria-current', 'page')
@@ -53,15 +54,34 @@ describe('网络', () => {
     expect(screen.queryByRole('form', { name: n.routing })).not.toBeInTheDocument()
   })
 
+  it('窄屏上分区名是横着滑的一行：打开排在后面的分区，它的名字滑进看得见的地方', () => {
+    setup()
+    const scrolled = vi.spyOn(Element.prototype, 'scrollIntoView')
+    open('danger')
+    const sections = within(screen.getByRole('navigation', { name: n.sectionsLabel }))
+    expect(scrolled.mock.contexts).toContain(sections.getByRole('link', { name: n.danger }))
+    scrolled.mockRestore()
+  })
+
   it('分区名旁边写着这个分区改过几项；都是默认值时不写', () => {
     setup()
-    open('basics', { ...NETWORK, reach: 'relay_only', class: 'bulk', max_ack_delay_ms: 5 })
+    open('basics', {
+      ...NETWORK,
+      reach: 'relay_only',
+      class: 'bulk',
+      max_ack_delay_ms: 5,
+      vnet_mtu: 1400,
+      vnet_offload: false,
+    })
     const sections = within(screen.getByRole('navigation', { name: n.sectionsLabel }))
     expect(
       within(sections.getByRole('link', { name: new RegExp(n.routing) })).getByLabelText(n.modifiedCount(2)),
     ).toBeVisible()
     expect(
       within(sections.getByRole('link', { name: new RegExp(n.connection) })).getByLabelText(n.modifiedCount(1)),
+    ).toBeVisible()
+    expect(
+      within(sections.getByRole('link', { name: new RegExp(n.adapter) })).getByLabelText(n.modifiedCount(2)),
     ).toBeVisible()
     expect(sections.getByRole('link', { name: n.basics })).toHaveTextContent(n.basics)
   })
@@ -193,18 +213,71 @@ describe('网络', () => {
     expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ ack_eliciting_threshold: 4, max_ack_delay_ms: 2 })
   })
 
-  it('连接：合并小包是一个开关，关掉之后只提交这一项；恢复默认把它打开', async () => {
+  it('虚拟网卡：三项设置按顺序排着；合并小包从连接那里搬到了这里', () => {
+    setup()
+    const { unmount } = open('adapter')
+    const form = within(screen.getByRole('form', { name: n.adapter }))
+    expect(form.getByRole('switch', { name: n.offloadLabel })).toBeChecked()
+    expect(form.getByLabelText(n.mtuLabel)).toHaveValue('1280')
+    expect(form.getByRole('switch', { name: n.bundleLabel })).toBeChecked()
+    expect(screen.getByText(n.offloadDesc)).toBeVisible()
+    expect(screen.getByText(n.mtuDesc)).toBeVisible()
+    expect(screen.getByRole('button', { name: n.saveSettings })).toBeDisabled()
+    unmount()
+
+    open('connection')
+    expect(screen.queryByRole('switch', { name: n.bundleLabel })).not.toBeInTheDocument()
+  })
+
+  it('虚拟网卡：关掉分段卸载只提交这一项；恢复默认把它打开', async () => {
     const user = userEvent.setup()
     const api = setup()
-    open('connection')
+    open('adapter')
+    const offload = screen.getByRole('switch', { name: n.offloadLabel })
+    await user.click(offload)
+    expect(offload).not.toBeChecked()
+    expect(screen.getByText(t.common.defaultIs(n.switchOn), { exact: false })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: n.saveSettings }))
+    await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
+    expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ vnet_offload: false })
+
+    await user.click(screen.getByRole('button', { name: t.common.restoreDefaultOf(n.offloadLabel) }))
+    expect(offload).toBeChecked()
+  })
+
+  it('虚拟网卡：默认 MTU 写得不对时有提示、不能保存；写对了只提交这一项', async () => {
+    const user = userEvent.setup()
+    const api = setup()
+    open('adapter')
+    const mtu = screen.getByLabelText(n.mtuLabel)
+    for (const wrong of ['575', '1501', '12.5', '']) {
+      await user.clear(mtu)
+      if (wrong !== '') await user.type(mtu, wrong)
+      expect(screen.getByRole('alert')).toHaveTextContent(n.wholeNumberBetween(576, 1500))
+      expect(screen.getByRole('button', { name: n.saveSettings })).toBeDisabled()
+    }
+    await user.clear(mtu)
+    await user.type(mtu, '1400')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByText(t.common.defaultIs(`1280 ${n.mtuUnit}`), { exact: false })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: n.saveSettings }))
+    await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
+    expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ vnet_mtu: 1400 })
+
+    await user.click(screen.getByRole('button', { name: t.common.restoreDefaultOf(n.mtuLabel) }))
+    expect(mtu).toHaveValue('1280')
+  })
+
+  it('虚拟网卡：合并小包是一个开关，关掉之后只提交这一项；恢复默认把它打开', async () => {
+    const user = userEvent.setup()
+    const api = setup()
+    open('adapter')
     const bundling = screen.getByRole('switch', { name: n.bundleLabel })
     expect(bundling).toBeChecked()
     expect(screen.getByText(n.bundleDesc)).toBeVisible()
-    expect(screen.getByRole('button', { name: n.saveSettings })).toBeDisabled()
 
     await user.click(bundling)
     expect(bundling).not.toBeChecked()
-    expect(screen.getByText(t.common.defaultIs(n.bundleOn), { exact: false })).toBeVisible()
     await user.click(screen.getByRole('button', { name: n.saveSettings }))
     await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
     expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ bundle_small_packets: false })
@@ -213,27 +286,50 @@ describe('网络', () => {
     expect(bundling).toBeChecked()
   })
 
-  it('连接：关着的合并小包标着已修改；controller 不报这一项时没有这一行，也不提交它', async () => {
+  it('虚拟网卡：改过的标着已修改；几项一起改一起提交，取消回到原来的', async () => {
     const user = userEvent.setup()
     const api = setup()
-    const { unmount } = open('connection', { ...NETWORK, bundle_small_packets: false })
+    open('adapter', { ...NETWORK, bundle_small_packets: false, vnet_mtu: 1400 })
     expect(screen.getByRole('switch', { name: n.bundleLabel })).not.toBeChecked()
-    expect(screen.getByText(t.common.modified)).toBeVisible()
-    unmount()
+    expect(screen.getAllByText(t.common.modified)).toHaveLength(2)
 
-    const older: Network = { ...NETWORK }
-    delete older.bundle_small_packets
-    open('connection', older)
-    expect(screen.queryByRole('switch', { name: n.bundleLabel })).not.toBeInTheDocument()
-    const threshold = screen.getByLabelText(n.ackThresholdLabel)
-    await user.clear(threshold)
-    await user.type(threshold, '4')
+    await user.click(screen.getByRole('switch', { name: n.offloadLabel }))
+    await user.click(screen.getByRole('switch', { name: n.bundleLabel }))
+    await user.click(screen.getByRole('button', { name: t.common.cancel }))
+    expect(screen.getByRole('switch', { name: n.offloadLabel })).toBeChecked()
+    expect(screen.getByRole('switch', { name: n.bundleLabel })).not.toBeChecked()
+
+    await user.click(screen.getByRole('switch', { name: n.offloadLabel }))
+    await user.click(screen.getByRole('switch', { name: n.bundleLabel }))
     await user.click(screen.getByRole('button', { name: n.saveSettings }))
     await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
-    expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ ack_eliciting_threshold: 4, max_ack_delay_ms: 2 })
+    expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ vnet_offload: false, bundle_small_packets: true })
   })
 
-  it('连接：别处改了合并小包，开关跟着变，不算有没保存的改动', async () => {
+  it('虚拟网卡：controller 不报的那几项没有那一行，也不提交；一项都不报时写着说明', async () => {
+    const user = userEvent.setup()
+    const api = setup()
+    // 有合并小包、还没有网卡那两项的 controller。
+    const older: Network = { ...NETWORK }
+    delete older.vnet_offload
+    delete older.vnet_mtu
+    const { unmount } = open('adapter', older)
+    expect(screen.queryByRole('switch', { name: n.offloadLabel })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(n.mtuLabel)).not.toBeInTheDocument()
+    await user.click(screen.getByRole('switch', { name: n.bundleLabel }))
+    await user.click(screen.getByRole('button', { name: n.saveSettings }))
+    await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
+    expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ bundle_small_packets: false })
+    unmount()
+
+    const oldest: Network = { ...older }
+    delete oldest.bundle_small_packets
+    open('adapter', oldest)
+    expect(screen.getByText(n.adapterUnsupported)).toBeVisible()
+    expect(screen.queryByRole('button', { name: n.saveSettings })).not.toBeInTheDocument()
+  })
+
+  it('虚拟网卡：别处改了设置，这里跟着变，不算有没保存的改动', async () => {
     const user = userEvent.setup()
     setup()
     // 网络的设置是从外面给进来的：别的标签页或者 i3tctl 改了之后，重新取到的就是新的。按钮代替"重新取到了"。
@@ -241,7 +337,10 @@ describe('网络', () => {
       const [network, setNetwork] = useState(NETWORK)
       return (
         <NetworkContext value={network}>
-          <button type="button" onClick={() => setNetwork({ ...NETWORK, bundle_small_packets: false })}>
+          <button
+            type="button"
+            onClick={() => setNetwork({ ...NETWORK, bundle_small_packets: false, vnet_offload: false, vnet_mtu: 1400 })}
+          >
             changed elsewhere
           </button>
           <Routes>
@@ -250,11 +349,13 @@ describe('网络', () => {
         </NetworkContext>
       )
     }
-    renderWithApp(<Page />, { route: '/n/1/network/connection' })
+    renderWithApp(<Page />, { route: '/n/1/network/adapter' })
     expect(screen.getByRole('switch', { name: n.bundleLabel })).toBeChecked()
 
     await user.click(screen.getByRole('button', { name: 'changed elsewhere' }))
     expect(screen.getByRole('switch', { name: n.bundleLabel })).not.toBeChecked()
+    expect(screen.getByRole('switch', { name: n.offloadLabel })).not.toBeChecked()
+    expect(screen.getByLabelText(n.mtuLabel)).toHaveValue('1400')
     expect(screen.getByRole('button', { name: n.saveSettings })).toBeDisabled()
   })
 

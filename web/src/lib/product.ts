@@ -39,6 +39,8 @@ export const MAX_RELAY_HOPS = { min: 1, max: 4 } as const
 /** 网络的两项确认设置可以取的值，和 controller 收的范围一样。 */
 export const ACK_ELICITING_THRESHOLD = { min: 1, max: 100 } as const
 export const MAX_ACK_DELAY_MS = { min: 1, max: 25 } as const
+/** 网络给虚拟网卡定的默认 MTU 可以取的值（字节），和 controller 收的范围一样。 */
+export const VNET_MTU = { min: 576, max: 1500 } as const
 export const MAX_RELAY_ADDRESSES = 8
 export const MAX_PINNED_RELAYS = 8
 
