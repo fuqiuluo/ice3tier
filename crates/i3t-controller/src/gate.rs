@@ -82,13 +82,19 @@ pub(crate) struct Pass {
     gate: Arc<Gate>,
     source: Source,
     id: u64,
-    /// 被挤掉之后是 `None`：tokio 的 oneshot 结束之后不能再等。
+    /// 名额已经交还，或者已经收到淘汰通知后是 `None`。
     evicted: Option<oneshot::Receiver<()>>,
 }
 
 impl Pass {
     pub(crate) fn source(&self) -> Source {
         self.source
+    }
+
+    /// 归还名额。返回 `false` 表示 Gate 已经将它淘汰，即使连接还没收到通知。
+    pub(crate) fn finish(mut self) -> bool {
+        self.evicted = None;
+        self.gate.release(self.source, self.id)
     }
 
     /// 等到这条连接被挤掉。已经被挤掉的马上返回。
@@ -103,7 +109,9 @@ impl Pass {
 
 impl Drop for Pass {
     fn drop(&mut self) {
-        self.gate.release(self.source, self.id);
+        if self.evicted.is_some() {
+            self.gate.release(self.source, self.id);
+        }
     }
 }
 
@@ -146,16 +154,17 @@ impl Gate {
         Pass { gate: Arc::clone(self), source, id, evicted: Some(evicted) }
     }
 
-    fn release(&self, source: Source, id: u64) {
+    fn release(&self, source: Source, id: u64) -> bool {
         let mut slots = self.lock();
-        let Some(queue) = slots.by_source.get_mut(&source) else { return };
+        let Some(queue) = slots.by_source.get_mut(&source) else { return false };
         // 被挤掉的那条已经不在队列里了。
-        let Some(index) = queue.iter().position(|slot| slot.id == id) else { return };
+        let Some(index) = queue.iter().position(|slot| slot.id == id) else { return false };
         queue.remove(index);
         if queue.is_empty() {
             slots.by_source.remove(&source);
         }
         slots.total -= 1;
+        true
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Slots> {
@@ -236,6 +245,17 @@ mod tests {
     fn is_evicted(pass: &mut Pass) -> bool {
         let mut evicted = pin!(pass.evicted());
         matches!(evicted.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(()))
+    }
+
+    #[test]
+    fn a_removed_slot_cannot_finish_even_before_its_eviction_notification() {
+        let gate = Gate::new("测试", SMALL);
+        let mut old = gate.admit(ip("192.0.2.1"));
+        // admit 先从名额表移除旧连接，放开锁以后才丢掉通知的发送端。
+        let victim = gate.lock().pop_oldest(old.source()).unwrap();
+        assert!(!is_evicted(&mut old));
+        assert!(!old.finish());
+        drop(victim);
     }
 
     #[test]

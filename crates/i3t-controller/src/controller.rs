@@ -38,7 +38,7 @@ use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use i3t_crypto::{NodeKey, tls};
@@ -54,6 +54,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::error::{Entity, Error};
 use crate::gate::Throttle;
 use crate::netmap::NetworkView;
+use crate::node_server::{PENDING, VerificationQuota};
 use crate::relay_reach::{self, ReachIndex};
 use crate::store::{DIGEST_LEN, GroupRecord, LogFilter, NetworkRecord, NodeRecord, Store};
 use crate::sync::NodeSync;
@@ -135,6 +136,8 @@ pub struct Controller {
     check_wake: Notify,
     /// 给还没认出来的连接的拒绝日志限速。
     pub(crate) refusal_log: Throttle,
+    /// 同一个控制器的节点监听器共用核验配额。重开监听时，旧的阻塞任务仍可能在运行。
+    pub(crate) verification_quota: Arc<VerificationQuota>,
 }
 
 /// [`Controller::open`] 的结果。
@@ -291,6 +294,7 @@ impl Controller {
             release_wake: Notify::new(),
             check_wake: Notify::new(),
             refusal_log: Throttle::new(REFUSAL_LOG_EVERY),
+            verification_quota: VerificationQuota::new(PENDING),
         })
     }
 

@@ -19,7 +19,7 @@ use std::time::Duration;
 use i3t_crypto::tls;
 use i3t_model::control::{MAX_FRAME_LEN, ToController, ToNode};
 use i3t_proto::PublicKey;
-use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -32,7 +32,8 @@ use crate::error::{Rejection, error_chain};
 use crate::frame::{FrameError, read_frame, write_frame};
 use crate::gate::{Gate, Limits, Pass, Throttle};
 use crate::server::blocking;
-use verification::Verifier;
+use verification::AdmissionError;
+pub(crate) use verification::VerificationQuota;
 
 /// 还没报到的连接上，一帧最长这么多字节。`Enroll` 和 `Hello` 都只有几百字节。
 const FIRST_FRAME_LIMIT: usize = 64 * 1024;
@@ -40,7 +41,7 @@ const FIRST_FRAME_LIMIT: usize = 64 * 1024;
 ///
 /// 正常的节点连上来几个往返就报到完了，同一个家用 NAT 后面的节点在 controller 重启之后带着随机的退避陆续连回来，
 /// 同时在握手的远到不了 16 条。
-const PENDING: Limits = Limits { per_source: 16, total: 256 };
+pub(crate) const PENDING: Limits = Limits { per_source: 16, total: 256 };
 /// 连上之后这么久还没有收到 TLS 的 ClientHello 就断开。正常的节点连上就发；只连不说话的连接不值得等满整个握手时限。
 pub const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 /// 接受连接失败（多半是文件描述符用完了）的日志多久最多记一条。
@@ -63,7 +64,6 @@ pub async fn serve(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let pending = Gate::new("还没报到的节点连接", PENDING);
-    let verifier = Verifier::new(PENDING);
     let accept_errors = Throttle::new(ACCEPT_ERROR_LOG_EVERY);
     let mut connections = JoinSet::new();
     loop {
@@ -73,9 +73,8 @@ pub async fn serve(
                     let pass = pending.admit(remote.ip());
                     let connection = Connection { controller: Arc::clone(&controller), remote, shutdown: shutdown.clone() };
                     let tls = Arc::clone(&tls);
-                    let verifier = Arc::clone(&verifier);
                     connections.spawn(async move {
-                        let Some(established) = connection.establish(tls, stream, pass, &verifier).await else { return };
+                        let Some(established) = connection.establish(tls, stream, pass).await else { return };
                         connection.run(established).await;
                     });
                 }
@@ -116,13 +115,7 @@ impl Connection {
     /// 握手，读第一条消息，让 controller 决定认不认这个节点。不认时回 `Rejected`（或者 `TryLater`）并返回 `None`。
     ///
     /// `pass` 在取得核验名额后交还。满额时仍用它约束过载应答，直到应答结束、被挤掉或握手时限到期。
-    async fn establish(
-        &self,
-        tls: Arc<rustls::ServerConfig>,
-        stream: TcpStream,
-        mut pass: Pass,
-        verifier: &Arc<Verifier>,
-    ) -> Option<Established> {
+    async fn establish(&self, tls: Arc<rustls::ServerConfig>, stream: TcpStream, mut pass: Pass) -> Option<Established> {
         let remote = self.remote;
         let deadline = Instant::now() + self.controller.timing().handshake_timeout;
         let handshake = timeout_at(deadline, handshake(tls, stream));
@@ -165,20 +158,10 @@ impl Connection {
                 Err(Rejection::UnexpectedFirstMessage)
             }
         };
-        match verifier.run(&self.controller, pass, check).await {
-            Ok(Ok(session)) => Some(Established { session, reader, writer, outbox: inbox }),
-            Ok(Err(rejection)) => {
-                reply_and_close(&mut writer, rejection.reply(), remote).await;
-                None
-            }
-            Err(mut pass) => {
-                let reply = ToNode::TryLater { reason: "正在核验的节点太多，稍后再试".to_owned() };
-                tokio::select! {
-                    biased;
-                    () = pass.evicted() => {}
-                    () = sleep_until(deadline) => {}
-                    () = reply_and_close(&mut writer, reply, remote) => {}
-                }
+        match self.controller.verify_node(pass, check).await {
+            Ok(session) => Some(Established { session, reader, writer, outbox: inbox }),
+            Err(error) => {
+                error.reply(&mut writer, remote, deadline).await;
                 None
             }
         }
@@ -284,7 +267,25 @@ fn spawn_reader(mut reader: Reader) -> (mpsc::Receiver<Result<ToController, Fram
     (rx, task)
 }
 
-async fn reply_and_close(writer: &mut Writer, reply: ToNode, remote: SocketAddr) {
+impl AdmissionError {
+    async fn reply(self, writer: &mut (impl AsyncWrite + Unpin), remote: SocketAddr, deadline: Instant) {
+        match self {
+            Self::Evicted => {}
+            Self::Rejected(reason, _permit) => reply_and_close(writer, reason.reply(), remote).await,
+            Self::Busy(mut pass) => {
+                let reply = ToNode::TryLater { reason: "正在核验的节点太多，稍后再试".to_owned() };
+                tokio::select! {
+                    biased;
+                    () = pass.evicted() => {}
+                    () = sleep_until(deadline) => {}
+                    () = reply_and_close(writer, reply, remote) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn reply_and_close(writer: &mut (impl AsyncWrite + Unpin), reply: ToNode, remote: SocketAddr) {
     if let Ok(Err(err)) = timeout(WRITE_TIMEOUT, write_frame(writer, &reply)).await {
         tracing::debug!(%remote, "拒绝的原因没能发给对方：{}", error_chain(&err));
     }
@@ -292,7 +293,7 @@ async fn reply_and_close(writer: &mut Writer, reply: ToNode, remote: SocketAddr)
 }
 
 /// 尽量体面地关掉连接。对方不配合也不多等。
-async fn close(writer: &mut Writer) {
+async fn close(writer: &mut (impl AsyncWrite + Unpin)) {
     // 关不关得干净不影响任何状态：连接反正要丢弃了。
     let _ = timeout(Duration::from_secs(1), writer.shutdown()).await;
 }
