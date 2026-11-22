@@ -7,6 +7,7 @@ use i3t_proto::flow::{Bundled, Fragment};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::*;
+use crate::device::{Unwritten, send_singly};
 use crate::ipv4::testing::{icmp, icmp_error, packet, refragment, split, tcp, udp};
 
 const ME: [u8; 4] = [10, 66, 0, 1];
@@ -27,6 +28,10 @@ struct FakeDevice {
     net: FakeNet,
     /// 每次往网卡里写的时候，连接层已经"把攒着的发出去"过几次。
     flushes_before_write: std::sync::Mutex<Vec<usize>>,
+    /// 引擎每次交过来的一批有几个包。
+    batches: std::sync::Mutex<Vec<usize>>,
+    /// 这么长的包写不进去；0 是都写得进。
+    unwritable: AtomicUsize,
 }
 
 impl FakeDevice {
@@ -51,8 +56,16 @@ impl Device for FakeDevice {
 
     async fn send(&self, packet: &[u8]) -> io::Result<()> {
         self.flushes_before_write.lock().unwrap().push(self.net.0.flushed_at.lock().unwrap().len());
+        if packet.len() == self.unwritable.load(Ordering::Relaxed) {
+            return Err(io::Error::other("网卡不收"));
+        }
         let _ = self.to_kernel.send(packet.to_vec());
         Ok(())
+    }
+
+    async fn send_many(&self, packets: &[Bytes]) -> Result<(), Unwritten> {
+        self.batches.lock().unwrap().push(packets.len());
+        send_singly(self, packets).await
     }
 }
 
@@ -176,6 +189,8 @@ fn world(map: Netmap, connected: &[u32], dial_delay: Duration) -> World {
         waits: AtomicUsize::new(0),
         net: net.clone(),
         flushes_before_write: std::sync::Mutex::default(),
+        batches: std::sync::Mutex::default(),
+        unwritable: AtomicUsize::new(0),
     });
     let (netmap, netmap_rx) = watch::channel(Arc::new(map));
     let counters = Arc::new(Counters::default());
@@ -555,6 +570,46 @@ async fn packets_that_arrive_in_one_frame_are_written_one_by_one_in_order_and_ea
 }
 
 #[tokio::test]
+async fn packets_let_in_from_frames_that_came_together_reach_the_device_as_one_batch() {
+    let mut world = world(netmap(&serde_json::json!([peer(2, true, true), peer(3, true, true)]), &[]), &[], Duration::ZERO);
+    let data = |fill: u8, len: usize| udp(B, ME, (53, 40000), &vec![fill; len]);
+    // 引擎还没有轮到跑，四帧已经都到了：一个整包，一个冒充别的节点的，合着两个小包的一帧，又一个整包。
+    world.peer_sends(2, whole(&data(1, 600)));
+    world.peer_sends(2, whole(&udp(C, ME, (53, 40000), &[9; 600])));
+    world.peer_sends(2, bundle(&[&data(2, 20), &data(3, 20)]));
+    world.peer_sends(2, whole(&data(4, 600)));
+    for (fill, len) in [(1, 600), (2, 20), (3, 20), (4, 600)] {
+        assert_eq!(world.kernel_gets().await, data(fill, len), "顺序不变");
+    }
+    assert_eq!(world.device.batches.lock().unwrap().clone(), [4], "核对完了一起交给网卡，不是到一帧写一帧");
+    let traffic = world.snapshot();
+    assert_eq!((traffic.received_packets, traffic.dropped.bad_source), (4, 1), "冒充的那个不在里面");
+    assert_eq!(traffic.received_bytes, u64::try_from(2 * data(1, 600).len() + 2 * data(2, 20).len()).unwrap());
+
+    // 后来才到的一帧自己一批：不为了凑一批等它。
+    world.peer_sends(2, whole(&data(5, 600)));
+    assert_eq!(world.kernel_gets().await, data(5, 600));
+    assert_eq!(world.device.batches.lock().unwrap().clone(), [4, 1]);
+}
+
+#[tokio::test]
+async fn packets_the_device_does_not_take_are_counted_as_dropped_and_the_others_as_received() {
+    let mut world = world(netmap(&serde_json::json!([peer(2, true, true)]), &[]), &[], Duration::ZERO);
+    let (taken, refused) = (udp(B, ME, (53, 40000), &[1; 100]), udp(B, ME, (53, 40000), &[2; 300]));
+    world.device.unwritable.store(refused.len(), Ordering::Relaxed);
+    for packet in [&taken, &refused, &refused, &taken] {
+        world.peer_sends(2, whole(packet));
+    }
+    for _ in 0..2 {
+        assert_eq!(world.kernel_gets().await, taken);
+    }
+    world.nothing_to_kernel().await;
+    let traffic = world.snapshot();
+    assert_eq!((traffic.received_packets, traffic.dropped.malformed), (2, 2), "{traffic:?}");
+    assert_eq!(traffic.received_bytes, u64::try_from(2 * taken.len()).unwrap());
+}
+
+#[tokio::test]
 async fn packets_from_a_peer_must_carry_its_own_address_and_ours() {
     let mut world = world(netmap(&serde_json::json!([peer(2, true, true), peer(3, true, true)]), &[]), &[], Duration::ZERO);
     world.peer_sends(2, whole(&icmp(C, ME, 8)));
@@ -613,6 +668,20 @@ async fn the_engine_follows_the_netmap_and_stops_when_the_device_fails() {
     world.app.send(Err(io::Error::other("网卡没了"))).unwrap();
     let stopped = tokio::time::timeout(SOON, world.engine).await.unwrap().unwrap();
     assert!(matches!(stopped, Stopped::Device(_)), "{stopped:?}");
+}
+
+#[tokio::test]
+async fn something_read_from_the_device_that_is_not_a_packet_is_counted_and_reading_goes_on() {
+    let mut world = world(netmap(&serde_json::json!([peer(2, true, true)]), &[]), &[2], Duration::ZERO);
+    // 网卡说它读到的东西切不成包、已经丢了：这不是网卡坏了。前后的包照常走。
+    world.app_sends(icmp(ME, B, 8));
+    world.app.send(Err(io::Error::new(io::ErrorKind::InvalidData, "切出来的包太多"))).unwrap();
+    world.app_sends(icmp(ME, B, 8));
+    for _ in 0..2 {
+        world.on_wire().await;
+    }
+    assert_eq!(world.snapshot().dropped.malformed, 1);
+    assert!(!world.engine.is_finished(), "引擎还在搬包");
 }
 
 #[tokio::test]

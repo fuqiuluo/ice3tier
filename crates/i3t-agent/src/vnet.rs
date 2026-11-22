@@ -73,7 +73,14 @@ impl Vnet {
             status_tx.send_replace(Status::of(VnetState::Unsupported));
             None
         } else {
-            let parts = Parts { netmap, endpoint, counters: Arc::clone(&counters), firewall: network.firewall, mtu: network.mtu };
+            let parts = Parts {
+                netmap,
+                endpoint,
+                counters: Arc::clone(&counters),
+                firewall: network.firewall,
+                mtu: network.mtu,
+                offload: network.offload,
+            };
             Some(tokio::spawn(supervise(parts, status_tx, stop)))
         };
         Self { status, counters, stop: Mutex::new(Some(stop_tx)), task: Mutex::new(task) }
@@ -161,6 +168,8 @@ struct Parts {
     firewall: bool,
     /// 网卡的 MTU（本机配置的 `[network] mtu`）。
     mtu: u16,
+    /// 网卡和内核之间要不要一大块一大块地交接（本机配置的 `[network] offload`）。
+    offload: bool,
 }
 
 /// 装上、跟着 netmap 改、隔一阵再查地址段的重叠、收到停止就拆掉。
@@ -299,13 +308,15 @@ impl Session {
             Ok(None) => {}
             Err(error) => return Err(setup::cause(error)),
         }
-        let spec = DeviceSpec::new(platform, own, cidr, std::env::current_exe().ok().as_deref()).with_mtu(parts.mtu);
+        let spec =
+            DeviceSpec::new(platform, own, cidr, std::env::current_exe().ok().as_deref()).with_mtu(parts.mtu).with_offload(parts.offload);
         let mtu = spec.mtu;
         let tun = tokio::task::spawn_blocking(move || Tun::create(&spec))
             .await
             .map_err(|error| VnetCause::DeviceFailed { detail: error.to_string() })?
             .map_err(device_cause)?;
         let device_name = tun.name().to_owned();
+        tracing::info!(device = device_name, offload = %tun.offload(), "虚拟网卡建好了");
         let plan = Plan { device: device_name.clone(), own, cidr };
         let firewall = if parts.firewall {
             let present = present_devices();

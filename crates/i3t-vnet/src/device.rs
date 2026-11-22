@@ -5,20 +5,28 @@
 //! 按前缀自己加，macOS 的 utun 不会，由 `tun-rs` 加（它的 `associate_route`）。网卡不是持久的：进程退出（包括被杀掉）时 Linux 和 macOS
 //! 的内核把它连同地址和路由一起删掉；Windows 上 Wintun 的适配器随句柄关掉而删掉，崩溃留下的同名适配器下次按名字认出来、接着用。
 //!
-//! 引擎只看 [`Device`]：读一个包、写一个包。测试里换成一对内存里的队列。
+//! 引擎只看 [`Device`]：读一个包，写一个包或者一批。测试里换成一对内存里的队列。Linux 上网卡和内核之间一次可以交接一大块
+//! （[`Offload`]），那是 [`Tun`] 里面的事：引擎读到、写下的还是一个个不超过 MTU 的包。
 
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
+use bytes::Bytes;
 use ipnet::Ipv4Net;
 
 use crate::{DEFAULT_MTU, DEVICE_PATTERN};
 
-/// 引擎和网卡之间的接缝：一次读一个包，一次写一个包。
+#[cfg(target_os = "linux")]
+mod offload;
+
+/// 引擎和网卡之间的接缝：一次读一个包，一次写一个包或者一批。
 pub trait Device: Send + Sync + 'static {
     /// 读下一个本机发出、经这块网卡走的包，放进 `buf`，返回长度。
+    ///
+    /// `InvalidData` 的错误是说读到的东西不成一个包、已经丢掉了，网卡还在，接着读就是；别的错误是网卡读不了了。
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
 
     /// 网卡上现在就有包的话读一个，没有就是 `None`，不等。
@@ -29,6 +37,67 @@ pub trait Device: Send + Sync + 'static {
 
     /// 把一个包交给本机的内核，像是从这块网卡进来的。
     fn send(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// 把一批包按顺序交给本机的内核。默认一个一个地写；写得了一大块的网卡把首尾相接的先合起来。
+    ///
+    /// # Errors
+    ///
+    /// 有写不进去的：几个、多少字节、为什么。别的都写进去了。
+    fn send_many(&self, packets: &[Bytes]) -> impl Future<Output = Result<(), Unwritten>> + Send {
+        send_singly(self, packets)
+    }
+}
+
+/// 一批里没写进网卡的包。
+#[derive(Debug)]
+pub struct Unwritten {
+    pub packets: usize,
+    pub bytes: usize,
+    /// 最后一个写不进去的原因。
+    pub error: io::Error,
+}
+
+impl Unwritten {
+    /// 一批里又有 `packets` 个、一共 `bytes` 字节没写进去。
+    fn add(lost: &mut Option<Self>, packets: usize, bytes: usize, error: io::Error) {
+        let (earlier_packets, earlier_bytes) = lost.as_ref().map_or((0, 0), |lost| (lost.packets, lost.bytes));
+        *lost = Some(Self { packets: earlier_packets + packets, bytes: earlier_bytes + bytes, error });
+    }
+}
+
+/// 一个一个地写，写不进去的记下来接着写后面的。
+pub(crate) async fn send_singly<D: Device + ?Sized>(device: &D, packets: &[Bytes]) -> Result<(), Unwritten> {
+    let mut lost = None;
+    for packet in packets {
+        if let Err(error) = device.send(packet).await {
+            Unwritten::add(&mut lost, 1, packet.len(), error);
+        }
+    }
+    lost.map_or(Ok(()), Err)
+}
+
+/// 网卡和内核之间一次交接多少（Linux）。
+///
+/// 不是 [`Off`](Self::Off) 时内核把本机发出的数据一大块（最长 64 KB）地交过来，程序自己切成不超过 MTU 的包；
+/// 对端来的包合成大块再交给内核。每个包一次系统调用变成几十个包一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offload {
+    /// 一次一个包。别的平台上，本机设了不要，或者内核不给的时候。
+    Off,
+    /// TCP 的数据成块地交接。
+    Tcp,
+    /// UDP 的也是（Linux 6.2 起）。
+    TcpUdp,
+}
+
+impl fmt::Display for Offload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Tcp => "tcp",
+            Self::TcpUdp => "tcp+udp",
+        })
+    }
 }
 
 /// 建网卡的平台。
@@ -77,6 +146,8 @@ pub struct DeviceSpec {
     pub mtu: u16,
     /// Windows：Wintun 的驱动文件在哪里（程序旁边）。
     pub driver: Option<PathBuf>,
+    /// 要不要和内核一大块一大块地交接（[`Offload`]）。只有 Linux 上有；内核不给时照一次一个包的办法建。
+    pub offload: bool,
 }
 
 impl DeviceSpec {
@@ -93,13 +164,21 @@ impl DeviceSpec {
             Platform::Windows => program.map(|program| program.with_file_name(WINTUN_DLL)),
             Platform::Linux | Platform::MacOs | Platform::Other => None,
         };
-        Self { platform, name, address: own, prefix: cidr.prefix_len(), mtu: DEFAULT_MTU, driver }
+        let offload = platform == Platform::Linux;
+        Self { platform, name, address: own, prefix: cidr.prefix_len(), mtu: DEFAULT_MTU, driver, offload }
     }
 
     /// 换一个 MTU（本机配置里设的）。调用方保证它在 [`crate::MTU_RANGE`] 里：配置文件读进来时查过。
     #[must_use]
     pub const fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = mtu;
+        self
+    }
+
+    /// 本机设了要不要一大块一大块地交接（`[network] offload`）。没有这回事的平台上怎么设都是不要。
+    #[must_use]
+    pub const fn with_offload(mut self, wanted: bool) -> Self {
+        self.offload = wanted && matches!(self.platform, Platform::Linux);
         self
     }
 
@@ -173,6 +252,9 @@ fn no_device_code(platform: Platform, code: i32) -> bool {
 pub struct Tun {
     device: tun_rs::AsyncDevice,
     name: String,
+    /// 和内核一大块一大块地交接时有。
+    #[cfg(target_os = "linux")]
+    segmented: Option<offload::Segmented>,
 }
 
 impl std::fmt::Debug for Tun {
@@ -197,6 +279,18 @@ impl Tun {
         if spec.platform == Platform::Linux {
             open_tun_node()?;
         }
+        match Self::build(spec, spec.offload) {
+            // 内核不收分段卸载的设置（很老的内核，或者不完整的 TUN 实现）：没建成的那一块已经随着关掉没了，
+            // 照一次一个包的办法再建。
+            Err(DeviceError::Failed(error)) if spec.offload => {
+                tracing::info!(%error, "带着分段卸载建不起虚拟网卡，照一次一个包的办法再建");
+                Self::build(spec, false)
+            }
+            built => built,
+        }
+    }
+
+    fn build(spec: &DeviceSpec, offload: bool) -> Result<Self, DeviceError> {
         let mut builder = tun_rs::DeviceBuilder::new().ipv4(spec.address, spec.prefix, None).mtu(spec.mtu).enable(true);
         if let Some(name) = &spec.name {
             builder = builder.name(name.clone());
@@ -215,9 +309,22 @@ impl Tun {
                 options.associate_route(true);
             });
         }
+        #[cfg(target_os = "linux")]
+        {
+            builder = builder.with(|options| {
+                options.offload(offload);
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = offload;
         let device = builder.build_async().map_err(|error| DeviceError::classify(spec.platform, error))?;
         let name = device.name().map_err(DeviceError::Failed)?;
-        Ok(Self { device, name })
+        Ok(Self {
+            #[cfg(target_os = "linux")]
+            segmented: device.tcp_gso().then(|| offload::Segmented::new(device.udp_gso())),
+            device,
+            name,
+        })
     }
 
     /// 网卡实际的名字：`i3t0`（Linux、Windows）、`utun7`（macOS）。
@@ -225,14 +332,32 @@ impl Tun {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// 这块网卡和内核之间谈下来的交接办法。
+    #[must_use]
+    pub fn offload(&self) -> Offload {
+        #[cfg(target_os = "linux")]
+        if let Some(segmented) = &self.segmented {
+            return if segmented.udp { Offload::TcpUdp } else { Offload::Tcp };
+        }
+        Offload::Off
+    }
 }
 
 impl Device for Tun {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(segmented) = &self.segmented {
+            return segmented.recv(&self.device, buf).await;
+        }
         self.device.recv(buf).await
     }
 
     fn try_recv(&self, buf: &mut [u8]) -> Option<io::Result<usize>> {
+        #[cfg(target_os = "linux")]
+        if let Some(segmented) = &self.segmented {
+            return segmented.try_recv(&self.device, buf);
+        }
         match self.device.try_recv(buf) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
             result => Some(result),
@@ -240,7 +365,19 @@ impl Device for Tun {
     }
 
     async fn send(&self, packet: &[u8]) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.segmented.is_some() {
+            return offload::send_plain(&self.device, packet).await;
+        }
         self.device.send(packet).await.map(drop)
+    }
+
+    async fn send_many(&self, packets: &[Bytes]) -> Result<(), Unwritten> {
+        #[cfg(target_os = "linux")]
+        if let Some(segmented) = &self.segmented {
+            return segmented.send_many(&self.device, packets).await;
+        }
+        send_singly(self, packets).await
     }
 }
 

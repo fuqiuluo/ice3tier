@@ -114,7 +114,7 @@ impl Config {
             document[section] = toml_edit::table();
         }
         match change {
-            Change::Declare(_, on) | Change::ThroughputTests(on) | Change::Network(on) | Change::Firewall(on) => {
+            Change::Declare(_, on) | Change::ThroughputTests(on) | Change::Network(on) | Change::Firewall(on) | Change::Offload(on) => {
                 document[section][key] = toml_edit::value(on);
             }
             Change::CanForward(_) => {}
@@ -269,6 +269,8 @@ pub enum Setting {
     Firewall,
     /// 虚拟网卡的 MTU（`[network] mtu`）。
     Mtu,
+    /// 虚拟网卡和内核之间是不是一大块一大块地交接（`[network] offload`，只有 Linux 上有这回事）。
+    Offload,
 }
 
 impl Setting {
@@ -284,6 +286,7 @@ impl Setting {
             Self::Network => ("network", "enabled"),
             Self::Firewall => ("network", "firewall"),
             Self::Mtu => ("network", "mtu"),
+            Self::Offload => ("network", "offload"),
         }
     }
 
@@ -305,6 +308,7 @@ impl Setting {
             Self::ThroughputTests => Change::ThroughputTests(switch()?),
             Self::Network => Change::Network(switch()?),
             Self::Firewall => Change::Firewall(switch()?),
+            Self::Offload => Change::Offload(switch()?),
             Self::Mtu => match value.parse::<u16>() {
                 Ok(mtu) if i3t_vnet::MTU_RANGE.contains(&mtu) => Change::Mtu(mtu),
                 Ok(_) | Err(_) => bail!((texts().bad_mtu)(value)),
@@ -324,7 +328,8 @@ impl Setting {
     }
 }
 
-/// 命令行上的写法：`can-exit`、`can-relay`、`can-forward`、`relay-address`、`throughput-tests`、`profile`、`network`、`firewall`、`mtu`。
+/// 命令行上的写法：`can-exit`、`can-relay`、`can-forward`、`relay-address`、`throughput-tests`、`profile`、`network`、`firewall`、`mtu`、
+/// `offload`。
 impl FromStr for Setting {
     type Err = anyhow::Error;
 
@@ -337,6 +342,7 @@ impl FromStr for Setting {
             "network" => Ok(Self::Network),
             "firewall" => Ok(Self::Firewall),
             "mtu" => Ok(Self::Mtu),
+            "offload" => Ok(Self::Offload),
             other => other.parse().map(Self::Declare).map_err(|_| anyhow::anyhow!((texts().unknown_setting)(other))),
         }
     }
@@ -353,6 +359,7 @@ impl fmt::Display for Setting {
             Self::Network => f.write_str("network"),
             Self::Firewall => f.write_str("firewall"),
             Self::Mtu => f.write_str("mtu"),
+            Self::Offload => f.write_str("offload"),
         }
     }
 }
@@ -370,6 +377,7 @@ pub enum Change {
     Network(bool),
     Firewall(bool),
     Mtu(u16),
+    Offload(bool),
 }
 
 impl Change {
@@ -384,6 +392,7 @@ impl Change {
             Self::Network(_) => Setting::Network,
             Self::Firewall(_) => Setting::Firewall,
             Self::Mtu(_) => Setting::Mtu,
+            Self::Offload(_) => Setting::Offload,
         }
     }
 }
@@ -392,9 +401,12 @@ impl Change {
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Declare(_, on) | Self::CanForward(on) | Self::ThroughputTests(on) | Self::Network(on) | Self::Firewall(on) => {
-                f.write_str(if *on { "on" } else { "off" })
-            }
+            Self::Declare(_, on)
+            | Self::CanForward(on)
+            | Self::ThroughputTests(on)
+            | Self::Network(on)
+            | Self::Firewall(on)
+            | Self::Offload(on) => f.write_str(if *on { "on" } else { "off" }),
             Self::Profile(profile) => f.write_str(profile.spelling()),
             Self::Mtu(mtu) => mtu.fmt(f),
             Self::RelayAddress(Some(address)) => address.fmt(f),
@@ -587,6 +599,10 @@ pub struct Network {
     /// 只管这台机器的网卡：别的节点设得不一样也通。重启之后生效。
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Linux：网卡和内核之间一大块一大块地交接数据，不是一个个的包（`i3t set offload`）。默认打开，内核不给时自己退回去；
+    /// 关掉是为了排查：经网卡的传输出了怪事时看是不是它。别的平台上没有这回事。重启之后生效。
+    #[serde(default = "default_true")]
+    pub offload: bool,
 }
 
 const fn default_mtu() -> u16 {
@@ -595,7 +611,7 @@ const fn default_mtu() -> u16 {
 
 impl Default for Network {
     fn default() -> Self {
-        Self { enabled: true, firewall: true, mtu: default_mtu() }
+        Self { enabled: true, firewall: true, mtu: default_mtu(), offload: true }
     }
 }
 
@@ -775,7 +791,7 @@ mod tests {
 
     #[test]
     fn the_network_is_on_by_default_and_both_switches_keep_the_comments() {
-        assert_eq!(Config::default().network, Network { enabled: true, firewall: true, mtu: 1280 });
+        assert_eq!(Config::default().network, Network { enabled: true, firewall: true, mtu: 1280, offload: true });
         assert_eq!(Config::parse("[network]\n").unwrap().network, Network::default(), "没写就是开着");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -786,7 +802,7 @@ mod tests {
         assert!(!Config::load(&path).unwrap().network.enabled);
         let firewall: Setting = "firewall".parse().unwrap();
         Config::set(&path, firewall.change("off").unwrap()).unwrap();
-        assert_eq!(Config::load(&path).unwrap().network, Network { enabled: false, firewall: false, mtu: 1280 });
+        assert_eq!(Config::load(&path).unwrap().network, Network { enabled: false, firewall: false, ..Network::default() });
         Config::set(&path, network.change("on").unwrap()).unwrap();
         Config::set(&path, firewall.change("on").unwrap()).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), texts().template);
@@ -818,6 +834,24 @@ mod tests {
     }
 
     #[test]
+    fn handing_whole_blocks_to_the_kernel_is_a_local_switch_that_is_on_by_default() {
+        assert!(Network::default().offload);
+        assert!(!Config::parse("[network]\noffload = false\n").unwrap().network.offload);
+        let offload: Setting = "offload".parse().unwrap();
+        assert_eq!((offload, offload.to_string()), (Setting::Offload, "offload".to_owned()));
+        assert_eq!(offload.change("off").unwrap(), Change::Offload(false));
+        assert_eq!(offload.change("on").unwrap().to_string(), "on");
+        assert!(offload.change("1").is_err());
+
+        // 模板里的那一行原地改，别的字节不动。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::set(&path, Change::Offload(false)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), texts().template.replace("offload = true", "offload = false"));
+        assert!(!Config::load(&path).unwrap().network.offload);
+    }
+
+    #[test]
     fn a_setting_whose_section_is_missing_gets_a_section_of_its_own() {
         // 更早的版本写的配置文件里没有 [network]：加成一节，不是一行 `network = { … }`；已经写成那样的照样改得了。
         let dir = tempfile::tempdir().unwrap();
@@ -828,12 +862,12 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.ends_with("[network]\nenabled = false\nmtu = 1400\n"), "{text}");
         assert!(text.starts_with("# 我的节点\nport = 20444\n\n[log]\n"), "原来的内容不动：{text}");
-        assert_eq!(Config::load(&path).unwrap().network, Network { enabled: false, firewall: true, mtu: 1400 });
+        assert_eq!(Config::load(&path).unwrap().network, Network { enabled: false, mtu: 1400, ..Network::default() });
 
         fs::write(&path, "network = { enabled = false, firewall = false }\n").unwrap();
         Config::set(&path, Change::Network(true)).unwrap();
         Config::set(&path, Change::Mtu(1200)).unwrap();
-        assert_eq!(Config::load(&path).unwrap().network, Network { enabled: true, firewall: false, mtu: 1200 });
+        assert_eq!(Config::load(&path).unwrap().network, Network { firewall: false, mtu: 1200, ..Network::default() });
     }
 
     #[test]

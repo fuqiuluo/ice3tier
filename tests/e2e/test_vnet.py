@@ -17,6 +17,8 @@
   灌完之后两秒之内 ping 又通。
 - nat：两端都在 NAT 后面：ping 和 20MB。
 - bundling：直连的两个节点之间一串很密的小包合起来发，线上的包数只有几分之一，一个不丢；网络的开关关着时一个包一个包地发。
+- offload：网卡和内核之间一大块一大块地交接（Linux 的分段卸载）：一条 TCP 流在两头的虚拟网卡上只有几分之一的包数，内容一个字节不差；
+  内核切的、程序一个个发的 UDP 包都按原样到；一头 `i3t set offload off` 之后那一头一个包一个包地交接，两头照样通。
 - firewall：开关开着时，默认拒绝入站的防火墙（iptables 的 INPUT 策略是 DROP）也让别的节点进来；从真网卡来、冒充虚拟 IP 的包被丢掉。
   开关关着时 `nft list ruleset` 和 `iptables-save` 装之前、装着、拆之后都一样，冒充的包照样进来（防火墙由这台机器自己管）。
 - privilege：没有 CAP_NET_ADMIN、没有 /dev/net/tun：不装，状态说为什么，代理照常。
@@ -364,6 +366,121 @@ def bundling(lab: Lab, work: Path, t: Checks) -> None:
         t.check("开关关着：一个不丢", delivered >= count, f"对面的虚拟网卡收到 {delivered} 个")
     if t.failures:
         print(tail(a.read_log(), 20), tail(b.read_log()), sep="\n  ---\n")
+
+
+# 往一个地址发一串 1000 字节的 UDP 包，每个包里全是它的序号。前 `blocks` 个一次交给内核、让它切（UDP_SEGMENT）：
+# 内核给虚拟网卡 UDP 的大块时，到网卡上的是没切的一大块。内核不肯这样发时一个一个地发，结果里说明。后 `singles` 个一个一个地发。
+UDP_BLOCKS = r'''
+import json, socket, sys
+target, port, blocks, singles = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+UDP_SEGMENT, SIZE = 103, 1000
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.connect((target, port))
+packets = [bytes([index]) * SIZE for index in range(blocks + singles)]
+refused = None
+try:
+    sock.setsockopt(socket.IPPROTO_UDP, UDP_SEGMENT, SIZE)
+    sock.send(b"".join(packets[:blocks]))
+except OSError as error:
+    refused = str(error)
+sock.setsockopt(socket.IPPROTO_UDP, UDP_SEGMENT, 0)
+for packet in packets[0 if refused else blocks:]:
+    sock.send(packet)
+print(json.dumps({"refused": refused}))
+'''
+
+# 收上面那一串：每个包的序号、长度、内容是不是全是序号，写进一个文件。收够了，或者三秒没有新的，就结束。
+UDP_SERIES_SINK = r'''
+import json, socket, sys
+port, expected, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", port))
+sock.settimeout(30)
+seen = []
+try:
+    while len(seen) < expected:
+        data = sock.recv(65535)
+        sock.settimeout(3)
+        seen.append([data[0], len(data), data == bytes([data[0]]) * len(data)])
+except socket.timeout:
+    pass
+with open(out, "w") as result:
+    json.dump(seen, result)
+'''
+
+
+def offload_of(node: Node) -> str:
+    """节点的日志里，它的虚拟网卡和内核之间谈下来的交接办法：off、tcp 或者 tcp+udp。"""
+    found = re.search(r"虚拟网卡建好了.*?offload=(\S+)", re.sub(r"\x1b\[[0-9;]*m", "", node.read_log()))
+    return found.group(1) if found else "?"
+
+
+def stream_counted(t: Checks, sender: Node, receiver: Node, what: str, size: int = 20 * MB) -> tuple[int, int]:
+    """`sender` 经虚拟网卡给 `receiver` 发一条核对过的 TCP 流。返回（`sender` 的内核交给它的网卡几次，`receiver` 的节点往网卡里写了几次）。"""
+    before = device_counter(sender, "i3t*", "tx_packets"), device_counter(receiver, "i3t*", "rx_packets")
+    sent = send_checked(sender.host, receiver.virtual_ip, 9000, size, timeout=240)
+    t.check(f"{what}：TCP 发 {size // MB}MB 一个字节不差", sent.get("ok") is True, str(sent))
+    counted = device_counter(sender, "i3t*", "tx_packets") - before[0], device_counter(receiver, "i3t*", "rx_packets") - before[1]
+    print(f"  {what}：{size // MB}MB 用了 {sent.get('seconds')} 秒，{sender.name} 的网卡读了 {counted[0]} 次，{receiver.name} 的网卡写了 {counted[1]} 次")
+    return counted
+
+
+def udp_series(t: Checks, sender: Node, receiver: Node, work: Path, what: str, *, port: int, blocks: int = 20, singles: int = 60) -> None:
+    """`sender` 给 `receiver` 发一串 UDP 包（见 `UDP_BLOCKS`）：个数、顺序、每个包的内容都不变。"""
+    out = work / f"udp-{port}.json"
+    sink = receiver.host.spawn(sys.executable, "-c", UDP_SERIES_SINK, str(port), str(blocks + singles), str(out))
+    wait_until(lambda: f":{port} " in receiver.host.run("ss", "-lnu").stdout, what=f"{receiver.name} 上收 UDP 的程序启动")
+    done = sender.host.run(sys.executable, "-c", UDP_BLOCKS, receiver.virtual_ip, str(port), str(blocks), str(singles), check=False)
+    said = json.loads(done.stdout) if done.stdout.strip() else {"refused": done.stderr.strip()[-200:]}
+    sink.wait(timeout=45)
+    seen = json.loads(out.read_text())
+    intact = all(length == 1000 and whole for _, length, whole in seen)
+    t.check(f"{what}：{blocks + singles} 个 UDP 包一个不少、顺序不变、内容不变",
+            [index for index, _, _ in seen] == list(range(blocks + singles)) and intact, f"收到 {len(seen)} 个：{[index for index, _, _ in seen][:40]}")
+    if offload_of(sender) != "off":
+        t.check(f"{what}：程序一次交给内核、让它切的一大块 UDP 也发得出去", said.get("refused") is None, str(said))
+
+
+def offload(lab: Lab, work: Path, t: Checks) -> None:
+    """直连的两个节点：先都照默认的一大块一大块地交接，再让 a 关掉。"""
+    a, b = pair(lab, work)
+    for node in (a, b):
+        start_digest_server(node.host, 9000)
+    start_pair(a, b)
+    if not installed(t, a, b):
+        return
+    wait_until(lambda: current_route(a, b).startswith("直连"), timeout=20, what="a 到 b 直连")
+    kinds = offload_of(a), offload_of(b)
+    t.check("默认开着：两头的内核都给大块", all(kind in ("tcp", "tcp+udp") for kind in kinds), str(kinds))
+    print(f"  交接办法：a {kinds[0]}，b {kinds[1]}")
+    # 一个包一个包地交接的话，20MB 至少是这么多个满长的包。
+    one_by_one = 20 * MB // 1240
+    for sender, receiver in ((a, b), (b, a)):
+        read, written = stream_counted(t, sender, receiver, f"{sender.name} → {receiver.name}")
+        t.check(f"{sender.name} → {receiver.name}：内核交给 {sender.name} 的网卡的次数不到包数的四分之一", read < one_by_one // 4, f"{read} 次")
+        t.check(f"{sender.name} → {receiver.name}：{receiver.name} 往网卡里写的次数不到包数的一半", written < one_by_one // 2, f"{written} 次")
+    udp_series(t, a, b, work, "a → b", port=5400)
+    idle = ping(a, b.virtual_ip, count=5)
+    t.check("稀的包照旧：ping 不丢", received(idle) == 5, idle.stdout)
+    unreachable = ping(a, "10.66.0.9", count=1)
+    t.check("回给本机程序的\"不可达\"照样写得进网卡", "Unreachable" in unreachable.stdout, unreachable.stdout)
+
+    # a 关掉，b 不动：两头不一样也通。
+    a.stop()
+    done = i3t(a, "set", "offload", "off")
+    t.check("i3t set offload off：写下了", done.returncode == 0 and "offload" in done.stdout, done.stdout + done.stderr)
+    a.start_static(a.netmap(peers=[b.as_peer()]))
+    if not installed(t, a):
+        return
+    t.check("a 关掉之后一个包一个包地交接，b 照旧", (offload_of(a), offload_of(b)) == ("off", kinds[1]), f"{offload_of(a)} {offload_of(b)}")
+    read, _ = stream_counted(t, a, b, "a（关着）→ b")
+    t.check("a（关着）→ b：内核一个包一个包地交给 a 的网卡", read >= one_by_one, f"{read} 次")
+    _, written = stream_counted(t, b, a, "b → a（关着）")
+    t.check("b → a（关着）：a 一个包一个包地往网卡里写", written >= one_by_one, f"{written} 次")
+    udp_series(t, a, b, work, "a（关着）→ b", port=5401)
+    udp_series(t, b, a, work, "b → a（关着）", port=5402)
+    if t.failures:
+        print(tail(a.read_log(), 30), tail(b.read_log()), sep="\n  ---\n")
 
 
 def nat(lab: Lab, work: Path, t: Checks) -> None:
@@ -968,6 +1085,7 @@ def legacy(lab: Lab, work: Path, t: Checks) -> None:
 SCENARIOS = {
     "basics": basics, "rules": rules, "relay": relay, "tcp_relay": tcp_relay, "tcp_relay_flood": tcp_relay_flood, "nat": nat, "bundling": bundling, "firewall": firewall, "privilege": privilege,
     "overlap": overlap, "appears": appears, "leftover": leftover, "restart": restart, "mtu": mtu, "forward": forward,
+    "offload": offload,
     "lan": lan, "lan_iptables": lan_iptables, "hostile": hostile, "managed": managed, "legacy": legacy,
 }
 

@@ -143,7 +143,9 @@ fn command(lang: Lang) -> clap::Command {
         .mut_subcommand("run", |sub| sub.about(h.run).mut_arg("static", |arg| arg.help(h.run_static).value_name(v.file)))
         .mut_subcommand("set", |sub| {
             sub.about(h.set)
-                .mut_arg("setting", |arg| arg.value_name("can-exit|can-relay|relay-address|throughput-tests|profile|network|firewall|mtu"))
+                .mut_arg("setting", |arg| {
+                    arg.value_name("can-exit|can-relay|relay-address|throughput-tests|profile|network|firewall|mtu|offload")
+                })
                 .mut_arg("value", |arg| arg.value_name("on|off|low-footprint|balanced|high-throughput|IP:PORT|576-1500"))
         })
         .mut_subcommand("status", |sub| sub.about(h.status))
@@ -275,7 +277,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 | Change::ThroughputTests(_)
                 | Change::Network(true)
                 | Change::Firewall(true)
-                | Change::Mtu(_) => {}
+                | Change::Mtu(_)
+                | Change::Offload(_) => {}
             }
         }
         Command::Status => {

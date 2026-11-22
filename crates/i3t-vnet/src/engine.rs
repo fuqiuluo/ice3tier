@@ -64,10 +64,11 @@ const ICMP_PER_SECOND: u32 = 200;
 /// 一次从连接层最多取多少个进来的包。
 const INBOUND_BATCH: usize = 64;
 
-/// 网卡上读出来的包最长多少（Linux 的 TUN 不会给比 MTU 大的包；留够 IPv4 的上限）。
+/// 网卡上读出来的包最长多少（网卡交出来的不会比 MTU 大；留够 IPv4 的上限）。
 const READ_BUFFER: usize = u16::MAX as usize;
 /// 网卡上现成的包一口气最多读几个再交下去。一条跑满的流因此成批地走，别的事（建好的连接、进来的包）也轮得到。
-const OUTBOUND_BURST: usize = 32;
+/// Linux 的内核一次交过来的一大块（64 KB）在默认的 MTU 下是 53 个包，一轮装得下。
+const OUTBOUND_BURST: usize = 64;
 
 /// 丢掉的包按原因的计数，和收发的计数。上报和本机的状态都读它。
 #[derive(Debug, Default)]
@@ -140,8 +141,8 @@ impl Counters {
         self.sent_bytes.fetch_add(count(bytes), Ordering::Relaxed);
     }
 
-    fn received(&self, bytes: usize) {
-        self.received_packets.fetch_add(1, Ordering::Relaxed);
+    fn received(&self, packets: usize, bytes: usize) {
+        self.received_packets.fetch_add(count(packets), Ordering::Relaxed);
         self.received_bytes.fetch_add(count(bytes), Ordering::Relaxed);
     }
 }
@@ -156,8 +157,8 @@ pub struct Traffic {
     pub dropped: VnetDrops,
 }
 
-fn count(bytes: usize) -> u64 {
-    u64::try_from(bytes).unwrap_or(u64::MAX)
+fn count(amount: usize) -> u64 {
+    u64::try_from(amount).unwrap_or(u64::MAX)
 }
 
 /// 每种原因的丢包日志：第一次记一行，之后每分钟最多一行。
@@ -393,6 +394,10 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                                 }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            // 读到的东西不成一个包，网卡已经把它丢了（见 [`Device::recv`]）。
+                            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                                self.log.note(&self.counters, Loss::Malformed, &error);
+                            }
                             Err(error) => {
                                 broken = Some(error);
                                 break;
@@ -619,15 +624,27 @@ impl<D: Device, P: Packets> Inbound<D, P> {
             self.index.follow(&mut self.netmap);
             for datagram in batch.drain(..) {
                 self.admit(datagram, &mut admitted);
-                for packet in admitted.drain(..) {
-                    let len = packet.len();
-                    match self.device.send(&packet).await {
-                        Ok(()) => self.counters.received(len),
-                        Err(error) => self.log.note(&self.counters, Loss::Malformed, &error),
-                    }
-                }
+            }
+            self.deliver(&admitted).await;
+            admitted.clear();
+        }
+    }
+
+    /// 这一批里让进来的包一起交给网卡：同一条流首尾相接的，网卡可以合成一个大的再给内核（[`Device::send_many`]）。
+    /// 只合手上已经到了的，不为了凑大的等后面的包。
+    async fn deliver(&mut self, admitted: &[Bytes]) {
+        let (mut packets, mut bytes) = (admitted.len(), admitted.iter().map(Bytes::len).sum::<usize>());
+        if packets == 0 {
+            return;
+        }
+        if let Err(unwritten) = self.device.send_many(admitted).await {
+            packets = packets.saturating_sub(unwritten.packets);
+            bytes = bytes.saturating_sub(unwritten.bytes);
+            for _ in 0..unwritten.packets {
+                self.log.note(&self.counters, Loss::Malformed, &unwritten.error);
             }
         }
+        self.counters.received(packets, bytes);
     }
 
     /// 对端发来的一帧：取出里面的包（切开的拼好，合在一起的拆开），逐个核对，能写进网卡的放进 `admitted`。
