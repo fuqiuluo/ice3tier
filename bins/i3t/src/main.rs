@@ -2,6 +2,8 @@
 //!
 //! 终端上的文字跟着系统的语言（见 `i3t_lang`），日志不翻译。
 
+#[cfg(any(windows, test))]
+mod log_file;
 mod network;
 #[cfg(windows)]
 mod service;
@@ -363,13 +365,13 @@ fn runs_as_service(state: &StateDir) -> bool {
 /// 服务控制管理器启动的节点：日志写进状态目录里的文件（服务没有终端），停止的通知来自 SCM。
 #[cfg(windows)]
 fn run_as_service(state: StateDir, version: Version, r#static: Option<PathBuf>) -> anyhow::Result<ExitCode> {
-    let log = state.path().join(SERVICE_LOG);
-    let job = move |stop: service::Stop| match run_node(&state, &version, r#static, &LogTo::File(log.clone()), stop) {
+    let log = std::sync::Arc::new(log_file::LogFile::new(state.path().join(SERVICE_LOG), log_file::FILE_LIMIT));
+    let job = move |stop: service::Stop| match run_node(&state, &version, r#static, &LogTo::File(std::sync::Arc::clone(&log)), stop) {
         Ok(Outcome::Stopped) => 0,
         Ok(Outcome::Restart) => u32::from(RESTART_EXIT_CODE),
         Err(error) => {
             // 出错可能早于日志初始化（配置文件读不了），所以直接写进日志文件。
-            append_line(&log, &format!("i3t: {}", i3t_lang::current().chain(error.chain())));
+            log.append_line(&format!("i3t: {}", i3t_lang::current().chain(error.chain())));
             // 重启也救不了的以 0 停止，服务控制管理器不再拉；别的它过一会儿重新启动。
             if is_unrecoverable(&error) { 0 } else { 1 }
         }
@@ -461,16 +463,12 @@ enum LogTo {
     Stderr,
     /// 一个文件。Windows 的服务没有终端，也没有人替它收标准错误。
     #[cfg(windows)]
-    File(PathBuf),
+    File(std::sync::Arc<log_file::LogFile>),
 }
 
 /// Windows 上作为服务运行时的日志文件，在状态目录里。
 #[cfg(windows)]
 const SERVICE_LOG: &str = "i3t.log";
-
-/// 日志文件超过这么大，下次启动时改名留作上一份（`i3t.log.old`），重新开始写。
-#[cfg(windows)]
-const SERVICE_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 初始化日志。级别来自配置文件，可以用环境变量 `I3T_LOG` 临时覆盖（写法同 `RUST_LOG`，可以按模块设）。
 fn init_logging(level: &str, to: &LogTo) {
@@ -484,51 +482,8 @@ fn init_logging(level: &str, to: &LogTo) {
         // 输出到文件或者日志服务时不带颜色的控制符。
         LogTo::Stderr => logs.with_ansi(std::io::stderr().is_terminal()).with_writer(std::io::stderr).init(),
         #[cfg(windows)]
-        LogTo::File(path) => match open_log(path) {
-            Ok(file) => logs.with_ansi(false).with_writer(std::sync::Mutex::new(file)).init(),
-            // 日志文件打不开不该让节点起不来。
-            Err(_) => logs.with_ansi(false).with_writer(std::io::sink).init(),
-        },
-    }
-}
-
-/// 确认 Windows 日志路径本身不是符号链接或重解析点（如 NTFS Junction），避免 `LocalSystem` 被诱导跨目录写日志。
-#[cfg(windows)]
-fn reject_reparse_point(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 => {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "拒绝跟随重解析点"))
-        }
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-/// 打开日志文件接着写；已经太大的先改名留作上一份。
-#[cfg(windows)]
-fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    reject_reparse_point(path)?;
-    let backup = path.with_extension("log.old");
-    reject_reparse_point(&backup)?;
-    if std::fs::symlink_metadata(path).is_ok_and(|file| file.len() > SERVICE_LOG_MAX_BYTES) {
-        // 改不了名就接着往原来的文件里写。
-        let _kept = std::fs::rename(path, &backup);
-    }
-    std::fs::OpenOptions::new().create(true).append(true).open(path)
-}
-
-/// 往日志文件里添一行。写不进去就算了：这已经是报错的最后一条路。
-#[cfg(windows)]
-fn append_line(path: &std::path::Path, line: &str) {
-    use std::io::Write;
-    if reject_reparse_point(path).is_err() {
-        return;
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _written = writeln!(file, "{line}");
+        // 日志文件打不开不该让节点起不来：写不进去的那几条丢掉，下一条再试。
+        LogTo::File(file) => logs.with_ansi(false).with_writer(std::sync::Arc::clone(file)).init(),
     }
 }
 
