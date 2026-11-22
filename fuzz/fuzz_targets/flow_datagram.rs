@@ -1,11 +1,13 @@
-//! 数据报上下文里的一帧（对端发来的数据报的头、分片头）、测量流结束时对端写回的摘要，以及发送一侧的分片。
+//! 数据报上下文里的一帧（对端发来的数据报的头、分片头）、网络包帧（完整的、一片、合着好几个包的）、
+//! 测量流结束时对端写回的摘要，以及发送一侧的分片。
 //!
 //! 除了不能 panic，还查：头重新编码接上后面的字节就是原来的帧，`Recipient::peek` 和完整的解析说的一样；
-//! 用输入的后半段当内容切片，每一片都不超过要求的长度，按片序号拼回来就是原来的内容。
+//! 用输入的后半段当内容切片，每一片都不超过要求的长度，按片序号拼回来就是原来的内容；
+//! 解析得了的网络包帧，只看首字节也认得出来；合在一帧里的包读出来再装回去就是原来的帧。
 
 #![no_main]
 
-use i3t_proto::flow::{DatagramHeader, Frames, MeasureSteady, MeasureSummary, Recipient};
+use i3t_proto::flow::{Bundled, Channel, DatagramHeader, Frames, MeasureSteady, MeasureSummary, PacketHeader, Recipient};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -31,8 +33,33 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(MeasureSteady::from_bytes(steady).to_bytes(), *steady);
     }
 
+    packet_frame(data);
     split_and_join(data);
 });
+
+/// 网络包帧：对端发来的，内容不可信。
+fn packet_frame(data: &[u8]) {
+    // 反过来不成立：只看首字节时像网络包的帧，完整解析可能发现它被截短了，或者几个标志凑在一起说不通。
+    let Ok((header, rest)) = PacketHeader::decode(data) else { return };
+    assert_eq!(Channel::peek(data), Some(Channel::Packet), "只看首字节的判断和完整的解析不一样");
+    let mut encoded = Vec::new();
+    header.encode(&mut encoded);
+    if header != PacketHeader::Bundle {
+        encoded.extend_from_slice(rest);
+        assert_eq!(encoded, data, "网络包帧的头重新编码之后对不上原来的帧");
+        return;
+    }
+    // 合着好几个包的：读得出来的那些原样装回去，是原来的帧的开头；一个错都没有的话就是整个帧。
+    let mut intact = true;
+    for packet in Bundled::new(rest) {
+        match packet {
+            Ok(packet) => Bundled::push(&mut encoded, packet).expect("读出来的包长度写得进两个字节"),
+            Err(_) => intact = false,
+        }
+    }
+    assert!(data.starts_with(&encoded), "读出来的包装回去对不上原来的帧");
+    assert!(!intact || encoded == data, "没有读到错，却没有读完整个帧");
+}
 
 /// 前 2 字节是每帧的上限，再 2 字节是报文号，剩下的是内容。
 fn split_and_join(data: &[u8]) {
