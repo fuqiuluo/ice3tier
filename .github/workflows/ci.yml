@@ -72,11 +72,14 @@ jobs:
           I3T_VNET_DEVICE_TEST: "1"
         run: |
           program=$(cat test-program.txt)
-          if [ "$RUNNER_OS" = Windows ]; then
-            "$program" a_real_device --nocapture
-          else
-            sudo -E "$program" a_real_device --nocapture
-          fi
+          # Ubuntu 的 sudo 不把环境变量带过去（-E 也不带），所以经 env 设。
+          case "$RUNNER_OS" in
+            Linux) sudo env I3T_VNET_DEVICE_TEST=1 "$program" a_real_device --nocapture | tee device-test.txt ;;
+            macOS) sudo -E "$program" a_real_device --nocapture | tee device-test.txt ;;
+            *) "$program" a_real_device --nocapture | tee device-test.txt ;;
+          esac
+          # 没带上那个环境变量的话测试什么也不做就通过：看它真的建了网卡。
+          grep -q '网卡 ' device-test.txt
 
   # 安装脚本在真的 systemd（ubuntu）和 launchd（macOS）上装一遍：不带令牌装、sudo i3t join 加入并启动、
   # 覆盖重装、卸载干净。controller 起在同一台机器的回环上。
