@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// 被挤掉、被拒绝这一类日志，同一个入口多久最多记一条。洪泛的时候每条连接记一行只会把日志刷满。
-const LOG_EVERY: Duration = Duration::from_secs(10);
+pub(crate) const LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// 名额。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
