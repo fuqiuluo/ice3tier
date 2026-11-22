@@ -9,7 +9,7 @@ On a direct route, small packets going to the same node at the same moment leave
 
 | Setting | Default | Where |
 | --- | --- | --- |
-| Bundle small packets | On | Network → Connections |
+| Bundle small packets | On | Network → Virtual adapter |
 
 With the command line:
 
