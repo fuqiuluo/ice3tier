@@ -192,6 +192,46 @@ describe('网络', () => {
     expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ ack_eliciting_threshold: 4, max_ack_delay_ms: 2 })
   })
 
+  it('连接：合并小包是一个开关，关掉之后只提交这一项；恢复默认把它打开', async () => {
+    const user = userEvent.setup()
+    const api = setup()
+    open('connection')
+    const bundling = screen.getByRole('switch', { name: n.bundleLabel })
+    expect(bundling).toBeChecked()
+    expect(screen.getByText(n.bundleDesc)).toBeVisible()
+    expect(screen.getByRole('button', { name: n.saveSettings })).toBeDisabled()
+
+    await user.click(bundling)
+    expect(bundling).not.toBeChecked()
+    expect(screen.getByText(t.common.defaultIs(n.bundleOn), { exact: false })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: n.saveSettings }))
+    await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
+    expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ bundle_small_packets: false })
+
+    await user.click(screen.getByRole('button', { name: t.common.restoreDefaultOf(n.bundleLabel) }))
+    expect(bundling).toBeChecked()
+  })
+
+  it('连接：关着的合并小包标着已修改；controller 不报这一项时没有这一行，也不提交它', async () => {
+    const user = userEvent.setup()
+    const api = setup()
+    const { unmount } = open('connection', { ...NETWORK, bundle_small_packets: false })
+    expect(screen.getByRole('switch', { name: n.bundleLabel })).not.toBeChecked()
+    expect(screen.getByText(t.common.modified)).toBeVisible()
+    unmount()
+
+    const older: Network = { ...NETWORK }
+    delete older.bundle_small_packets
+    open('connection', older)
+    expect(screen.queryByRole('switch', { name: n.bundleLabel })).not.toBeInTheDocument()
+    const threshold = screen.getByLabelText(n.ackThresholdLabel)
+    await user.clear(threshold)
+    await user.type(threshold, '4')
+    await user.click(screen.getByRole('button', { name: n.saveSettings }))
+    await waitFor(() => expect(api.callsTo('PATCH /networks/1')).toHaveLength(1))
+    expect(api.callsTo('PATCH /networks/1')[0]?.body).toEqual({ ack_eliciting_threshold: 4, max_ack_delay_ms: 2 })
+  })
+
   it('危险操作：网络里还有节点时删除是灰的，写着要先删节点', () => {
     setup()
     open('danger', { ...NETWORK, nodes: 2 })

@@ -59,7 +59,7 @@ export const networks: Messages['networks'] = {
   saveSettings: 'Save',
   settingsSaved: 'Settings saved',
   connection: 'Connections',
-  connectionNote: 'Applies to connections made from now on',
+  connectionNote: 'The two ACK settings apply to connections made from now on',
   ackThresholdLabel: 'ACK threshold',
   ackThresholdDesc: 'A peer sends an ACK only after more than this many packets',
   ackThresholdHint:
@@ -69,6 +69,12 @@ export const networks: Messages['networks'] = {
   ackDelayDesc: 'How long a peer waits below the threshold',
   ackDelayHint: 'A high threshold with a long delay tends to drop one-way traffic.',
   ackDelayUnit: 'ms',
+  bundleLabel: 'Bundle small packets',
+  bundleDesc: 'On a direct route, small packets going to the same node at the same moment leave in one packet',
+  bundleHint:
+    'A download then sends far fewer ACK packets back, which helps a lot on a line that limits packets per second. When small packets come thick, each may wait a millisecond or two; sparse ones never wait. Nodes apply it as soon as they get the setting.',
+  bundleOn: 'On',
+  bundleOff: 'Off',
   wholeNumberBetween: (min, max) => `Must be a whole number from ${min} to ${max}`,
 
   danger: 'Danger zone',

@@ -102,6 +102,7 @@ export const NETWORK: Network = {
   class: null,
   ack_eliciting_threshold: 3,
   max_ack_delay_ms: 2,
+  bundle_small_packets: true,
   defaults: {
     routing: 'direct_first',
     max_relay_hops: 2,
@@ -109,6 +110,7 @@ export const NETWORK: Network = {
     class: null,
     ack_eliciting_threshold: 3,
     max_ack_delay_ms: 2,
+    bundle_small_packets: true,
   },
 }
 

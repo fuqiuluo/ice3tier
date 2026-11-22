@@ -56,7 +56,7 @@ export const networks = {
   saveSettings: '保存',
   settingsSaved: '设置已保存',
   connection: '连接',
-  connectionNote: '只对之后新建的连接生效',
+  connectionNote: '确认的两项只对之后新建的连接生效',
   ackThresholdLabel: '确认阈值',
   ackThresholdDesc: '对端收到超过这么多个包才发一次确认',
   ackThresholdHint: '调大，回程的确认包更少。超过 3 时吞吐要看对端的定时器准不准，对端是 Windows 时会明显变慢',
@@ -65,6 +65,12 @@ export const networks = {
   ackDelayDesc: '不够数时，对端最多等这么久',
   ackDelayHint: '阈值和等待都调大时，单向流量容易丢包',
   ackDelayUnit: '毫秒',
+  bundleLabel: '合并小包',
+  bundleDesc: '直连时，同时要发给同一个节点的小包装进一个包发',
+  bundleHint:
+    '下载时回程的确认包因此少很多，线路按包数限速时快得多。小包很密时每个最多多等一两毫秒，稀的时候不等。保存之后节点收到就生效',
+  bundleOn: '开',
+  bundleOff: '关',
   wholeNumberBetween: (min: number, max: number) => `需为 ${min} 到 ${max} 的整数`,
 
   danger: '危险操作',

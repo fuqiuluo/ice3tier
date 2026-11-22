@@ -152,6 +152,8 @@ export interface Network {
   ack_eliciting_threshold: number
   /** 没攒够时，对端最多等多少毫秒就发确认。 */
   max_ack_delay_ms: number
+  /** 节点直连时把同时要发给同一个节点的几个小包合成一个包发。比这个字段旧的 controller 不给：那时没有这项设置。 */
+  bundle_small_packets?: boolean
   /** 各项设置的默认值；比这个字段旧的 controller 不给，这时说不出哪些设置改过。 */
   defaults?: NetworkDefaults | null
 }
@@ -165,6 +167,7 @@ export interface NetworkDefaults {
   class: ServiceClass | null
   ack_eliciting_threshold: number
   max_ack_delay_ms: number
+  bundle_small_packets?: boolean
 }
 
 export interface CreateNetwork {
@@ -176,6 +179,7 @@ export interface CreateNetwork {
   class?: ServiceClass | null
   ack_eliciting_threshold?: number
   max_ack_delay_ms?: number
+  bundle_small_packets?: boolean
 }
 
 export interface UpdateNetwork {
@@ -188,6 +192,8 @@ export interface UpdateNetwork {
   /** 这两项只对改了之后新建立的连接生效。 */
   ack_eliciting_threshold?: number
   max_ack_delay_ms?: number
+  /** 节点收到新的设置就生效。 */
+  bundle_small_packets?: boolean
 }
 
 export interface NodePair {
