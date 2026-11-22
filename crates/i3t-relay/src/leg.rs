@@ -316,8 +316,8 @@ async fn serve(inner: &Inner, stream: TcpStream, addr: SocketAddr, handshake: Ha
                         break "握手成功之前发来了别的帧";
                     }
                     // 拨进来的是别的 relay：本节点自己在它那里的会话也在这条 TCP 上，那一部分的帧归路径层。
-                    let neighbour = owner.filter(|node| has_session && inner.is_relay(*node));
-                    if neighbour.is_some_and(|node| inner.neighbour_frame(node, id, &frame)) {
+                    // 它的会话还在不在这条 TCP 上由 `neighbour_frame` 现看，不用上面等这一帧之前看到的。
+                    if owner.is_some_and(|node| inner.neighbour_frame(node, id, &frame)) {
                         continue;
                     }
                     if let Some(node) = inner.handle_tcp_frame(&source, &frame) {

@@ -319,6 +319,32 @@ async fn packets_a_tcp_neighbour_hands_over_for_this_node_are_delivered_on_its_w
 }
 
 #[tokio::test]
+async fn a_tcp_neighbour_whose_key_changed_is_not_taken_at_its_word_from_its_very_next_frame() {
+    let peer = Client::new(5).await;
+    let neighbour = Client::new(101).await;
+    let relay = TestRelay::start_in(&Net { role: Role::On, clients: &[], relays: &[&neighbour], max_relay_hops: 2 });
+    let delivered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&delivered);
+    relay.relay().set_local_delivery(move |src, packet| sink.lock().unwrap().push((src, packet)));
+    let mut tcp = TcpClient::connect_as(neighbour.id, NodeKey::from_pem(&neighbour.key.to_pem()).unwrap(), &relay).await;
+    tcp.attach(&relay).await;
+    tcp.send(&relayed(node(ME), peer.id, b"while its key stood")).await;
+    tokio::time::sleep(common::SILENCE).await;
+    assert_eq!(delivered.lock().unwrap().len(), 1);
+
+    // 这条 TCP 正等着下一帧的时候，netmap 里这个 relay 换了公钥：旧钥匙在上面建的会话没了。
+    let successor = neighbour.rekeyed().await;
+    relay.set_net(&Net { role: Role::On, clients: &[], relays: &[&successor], max_relay_hops: 2 });
+    assert!(relay.session_closes(neighbour.id).await, "公钥换了的 relay，旧钥匙建的会话应该立刻关闭");
+
+    // 旧钥匙的一方在这条 TCP 上再发来的，从头一帧起就不作数：它替别的节点送的包，本节点不收。
+    tcp.send(&relayed(node(ME), peer.id, b"its first frame after the change")).await;
+    tcp.send(&routed(node(ME), peer.id, &[node(77), neighbour.id], b"and the one after")).await;
+    tokio::time::sleep(common::SILENCE).await;
+    assert_eq!(delivered.lock().unwrap().len(), 1, "换了公钥之后它送来的包不该交给本节点");
+}
+
+#[tokio::test]
 async fn a_neighbour_relay_opens_its_session_on_a_connection_this_node_dialled_and_is_forwarded_to_over_it() {
     let a = Client::new(1).await;
     let neighbour = Client::new(101).await;

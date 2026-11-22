@@ -587,11 +587,22 @@ impl Inner {
         self.inbox.get()
     }
 
-    /// 别的 relay 拨进来的骨干 TCP（第 `conn` 条，`neighbour` 在上面有会话）上的一帧，属于本节点自己的那些：
-    /// 本节点在对方那里的会话的应答和矩阵行交给路径层；对方送给本节点的包交给连接层（它替来源节点担保，
-    /// 和 UDP 上 relay 的地址来的包一样）。返回这一帧是不是就此处理完了；别的（对方的握手和保活、要往下转的包）照常由 relay 处理。
+    /// 接进来的第 `conn` 条 TCP 上的一帧，这条 TCP 是在上面握手成功的 `neighbour` 的。`neighbour` 是别的 relay、它的会话现在就在
+    /// 这条 TCP 上的话，这条 TCP 是骨干上的一段，属于本节点自己的那些帧在这里处理：本节点在对方那里的会话的应答和矩阵行交给路径层；
+    /// 对方送给本节点的包交给连接层（它替来源节点担保，和 UDP 上 relay 的地址来的包一样）。
+    /// 返回这一帧是不是就此处理完了；别的（对方的握手和保活、要往下转的包）照常由 relay 处理。
+    ///
+    /// 会话在不在，每一帧都在这里现看：一条 TCP 等下一帧可以等很久，这期间那个 relay 可能已经被去掉、换了公钥，
+    /// 或者把会话搬到了别处，它在这条 TCP 上说的话就不再作数。
     pub(crate) fn neighbour_frame(&self, neighbour: NodeId, conn: u64, frame: &Bytes) -> bool {
-        let me = self.read().me;
+        let me = {
+            let state = self.read();
+            let on_this_tcp = state.sessions.owned_by(neighbour, Origin::Tcp(TcpConn::Accepted(conn)), Instant::now());
+            if !on_this_tcp || !state.relays.contains(&neighbour) {
+                return false;
+            }
+            state.me
+        };
         match Datagram::parse(frame) {
             Ok(Datagram::Session(session)) if !session.is_request() => {
                 self.deliver_to_inbox(neighbour, conn, frame);
