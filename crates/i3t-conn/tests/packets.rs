@@ -245,30 +245,42 @@ async fn a_one_way_flow_keeps_its_route_and_costs_the_connection_about_a_packet_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn packets_resume_within_seconds_after_the_peer_crashed_and_came_back() {
-    let (a, r) = (Node::start(1), Node::start(9));
+    let a = Node::start(1);
     let first = Node::start(2);
-    let key = Arc::clone(&first.key);
-    // A 和 B 只经 relay R 来往：B 重启换了端口之后，A 发的包照样经 R 送到新的 B 手上。
-    let via_relay = |b: &Node| {
-        r.apply(&View { relay_clients: Some(&[&a, b]), ..View::default() });
-        a.apply(&View { peers: &[Peer::via(b, &[&r])], relays: &[&r], reach: Some("relay_only"), ..View::default() });
-        b.apply(&View { peers: &[Peer::via(&a, &[&r])], relays: &[&r], reach: Some("relay_only"), ..View::default() });
+    let (key, addr) = (Arc::clone(&first.key), first.addr());
+    let directly = |b: &Node| {
+        a.apply(&View { peers: &[Peer::direct(b)], ..View::default() });
+        b.apply(&View { peers: &[Peer::direct(&a)], ..View::default() });
     };
-    via_relay(&first);
-    r.wait_tcp_listening().await;
+    directly(&first);
     let sender = a.endpoint.packet_sender();
-    tokio::time::timeout(3 * SOON, sender.connect(first.id)).await.expect("经 relay 建连接超时").unwrap();
+    tokio::time::timeout(SOON, sender.connect(first.id)).await.expect("建连接超时").unwrap();
+    a.wait_route(&first, "直连", is_direct).await;
     sender.send_packet(first.id, packet(b"\x45 before")).unwrap();
     assert_eq!(next(&first).await.peer, a.id);
+    // 等连接自己的路径 MTU 探测做完：之后它自己没有东西要发，下一次保活在 15 秒之后。
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // 这条路是直连，包是封好了单独发的，不进连接：下面要看的正是这种包没有回音时怎么办。经 relay 的路上包是连接的数据报，
+    // 对端重启之后头一个数据报自己就引出重置，走不到那一步。
+    let before = counters(&a, &first);
+    for _ in 0..20 {
+        sender.send_packet(first.id, packet(&[0x45; 200])).unwrap();
+        next(&first).await;
+    }
+    let quiet = counters(&a, &first).since(before);
+    assert!(quiet.sent_packets <= 3, "二十个网络包走了，连接自己几乎没有发东西：{quiet:?}");
 
-    // B 崩溃了：一个包也不再发，连关闭帧也没有。然后带着同一把密钥回来。
+    // B 崩溃了：一个包也不再发，连关闭帧也没有。然后带着同一把密钥、在原来的地址上回来。
     first.block_all();
     drop(first);
-    let back = Node::start_with_key(2, key);
-    via_relay(&back);
+    let back = Node::restart_at(2, key, addr).await;
+    directly(&back);
 
-    // A 只管接着发，没有任何回程的包。新的 B 没有那条连接的密钥，这些包它解不开；A 的连接隔一秒替它问一次，
+    // A 只管接着发，没有任何回程的包。新的 B 没有那条连接的密钥，这些包它解不开，也不会回什么；A 的连接隔一秒替它问一次，
     // 新的 B 回一个无状态重置，A 这才知道连接没了，不用等 15 秒的保活。
+    //
+    // 引出重置的还可能是另一样东西：路径层要是察觉了这一下中断，路恢复时会把留底的旧连接包补发一遍。所以这个用例看的是结果
+    // （几秒之内恢复），"隔一秒问一次"这件事本身由上面单向流的那个用例盯着（不问的话那里连接一个包都不发）。
     let ended = tokio::time::timeout(Duration::from_secs(10), async {
         while sender.send_packet(back.id, packet(b"\x45 into the void")).is_ok() {
             tokio::time::sleep(Duration::from_millis(50)).await;

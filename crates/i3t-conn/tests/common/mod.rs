@@ -99,6 +99,23 @@ impl Node {
         Self::start_inner(id, key, &[], PacketTransport::Sealed)
     }
 
+    /// 同一个节点崩溃之后在原来的地址 `addr` 上回来（节点的端口是配置里定的，重启不换），密钥也是原来那把。
+    /// 原来那个节点要已经丢掉了：它的端口等它的任务收了场才放出来，所以绑不上就等一下再试。
+    pub async fn restart_at(id: u32, key: Arc<NodeKey>, addr: SocketAddr) -> Self {
+        init_logging();
+        let id = NodeId::new(id).unwrap();
+        let (netmap, netmap_rx) = watch::channel(build_netmap(id, &View::default()));
+        let deadline = Instant::now() + SOON;
+        loop {
+            let config = EndpointConfig { key: Arc::clone(&key), bind: addr, netmap: netmap_rx.clone(), addr_servers: Vec::new() };
+            match Endpoint::bind_with(config, PacketTransport::Sealed) {
+                Ok(endpoint) => return Self { id, key, endpoint: Arc::new(endpoint), netmap },
+                Err(error) => assert!(Instant::now() < deadline, "原来的地址 {addr} 一直绑不上：{error:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// 同 [`Node::start`]，只是网络包一律走连接的数据报：不认识封好的包的旧节点就是这样。
     pub fn start_datagram_only(id: u32) -> Self {
         Self::start_inner(id, Arc::new(NodeKey::generate().unwrap()), &[], PacketTransport::Datagram)
