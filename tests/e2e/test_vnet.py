@@ -33,7 +33,8 @@
 - hostile：b 不能访问 a，它在自己的机器上用原始套接字经虚拟网卡往 a 发拼不齐的 IP 分片（还有切开的 TCP、凑得齐但后一片带着
   内核会先扔掉的坏选项的）和伪造的 ICMP"需要分片"
   （说的是 a 发往别处的包）：a 的内核拼片缓存不被占用，a 到别处的路径 MTU 不被改成 552；b 的内核回给 a 的真的"端口不可达"照常。
-- managed：由 controller 管理：状态在节点详情里；一个节点关着网卡，别的节点发给它的包当场"不可达"；`i3t hosts`。
+- managed：由 controller 管理：状态在节点详情里；一个节点关着网卡，别的节点发给它的包当场"不可达"；`i3t hosts`；
+  管理员改网络给虚拟网卡定的默认 MTU 和分段卸载的开关，节点不重启、自己把网卡重装成新的样子，本机另设了 MTU 的不跟着变。
 - legacy：配置文件里的 `[intercept]` 不让节点起不来；以前的透明访问留下的规则和网卡被拆掉，网卡照常装上。
 """
 
@@ -420,9 +421,9 @@ with open(out, "w") as result:
 
 
 def offload_of(node: Node) -> str:
-    """节点的日志里，它的虚拟网卡和内核之间谈下来的交接办法：off、tcp 或者 tcp+udp。"""
-    found = re.search(r"虚拟网卡建好了.*?offload=(\S+)", re.sub(r"\x1b\[[0-9;]*m", "", node.read_log()))
-    return found.group(1) if found else "?"
+    """节点的日志里，它的虚拟网卡（最近建的那一次）和内核之间谈下来的交接办法：off、tcp 或者 tcp+udp。"""
+    found = re.findall(r"虚拟网卡建好了.*?offload=(\S+)", re.sub(r"\x1b\[[0-9;]*m", "", node.read_log()))
+    return found[-1] if found else "?"
 
 
 def stream_counted(t: Checks, sender: Node, receiver: Node, what: str, size: int = 20 * MB) -> tuple[int, int]:
@@ -1024,6 +1025,8 @@ def managed(lab: Lab, work: Path, t: Checks) -> None:
     controller.ctl("network", "create", "lab", "--cidr", "10.66.0.0/16")
     a, b, c = Node(lab.host("a"), work), Node(lab.host("b"), work), Node(lab.host("c"), work)
     add_node_config(c, "[network]\nenabled = false\n")
+    # b 本机另外设了 MTU：后面网络的默认值变了，它不跟着变。
+    i3t(b, "set", "mtu", "1200")
     for node in (a, b, c):
         node.join(controller)
     installed(t, a, b)
@@ -1056,6 +1059,30 @@ def managed(lab: Lab, work: Path, t: Checks) -> None:
     t.check("靠 hosts 文件按名字找到 b", resolved.startswith(b.virtual_ip), resolved)
     removed = i3t(a, "hosts", "--remove")
     t.check("i3t hosts --remove 只去掉那一段", removed.returncode == 0 and hosts.read_text() == original, removed.stdout + removed.stderr)
+
+    # 网络给虚拟网卡定的两项：管理员改了，节点收到新的 netmap 就自己把网卡重装一遍。
+    def link_mtu(node: Node) -> int | None:
+        found = re.search(r"mtu (\d+)", node.host.run("ip", "-o", "link", "show", "i3t0", check=False).stdout)
+        return int(found.group(1)) if found else None
+
+    t.check("a 用网络的默认 MTU 1280，b 用它本机设的 1200", (link_mtu(a), link_mtu(b)) == (1280, 1200), f"{link_mtu(a)} {link_mtu(b)}")
+    before = offload_of(a)
+    t.check("分段卸载默认开着", before in ("tcp", "tcp+udp"), before)
+    changed = controller.ctl("network", "set", "--vnet-mtu", "1400", "--vnet-offload", "off")
+    t.check("i3tctl network set --vnet-mtu / --vnet-offload：写下了", (changed.get("vnet_mtu"), changed.get("vnet_offload")) == (1400, False), str(changed))
+    wait_until(lambda: link_mtu(a) == 1400 and offload_of(a) == "off", timeout=30, what="a 的网卡变成 MTU 1400、不用分段卸载")
+    wait_until(lambda: offload_of(b) == "off", timeout=30, what="b 的网卡也不用分段卸载了")
+    t.check("b 本机另设了 MTU：还是 1200", link_mtu(b) == 1200, str(link_mtu(b)))
+    t.check("节点没有重启：还是原来的进程", a.proc.poll() is None and b.proc.poll() is None)
+    wait_until(lambda: (detail(a).get("vnet") or {}).get("mtu") == 1400, timeout=30, what="a 把新的 MTU 报给 controller")
+    wait_until(lambda: received(ping(a, b.virtual_ip, count=1)) == 1, timeout=20, what="网卡重装之后 a 又 ping 通 b")
+    carried(t, a, b, "网卡重装之后")
+    refused = controller.ctl("network", "set", "--vnet-mtu", "1501", check=False)
+    t.check("范围外的 MTU：controller 不收，说得出范围", refused.returncode != 0 and "576" in refused.stderr and "1500" in refused.stderr,
+            refused.stdout + refused.stderr)
+    controller.ctl("network", "set", "--vnet-mtu", "1280", "--vnet-offload", "on")
+    wait_until(lambda: link_mtu(a) == 1280 and offload_of(a) == before, timeout=30, what="改回去之后 a 的网卡回到原来的样子")
+    wait_until(lambda: received(ping(a, b.virtual_ip, count=1)) == 1, timeout=20, what="改回去之后 a 又 ping 通 b")
     if t.failures:
         print(tail(a.read_log(), 30), tail(controller.log.read_text(errors="replace")), sep="\n  ---\n")
 
