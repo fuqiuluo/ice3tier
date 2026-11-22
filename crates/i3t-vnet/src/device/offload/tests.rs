@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use super::Merging;
+use super::{GROTable, Merger, Merging, Segmented, Writing};
 use crate::device::{Device, DeviceSpec, Offload, Platform, Tun};
 use crate::ipv4::testing::{header_checksum, packet, tcp};
 use crate::ipv4::{Ipv4, TCP, UDP};
@@ -151,6 +151,18 @@ fn a_refused_block_stops_udp_merging_first_and_all_merging_the_second_time() {
     assert_eq!(runs(Merging::All), [7]);
     assert_eq!(runs(Merging::TcpOnly), [2, 1, 1, 3]);
     assert_eq!(runs(Merging::Off), [1; 7]);
+}
+
+#[test]
+fn what_merging_needs_is_built_on_first_use_and_dropped_when_merging_ends() {
+    let fresh = Segmented::new(true);
+    assert!(fresh.writing.try_lock().unwrap().merger.is_none(), "还没有合过包的网卡不占这些地方");
+
+    let mut writing = Writing { merging: Merging::All, merger: Some(Merger { table: GROTable::new(), buffers: Vec::new() }) };
+    writing.refused(true);
+    assert!(writing.merging == Merging::TcpOnly && writing.merger.is_some(), "还合 TCP：留着");
+    writing.refused(true);
+    assert!(writing.merging == Merging::Off && writing.merger.is_none(), "不合了：表和格子都放掉，不留一张空表");
 }
 
 #[tokio::test]

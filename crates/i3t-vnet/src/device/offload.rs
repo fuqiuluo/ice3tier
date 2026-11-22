@@ -45,7 +45,7 @@ const _: () = assert!(MERGE_BATCH <= KERNEL_UDP_SEGMENTS, "一次拿去合的包
 /// （地方不够就不合），所以每一格都要事先留够。
 ///
 /// 没写到的页不占内存，写到过的就一直占着：哪一格都可能排在一条流的最前面、被接成一大块，跑久了 [`MERGE_BATCH`] 格
-/// 都写满过，一共四兆多，网卡在就留着（不合了的时候才放掉）。
+/// 都写满过，一共四兆多，网卡在就留着（不合了的时候才放掉，见 [`Merger`]）。
 const BLOCK_CAPACITY: usize = 2 * VIRTIO_NET_HDR_LEN + u16::MAX as usize;
 
 /// 开了分段卸载的网卡：切好了还没交出去的包，和合包用的东西。
@@ -69,8 +69,15 @@ struct Reading {
 
 struct Writing {
     merging: Merging,
+    /// 第一次有包要合的时候才有，不合了就没有。
+    merger: Option<Merger>,
+}
+
+/// 合包用的东西。都不小，所以用得着才建：`tun-rs` 的表一建出来就按最多的流数把地方分配好（近两兆，空着的也一样），
+/// 格子见 [`BLOCK_CAPACITY`]。
+struct Merger {
     table: GROTable,
-    /// 要写的包，一个一格（最多 [`MERGE_BATCH`] 格，每格 [`BLOCK_CAPACITY`]），前面留着头的位置。
+    /// 要写的包，一个一格（最多 [`MERGE_BATCH`] 格），前面留着头的位置。
     buffers: Vec<Vec<u8>>,
 }
 
@@ -119,7 +126,7 @@ impl Segmented {
                 lens: vec![0; SEGMENTS],
                 pending: 0..0,
             }),
-            writing: tokio::sync::Mutex::new(Writing { merging: Merging::All, table: GROTable::new(), buffers: Vec::new() }),
+            writing: tokio::sync::Mutex::new(Writing { merging: Merging::All, merger: None }),
         }
     }
 
@@ -189,16 +196,17 @@ impl Writing {
         if packets.len() < 2 || self.merging == Merging::Off {
             return None;
         }
-        if self.buffers.len() < packets.len() {
-            self.buffers.resize_with(packets.len(), || Vec::with_capacity(BLOCK_CAPACITY));
+        let Merger { table, buffers } = self.merger.get_or_insert_with(|| Merger { table: GROTable::new(), buffers: Vec::new() });
+        if buffers.len() < packets.len() {
+            buffers.resize_with(packets.len(), || Vec::with_capacity(BLOCK_CAPACITY));
         }
-        let buffers = &mut self.buffers[..packets.len()];
+        let buffers = &mut buffers[..packets.len()];
         for (buffer, packet) in buffers.iter_mut().zip(packets) {
             buffer.clear();
             buffer.resize(VIRTIO_NET_HDR_LEN, 0);
             buffer.extend_from_slice(packet);
         }
-        let error = match device.send_multiple(&mut self.table, buffers, VIRTIO_NET_HDR_LEN).await {
+        let error = match device.send_multiple(table, buffers, VIRTIO_NET_HDR_LEN).await {
             Ok(_) => return Some(Ok(())),
             Err(error) => error,
         };
@@ -209,17 +217,23 @@ impl Writing {
                 None
             }
             Some(libc::EINVAL) => {
-                self.merging = self.merging.after_refusal(udp);
+                self.refused(udp);
                 if self.merging == Merging::TcpOnly {
                     tracing::warn!(%error, "内核不收合起来的包：这块虚拟网卡往后只合 TCP 的");
                 } else {
                     tracing::warn!(%error, "内核不收合起来的包：这块虚拟网卡往后一个一个地写");
-                    // 用不着了：格子和表都放掉。
-                    (self.table, self.buffers) = (GROTable::default(), Vec::new());
                 }
                 None
             }
             Some(_) => Some(Err(error)),
+        }
+    }
+
+    /// 内核拒绝了一次合好的包：往后少合一样；不合了的话，合包用的东西整个放掉。
+    fn refused(&mut self, udp: bool) {
+        self.merging = self.merging.after_refusal(udp);
+        if self.merging == Merging::Off {
+            self.merger = None;
         }
     }
 }
