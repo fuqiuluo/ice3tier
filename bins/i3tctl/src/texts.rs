@@ -61,6 +61,7 @@ pub struct Help {
     pub network_max_relay_hops: &'static str,
     pub network_ack_eliciting_threshold: &'static str,
     pub network_max_ack_delay_ms: &'static str,
+    pub network_bundle_small_packets: &'static str,
     pub routing: &'static str,
     pub reach: &'static str,
     pub class: &'static str,
@@ -322,6 +323,7 @@ pub struct Ui {
     pub class: &'static str,
     pub ack_eliciting_threshold: &'static str,
     pub max_ack_delay: &'static str,
+    pub bundle_small_packets: &'static str,
     /// 写在一项改过的设置后面：它的默认值是什么。
     pub default_is: fn(&str) -> String,
 

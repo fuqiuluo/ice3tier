@@ -177,6 +177,10 @@ async fn the_command_line_drives_a_running_controller() {
     assert_eq!((&shown["ack_eliciting_threshold"], &shown["max_ack_delay_ms"]), (&4.into(), &5.into()));
     let refused = fixture.fails(&["network", "set", "--max-ack-delay-ms", "26"]).await;
     assert!(refused.contains("1 到 25"), "{refused}");
+    assert_eq!(shown["bundle_small_packets"], true, "合并小包默认开着");
+    let set = fixture.ok(&["network", "set", "--bundle-small-packets", "off"]).await;
+    assert!(set.contains("合并小包") && set.contains("关（默认 开）"), "关掉之后写着默认值：{set}");
+    assert_eq!(fixture.json(&["network", "show"]).await["bundle_small_packets"], false);
 
     // 分组。
     assert!(fixture.ok(&["group", "list"]).await.contains("All（内置）"));

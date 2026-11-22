@@ -333,6 +333,10 @@ pub fn network(network: &Network) {
         setting(network.ack_eliciting_threshold.to_string(), defaults.map(|defaults| defaults.ack_eliciting_threshold.to_string())),
     );
     fields.add(t.max_ack_delay, setting(millis(network.max_ack_delay_ms), defaults.map(|defaults| millis(defaults.max_ack_delay_ms))));
+    fields.add(
+        t.bundle_small_packets,
+        setting(on_off(network.bundle_small_packets), defaults.map(|defaults| on_off(defaults.bundle_small_packets))),
+    );
     fields.print();
 }
 

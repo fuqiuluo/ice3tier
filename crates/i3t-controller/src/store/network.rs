@@ -23,6 +23,8 @@ pub struct NetworkRecord {
     /// 节点之间的连接请对端怎样确认：攒到多于几个包才单独发确认，没攒够时最多等多少毫秒。
     pub ack_eliciting_threshold: u32,
     pub max_ack_delay_ms: u32,
+    /// 节点之间直连时把同一时刻要发的几个小网络包合成一个包发。
+    pub bundle_small_packets: bool,
 }
 
 impl NetworkRecord {
@@ -44,6 +46,7 @@ impl NetworkRecord {
             class: row.get::<_, Option<Json<Class>>>("class")?.map(|json| json.0),
             ack_eliciting_threshold: row.get("ack_eliciting_threshold")?,
             max_ack_delay_ms: row.get("max_ack_delay_ms")?,
+            bundle_small_packets: row.get("bundle_small_packets")?,
         })
     }
 }
@@ -59,6 +62,7 @@ pub struct NewNetwork {
     pub class: Option<Class>,
     pub ack_eliciting_threshold: u32,
     pub max_ack_delay_ms: u32,
+    pub bundle_small_packets: bool,
 }
 
 impl Store {
@@ -69,8 +73,9 @@ impl Store {
     /// 写数据库失败，包括名字和已有的网络重复。
     pub fn insert_network(&self, new: &NewNetwork) -> Result<NetworkId, StoreError> {
         self.conn.execute(
-            "INSERT INTO networks (name, cidr, routing, max_relay_hops, reach, created_at, class, ack_eliciting_threshold, max_ack_delay_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO networks (name, cidr, routing, max_relay_hops, reach, created_at, class, ack_eliciting_threshold, max_ack_delay_ms,
+                                   bundle_small_packets)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 new.name,
                 Text(new.cidr),
@@ -80,7 +85,8 @@ impl Store {
                 Unsigned(new.created_at),
                 new.class.map(Json),
                 new.ack_eliciting_threshold,
-                new.max_ack_delay_ms
+                new.max_ack_delay_ms,
+                new.bundle_small_packets
             ],
         )?;
         let id = NetworkId(row_id(self.conn.last_insert_rowid())?);
@@ -121,7 +127,7 @@ impl Store {
     pub fn update_network(&self, network: &NetworkRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE networks SET cidr = ?2, routing = ?3, max_relay_hops = ?4, reach = ?5, class = ?6,
-                                 ack_eliciting_threshold = ?7, max_ack_delay_ms = ?8
+                                 ack_eliciting_threshold = ?7, max_ack_delay_ms = ?8, bundle_small_packets = ?9
              WHERE id = ?1",
             params![
                 SqlNetwork(network.id),
@@ -131,7 +137,8 @@ impl Store {
                 Json(network.reach),
                 network.class.map(Json),
                 network.ack_eliciting_threshold,
-                network.max_ack_delay_ms
+                network.max_ack_delay_ms,
+                network.bundle_small_packets
             ],
         )?;
         Ok(())
@@ -161,7 +168,7 @@ mod tests {
         assert_eq!(record.name, "home");
         assert_eq!(record.domain(), "home.i3t");
         assert_eq!(record.cidr, "10.66.0.0/16".parse().unwrap());
-        assert_eq!((record.ack_eliciting_threshold, record.max_ack_delay_ms), (3, 2));
+        assert_eq!((record.ack_eliciting_threshold, record.max_ack_delay_ms, record.bundle_small_packets), (3, 2, true));
         assert_eq!(store.network_by_name("home").unwrap(), Some(record.clone()));
         assert_eq!(store.networks().unwrap(), vec![record.clone()]);
 
@@ -172,6 +179,7 @@ mod tests {
             class: Some(Class::Bulk),
             ack_eliciting_threshold: 4,
             max_ack_delay_ms: 5,
+            bundle_small_packets: false,
             ..record
         };
         store.update_network(&updated).unwrap();

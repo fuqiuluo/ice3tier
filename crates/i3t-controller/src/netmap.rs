@@ -254,6 +254,7 @@ impl NetworkView {
                 class: self.network.class,
                 ack_eliciting_threshold: self.network.ack_eliciting_threshold,
                 max_ack_delay_ms: self.network.max_ack_delay_ms,
+                bundle_small_packets: self.network.bundle_small_packets,
             },
             me: LocalNode {
                 id,

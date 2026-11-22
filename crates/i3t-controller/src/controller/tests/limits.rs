@@ -230,6 +230,27 @@ fn the_networks_acknowledgement_settings_reach_every_node_and_stay_within_their_
 }
 
 #[test]
+fn the_networks_small_packet_bundling_switch_reaches_every_node() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let (mut laptop, mut nas) = (lab.join(network.id, &[]), lab.join(network.id, &[]));
+    lab.settle(&mut [&mut laptop, &mut nas]);
+    let sent = |netmap: &netmap::Netmap| netmap.network.bundle_small_packets;
+    assert!(sent(laptop.netmap()) && sent(nas.netmap()), "新建的网络开着");
+
+    let off = UpdateNetwork { bundle_small_packets: Some(false), ..UpdateNetwork::default() };
+    let changed = lab.controller.update_network(network.id, &off).unwrap();
+    assert!(!changed.bundle_small_packets);
+    assert_eq!(changed.defaults.map(|defaults| defaults.bundle_small_packets), Some(true), "默认值不跟着变");
+    lab.settle(&mut [&mut laptop, &mut nas]);
+    assert!(!sent(laptop.netmap()) && !sent(nas.netmap()), "关了之后每个节点都收到");
+
+    // 改别的设置不动它。
+    lab.controller.update_network(network.id, &UpdateNetwork { max_relay_hops: Some(3), ..UpdateNetwork::default() }).unwrap();
+    assert!(!lab.controller.network(network.id).unwrap().bundle_small_packets);
+}
+
+#[test]
 fn classes_and_the_optimistic_reply_set_on_the_network_proxy_forward_and_exit_reach_the_netmaps() {
     let mut lab = Lab::new();
     let network = lab.network("home");

@@ -94,6 +94,10 @@ pub struct Network {
     /// 没攒够时，对端最多等多少毫秒就发确认。旧的 controller 不发这一项，读成 [`DEFAULT_MAX_ACK_DELAY_MS`]。
     #[serde(default = "default_max_ack_delay_ms")]
     pub max_ack_delay_ms: u32,
+    /// 节点之间直连时，同一时刻要发给同一个节点的几个小网络包合成一个包发（见 [`DEFAULT_BUNDLE_SMALL_PACKETS`]）。
+    /// 旧的 controller 不发这一项，读成默认值。
+    #[serde(default = "default_bundle_small_packets")]
+    pub bundle_small_packets: bool,
 }
 
 impl Network {
@@ -146,6 +150,17 @@ pub(crate) const fn default_ack_eliciting_threshold() -> u32 {
 
 pub(crate) const fn default_max_ack_delay_ms() -> u32 {
     DEFAULT_MAX_ACK_DELAY_MS
+}
+
+/// [`Network::bundle_small_packets`] 的默认值：合。
+///
+/// 一条下载在回程方向上全是小包（TCP 的确认，五六十个字节一个），一个包一个地发，包数是数据方向的一半。线路按包数限速的
+/// 方向上，这些小包先把额度用完，下载的速度就卡在那里。把同时在手上的几个装进一个包，回程的包数少到几分之一。
+/// 代价：小包来得很密（间隔不到两毫秒）的时候，一个小包最多多等一两毫秒凑下一个；稀的时候（ping、游戏的包）不等。
+pub const DEFAULT_BUNDLE_SMALL_PACKETS: bool = true;
+
+pub(crate) const fn default_bundle_small_packets() -> bool {
+    DEFAULT_BUNDLE_SMALL_PACKETS
 }
 
 /// 选路模式。
@@ -844,6 +859,15 @@ mod tests {
         json["network"]["max_ack_delay_ms"] = 5.into();
         let network = serde_json::from_value::<Netmap>(json).unwrap().network;
         assert_eq!((network.ack_eliciting_threshold, network.max_ack_delay_ms), (4, 5));
+    }
+
+    #[test]
+    fn a_netmap_from_a_controller_without_the_bundling_switch_reads_as_switched_on() {
+        assert!(minimal().network.bundle_small_packets, "旧的 controller 不发：用默认值");
+        let mut json = serde_json::to_value(minimal()).unwrap();
+        assert_eq!(json["network"]["bundle_small_packets"], true);
+        json["network"]["bundle_small_packets"] = false.into();
+        assert!(!serde_json::from_value::<Netmap>(json).unwrap().network.bundle_small_packets);
     }
 
     #[test]

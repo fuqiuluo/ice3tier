@@ -18,6 +18,7 @@ pub(crate) fn home() -> NewNetwork {
         class: None,
         ack_eliciting_threshold: 3,
         max_ack_delay_ms: 2,
+        bundle_small_packets: true,
     }
 }
 

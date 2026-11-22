@@ -28,6 +28,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0015_proxies.sql"),
     include_str!("migrations/0016_proxy_lane.sql"),
     include_str!("migrations/0017_network_ack_frequency.sql"),
+    include_str!("migrations/0018_network_bundle_small_packets.sql"),
 ];
 
 #[cfg(test)]
@@ -562,5 +563,24 @@ mod tests {
         let network = store.network_by_name("home").unwrap().unwrap();
         assert_eq!((network.ack_eliciting_threshold, network.max_ack_delay_ms), (3, 2));
         assert_eq!(network.max_relay_hops, 2, "别的设置不动");
+    }
+
+    /// 第 18 版之前：网络没有"合并小包"的开关。
+    const BEFORE_NETWORK_BUNDLE_SMALL_PACKETS: usize = 17;
+
+    #[test]
+    fn an_existing_network_gets_small_packet_bundling_switched_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        {
+            let store = Store::prepare(Connection::open(&path).unwrap(), &MIGRATIONS[..BEFORE_NETWORK_BUNDLE_SMALL_PACKETS]).unwrap();
+            home_network(&store.conn);
+            store.conn.execute("UPDATE networks SET ack_eliciting_threshold = 7", []).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), u32::try_from(MIGRATIONS.len()).unwrap());
+        let network = store.network_by_name("home").unwrap().unwrap();
+        assert!(network.bundle_small_packets, "已有的网络取默认值：开着");
+        assert_eq!(network.ack_eliciting_threshold, 7, "别的设置不动");
     }
 }

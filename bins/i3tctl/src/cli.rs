@@ -180,6 +180,8 @@ pub struct NetworkSettings {
     pub ack_eliciting_threshold: Option<u32>,
     #[arg(long)]
     pub max_ack_delay_ms: Option<u32>,
+    #[arg(long)]
+    pub bundle_small_packets: Option<OnOff>,
 }
 
 #[derive(Subcommand)]
@@ -795,6 +797,7 @@ fn describe(command: clap::Command, h: &Help, v: &Values) -> clap::Command {
             .mut_arg("class", |arg| arg.help(h.class).value_name("auto|interactive|reliable|bulk|default"))
             .mut_arg("ack_eliciting_threshold", |arg| arg.help(h.network_ack_eliciting_threshold).value_name(v.count))
             .mut_arg("max_ack_delay_ms", |arg| arg.help(h.network_max_ack_delay_ms).value_name("ms"))
+            .mut_arg("bundle_small_packets", |arg| on_off(arg.help(h.network_bundle_small_packets)))
     };
     command
         .about(h.about)

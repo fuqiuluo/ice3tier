@@ -27,8 +27,8 @@ use crate::control::{
     RouteSince, SelfUpdate, TargetCause, TryOutcome, VnetReport,
 };
 use crate::netmap::{
-    Attachment, Congestion, DEFAULT_ACK_ELICITING_THRESHOLD, DEFAULT_MAX_ACK_DELAY_MS, ExitRole, ForwardProtocol, ListenerProtocol,
-    Profile, ProxyProtocol, Reach, RoutingMode,
+    Attachment, Congestion, DEFAULT_ACK_ELICITING_THRESHOLD, DEFAULT_BUNDLE_SMALL_PACKETS, DEFAULT_MAX_ACK_DELAY_MS, ExitRole,
+    ForwardProtocol, ListenerProtocol, Profile, ProxyProtocol, Reach, RoutingMode,
 };
 use crate::update::{FailureKind, SelfUpdateBlocker, UpdateCause, UpdateStatus, UpdateTiming, Version};
 
@@ -222,6 +222,9 @@ pub struct Network {
     /// 没攒够时，对端最多等多少毫秒就发确认（[`MAX_ACK_DELAY_MS`] 之内）。比这个字段旧的 controller 不给，读成默认值。
     #[serde(default = "crate::netmap::default_max_ack_delay_ms")]
     pub max_ack_delay_ms: u32,
+    /// 节点之间直连时，同一时刻要发给同一个节点的几个小网络包合成一个包发。比这个字段旧的 controller 不给，读成默认值。
+    #[serde(default = "crate::netmap::default_bundle_small_packets")]
+    pub bundle_small_packets: bool,
     /// 各项设置的默认值。比这个字段旧的 controller 不给，是 `null`：这时说不出哪些设置改过。
     #[serde(default)]
     pub defaults: Option<NetworkDefaults>,
@@ -240,6 +243,7 @@ pub struct NetworkDefaults {
     pub class: Option<Class>,
     pub ack_eliciting_threshold: u32,
     pub max_ack_delay_ms: u32,
+    pub bundle_small_packets: bool,
 }
 
 impl Default for NetworkDefaults {
@@ -251,6 +255,7 @@ impl Default for NetworkDefaults {
             class: None,
             ack_eliciting_threshold: DEFAULT_ACK_ELICITING_THRESHOLD,
             max_ack_delay_ms: DEFAULT_MAX_ACK_DELAY_MS,
+            bundle_small_packets: DEFAULT_BUNDLE_SMALL_PACKETS,
         }
     }
 }
@@ -283,6 +288,8 @@ pub struct CreateNetwork {
     pub ack_eliciting_threshold: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ack_delay_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_small_packets: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -304,6 +311,9 @@ pub struct UpdateNetwork {
     pub ack_eliciting_threshold: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ack_delay_ms: Option<u32>,
+    /// 节点收到新的 netmap 就生效，不用重建连接。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_small_packets: Option<bool>,
 }
 
 /// 一个网络的总览。

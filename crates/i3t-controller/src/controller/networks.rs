@@ -69,6 +69,7 @@ impl Controller {
                 class: request.class.or(defaults.class),
                 ack_eliciting_threshold,
                 max_ack_delay_ms,
+                bundle_small_packets: request.bundle_small_packets.unwrap_or(defaults.bundle_small_packets),
             })?;
             let all = store.builtin_group(id)?.ok_or(Error::NotFound(Entity::Group))?;
             let all = GroupRef { id: all, name: BUILTIN_GROUP.to_owned(), builtin: true };
@@ -111,6 +112,9 @@ impl Controller {
             if let Some(delay) = request.max_ack_delay_ms {
                 network.max_ack_delay_ms = check_max_ack_delay_ms(delay)?;
             }
+            if let Some(bundle) = request.bundle_small_packets {
+                network.bundle_small_packets = bundle;
+            }
             network.routing = request.routing.unwrap_or(network.routing);
             network.reach = request.reach.unwrap_or(network.reach);
             network.class = request.class.unwrap_or(network.class);
@@ -126,6 +130,7 @@ impl Controller {
                 "class": network.class,
                 "ack_eliciting_threshold": network.ack_eliciting_threshold,
                 "max_ack_delay_ms": network.max_ack_delay_ms,
+                "bundle_small_packets": network.bundle_small_packets,
             });
             store.log_refs(now, Some(id), action::NETWORK_UPDATE, &format!("修改网络 {} 的设置", network.name), &refs, params)?;
             Ok::<_, Error>(network)
@@ -173,6 +178,7 @@ impl Inner {
             class: record.class,
             ack_eliciting_threshold: record.ack_eliciting_threshold,
             max_ack_delay_ms: record.max_ack_delay_ms,
+            bundle_small_packets: record.bundle_small_packets,
             defaults: Some(NetworkDefaults::default()),
         })
     }
