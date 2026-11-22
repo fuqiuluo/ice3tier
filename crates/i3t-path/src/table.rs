@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use crate::backbone::Gates;
 use crate::control::{Ctrl, Inbound};
 use crate::timing::{PEER_ACTIVE, SILENCE, STASH_MAX_AGE, UNANSWERED_WINDOW};
-use crate::{LocalRelay, RouteChange, SessionLeg, Status};
+use crate::{LocalRelay, RouteChange, Status};
 
 /// 路可疑或者没有路的时候，留着最后几个包，路恢复时立刻补发。
 const STASH_PACKETS: usize = 4;
@@ -50,27 +50,6 @@ pub struct Packets<'a> {
 impl<'a> Packets<'a> {
     fn segments(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
         self.contents.chunks(self.segment_size.unwrap_or(self.contents.len()).max(1))
-    }
-}
-
-/// 一批包里没有发出去的那一部分。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Unsent {
-    pub packets: usize,
-    pub bytes: usize,
-}
-
-impl Unsent {
-    /// 都发出去了。
-    pub const NONE: Self = Self { packets: 0, bytes: 0 };
-
-    /// 一个都没有发出去。
-    pub(crate) fn all(packets: &Packets<'_>) -> Self {
-        Self { packets: packets.segments().count(), bytes: packets.contents.len() }
-    }
-
-    fn unless(sent: bool, packets: &Packets<'_>) -> Self {
-        if sent { Self::NONE } else { Self::all(packets) }
     }
 }
 
@@ -131,15 +110,13 @@ pub(crate) struct RelaySlot {
     pub(crate) id: NodeId,
     /// 最近一次从它收到任何东西。
     pub(crate) last_rx: Stamp,
-    /// 最近一次从本节点拨给它的那条 TCP 里读到东西。
-    pub(crate) last_rx_tcp: Stamp,
     /// 最近一次经它发包。
     pub(crate) last_tx: Stamp,
 }
 
 impl RelaySlot {
     pub(crate) fn new(id: NodeId) -> Arc<Self> {
-        Arc::new(Self { id, last_rx: Stamp::default(), last_rx_tcp: Stamp::default(), last_tx: Stamp::default() })
+        Arc::new(Self { id, last_rx: Stamp::default(), last_tx: Stamp::default() })
     }
 }
 
@@ -217,31 +194,9 @@ pub(crate) struct PeerSlot {
     contact: Stamp,
     /// 当前的路可疑（探测没有回答），或者根本没有路。这时发的包多留一份，见 [`PeerSlot::flush`]。
     doubt: AtomicBool,
-    /// 现在的路是哪一种（[`Carriage`] 的值）。和 `inner` 里的路一起改；发包的路径上不拿锁就要看它。
-    carriage: AtomicU8,
+    /// 当前的路是直连。和 `inner` 里的路一起改；发包的路径上不拿锁就要看它（[`PeerSlot::is_direct`]）。
+    direct: AtomicBool,
     inner: Mutex<SlotInner>,
-}
-
-/// 一条路把包装在什么里面走。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum Carriage {
-    /// 一个包一个数据报（直连、经 relay 的 UDP），或者没有路。
-    Datagrams = 0,
-    /// 本节点到 relay 的那一段是一条 TCP。
-    Tcp = 1,
-    /// 本节点自己是 relay，对端挂在上面：它的会话走什么要问本节点的 relay。
-    LocalSession = 2,
-}
-
-impl Carriage {
-    const fn of(hop: &Hop) -> Self {
-        match hop {
-            Hop::None | Hop::Direct(_) | Hop::RelayUdp { .. } => Self::Datagrams,
-            Hop::RelayTcp { .. } => Self::Tcp,
-            Hop::Local => Self::LocalSession,
-        }
-    }
 }
 
 impl PeerSlot {
@@ -254,7 +209,7 @@ impl PeerSlot {
             last_rx: Stamp::default(),
             contact: Stamp::default(),
             doubt: AtomicBool::new(true),
-            carriage: AtomicU8::new(Carriage::Datagrams as u8),
+            direct: AtomicBool::new(false),
             inner: Mutex::new(SlotInner { hop: Hop::None, scratch: Vec::new(), stash: VecDeque::new() }),
         })
     }
@@ -265,18 +220,8 @@ impl PeerSlot {
 
     pub(crate) fn set_hop(&self, hop: Hop) {
         let mut inner = self.lock();
-        self.carriage.store(Carriage::of(&hop) as u8, Ordering::Relaxed);
+        self.direct.store(matches!(hop, Hop::Direct(_)), Ordering::Relaxed);
         inner.hop = hop;
-    }
-
-    /// 到它的包现在是不是装在一条 TCP 里走：本节点到 relay 的那一段是 TCP，或者本节点自己是 relay、它经 TCP 挂在上面。
-    pub(crate) fn carried_in_tcp(&self, shared: &Shared) -> bool {
-        let carriage = self.carriage.load(Ordering::Relaxed);
-        if carriage == Carriage::LocalSession as u8 {
-            let leg = shared.local_relay.get().and_then(|relay| relay.session_leg(self.id));
-            return matches!(leg, Some(SessionLeg::Accepted(_) | SessionLeg::Dialled(_)));
-        }
-        carriage == Carriage::Tcp as u8
     }
 
     /// 这个对端是不是活跃的：最近有包要发给它，或者有人要和它通信。
@@ -368,56 +313,34 @@ impl PeerSlot {
         }
     }
 
-    /// 发一批丢了也没关系的包（封好的网络包），不等，也不留底：端口忙着、经 TCP 中转时队列满了，或者没有路，
-    /// 发不出去的就丢掉。返回没有发出去的那一部分。
+    /// 现在是不是直连：包直接发到它的地址上，不经任何 relay。
+    pub(crate) fn is_direct(&self) -> bool {
+        self.direct.load(Ordering::Relaxed)
+    }
+
+    /// 把一批丢了也没关系的包（封好的网络包）直接发到它的地址上，不等，也不留底。现在不是直连，或者端口忙着，
+    /// 这一批就丢掉。返回发出去了没有。
+    ///
+    /// 只走直连：经 relay 的路上可能有一段是 TCP（本节点到 relay 的、对端到 relay 的、relay 和 relay 之间的），发的一方看不全。
+    /// 那样的一段是可靠的流，这种没有人管量的包把它灌满之后，数据一直排到线路的缓冲区里，同一条 TCP 上的东西都跟着晚到几秒，
+    /// 到 relay 的保活等不到回答，那条 TCP 还会被当作断了拆掉（实测：2 Mbit/s 的 TCP 中转上灌 20 Mbit/s，每六七秒拆一次）。
+    /// 经 relay 的路上，量要有人管着，所以调用方在不是直连时照旧用 [`send`](Self::send)（连接自己的包）。
     ///
     /// 它直接问内核，不走 [`send`](Self::send) 用的那个入口。那个入口是给会等"可写"的连接用的：内核说过一次
     /// "现在发不了"之后，运行时记下端口不可写，到它收到下一次可写的通知之前，再来的包不问内核就当作发不了。
     /// 连接会等；不等的调用方在这段时间里一个包也发不出去，尽管内核一有地方就能收。
     ///
     /// 不留底：这样的包本来就不保证送达，补发一个过了时的没有用，还会把连接自己的包从留底里挤出去。
-    pub(crate) fn send_or_drop(&self, shared: &Shared, packets: &Packets<'_>) -> Unsent {
+    pub(crate) fn send_direct(&self, shared: &Shared, packets: &Packets<'_>) -> bool {
         self.last_tx.touch(&shared.clock);
-        let mut inner = self.lock();
-        let SlotInner { hop, scratch, .. } = &mut *inner;
-        match hop {
-            Hop::None => Unsent::all(packets),
-            Hop::Direct(addr) => {
-                let sent = shared.port.send_or_drop(&Transmit {
-                    destination: *addr,
-                    contents: packets.contents,
-                    segment_size: packets.segment_size,
-                    ecn: packets.ecn,
-                });
-                Unsent::unless(sent, packets)
-            }
-            Hop::RelayUdp { relay, addr, header } => {
-                relay.last_tx.touch(&shared.clock);
-                let sent = shared.port.send_or_drop(&framed(header.as_slice(), scratch, packets, *addr));
-                Unsent::unless(sent, packets)
-            }
-            Hop::RelayTcp { relay, sender, header } => {
-                relay.last_tx.touch(&shared.clock);
-                let mut unsent = Unsent::NONE;
-                // 排它们自己的那条队：把队排满了，连接的包和到 relay 的保活还进得来。
-                // 队列满了也接着试后面的：中间可能正好腾出了位置。
-                for packet in packets.segments() {
-                    if !sender.try_send_bulk(frame(header.as_slice(), packet)) {
-                        unsent.packets += 1;
-                        unsent.bytes += packet.len();
-                    }
-                }
-                unsent
-            }
-            Hop::Local => {
-                let transmit = framed(&self.header(shared), scratch, packets, shared.port.local_addr());
-                // 那边只说是不是全送出去了：有一个没送出去，这一批就都算没发。
-                let sent = shared
-                    .local_relay
-                    .get()
-                    .is_some_and(|relay| relay.send_to_client(self.id, transmit.contents, transmit.segment_size, transmit.ecn));
-                Unsent::unless(sent, packets)
-            }
+        match self.lock().hop {
+            Hop::Direct(destination) => shared.port.send_or_drop(&Transmit {
+                destination,
+                contents: packets.contents,
+                segment_size: packets.segment_size,
+                ecn: packets.ecn,
+            }),
+            Hop::None | Hop::RelayUdp { .. } | Hop::RelayTcp { .. } | Hop::Local => false,
         }
     }
 
@@ -750,7 +673,7 @@ mod tests {
         // 端口刚绑定，运行时还没有收到它的头一次"可写"通知，在它看来端口是不可写的，和内核说过一次"现在发不了"之后一样。
         // 这里故意不等可写：经过运行时的那个入口这时一个包也发不出去。
         let packets = Packets { contents: &[6; 100], segment_size: None, ecn: None };
-        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent::NONE);
+        assert!(slot.send_direct(&shared, &packets));
         assert_eq!(receive(&receiver).await, Some(vec![6; 100]));
         assert!(slot.lock().stash.is_empty(), "丢了也没关系的包不留底");
         slot.send(&shared, &Packets { contents: &[0x40; 100], segment_size: None, ecn: None }).unwrap();
@@ -758,47 +681,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_route_through_a_tcp_leg_counts_as_carried_in_tcp() {
+    async fn packets_that_may_be_dropped_only_ever_leave_on_a_direct_route() {
         let shared = shared();
-        let slot = PeerSlot::new(NodeId::new(2).unwrap());
-        let addr: SocketAddr = "203.0.113.9:4000".parse().unwrap();
-        let header = FrameHeader::single(RelayHeader { dst: slot.id, src: shared.me });
-        let relay = || RelaySlot::new(NodeId::new(9).unwrap());
-        assert!(!slot.carried_in_tcp(&shared), "没有路");
-        slot.set_hop(Hop::Direct(addr));
-        assert!(!slot.carried_in_tcp(&shared), "直连");
-        slot.set_hop(Hop::RelayUdp { relay: relay(), addr, header });
-        assert!(!slot.carried_in_tcp(&shared), "经 relay，到 relay 的那一段是 UDP");
-        slot.set_hop(Hop::RelayTcp { relay: relay(), sender: i3t_underlay::tcp_leg::frame_queue().0, header });
-        assert!(slot.carried_in_tcp(&shared), "到 relay 的那一段是 TCP");
-        slot.set_hop(Hop::Local);
-        assert!(!slot.carried_in_tcp(&shared), "本节点没有在当 relay：问不到会话，按不是算");
-        slot.set_hop(Hop::None);
-        assert!(!slot.carried_in_tcp(&shared), "路没了，标记跟着清掉");
-    }
-
-    #[tokio::test]
-    async fn packets_dropped_for_want_of_a_route_or_of_room_in_a_tcp_relay_queue_are_reported() {
-        let shared = shared();
+        let receiver = UdpPort::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let slot = PeerSlot::new(NodeId::new(2).unwrap());
         let packets = Packets { contents: &[6; 250], segment_size: Some(100), ecn: None };
-        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 3, bytes: 250 }, "没有路");
-
-        // 没有人在写这条 TCP：排进队列的包不会走。
-        let (sender, _queue) = i3t_underlay::tcp_leg::frame_queue();
         let header = FrameHeader::single(RelayHeader { dst: slot.id, src: shared.me });
-        slot.set_hop(Hop::RelayTcp { relay: RelaySlot::new(NodeId::new(9).unwrap()), sender: sender.clone(), header });
-        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent::NONE, "队列里有地方");
-        // 把它们那条队填到只剩一个位置：三个包里排得进去的只有头一个。
-        for _ in 3..i3t_underlay::tcp_leg::SEND_QUEUE_PACKETS - 1 {
-            assert!(sender.try_send_bulk(Bytes::new()));
-        }
-        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 2, bytes: 150 }, "后两个没有排进去，其中最后一个是短的");
-        assert_eq!(slot.send_or_drop(&shared, &packets), Unsent { packets: 3, bytes: 250 }, "队列满了");
-        // 满的只是丢了也没关系的包那条队：连接的包和路径层自己的帧（到 relay 的保活走的也是这一条）照样排得进去。
-        slot.send(&shared, &Packets { contents: &[0x40; 100], segment_size: None, ecn: None }).unwrap();
-        slot.send_frame(&shared, b"probe");
-        assert!(sender.try_send(Bytes::new()), "连接的包那条队还远没有满");
+        let relay = || RelaySlot::new(NodeId::new(9).unwrap());
+        assert!(!slot.is_direct() && !slot.send_direct(&shared, &packets), "没有路");
+
+        // 经 relay 的路，不管到 relay 的那一段是 UDP 还是 TCP：这种包不交给 relay，也不占 TCP 的待发队列。
+        slot.set_hop(Hop::RelayUdp { relay: relay(), addr: receiver.local_addr(), header });
+        assert!(!slot.is_direct() && !slot.send_direct(&shared, &packets));
+        assert_eq!(receive(&receiver).await, None, "什么都没有发给 relay");
+        let (sender, _queue) = i3t_underlay::tcp_leg::frame_queue();
+        slot.set_hop(Hop::RelayTcp { relay: relay(), sender: sender.clone(), header });
+        assert!(!slot.is_direct() && !slot.send_direct(&shared, &packets));
+        let room = (0..i3t_underlay::tcp_leg::SEND_QUEUE_PACKETS + 1).filter(|_| sender.try_send(Bytes::new())).count();
+        assert_eq!(room, i3t_underlay::tcp_leg::SEND_QUEUE_PACKETS, "TCP 的待发队列一个位置都没有被占");
+        slot.set_hop(Hop::Local);
+        assert!(!slot.is_direct() && !slot.send_direct(&shared, &packets), "对端挂在本节点自己的 relay 上");
+
+        slot.set_hop(Hop::Direct(receiver.local_addr()));
+        assert!(slot.is_direct() && slot.send_direct(&shared, &packets), "直连");
+        slot.set_hop(Hop::None);
+        assert!(!slot.is_direct(), "路没了，直连的标记跟着清掉");
     }
 
     #[tokio::test]

@@ -154,7 +154,7 @@ pub(crate) struct Session {
     /// 线上的字节数（整个封好的包）。
     sent_bytes: AtomicU64,
     received_bytes: AtomicU64,
-    /// 没有发出去就丢掉的包数：端口忙着、经 TCP 中转时队列满了，或者当时没有路。
+    /// 没有发出去就丢掉的包数：端口忙着，或者封好之后到对端刚好不再是直连。
     unsent: AtomicU64,
 }
 
@@ -356,14 +356,16 @@ impl Batch {
         self.ended || self.packets >= limit
     }
 
-    /// 把攒着的交给路径层，然后清空。发不出去的（端口忙着、经 TCP 中转时队列满了、没有路）就丢了：
+    /// 把攒着的交给路径层，然后清空。发不出去的（端口忙着，或者到对端刚好不再是直连）就丢了：
     /// 这里没有队列可排，包里面的协议自己会重传、会降速。
     pub(crate) fn send(&mut self, paths: &Paths) {
         let Some((peer, session)) = self.to.take() else { return };
         let segment_size = (self.packets > 1).then_some(self.stride);
-        let unsent = paths.send_or_drop(peer, &Packets { contents: &self.contents, segment_size, ecn: None });
-        session.sent(self.contents.len() - unsent.bytes);
-        session.not_sent(unsent.packets);
+        if paths.send_direct(peer, &Packets { contents: &self.contents, segment_size, ecn: None }) {
+            session.sent(self.contents.len());
+        } else {
+            session.not_sent(self.packets);
+        }
         self.contents.clear();
         self.packets = 0;
         self.ended = false;

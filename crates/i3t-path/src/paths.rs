@@ -28,7 +28,7 @@ use crate::diag::{
     DirectAttempt, DirectFailure, HopReport, Pin, RouteDecision, Side, TestPath, TestSpec, TrainError, TrainReport, TrainSpec,
 };
 use crate::report::{BackboneRow, PathReport};
-use crate::table::{Clock, Packets, PeerSlot, Shared, Table, Unsent};
+use crate::table::{Clock, Packets, PeerSlot, Shared, Table};
 use crate::{LocalRelay, RouteChange, Status};
 
 /// 交给控制任务的内部事件最多攒多少。
@@ -246,27 +246,22 @@ impl Paths {
         }
     }
 
-    /// 把一批丢了也没关系的包发给 `peer`，不等：端口忙着、经 TCP 中转时队列满了，或者没有路，发不出去的就丢掉。
-    /// 返回没有发出去的那一部分。
+    /// 到 `peer` 现在是不是直连：包直接发到它的地址上，不经任何 relay。不认识这个对端、没有路时是 `false`。
+    #[must_use]
+    pub fn is_direct(&self, peer: NodeId) -> bool {
+        self.shared.table().peers.get(&peer).is_some_and(|slot| slot.is_direct())
+    }
+
+    /// 把一批丢了也没关系的包直接发到 `peer` 的地址上，不等。到它现在不是直连，或者端口忙着，这一批就丢掉。
+    /// 返回发出去了没有。
+    ///
+    /// 这种包没有人管它的量，所以只走直连；到对端的路经 relay 时（先问 [`is_direct`](Self::is_direct)），
+    /// 调用方该把东西交给有拥塞控制的连接，经 [`try_send`](Self::try_send) 发。
     ///
     /// 不等 [`writable`](Self::writable) 的调用方用这个，不用 [`try_send`](Self::try_send)：那个入口说过一次"现在发不了"之后，
     /// 要等到有人等来了可写才会再去问内核。
-    pub fn send_or_drop(&self, peer: NodeId, packets: &Packets<'_>) -> Unsent {
-        let table = self.shared.table();
-        match table.peers.get(&peer) {
-            Some(slot) => slot.send_or_drop(&self.shared, packets),
-            None => Unsent::all(packets),
-        }
-    }
-
-    /// 到 `peer` 的包现在是不是装在一条 TCP 里走：本节点到 relay 的那一段是 TCP，或者本节点自己是 relay、对端经 TCP 挂在上面。
-    /// 不认识这个对端、没有路时是 `false`。
-    ///
-    /// 那一段是一条可靠的流，有它自己的重传和拥塞控制。没有人管量的包（[`send_or_drop`](Self::send_or_drop) 发的那种）
-    /// 把它灌满之后，同一条流上的东西都跟着晚到；量要有人管着才不会这样，所以连接层这时不该用那个入口发大量的包。
-    #[must_use]
-    pub fn carried_in_tcp(&self, peer: NodeId) -> bool {
-        self.shared.table().peers.get(&peer).is_some_and(|slot| slot.carried_in_tcp(&self.shared))
+    pub fn send_direct(&self, peer: NodeId, packets: &Packets<'_>) -> bool {
+        self.shared.table().peers.get(&peer).is_some_and(|slot| slot.send_direct(&self.shared, packets))
     }
 
     /// 等到可以再发。可以有多个任务同时等。

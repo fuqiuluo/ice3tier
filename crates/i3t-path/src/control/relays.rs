@@ -364,9 +364,6 @@ impl Control {
                 entry.link.set_wanted(want, now, &mut wire);
             }
             let urgent = table::unanswered(&shared.clock, &entry.slot.last_tx, &entry.slot.last_rx);
-            if let Some(heard) = entry.slot.last_rx_tcp.elapsed(&shared.clock).and_then(|ago| now.checked_sub(ago)) {
-                entry.link.heard_on_tcp(heard);
-            }
             entry.link.poll(now, who, urgent, survey, backbone, &mut wire);
         }
         self.sync_relay_targets();

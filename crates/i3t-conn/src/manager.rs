@@ -738,11 +738,9 @@ impl Manager {
     fn send_packet(&self, peer: NodeId, frame: Bytes, hold: Hold) -> Result<(), DatagramSendError> {
         let conn = self.preferred(peer).ok_or(DatagramSendError::NotConnected(peer))?;
         match &conn.sealed {
-            // 到对端的路装在一条 TCP 里（到 relay 的 TCP 中转）时不这样发，照旧作为连接的数据报：那一段是可靠的流，
-            // 不受连接的拥塞控制管的包把它灌满之后，数据一直排到线路的缓冲区里，同一条 TCP 上到 relay 的保活和连接自己的包
-            // 都跟着晚到。实测 2 Mbit/s 的线上灌 20 Mbit/s 的 UDP：ping 的延迟 0.9 秒，到 relay 的 TCP 还会被当作断了拆掉；
-            // 走数据报是 0.14 秒，因为连接的拥塞控制不让那条流排满。对端收哪一种都一样，所以可以一个包一个包地定。
-            Some(session) if !self.paths.carried_in_tcp(peer) => self.send_sealed(peer, &conn, session, &frame, hold)?,
+            // 只在到对端是直连的时候这样发。经 relay 的路上可能有一段是 TCP，这种不受连接的拥塞控制管的包会把它灌满
+            // （见 `Paths::send_direct`）：那时照旧作为连接的数据报，量有连接管着。对端收哪一种都一样，所以一个包一个包地定。
+            Some(session) if self.paths.is_direct(peer) => self.send_sealed(peer, &conn, session, &frame, hold)?,
             // 连接的数据报由 QUIC 库自己成批地发，这里不用攒。
             Some(_) | None => {
                 let len = frame.len();

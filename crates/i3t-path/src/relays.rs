@@ -275,13 +275,6 @@ impl RelayLink {
         }
     }
 
-    /// 本节点拨给它的那条 TCP 上在 `at` 读到了东西：TCP 上的会话判断保活有没有回应时要知道（见 [`Session::heard`]）。
-    pub(crate) fn heard_on_tcp(&mut self, at: Instant) {
-        if let Some(tcp) = &mut self.tcp {
-            tcp.session.heard(at);
-        }
-    }
-
     /// netmap 更新了这个 relay 的信息。正在用的地址不在新的列表里也接着用：它还通着；会话断了之后才只试新的。
     pub(crate) fn update(&mut self, relay: &Relay) {
         self.key = relay.key;

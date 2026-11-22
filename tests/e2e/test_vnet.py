@@ -12,8 +12,9 @@
 - rules：访问规则只允许 a 访问 b：a 发起的照常（TCP、ping、UDP 的问答，比 MTU 大、切成了片的也通），b 发起的连不上；
   对端发来的新会话在本节点被丢掉。
 - relay：两个节点之间不通，经 relay：ping 和 20MB。
-- tcp_relay：一端用不了 UDP，连接经 relay 的 TCP 中转：ping 和 20MB；线路限到 2 Mbit/s、两个方向各灌 20 Mbit/s 的 UDP 时，
-  到 relay 的那条 TCP 不被当作断了。
+- tcp_relay：一端用不了 UDP，连接经 relay 的 TCP 中转：ping 和 20MB。
+- tcp_relay_flood：同上，那一端的线路只有 2 Mbit/s：两个方向各灌 20 Mbit/s 的 UDP 时，到 relay 的那条 TCP 不被当作断了，
+  灌完之后两秒之内 ping 又通。
 - nat：两端都在 NAT 后面：ping 和 20MB。
 - firewall：开关开着时，默认拒绝入站的防火墙（iptables 的 INPUT 策略是 DROP）也让别的节点进来；从真网卡来、冒充虚拟 IP 的包被丢掉。
   开关关着时 `nft list ruleset` 和 `iptables-save` 装之前、装着、拆之后都一样，冒充的包照样进来（防火墙由这台机器自己管）。
@@ -234,8 +235,9 @@ while (now := time.monotonic() - start) < seconds:
 def survives_flood(t: Checks, sender: Node, target: Node, leg: Node, what: str) -> None:
     """`sender` 经虚拟网卡往 `target` 灌一条比线路宽十倍的 UDP 流：`leg` 到 relay 的那条 TCP 不能因此被当作断了。
 
-    这样的流的量没有人管（包不进连接，连接的拥塞控制管不着）。它和到 relay 的保活排在一条队里的话，保活进不来，
-    连续三次没有回音那条 TCP 就被拆掉重连，每六七秒一次。"""
+    经 relay 的路上网络包是连接的数据报，量有连接的拥塞控制管着。要是不进连接、单独封好了就发（直连时是这样），
+    没有人管量的包会把这条 TCP 灌满：到 relay 的保活等不到回答，连续三次那条 TCP 就被拆掉重连，每六七秒一次；
+    不拆的话里面的东西也要晚几秒才到。"""
     mark = len(leg.read_log())
     sender.host.run(sys.executable, "-c", UDP_FLOOD, target.virtual_ip, "20", "20")
     during = leg.read_log()[mark:]
@@ -273,11 +275,28 @@ def tcp_relay(lab: Lab, work: Path, t: Checks) -> None:
     if installed(t, a, b):
         wait_until(lambda: "经 TCP" in b.read_log() or "TCP" in b.read_log(), timeout=20, what="b 经 TCP 挂上 relay")
         carried(t, a, b, "经 TCP 中转")
-        b_host.shape(Shape(rtt_ms=20, rate_mbit=2))
-        survives_flood(t, b, a, b, "b 往外灌（占的是它自己那条 TCP 的待发队列）")
-        survives_flood(t, a, b, b, "a 往 b 灌（占的是 relay 发给 b 的那条队列）")
+    if t.failures:
+        print(tail(a.read_log(), 20), tail(b.read_log()), sep="\n  ---\n")
+
+
+def tcp_relay_flood(lab: Lab, work: Path, t: Checks) -> None:
+    """b 用不了 UDP，线路只有 2 Mbit/s：经虚拟网卡灌一条宽十倍的 UDP 流，它到 relay 的那条 TCP 不被当作断了。"""
+    a_host, b_host = lab.host("a"), lab.host("b")
+    b_host.block_udp()
+    # 从一开始就限着。先跑满再限的话，连接的拥塞控制还记着原来的带宽，限下来的头几秒照那个数发，那是另一回事。
+    b_host.shape(Shape(rtt_ms=20, rate_mbit=2))
+    a, b, _ = relayed_pair(lab, work, a_host=a_host, b_host=b_host)
+    if installed(t, a, b):
+        wait_until(lambda: "中转会话建立（TCP）" in b.read_log(), timeout=20, what="b 经 TCP 挂上 relay")
+        t.check("灌之前 ping 通", received(ping(b, a.virtual_ip, count=3)) >= 2)
+        survives_flood(t, b, a, b, "b 往外灌（它自己到 relay 的那条 TCP）")
+        survives_flood(t, a, b, b, "a 往 b 灌（relay 发给 b 的那条 TCP）")
         b_host.shape(None)
-        t.check("灌完之后 ping 照通", received(ping(b, a.virtual_ip, count=3)) >= 2)
+        # 线路上排着的东西要一点时间走完。没有人管量的包灌过的话要好几秒，这里只给两秒。
+        deadline = time.monotonic() + 2
+        while not (back := received(ping(b, a.virtual_ip, "-W", "1", count=1)) == 1) and time.monotonic() < deadline:
+            pass
+        t.check("灌完之后两秒之内 ping 又通", back)
     if t.failures:
         print(tail(a.read_log(), 20), tail(b.read_log()), sep="\n  ---\n")
 
@@ -882,7 +901,7 @@ def legacy(lab: Lab, work: Path, t: Checks) -> None:
 
 
 SCENARIOS = {
-    "basics": basics, "rules": rules, "relay": relay, "tcp_relay": tcp_relay, "nat": nat, "firewall": firewall, "privilege": privilege,
+    "basics": basics, "rules": rules, "relay": relay, "tcp_relay": tcp_relay, "tcp_relay_flood": tcp_relay_flood, "nat": nat, "firewall": firewall, "privilege": privilege,
     "overlap": overlap, "appears": appears, "leftover": leftover, "restart": restart, "mtu": mtu, "forward": forward,
     "lan": lan, "lan_iptables": lan_iptables, "hostile": hostile, "managed": managed, "legacy": legacy,
 }
