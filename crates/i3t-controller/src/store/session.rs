@@ -10,10 +10,12 @@
 //! 等都有期限：连不上（包括连上了端口、对面却不答话）等到 [`connect_limit`]，一条语句等回答等到
 //! [`RESPONSE_TIMEOUT`]。调用方是拿着 controller 的锁在等的，没有期限的话，一个不答话的数据库就能把它卡死。
 //!
-//! 丢掉 [`Session`] 就是关连接：`Client` 没了，`Connection` 随之结束，那条线程跟着退出。
+//! 丢掉 [`Session`] 就是关连接：`Client` 没了，`Connection` 向数据库说完再见就结束，那条线程跟着退出。
+//! 有请求还没等到回答时也关得掉，只是不再等那个回答（见 [`drive`]）。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::pin;
@@ -22,6 +24,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
+use tokio::sync::oneshot;
 use tokio_postgres::error::Severity;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, Row, Statement};
@@ -42,6 +45,9 @@ pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 等驱动线程交回连接比 [`connect_limit`] 多等的一点：正常情况下它自己会在期限到时说没连上。
 const HANDOVER_MARGIN: Duration = Duration::from_secs(5);
 
+/// [`Session`] 被丢掉之后，连接向数据库说再见最多给这么久。平时那是一眨眼的事。
+const GOODBYE: Duration = Duration::from_secs(1);
+
 /// 整个建连最多花多久：找地址、连上、认证，都算在里面。`tokio-postgres` 自己的 `connect_timeout` 只管连上端口
 /// 那一步，对面接了连接却不答话时它一直等。连接串里写了几个主机就给几份。
 pub(super) fn connect_limit(config: &Config) -> Duration {
@@ -59,6 +65,8 @@ pub(super) struct Session {
     /// `Client` 自己要等驱动线程退出才知道连接断了，中间那一小会儿发出去的请求只会白白失败。
     broken: Cell<bool>,
     response_timeout: Cell<Duration>,
+    /// 不往里放东西：这一头和 `Session` 一起没了，驱动线程由此知道这条连接没人用了（见 [`drive`]）。
+    _in_use: oneshot::Sender<Infallible>,
 }
 
 impl Session {
@@ -66,6 +74,7 @@ impl Session {
     pub(super) fn connect(config: &Config) -> Result<Self, StoreError> {
         let limit = connect_limit(config);
         let (sender, receiver) = mpsc::channel();
+        let (in_use, dropped) = oneshot::channel();
         let config = config.clone();
         let drive = move || {
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -83,9 +92,7 @@ impl Session {
                         if sender.send(Ok(client)).is_err() {
                             return;
                         }
-                        if let Err(error) = connection.await {
-                            tracing::warn!(%error, "和数据库的连接断了");
-                        }
+                        drive(connection, dropped).await;
                     }
                     Ok(Err(error)) => {
                         let _ = sender.send(Err(StoreError::Connect(error)));
@@ -104,7 +111,13 @@ impl Session {
                 return Err(StoreError::Driver(io::Error::other("照看数据库连接的线程没有回音就退出了")));
             }
         };
-        Ok(Self { client, statements: RefCell::default(), broken: Cell::new(false), response_timeout: Cell::new(RESPONSE_TIMEOUT) })
+        Ok(Self {
+            client,
+            statements: RefCell::default(),
+            broken: Cell::new(false),
+            response_timeout: Cell::new(RESPONSE_TIMEOUT),
+            _in_use: in_use,
+        })
     }
 
     /// 连接已经不能用了：之后的请求都会失败，要换一条新的。
@@ -185,6 +198,25 @@ impl Session {
     }
 }
 
+/// 照看一条连接（读写它的套接字），到它结束为止。
+///
+/// 平时它是这样结束的：`Client` 被丢掉，连接向数据库说完再见，自己结束。但只要还有请求没等到回答，连接就接着等；
+/// 数据库不答话（[`Session`] 正是因为这个才被丢掉的），它会一直等下去，套接字开着，数据库那边没做完的事务和它的锁也都留着。
+/// 所以 `Session` 没了之后只再给它 [`GOODBYE`] 这么久，过了就把连接丢掉：套接字随之关上，数据库由此知道对面走了。
+async fn drive(connection: impl Future<Output = Result<(), tokio_postgres::Error>>, dropped: oneshot::Receiver<Infallible>) {
+    let mut connection = pin!(connection);
+    let ended = tokio::select! {
+        ended = &mut connection => Some(ended),
+        // 那一头不放东西，这里等到的只会是它没了。
+        _ = dropped => tokio::time::timeout(GOODBYE, &mut connection).await.ok(),
+    };
+    match ended {
+        Some(Ok(())) => {}
+        Some(Err(error)) => tracing::warn!(%error, "和数据库的连接断了"),
+        None => tracing::warn!("数据库一直不回答，不等它了：直接关掉这条连接"),
+    }
+}
+
 /// 这次失败之后连接是不是完了：已经断了，读写套接字出了错，或者数据库说了 FATAL（它说完就会关掉这条连接）。
 fn ends_connection(error: &tokio_postgres::Error) -> bool {
     error.is_closed()
@@ -217,5 +249,64 @@ fn wait<F: Future>(future: F, limit: Duration) -> Option<F::Output> {
         let left = deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero())?;
         // `park_timeout` 可以无故返回，也可能是别处留下的一次叫醒：所以每次醒来都回去再问一遍。
         thread::park_timeout(left);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    use super::*;
+
+    /// "再见"这条消息。
+    const TERMINATE: &[u8] = b"X\0\0\0\x04";
+
+    /// 只会打招呼的"数据库"：连接建得起来，之后发什么都不答。
+    /// 返回的线程读到对面关了连接才结束，交出打完招呼之后收到的全部字节。
+    fn server_that_only_greets() -> (Config, JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = Config::new();
+        config.host("127.0.0.1").port(listener.local_addr().unwrap().port()).user("i3t").dbname("i3t");
+        let serve = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut chunk = [0; 1024];
+            assert!(stream.read(&mut chunk).unwrap() > 0, "启动消息");
+            // "认证通过"，"可以发语句了"。
+            stream.write_all(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I").unwrap();
+            let mut received = Vec::new();
+            while let Ok(read @ 1..) = stream.read(&mut chunk) {
+                received.extend_from_slice(&chunk[..read]);
+            }
+            received
+        });
+        (config, serve)
+    }
+
+    #[test]
+    fn dropping_an_idle_connection_says_goodbye() {
+        let (config, server) = server_that_only_greets();
+        drop(Session::connect(&config).unwrap());
+        assert_eq!(server.join().unwrap(), TERMINATE);
+    }
+
+    #[test]
+    fn dropping_a_connection_closes_it_even_when_a_statement_was_never_answered() {
+        let (config, server) = server_that_only_greets();
+        let session = Session::connect(&config).unwrap();
+        session.set_response_timeout(Duration::from_millis(100));
+        assert!(matches!(session.batch("SELECT 1"), Err(StoreError::Unresponsive(_))));
+        assert!(session.is_closed());
+
+        // 那个回答永远不会来，连接自己会一直等它。丢掉之后不能接着等：套接字得关上，对面才知道这边走了。
+        let dropped = Instant::now();
+        drop(session);
+        while !server.is_finished() {
+            assert!(dropped.elapsed() < Duration::from_secs(10), "连接还开着");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let received = server.join().unwrap();
+        assert!(!received.is_empty() && !received.ends_with(TERMINATE), "语句发出去了，再见来不及说：{received:?}");
     }
 }

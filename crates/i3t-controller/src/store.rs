@@ -164,7 +164,9 @@ enum Transaction {
 
 pub struct Store {
     database: Database,
-    session: RefCell<Session>,
+    /// 现在用着的连接。发现它不能用了就马上丢掉、留空，不等到下一次连上才换：丢掉就是关套接字，数据库那边由此撤销
+    /// 它没做完的事务、放开它的锁。留着的话，这个 `Store` 闲着或者一直连不上的那段时间里，那些锁就一直占着。
+    session: RefCell<Option<Session>>,
     transaction: Cell<Transaction>,
     /// 等锁平时肯等多久。
     lock_patience: Cell<Duration>,
@@ -221,7 +223,7 @@ impl Store {
         migrate(&session, migrations, missing)?;
         Ok(Self {
             database: database.clone(),
-            session: RefCell::new(session),
+            session: RefCell::new(Some(session)),
             transaction: Cell::new(Transaction::None),
             lock_patience: Cell::new(LOCK_TIMEOUT),
             impatient_until: Cell::new(None),
@@ -277,7 +279,7 @@ impl Store {
         self.lock_patience.set(timeout);
         self.impatient_until.set(None);
         self.impatient.set(false);
-        self.session.borrow().set_lock_timeout(timeout).unwrap();
+        self.on_session(|session| session.set_lock_timeout(timeout)).unwrap();
     }
 
     /// 测试用：到现在为止有几条语句是把等锁的期限等满了才失败的。每一条都是拿着 controller 的锁白等的一段时间；
@@ -287,10 +289,10 @@ impl Store {
         self.lock_waits.get()
     }
 
-    /// 测试用：一条语句等回答只等这么久。
+    /// 测试用：现在这条连接上，一条语句等回答只等这么久。
     #[cfg(test)]
     pub(crate) fn set_response_timeout(&self, timeout: Duration) {
-        self.session.borrow().set_response_timeout(timeout);
+        self.session.borrow().as_ref().expect("连接还在").set_response_timeout(timeout);
     }
 
     /// 测试用：直接执行几条 SQL。
@@ -343,7 +345,7 @@ impl Store {
             self.reconnect_if_closed()?;
             self.settle_lock_timeout()?;
         }
-        let result = f(&self.session.borrow());
+        let result = self.on_session(f);
         if let Err(error) = &result {
             if self.transaction.get() == Transaction::Open {
                 self.transaction.set(Transaction::Failed);
@@ -358,10 +360,28 @@ impl Store {
         result
     }
 
-    /// 连接不能用了的话换一条新的。刚试过没连上的那一小会儿里不去连，直接说连不上。
+    /// 在现在这条连接上做一件事，没有连接就是 [`StoreError::Disconnected`]。做完连接不能用了的话马上丢掉它。
+    fn on_session<T>(&self, f: impl FnOnce(&Session) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        let mut current = self.session.borrow_mut();
+        let Some(session) = current.as_ref() else {
+            return Err(StoreError::Disconnected);
+        };
+        let result = f(session);
+        if session.is_closed() {
+            *current = None;
+        }
+        result
+    }
+
+    /// 没有能用的连接的话连一条新的。刚试过没连上的那一小会儿里不去连，直接说连不上。
     fn reconnect_if_closed(&self) -> Result<(), StoreError> {
-        if !self.session.borrow().is_closed() {
-            return Ok(());
+        {
+            let mut current = self.session.borrow_mut();
+            if current.as_ref().is_some_and(|session| !session.is_closed()) {
+                return Ok(());
+            }
+            // 闲着的时候断的，现在才看见。
+            *current = None;
         }
         if self.reconnect_after.get().is_some_and(|after| Instant::now() < after) {
             return Err(StoreError::Disconnected);
@@ -373,7 +393,7 @@ impl Store {
         });
         match connected {
             Ok(session) => {
-                *self.session.borrow_mut() = session;
+                *self.session.borrow_mut() = Some(session);
                 self.reconnect_after.set(None);
                 self.impatient.set(false);
                 tracing::info!("重新连上了数据库");
@@ -392,7 +412,7 @@ impl Store {
         let impatient = self.impatient_until.get().is_some_and(|until| Instant::now() < until);
         if impatient != self.impatient.get() {
             let timeout = if impatient { NO_LOCK_WAIT } else { self.lock_patience.get() };
-            self.session.borrow().set_lock_timeout(timeout)?;
+            self.on_session(|session| session.set_lock_timeout(timeout))?;
             self.impatient.set(impatient);
         }
         Ok(())
@@ -440,7 +460,7 @@ impl OpenTransaction<'_> {
         if self.0.transaction.get() == Transaction::Failed {
             return Err(StoreError::Aborted);
         }
-        match self.0.session.borrow().batch("COMMIT") {
+        match self.0.on_session(|session| session.batch("COMMIT")) {
             Ok(()) => {
                 self.0.transaction.set(Transaction::None);
                 Ok(())
@@ -459,8 +479,8 @@ impl OpenTransaction<'_> {
 impl Drop for OpenTransaction<'_> {
     fn drop(&mut self) {
         if self.0.transaction.replace(Transaction::None) != Transaction::None {
-            // 撤销不了只会是连接断了，那样数据库已经自己撤销了这个事务。
-            let _ = self.0.session.borrow().batch("ROLLBACK");
+            // 撤销不了只会是连接断了或者已经被丢掉了，那样数据库自己会撤销这个事务。
+            let _ = self.0.on_session(|session| session.batch("ROLLBACK"));
         }
     }
 }
@@ -763,6 +783,36 @@ mod tests {
         assert!(matches!(error, StoreError::Unresponsive(_)) && error.is_database_wide(), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "下一次读写换了一条新连接");
+    }
+
+    #[test]
+    fn a_connection_that_stopped_answering_is_dropped_at_once_and_its_transaction_lets_go_of_its_locks() {
+        let scratch = Scratch::new();
+        let mut store = Store::open(&scratch.database()).unwrap();
+        store.set_meta("k", b"v").unwrap();
+        let other = Store::open(&scratch.database()).unwrap();
+        let backend = number(&store, "SELECT pg_backend_pid()::bigint");
+        let still_there = format!("SELECT COUNT(*) FROM pg_stat_activity WHERE pid = {backend}");
+        assert_eq!(number(&other, &still_there), 1);
+
+        // 事务里先占住一行，接着的一条语句在期限里等不到回答。
+        store.set_response_timeout(Duration::from_millis(200));
+        let outcome: Result<(), StoreError> = store.atomically(|store| {
+            store.set_meta("k", b"w")?;
+            store.execute("SELECT pg_sleep(2)", &[]).map(|_| ())
+        });
+        assert!(matches!(outcome.unwrap_err(), StoreError::Unresponsive(_)));
+        assert!(store.session.borrow().is_none(), "不能用的连接当场就丢掉");
+
+        // 之后没有人再用这个 `Store`，也就没有人去重新连。数据库那边照样发现对面走了：那条连接结束，事务撤销，锁放开。
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while number(&other, &still_there) != 0 {
+            assert!(Instant::now() < deadline, "那条连接还留在数据库那边，占着它的锁");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        other.set_lock_timeout(Duration::from_millis(500));
+        other.set_meta("k", b"x").unwrap();
+        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"x".as_slice()), "再用的时候连一条新的");
     }
 
     #[test]
