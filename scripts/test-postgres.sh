@@ -63,6 +63,18 @@ as_server_user() {
     fi
 }
 
+# 删掉数据目录。用 docker 起过的话，里面的套接字归容器里的 postgres 用户，目录也被它改成了只有属主能删：
+# 自己删不掉时借一个容器来删。
+remove_dir() {
+    if rm -rf "$DIR" 2>/dev/null; then
+        return 0
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        docker run --rm -v "$(dirname "$DIR"):/parent" --entrypoint rm "$IMAGE" -rf "/parent/$(basename "$DIR")" >/dev/null 2>&1 || true
+    fi
+    [ ! -e "$DIR" ] || die "删不掉 $DIR"
+}
+
 # 套接字所在的目录写进连接串时，斜杠要写成 %2F。
 socket_host() {
     printf '%s' "$DIR" | sed 's|/|%2F|g'
@@ -84,7 +96,7 @@ start_native() {
     if [ -f "$data/PG_VERSION" ] && as_server_user "'$bin/pg_ctl' -D '$data' status" >/dev/null 2>&1; then
         return 0
     fi
-    rm -rf "$DIR"
+    remove_dir
     mkdir -p "$DIR"
     if [ "$(id -u)" = 0 ]; then
         id postgres >/dev/null 2>&1 || die "以 root 运行时要有 postgres 这个用户"
@@ -107,7 +119,7 @@ start_docker() {
         return 0
     fi
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    rm -rf "$DIR"
+    remove_dir
     mkdir -p "$DIR"
     # 容器里的 postgres 用户要能在这个目录里建套接字。
     chmod 777 "$DIR"
@@ -142,7 +154,7 @@ stop() {
     if command -v docker >/dev/null 2>&1; then
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     fi
-    rm -rf "$DIR"
+    remove_dir
 }
 
 # 找一个能用的 psql：PATH 里的，PostgreSQL 的程序目录里的，或者容器里的。
