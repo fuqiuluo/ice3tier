@@ -17,7 +17,6 @@ use crate::access::AccessMap;
 use crate::error::Error;
 use crate::netmap::{NetworkView, Relation};
 use crate::secret;
-use crate::store::Unsettled;
 use crate::sync::NodeSync;
 
 /// 延后的重算失败之后多久再试。
@@ -176,17 +175,14 @@ impl Inner {
     }
 
     fn settle_commits_now(&mut self, now: Instant) -> Result<Option<Instant>, Error> {
-        match self.store.settle_commits()? {
-            Unsettled::Nothing => {}
-            Unsettled::Pending => return Ok(Some(now + RETRY_DELAY)),
-            Unsettled::Settled { committed } => self.out_of_step |= committed,
-        }
+        let settled = self.store.settle_commits()?;
+        self.out_of_step |= settled.committed;
         if self.out_of_step {
             tracing::warn!("有一次提交当时不知道结果，现在查到它算了数：照数据库现在的样子重算各个网络");
             self.catch_up_with_store()?;
             self.out_of_step = false;
         }
-        Ok(None)
+        Ok(settled.pending.then(|| now + RETRY_DELAY))
     }
 
     /// 照数据库现在的样子把内存里跟着它的状态补齐：数据库里已经没有的节点断开、忘掉，管理令牌按库里记的来，

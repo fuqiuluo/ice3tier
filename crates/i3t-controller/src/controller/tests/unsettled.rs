@@ -11,10 +11,14 @@ use crate::store::{Database, Scratch, Store, StoreError};
 
 const ADDR: &str = "ctl.example.com:20331";
 
-/// `table` 上有 `change`（比如 `DELETE`）的事务，提交要做上一阵：推迟到提交时才跑的触发器里睡一觉。
-fn stall_commits(database: &Database, change: &str, table: &str) {
+/// 提交要做上多久。比 controller 肯等的（[`be_impatient`]）长得多，所以它等不到回答；又不长，测试等得起它做完。
+const STALL: Duration = Duration::from_secs(1);
+
+/// `table` 上有 `change`（比如 `DELETE`）的事务，提交要做上 `stall` 这么久：推迟到提交时才跑的触发器里睡一觉。
+fn stall_commits(database: &Database, change: &str, table: &str, stall: Duration) {
+    let seconds = stall.as_secs_f64();
     Store::open(database).unwrap().execute_batch(&format!(
-        "CREATE FUNCTION stall() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NULL; END $$;
+        "CREATE FUNCTION stall() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep({seconds}); RETURN NULL; END $$;
          CREATE CONSTRAINT TRIGGER stall AFTER {change} ON {table} DEFERRABLE INITIALLY DEFERRED
              FOR EACH ROW EXECUTE FUNCTION stall();"
     ));
@@ -63,7 +67,7 @@ fn a_rule_deleted_by_a_commit_whose_answer_was_lost_is_still_taken_away_from_the
     let (lab, network, mut a, mut b) = two_members(&database, dir.path());
     let rule = lab.controller.rules(network).unwrap().remove(0);
 
-    stall_commits(&database, "DELETE", "rules");
+    stall_commits(&database, "DELETE", "rules", STALL);
     be_impatient(&lab);
     let error = lab.controller.delete_rule(network, rule.id).unwrap_err();
     assert!(is_unknown(&error), "{error:?}");
@@ -86,7 +90,7 @@ fn a_node_deleted_by_a_commit_whose_answer_was_lost_is_still_revoked() {
     let database = scratch.database();
     let (lab, network, mut a, mut b) = two_members(&database, dir.path());
 
-    stall_commits(&database, "DELETE", "nodes");
+    stall_commits(&database, "DELETE", "nodes", STALL);
     be_impatient(&lab);
     let error = lab.controller.delete_node(network, b.id).unwrap_err();
     assert!(is_unknown(&error), "{error:?}");
@@ -110,7 +114,7 @@ fn an_admin_token_changed_by_a_commit_whose_answer_was_lost_is_the_one_in_force(
     let old = opened.admin_token.unwrap();
     let lab = Lab::around(opened.controller);
 
-    stall_commits(&database, "INSERT OR UPDATE", "meta");
+    stall_commits(&database, "INSERT OR UPDATE", "meta", STALL);
     be_impatient(&lab);
     let error = lab.controller.issue_admin_token().unwrap_err();
     assert!(is_unknown(&error), "{error:?}");
@@ -133,13 +137,15 @@ fn a_commit_whose_answer_was_lost_and_that_did_not_count_changes_nothing() {
     let rule = lab.controller.rules(network).unwrap().remove(0);
 
     // 提交做到一半，数据库那边把这条连接掐了：事务没有算数。这边只知道回答没有回来。
-    stall_commits(&database, "DELETE", "rules");
+    // 掐它用的连接事先开好，提交又要做上一分钟：不管机器多慢，掐的时候它一定还没做完。掐了它就停，测试不用等这一分钟。
+    stall_commits(&database, "DELETE", "rules", Duration::from_secs(60));
+    let killer = Store::open(&database).unwrap();
     let backend = lab.controller.lock().store.backend();
     be_impatient(&lab);
     let sent = a.snapshots.len() + b.snapshots.len();
     let error = lab.controller.delete_rule(network, rule.id).unwrap_err();
     assert!(is_unknown(&error), "{error:?}");
-    Store::open(&database).unwrap().execute_batch(&format!("SELECT pg_terminate_backend({backend})"));
+    killer.execute_batch(&format!("SELECT pg_terminate_backend({backend})"));
 
     tick_until_settled(&lab);
     lab.settle(&mut [&mut a, &mut b]);

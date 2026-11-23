@@ -157,15 +157,13 @@ impl fmt::Debug for Database {
     }
 }
 
-/// 结果不明的提交（[`StoreError::CommitUnknown`]）后来怎么样了。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unsettled {
-    /// 没有这样的提交。
-    Nothing,
-    /// 数据库那边还没做完：过一会儿再问。
-    Pending,
-    /// 都有了结果。`committed` 是里面有没有算了数的：有的话，数据库里已经是改过的样子。
-    Settled { committed: bool },
+/// 去问结果不明的提交（[`StoreError::CommitUnknown`]）后来怎么样了，问到的。没有这样的提交时两样都是 `false`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Settled {
+    /// 这一次问出了结果的提交里有算了数的：数据库里已经是改过的样子。
+    pub(crate) committed: bool,
+    /// 还有数据库那边没做完的：还记着它们，过一会儿再问。
+    pub(crate) pending: bool,
 }
 
 /// 事务进行到哪了。
@@ -293,35 +291,35 @@ impl Store {
         self.unsettled_wake = Some(wake);
     }
 
-    /// 去问数据库，结果不明的那些提交后来怎么样了。都有了结果就不再记着它们。
+    /// 去问数据库，结果不明的那些提交后来怎么样了。有了结果的不再记着；数据库那边还没做完的留着，下次再问。
     ///
     /// # Errors
     ///
-    /// 读数据库失败：过后再问。
-    pub(crate) fn settle_commits(&self) -> Result<Unsettled, StoreError> {
+    /// 读数据库失败。这一次问到的都不算，一个也没有忘掉：过后全部再问。
+    pub(crate) fn settle_commits(&self) -> Result<Settled, StoreError> {
         let transactions = self.unsettled.borrow().clone();
-        if transactions.is_empty() {
-            return Ok(Unsettled::Nothing);
-        }
-        let mut committed = false;
+        let mut settled = Settled::default();
+        let mut pending = Vec::new();
         for transaction in &transactions {
             let asked = self.query_one("SELECT pg_xact_status($1::text::xid8)", &[transaction], |row| row.try_get::<_, Option<String>>(0));
             let status = match asked {
                 Ok(status) => status,
-                // 数据库答了话，说这个编号它答不上来（库换成了另一份的话，这个编号在它那里还没有用到）。
-                Err(StoreError::Postgres(error)) if error.code().is_some() => None,
+                // 数据库说这个编号它还没有用到：库换成了另一份。只有这一种错是"答不上来"；别的（数据库正在关、
+                // 语句被取消、连接满了）是这一次没问成，事务可能还在做，不能就此忘了它。
+                Err(StoreError::Postgres(error)) if error.code() == Some(&SqlState::INVALID_PARAMETER_VALUE) => None,
                 Err(error) => return Err(error),
             };
             match status.as_deref() {
-                Some("in progress") => return Ok(Unsettled::Pending),
+                Some("in progress") => pending.push(transaction),
                 Some("aborted") => {}
-                // 答不上来的（还有太久以前的事务）：当它算了数，多核对一次没有坏处。
-                Some(_) | None => committed = true,
+                // 答不上来的（换了库，或者是太久以前的事务）：当它算了数，多核对一次没有坏处。
+                Some(_) | None => settled.committed = true,
             }
         }
-        // 只去掉问过的这几个：问的时候不在事务里，不会有新的加进来，可是不靠这个。
-        self.unsettled.borrow_mut().retain(|transaction| !transactions.contains(transaction));
-        Ok(Unsettled::Settled { committed })
+        settled.pending = !pending.is_empty();
+        // 只去掉这一次问出了结果的：问的时候不在事务里，不会有新的加进来，可是不靠这个。
+        self.unsettled.borrow_mut().retain(|transaction| pending.contains(&transaction) || !transactions.contains(transaction));
+        Ok(settled)
     }
 
     /// 测试用：有没有提交的结果还不知道。
@@ -962,14 +960,15 @@ mod tests {
         // 问得出来：数据库那边做完之前是"还没做完"，然后是"算了数"。
         let deadline = Instant::now() + Duration::from_secs(20);
         let answer = loop {
-            match store.settle_commits().unwrap() {
-                Unsettled::Pending => {}
-                answer => break answer,
+            let answer = store.settle_commits().unwrap();
+            if !answer.pending {
+                break answer;
             }
+            assert!(!answer.committed, "还没做完的不算有了结果");
             assert!(Instant::now() < deadline, "数据库那边应该提交了");
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert_eq!(answer, Unsettled::Settled { committed: true });
+        assert_eq!(answer, Settled { committed: true, pending: false });
         assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()));
         assert!(!store.has_unsettled_commits(), "问出了结果就不再记着");
     }
@@ -978,29 +977,66 @@ mod tests {
     fn what_became_of_a_transaction_is_asked_by_its_number() {
         let scratch = Scratch::new();
         let (store, other) = (Store::open(&scratch.database()).unwrap(), Store::open(&scratch.database()).unwrap());
-        assert_eq!(store.settle_commits().unwrap(), Unsettled::Nothing);
+        const NOTHING: Settled = Settled { committed: false, pending: false };
+        assert_eq!(store.settle_commits().unwrap(), NOTHING);
         let number = |store: &Store| store.query_one("SELECT pg_current_xact_id()::text", &[], |row| row.try_get::<_, String>(0)).unwrap();
 
         // 撤销了的。
         other.execute_batch("BEGIN");
         store.unsettled.borrow_mut().push(number(&other));
         other.execute_batch("ROLLBACK");
-        assert_eq!(store.settle_commits().unwrap(), Unsettled::Settled { committed: false });
+        assert_eq!(store.settle_commits().unwrap(), NOTHING, "没算数，等于什么都没发生");
         assert!(!store.has_unsettled_commits());
 
         // 还没做完的过后再问，这期间一直记着；做完了、算了数的。
         other.execute_batch("BEGIN");
         store.unsettled.borrow_mut().push(number(&other));
-        assert_eq!(store.settle_commits().unwrap(), Unsettled::Pending);
+        assert_eq!(store.settle_commits().unwrap(), Settled { committed: false, pending: true });
         assert!(store.has_unsettled_commits());
         other.execute_batch("COMMIT");
-        assert_eq!(store.settle_commits().unwrap(), Unsettled::Settled { committed: true });
-        assert_eq!(store.settle_commits().unwrap(), Unsettled::Nothing);
+        assert_eq!(store.settle_commits().unwrap(), Settled { committed: true, pending: false });
+        assert_eq!(store.settle_commits().unwrap(), NOTHING);
+
+        // 几个一起问：没做完的那个不耽误已经算了数的那个有结果，它自己留着下次再问。
+        let third = Store::open(&scratch.database()).unwrap();
+        other.execute_batch("BEGIN");
+        third.execute_batch("BEGIN");
+        let (still_running, done) = (number(&other), number(&third));
+        third.execute_batch("COMMIT");
+        store.unsettled.borrow_mut().extend([still_running.clone(), done]);
+        assert_eq!(store.settle_commits().unwrap(), Settled { committed: true, pending: true });
+        assert_eq!(*store.unsettled.borrow(), [still_running]);
+        other.execute_batch("ROLLBACK");
+        assert_eq!(store.settle_commits().unwrap(), NOTHING);
 
         // 数据库答不上来的编号（库换成了另一份的话，它在那里还没有用到）：当它算了数，多核对一次没有坏处。
         store.unsettled.borrow_mut().push(u64::MAX.to_string());
-        assert_eq!(store.settle_commits().unwrap(), Unsettled::Settled { committed: true });
+        assert_eq!(store.settle_commits().unwrap(), Settled { committed: true, pending: false });
         assert!(!store.has_unsettled_commits());
+    }
+
+    #[test]
+    fn a_question_that_could_not_be_asked_does_not_make_the_transaction_forgotten() {
+        // 问的那一下数据库出了别的错（这里是语句被取消；数据库正在关、连接满了也一样）：不是"这个编号查不到"。
+        // 事务可能还在做，就此当它算了数、不再记着它的话，提前核对读到的是旧的样子，之后也不会再核对。
+        // 把 pg_catalog 排在后面，就能用自己的一个同名函数顶替那个内置的来出这个错。
+        let scratch = Scratch::new();
+        let store = Store::open(&scratch.database_with_path(&[scratch.schema(), "pg_catalog"])).unwrap();
+        store.execute_batch(
+            "CREATE FUNCTION pg_xact_status(xid8) RETURNS text LANGUAGE plpgsql AS $$ BEGIN
+                 RAISE EXCEPTION '语句被取消了' USING ERRCODE = 'query_canceled';
+             END $$;",
+        );
+        store.execute_batch("BEGIN");
+        let running = store.query_one("SELECT pg_current_xact_id()::text", &[], |row| row.try_get::<_, String>(0)).unwrap();
+        store.unsettled.borrow_mut().push(running.clone());
+        store.execute_batch("COMMIT");
+
+        let error = store.settle_commits().unwrap_err();
+        assert!(matches!(&error, StoreError::Postgres(error) if error.code() == Some(&SqlState::QUERY_CANCELED)), "{error:?}");
+        assert_eq!(*store.unsettled.borrow(), [running], "还记着它");
+        store.execute_batch("DROP FUNCTION pg_xact_status(xid8)");
+        assert_eq!(store.settle_commits().unwrap(), Settled { committed: true, pending: false });
     }
 
     #[test]
