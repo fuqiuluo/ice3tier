@@ -31,7 +31,10 @@ services:
       - postgres:/var/lib/postgresql
       - postgres-socket:/var/run/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready --username i3t --dbname i3t"]
+      # On an empty volume the image first runs a temporary server, on this same socket, to create the user and the
+      # database, and stops it again. PID 1 is the image's start script meanwhile; it becomes postgres when the real
+      # server takes over. A server that answers before that is not the one to wait for.
+      test: ["CMD-SHELL", "[ \"$$(cat /proc/1/comm)\" = postgres ] && pg_isready --username i3t --dbname i3t"]
       interval: 5s
       timeout: 5s
       retries: 24

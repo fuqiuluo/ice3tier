@@ -137,13 +137,33 @@ token=$(compose run --rm -T controller --reset-admin-token 2>/dev/null | sed -n 
 compose start controller
 wait_for "the new admin token does not work" ctl status
 
+step "the health check does not pass on the server the image runs while it sets up an empty volume"
+# 那个临时的服务器听的是同一个套接字，pg_isready 分不出来。这里照样起一个不是 1 号进程的服务器，拿 compose 文件里的
+# 检查去问它：不能过。不然 `up --wait postgres` 会提前放行，接着的恢复会被临时服务器的退出打断。
+health=$(compose config --format json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["services"]["postgres"]["healthcheck"]["test"][1].replace("$$", "$"))')
+image=$(compose config --format json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["services"]["postgres"]["image"])')
+# shellcheck disable=SC2016
+docker run --rm --user postgres --entrypoint sh "$image" -c '
+    initdb -D /tmp/data -U i3t >/dev/null 2>&1 || exit 3
+    pg_ctl -D /tmp/data -o "-c listen_addresses=" -w start >/dev/null 2>&1 || exit 3
+    pg_isready --username i3t --dbname i3t >/dev/null || exit 3
+    if sh -c "$1" >/dev/null 2>&1; then exit 4; fi
+' sh "$health" || fail "the health check passed on a server that is not the container's main process (or the probe could not run): $health"
+compose exec -T postgres sh -c "$health" >/dev/null || fail "the health check does not pass on the real server: $health"
+
 step "back up: the database and the key"
 mkdir "$work/backup"
 chmod 755 "$work/backup"
-# 文档里的写法：两个文件在 umask 077 下写出来。转储里有代理的密码，密钥就是 controller 的身份。
+# 上一次备份留下的、谁都读得了的两个文件：新的不能沿用它们的权限。
+: > "$work/backup/controller.dump"
+: > "$work/backup/controller.key"
+chmod 644 "$work/backup/controller.dump" "$work/backup/controller.key"
+# 文档里的写法：两个文件在 umask 077 下重新写出来，有一步不成就停。转储里有代理的密码，密钥就是 controller 的身份。
 (
     cd "$work/backup"
+    set -e
     umask 077
+    rm -f controller.dump controller.key
     compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
     compose exec -T controller cat /data/controller.key > controller.key
 )
