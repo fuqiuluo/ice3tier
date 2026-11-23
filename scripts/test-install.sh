@@ -423,7 +423,9 @@ if [ "$os" = "Linux" ]; then
 
     step "one place says which database: a second one is refused"
     echo "I3T_DATABASE_URL=$ctl_database" | sudo tee -a /etc/i3t/controller.env >/dev/null
-    if sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url "$(new_database install_other)" >"$work/ctl-two.out" 2>&1; then
+    # The runs whose output is kept go without sudo, like the first install above: the script asks for it itself, and
+    # the output is this user's file.
+    if sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url "$(new_database install_other)" >"$work/ctl-two.out" 2>&1; then
         fail "a second place for the database was accepted"
     fi
     grep -q '/etc/i3t/controller.env' "$work/ctl-two.out" || fail "the refusal does not name controller.env: $(cat "$work/ctl-two.out")"
@@ -434,7 +436,7 @@ if [ "$os" = "Linux" ]; then
     # Stopped by hand, and its database setting gone or empty: the script still knows a controller lives here.
     sudo systemctl stop i3t-controller
     sudo sh -c ': > /var/lib/i3t-controller/database.url'
-    if sudo sh "$repo/deploy/install.sh" --from "$dir" --controller >"$work/ctl-stopped.out" 2>&1; then
+    if sh "$repo/deploy/install.sh" --from "$dir" --controller >"$work/ctl-stopped.out" 2>&1; then
         fail "a stopped controller without a database was upgraded anyway"
     fi
     grep -q -- '--database-url' "$work/ctl-stopped.out" || fail "the refusal does not name --database-url: $(cat "$work/ctl-stopped.out")"
@@ -447,12 +449,12 @@ if [ "$os" = "Linux" ]; then
 
     step "a first start that cannot reach its database, then one that can: the token is shown on the second"
     # Nothing listens on port 1. The controller connects before it creates its key, so the retry is a first start.
-    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 \
+    sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 \
         --database-url postgres://i3t@127.0.0.1:1/i3t >"$work/ctl-nodb.out" 2>&1 || true
     [ -z "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-nodb.out")" ] || fail "a token without a database?"
     sudo test ! -e /var/lib/i3t-controller/controller.key || fail "a key was created although the database could not be reached"
     retry_database=$(new_database install_retry)
-    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url "$retry_database" >"$work/ctl-retry.out" 2>&1 \
+    sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url "$retry_database" >"$work/ctl-retry.out" 2>&1 \
         || fail "the retry failed: $(cat "$work/ctl-retry.out")"
     [ -n "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-retry.out")" ] \
         || fail "the retry did not show the admin token: $(cat "$work/ctl-retry.out")"
@@ -490,7 +492,7 @@ if [ "$os" = "Linux" ]; then
     [ "$(sudo cat /var/lib/i3t-controller/database.url)" = "$old_database" ] || fail "the connection string was not kept for later"
 
     step "upgrading it to this build: the database was given earlier, and the new admin token is shown"
-    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller >"$work/ctl-new.out" 2>&1 || fail "the upgrade failed: $(cat "$work/ctl-new.out")"
+    sh "$repo/deploy/install.sh" --from "$dir" --controller >"$work/ctl-new.out" 2>&1 || fail "the upgrade failed: $(cat "$work/ctl-new.out")"
     new_token=$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-new.out" | head -n 1)
     [ -n "$new_token" ] && [ "$new_token" != "$old_token" ] || fail "the new admin token was not shown: $(cat "$work/ctl-new.out")"
     i=0
