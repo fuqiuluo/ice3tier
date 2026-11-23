@@ -88,7 +88,15 @@ has_content() {
     return 1
 }
 
-# 建数据目录（已经是这个脚本的就先清空）。它要是一个已经有东西、又不是这个脚本建的目录，不碰它。
+# 数据目录得是这个脚本能用的：还没有，是空的，或者是它自己建的。别的目录不用也不删，在动任何东西之前就退出：
+# start 和 stop 一上来先问这个，不然指错了目录，正在跑的测试服务器会先被停掉。
+own_dir_or_die() {
+    if [ -e "$DIR" ] && [ ! -e "$MARKER" ] && has_content; then
+        die "$DIR 里有东西，又不是这个脚本建的：不用它，也不删它。把 I3T_TEST_POSTGRES_DIR 指到一个没有的或者空的目录"
+    fi
+}
+
+# 建数据目录（已经是这个脚本的就先清空）。
 fresh_dir() {
     remove_dir
     mkdir -p "$DIR"
@@ -99,10 +107,8 @@ fresh_dir() {
 # 只有属主能删：自己删不掉时借一个容器来删。
 remove_dir() {
     [ -e "$DIR" ] || return 0
+    own_dir_or_die
     if [ ! -e "$MARKER" ]; then
-        if has_content; then
-            die "$DIR 里有东西，又不是这个脚本建的：不删它。把 I3T_TEST_POSTGRES_DIR 指到一个没有的或者空的目录"
-        fi
         rmdir "$DIR" 2>/dev/null || true
         return 0
     fi
@@ -180,6 +186,7 @@ container_psql() {
 }
 
 start() {
+    own_dir_or_die
     if bin=$(bin_dir); then
         start_native "$bin"
     elif command -v docker >/dev/null 2>&1; then
@@ -191,6 +198,7 @@ start() {
 }
 
 stop() {
+    own_dir_or_die
     if bin=$(bin_dir) && [ -e "$MARKER" ] && [ -f "$DIR/data/PG_VERSION" ]; then
         as_server_user "'$bin/pg_ctl' -D '$DIR/data' -m immediate -w stop" >/dev/null 2>&1 || true
     fi

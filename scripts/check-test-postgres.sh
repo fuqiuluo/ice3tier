@@ -1,7 +1,7 @@
 #!/bin/sh
 # scripts/test-postgres.sh 自己的检查，走的是"只有 docker"的那条路（I3T_TEST_POSTGRES_VIA=docker：不用本机装着的
 # PostgreSQL，连 psql 也用容器里的）：start、database、stop 都走得通，目录写成相对路径也行；
-# 不是它建的目录它不用、也不删。用自己的容器名和端口，不碰正在用的测试服务器。
+# 不是它建的目录它不用、也不删，指错了目录也不会顺手停掉正在跑的服务器。用自己的容器名和端口，不碰正在用的测试服务器。
 #
 #   scripts/check-test-postgres.sh
 set -eu
@@ -61,21 +61,23 @@ for server in "$url" "$tcp"; do
     [ "$(in_container "select count(*) from pg_database where datname = '${made##*/}'")" = 1 ] || fail "${made##*/} was not created"
 done
 
+step "a directory with something in it is neither used nor deleted, and the running server is left alone"
+mkdir "$work/precious"
+echo keep > "$work/precious/file"
+if I3T_TEST_POSTGRES_DIR="$work/precious" sh "$script" start >"$work/start.out" 2>&1; then
+    fail "start used a directory that is not its own"
+fi
+if I3T_TEST_POSTGRES_DIR="$work/precious" sh "$script" stop >"$work/stop.out" 2>&1; then
+    fail "stop accepted a directory that is not its own"
+fi
+[ "$(cat "$work/precious/file")" = keep ] || fail "the directory was touched"
+# 指错了目录的那两次什么都没动：先前起的服务器还在答话，没有被顺手停掉。
+[ "$(in_container 'select 1')" = 1 ] || fail "the running test server was stopped along the way"
+[ "$(sh "$script" start)" = "$started" ] || fail "the running test server was replaced"
+
 step "stop removes the directory it made"
 sh "$script" stop
 [ ! -e "$work/pg" ] || fail "$work/pg is still there"
 [ -z "$(docker ps -aq --filter "name=^${I3T_TEST_POSTGRES_CONTAINER}\$")" ] || fail "the container is still there"
-
-step "a directory with something in it is neither used nor deleted"
-mkdir "$work/precious"
-echo keep > "$work/precious/file"
-export I3T_TEST_POSTGRES_DIR="$work/precious"
-if sh "$script" start >"$work/start.out" 2>&1; then
-    fail "start used a directory that is not its own"
-fi
-if sh "$script" stop >"$work/stop.out" 2>&1; then
-    fail "stop accepted a directory that is not its own"
-fi
-[ "$(cat "$work/precious/file")" = keep ] || fail "the directory was touched"
 
 step "ok"
