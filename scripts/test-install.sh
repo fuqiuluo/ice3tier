@@ -16,6 +16,8 @@ work=$(mktemp -d)
 os=$(uname -s)
 ctl_pid=""
 https_pid=""
+# A temporary directory mounted noexec for one step: unmounted there, or on the way out when that step fails.
+noexec=""
 label="com.github.fuqiuluo.ice3tier"
 
 finish() {
@@ -39,6 +41,10 @@ finish() {
     fi
     if [ -n "$ctl_pid" ]; then
         kill "$ctl_pid" 2>/dev/null || true
+    fi
+    if [ -n "$noexec" ]; then
+        sudo umount "$noexec" 2>/dev/null || true
+        sudo rmdir "$noexec" 2>/dev/null || true
     fi
     rm -rf "$work"
     exit "$status"
@@ -449,6 +455,12 @@ if [ "$os" = "Linux" ]; then
 
     step "a first start that cannot reach its database, then one that can: the token is shown on the second"
     # Nothing listens on port 1. The controller connects before it creates its key, so the retry is a first start.
+    # systemd starts the failing service again and again: here ten times a second instead of every two seconds, so
+    # that one of those starts is sure to fall into the middle of the retry if the script lets it. That start would
+    # get the new database and print the token, and the start the script watches would have none to show.
+    sudo mkdir -p /etc/systemd/system/i3t-controller.service.d
+    printf '[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestartSec=100ms\n' \
+        | sudo tee /etc/systemd/system/i3t-controller.service.d/restart-fast.conf >/dev/null
     sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 \
         --database-url postgres://i3t@127.0.0.1:1/i3t >"$work/ctl-nodb.out" 2>&1 || true
     [ -z "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-nodb.out")" ] || fail "a token without a database?"
@@ -458,6 +470,26 @@ if [ "$os" = "Linux" ]; then
         || fail "the retry failed: $(cat "$work/ctl-retry.out")"
     [ -n "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-retry.out")" ] \
         || fail "the retry did not show the admin token: $(cat "$work/ctl-retry.out")"
+    sudo rm -r /etc/systemd/system/i3t-controller.service.d
+    sudo sh "$repo/deploy/install.sh" --uninstall --controller --purge >/dev/null
+
+    step "a controller whose log level hides the line that says it is up is not reported as down"
+    # Installed without starting, then the log level set by hand, then started for the first time.
+    quiet_database=$(new_database install_quiet)
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url "$quiet_database" >/dev/null
+    echo 'I3T_LOG=warn' | sudo tee -a /etc/i3t/controller.env >/dev/null
+    sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 >"$work/ctl-quiet.out" 2>&1 \
+        || fail "the install failed: $(cat "$work/ctl-quiet.out")"
+    systemctl is-active -q i3t-controller || fail "i3t-controller.service is not active"
+    if sudo journalctl _SYSTEMD_INVOCATION_ID="$(systemctl show -p InvocationID --value i3t-controller)" --no-pager -o cat \
+        | grep -q 'controller 已启动'; then
+        fail "the log was not quiet: this step proves nothing"
+    fi
+    if grep -q 'did not come up' "$work/ctl-quiet.out"; then
+        fail "a running controller was reported as down: $(cat "$work/ctl-quiet.out")"
+    fi
+    [ -n "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-quiet.out")" ] \
+        || fail "the first start with a quiet log did not show the admin token: $(cat "$work/ctl-quiet.out")"
     sudo sh "$repo/deploy/install.sh" --uninstall --controller --purge >/dev/null
 
     step "this script installs release 0.1.34, which takes no database, even from a noexec temporary directory"
@@ -485,6 +517,7 @@ if [ "$os" = "Linux" ]; then
         --database-url "$old_database" >"$work/ctl-old.out" 2>&1 || fail "installing 0.1.34 failed: $(cat "$work/ctl-old.out")"
     sudo umount "$noexec"
     sudo rmdir "$noexec"
+    noexec=""
     [ "$(/usr/local/bin/i3t-controller --version)" = "i3t-controller 0.1.34" ] || fail "not 0.1.34: $(/usr/local/bin/i3t-controller --version)"
     old_token=$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-old.out" | head -n 1)
     [ -n "$old_token" ] || fail "0.1.34 did not print its admin token: $(cat "$work/ctl-old.out")"

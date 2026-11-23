@@ -1369,42 +1369,75 @@ controller_log() {
     fi
 }
 
+# Says that the controller is up. `$1` is what this start printed: with the one-time admin token in it (a line
+# indented by four spaces), it is shown.
+report_controller_up() {
+    if printf '%s\n' "$1" | grep -q '^    [^ ]'; then
+        log "First start output (contains the one-time admin token):"
+        printf '%s\n' "$1"
+    else
+        log "i3t-controller is running"
+    fi
+}
+
+# Whether the controller's log level was set by hand in /etc/i3t/controller.env. With I3T_LOG=warn, say, the line
+# that says it is up is not logged.
+controller_log_level_is_set() {
+    $SUDO test -f /etc/i3t/controller.env \
+        && $SUDO grep -q '^[[:space:]]*I3T_LOG=[^[:space:]]' /etc/i3t/controller.env
+}
+
+# Whether the service is still running the start with invocation ID `$1` (systemd starts it again when it exits).
+controller_still_in_start() {
+    [ "$($SUDO systemctl show -p ActiveState --value i3t-controller 2>/dev/null || true)" = active ] \
+        && [ "$($SUDO systemctl show -p InvocationID --value i3t-controller 2>/dev/null || true)" = "$1" ]
+}
+
 # Restarts the controller service and watches this start in its log, for up to 30 seconds.
 #
 # Whether to show the one-time admin token is read off what the controller actually printed, not guessed from files:
-# it prints one (a line indented by four spaces) whenever it starts on a database that has no controller yet. That
-# is a new install, but also an install that kept its data in a file and now gets its database, or a retry after
-# the database could not be reached the first time.
+# it prints one whenever it starts on a database that has no controller yet. That is a new install, but also an
+# install that kept its data in a file and now gets its database, or a retry after the database could not be
+# reached the first time.
 restart_controller() {
     since=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
     # A service that kept failing (no database to reach) may have run into systemd's start limit: start counting anew.
     $SUDO systemctl reset-failed i3t-controller 2>/dev/null || true
     $SUDO systemctl restart i3t-controller
     invocation=$($SUDO systemctl show -p InvocationID --value i3t-controller 2>/dev/null || true)
+    # With the log level set by hand the controller may never say that it is up. A controller that cannot start says
+    # so whatever the level, and gives up on a database it cannot reach after 10 seconds: one that is still in the
+    # same start after 15 is taken to be up.
+    patience=30
+    quiet=0
+    if controller_log_level_is_set; then
+        patience=15
+        quiet=1
+    fi
     out=""
+    failed=0
     i=0
-    while [ "$i" -lt 30 ]; do
+    while [ "$i" -lt "$patience" ]; do
         out=$(controller_log "$invocation" "$since")
         # It is up (the log is not translated). The token, when there is one, was printed just before this line, on
         # the other stream: read once more so that it cannot be missed.
         if printf '%s\n' "$out" | grep -q 'controller 已启动'; then
             sleep 1
-            out=$(controller_log "$invocation" "$since")
-            if printf '%s\n' "$out" | grep -q '^    [^ ]'; then
-                log "First start output (contains the one-time admin token):"
-                printf '%s\n' "$out"
-            else
-                log "i3t-controller is running"
-            fi
+            report_controller_up "$(controller_log "$invocation" "$since")"
             return
         fi
         # It gave up with an error, or systemd did.
         if printf '%s\n' "$out" | grep -q '^i3t-controller: ' || $SUDO systemctl is-failed -q i3t-controller 2>/dev/null; then
+            failed=1
             break
         fi
         sleep 1
         i=$((i + 1))
     done
+    if [ "$failed" -eq 0 ] && [ "$quiet" -eq 1 ] && controller_still_in_start "$invocation"; then
+        report_controller_up "$(controller_log "$invocation" "$since")"
+        return
+    fi
     printf '%s\n' "$out"
     warn "i3t-controller did not come up; check: sudo journalctl -u i3t-controller --no-pager"
 }
@@ -1489,6 +1522,15 @@ install_controller() {
         warn "this release of the controller keeps its data in a file and does not use PostgreSQL; the connection string is saved for the release that does"
     fi
 
+    # Whether the service is started at the end. Found out now, and the service stopped now, before anything it
+    # starts from is changed: systemd starts a failing service again every two seconds, and one that comes up on its
+    # own in the middle prints the one-time admin token in a start this script is not watching.
+    start_at_end=0
+    if has_systemd && { [ -n "$PUBLIC_ADDR" ] || controller_meant_to_run; }; then
+        start_at_end=1
+        $SUDO systemctl stop i3t-controller 2>/dev/null || true
+    fi
+
     $SUDO install -d -m 0755 /usr/local/bin
     log "Installing i3t-controller and i3tctl to /usr/local/bin"
     install_binary_atomic "${WORK}/i3t-controller" /usr/local/bin/i3t-controller 0 0
@@ -1552,7 +1594,7 @@ EOF
         log "Enabling and starting i3t-controller.service"
         $SUDO systemctl enable i3t-controller >/dev/null
         restart_controller
-    elif controller_meant_to_run; then
+    elif [ "$start_at_end" -eq 1 ]; then
         log "Restarting i3t-controller.service"
         restart_controller
     else
