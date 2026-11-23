@@ -5,6 +5,8 @@
 # it, then uninstalls and checks nothing is left. Needs passwordless sudo and changes the machine: do not run it on
 # yours.
 #
+# The controllers need a PostgreSQL: start the test one first (scripts/test-postgres.sh start) and export what it prints.
+#
 # Usage: scripts/test-install.sh <dir with i3t, i3t-controller and i3tctl>
 set -eu
 
@@ -128,8 +130,16 @@ points_at_service() {
     grep -q "system service" "$work/run.err" || fail "sudo $*: unexpected answer: $(cat "$work/run.err")"
 }
 
+# A new empty database on the test PostgreSQL. Over TCP: the installed controller service is sandboxed away from
+# /tmp and /home, where that server keeps its socket.
+new_database() {
+    I3T_TEST_DATABASE_URL="${I3T_TEST_DATABASE_TCP_URL:?start the test PostgreSQL first: export \$(scripts/test-postgres.sh start)}" \
+        sh "$repo/scripts/test-postgres.sh" database "$1"
+}
+
 step "controller on loopback"
-"$dir/i3t-controller" --data-dir "$work/ctl" --public-addr 127.0.0.1:20331 --listen 127.0.0.1:20331 >"$work/ctl.out" 2>"$work/ctl.err" &
+I3T_DATABASE_URL=$(new_database install_test) "$dir/i3t-controller" --data-dir "$work/ctl" --public-addr 127.0.0.1:20331 \
+    --listen 127.0.0.1:20331 >"$work/ctl.out" 2>"$work/ctl.err" &
 ctl_pid=$!
 i=0
 until grep -q '^    [^ ]' "$work/ctl.out" 2>/dev/null; do
@@ -352,11 +362,31 @@ if [ "$os" = "Linux" ]; then
     kill "$ctl_pid" 2>/dev/null || true
     wait "$ctl_pid" 2>/dev/null || true
     ctl_pid=""
-    PATH=/usr/local/bin:/usr/bin:/bin TZ=Asia/Shanghai sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 >"$work/ctl-install.out"
+    if sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 >"$work/ctl-refused.out" 2>&1; then
+        fail "controller install without a database went through"
+    fi
+    grep -q -- '--database-url' "$work/ctl-refused.out" || fail "the refusal does not name --database-url: $(cat "$work/ctl-refused.out")"
+    [ ! -e /usr/local/bin/i3t-controller ] || fail "a refused controller install left the program behind"
+
+    ctl_database=$(new_database install_service)
+    PATH=/usr/local/bin:/usr/bin:/bin TZ=Asia/Shanghai sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 \
+        --database-url "$ctl_database" >"$work/ctl-install.out"
     cat "$work/ctl-install.out"
     ctl_token=$(sed -n 's/^    \([^ ]*\)$/\1/p' "$work/ctl-install.out" | head -n 1)
     [ -n "$ctl_token" ] || fail "controller install did not print the initial admin token"
     systemctl is-active -q i3t-controller || fail "i3t-controller.service is not active"
+    # The connection string holds the database password: only the service reads it.
+    [ "$(sudo stat -c '%a %U' /var/lib/i3t-controller/database.url)" = "600 i3t-controller" ] \
+        || fail "/var/lib/i3t-controller/database.url is readable by others"
+    [ "$(sudo cat /var/lib/i3t-controller/database.url)" = "$ctl_database" ] || fail "the connection string is not in database.url"
+
+    step "a new admin token with only the data directory, as the WebUI and the docs say"
+    sudo systemctl stop i3t-controller
+    new_token=$(sudo -u i3t-controller /usr/local/bin/i3t-controller --data-dir /var/lib/i3t-controller --reset-admin-token \
+        | sed -n 's/^    \([^ ]*\)$/\1/p' | head -n 1)
+    [ -n "$new_token" ] && [ "$new_token" != "$ctl_token" ] || fail "no new admin token was printed"
+    ctl_token=$new_token
+    sudo systemctl start i3t-controller
 
     step "upgrade installed controller in place without losing state"
     i=0

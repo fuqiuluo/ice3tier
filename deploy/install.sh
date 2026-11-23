@@ -7,12 +7,15 @@
 # Install, join, and start node in one command:
 #   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --token <TOKEN> [--can-relay] [--can-exit]
 #
-# Install and start controller (+ i3tctl):
-#   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <HOST:PORT>
+# Install and start controller (+ i3tctl). The controller stores its data in a PostgreSQL database you provide;
+# to get both with one command use deploy/docker/compose.yaml instead:
+#   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <HOST:PORT> --database-url <URL>
 #
 # Options:
 #   --controller              Install i3t-controller + i3tctl instead of the node
 #   --public-addr HOST:PORT   Controller public address (writes /etc/i3t/controller.env and starts service)
+#   --database-url URL        Controller database, postgres://USER:PASSWORD@HOST/DBNAME (or set I3T_DATABASE_URL);
+#                             written to /var/lib/i3t-controller/database.url
 #   --token TOKEN             Enrollment token (or set I3T_TOKEN); joins and starts the node immediately
 #   --can-relay               Declare relay capability during join
 #   --can-exit                Declare exit capability during join
@@ -41,6 +44,7 @@ VERSION="${I3T_VERSION:-}"
 TOKEN="${I3T_TOKEN:-}"
 MODE="node"
 PUBLIC_ADDR=""
+DATABASE_URL="${I3T_DATABASE_URL:-}"
 CAN_RELAY=0
 CAN_EXIT=0
 INSTALL_POLKIT=1
@@ -80,6 +84,10 @@ Node options:
 Controller options:
   --controller              Install i3t-controller and i3tctl (systemd service on Linux)
   --public-addr HOST:PORT   Set I3T_PUBLIC_ADDR in /etc/i3t/controller.env and start the service
+  --database-url URL        PostgreSQL database the controller stores its data in, e.g.
+                            postgres://USER:PASSWORD@HOST/DBNAME (or set I3T_DATABASE_URL).
+                            Written to /var/lib/i3t-controller/database.url, readable by the
+                            service only. This script does not install PostgreSQL
 
 Common options:
   --version TAG             Install a specific release tag (e.g. v0.1.31; default: latest)
@@ -124,6 +132,14 @@ parse_args() {
                 ;;
             --public-addr=*)
                 PUBLIC_ADDR="${1#*=}"
+                ;;
+            --database-url)
+                [ "$#" -ge 2 ] || die "--database-url requires an argument"
+                DATABASE_URL="$2"
+                shift
+                ;;
+            --database-url=*)
+                DATABASE_URL="${1#*=}"
                 ;;
             --token)
                 [ "$#" -ge 2 ] || die "--token requires an argument"
@@ -795,11 +811,13 @@ write_controller_service() {
 [Unit]
 Description=ice3tier controller
 Documentation=https://github.com/fuqiuluo/ice3tier
-After=network-online.target
+# 数据库在本机时等它先起来；不在本机、或者叫别的名字时这一项没有作用，连不上会隔两秒再试。
+After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 # 数据目录默认和 StateDirectory= 一致，由 ProtectSystem=strict 放行写入；若改用别的目录，需另加 ReadWritePaths=。
+# 里面是 controller 的密钥、更新包的缓存，和 database.url：数据库的连接串（有密码，只有这个服务的用户可读）。
 Environment=I3T_DATA_DIR=/var/lib/i3t-controller
 # 对外地址和额外选项写在 /etc/i3t/controller.env 里，比如：
 #   I3T_PUBLIC_ADDR=ctl.example.com:20331
@@ -1370,7 +1388,30 @@ show_first_start() {
     warn "the admin token did not show up; check: sudo journalctl -u i3t-controller --no-pager"
 }
 
+# Whether the installed controller already knows which database to use: the file this script writes, or a setting
+# someone put into /etc/i3t/controller.env by hand.
+controller_has_database() {
+    if $SUDO test -f /var/lib/i3t-controller/database.url; then
+        return 0
+    fi
+    $SUDO test -f /etc/i3t/controller.env \
+        && $SUDO grep -q -e '^[[:space:]]*I3T_DATABASE_URL=' -e '^[[:space:]]*I3T_CONTROLLER_ARGS=.*--database-url' /etc/i3t/controller.env
+}
+
 install_controller() {
+    case "$DATABASE_URL" in
+        *"
+"*) die "invalid --database-url value (it must be a single line)" ;;
+    esac
+
+    # Stop before touching anything when the controller is going to be (re)started without a database:
+    # this version cannot start without one, and an older install has none configured.
+    if has_systemd && [ -z "$DATABASE_URL" ] && ! controller_has_database; then
+        if [ -n "$PUBLIC_ADDR" ] || $SUDO systemctl is-active -q i3t-controller 2>/dev/null; then
+            die "the controller stores its data in PostgreSQL: pass --database-url postgres://USER:PASSWORD@HOST/DBNAME (or set I3T_DATABASE_URL). This script does not install PostgreSQL; deploy/docker/compose.yaml starts the controller together with one. Data of an older install (/var/lib/i3t-controller/controller.db) is not carried over."
+        fi
+    fi
+
     fetch_binary "i3t-controller" "${WORK}/i3t-controller"
     fetch_binary "i3tctl" "${WORK}/i3tctl"
 
@@ -1382,6 +1423,7 @@ install_controller() {
     if ! has_systemd; then
         log "Installed /usr/local/bin/i3t-controller and /usr/local/bin/i3tctl (systemd not detected)"
         printf '\nNext steps:\n'
+        printf '  export I3T_DATABASE_URL=postgres://USER:PASSWORD@HOST/DBNAME\n'
         printf '  i3t-controller --data-dir /var/lib/i3t-controller --public-addr <public-address>:20331\n'
         return
     fi
@@ -1391,9 +1433,19 @@ install_controller() {
     write_controller_service "${WORK}/i3t-controller.service"
     $SUDO install -D -m 0644 "${WORK}/i3t-controller.service" /etc/systemd/system/i3t-controller.service
 
+    # The key is created on the first start, together with the admin token.
     first_start=0
-    if ! $SUDO test -f /var/lib/i3t-controller/controller.db; then
+    if ! $SUDO test -f /var/lib/i3t-controller/controller.key; then
         first_start=1
+    fi
+
+    if [ -n "$DATABASE_URL" ]; then
+        # The connection string holds the database password: it goes into the data directory, readable by the service
+        # user only, where the controller looks for it when it is not given on the command line.
+        log "Writing the database connection string to /var/lib/i3t-controller/database.url"
+        printf '%s\n' "$DATABASE_URL" > "${WORK}/database.url"
+        $SUDO install -d -o i3t-controller -g i3t-controller -m 0700 /var/lib/i3t-controller
+        $SUDO install -o i3t-controller -g i3t-controller -m 0600 "${WORK}/database.url" /var/lib/i3t-controller/database.url
     fi
 
     if [ -n "$PUBLIC_ADDR" ]; then
@@ -1440,6 +1492,9 @@ EOF
         log "Installation complete!"
         printf '\nNext steps:\n'
         printf '  Edit /etc/i3t/controller.env and set I3T_PUBLIC_ADDR=<public-address>:20331\n'
+        if ! controller_has_database; then
+            printf '  Run this script again with --controller --database-url postgres://USER:PASSWORD@HOST/DBNAME\n'
+        fi
         printf '  sudo systemctl enable --now i3t-controller\n'
         printf '  sudo journalctl -u i3t-controller -n 30 --no-pager   # get the initial admin token\n'
     fi
@@ -1491,10 +1546,10 @@ uninstall_controller() {
     fi
     $SUDO rm -f /usr/local/bin/i3t-controller /usr/local/bin/i3tctl
     if [ "$PURGE" -eq 1 ]; then
-        log "Purging /var/lib/i3t-controller and /etc/i3t"
+        log "Purging /var/lib/i3t-controller and /etc/i3t (the PostgreSQL database is left as it is)"
         $SUDO rm -rf /var/lib/i3t-controller /etc/i3t
     else
-        log "Removed i3t-controller service and binaries (data kept in /var/lib/i3t-controller and /etc/i3t; pass --purge to remove)"
+        log "Removed i3t-controller service and binaries (the key and settings are kept in /var/lib/i3t-controller and /etc/i3t; pass --purge to remove. The PostgreSQL database is left as it is)"
     fi
 }
 

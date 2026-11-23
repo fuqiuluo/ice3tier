@@ -1,11 +1,13 @@
 [Unit]
 Description=ice3tier controller
 Documentation=https://github.com/fuqiuluo/ice3tier
-After=network-online.target
+# 数据库在本机时等它先起来；不在本机、或者叫别的名字时这一项没有作用，连不上会隔两秒再试。
+After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 # 数据目录默认和 StateDirectory= 一致，由 ProtectSystem=strict 放行写入；若改用别的目录，需另加 ReadWritePaths=。
+# 里面是 controller 的密钥、更新包的缓存，和 database.url：数据库的连接串（有密码，只有这个服务的用户可读）。
 Environment=I3T_DATA_DIR=/var/lib/i3t-controller
 # 对外地址和额外选项写在 /etc/i3t/controller.env 里，比如：
 #   I3T_PUBLIC_ADDR=ctl.example.com:20331

@@ -4,6 +4,9 @@ joins it to a controller started here on loopback with `i3t join`, checks that i
 the service, that the service comes back after its process is killed, installs over it, then uninstalls and checks
 nothing is left. Needs administrator rights and changes the machine: do not run it on yours.
 
+The controller needs a PostgreSQL: start the test one first (scripts/test-postgres.sh start) and put what it prints
+into the environment.
+
 Usage: scripts\test-install.ps1 <dir with i3t.exe, wintun.dll, i3t-controller.exe and i3tctl.exe>
 #>
 param([Parameter(Mandatory = $true)][string]$Dir)
@@ -100,6 +103,14 @@ function Invoke-I3t([string]$arguments) {
 
 try {
     Step 'controller on loopback'
+    # A new empty database on the test PostgreSQL, so that running this twice against one server works.
+    $server = $env:I3T_TEST_DATABASE_URL
+    if (-not $server) { Fail 'I3T_TEST_DATABASE_URL is not set: start the test PostgreSQL first (scripts/test-postgres.sh start)' }
+    $psql = if ($env:PGBIN) { Join-Path $env:PGBIN 'psql.exe' } else { 'psql' }
+    $database = "install_test_$PID"
+    & $psql $server -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE $database"
+    if ($LASTEXITCODE -ne 0) { Fail "could not create the database $database" }
+    $env:I3T_DATABASE_URL = $server.Substring(0, $server.LastIndexOf('/') + 1) + $database
     $controller = Start-Process -FilePath (Join-Path $dir 'i3t-controller.exe') -PassThru -NoNewWindow `
         -ArgumentList '--data-dir', (Join-Path $work 'ctl'), '--public-addr', '127.0.0.1:20331', '--listen', '127.0.0.1:20331' `
         -RedirectStandardOutput (Join-Path $work 'ctl.out') -RedirectStandardError (Join-Path $work 'ctl.err')
