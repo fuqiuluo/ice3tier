@@ -73,6 +73,7 @@ def backup_and_restore(lab: Lab, work: Path, t: Checks) -> None:
     backup.mkdir()
     done = dump_database(controller.database, backup / "controller.dump")
     t.check("controller 运行中 pg_dump 成功", done.returncode == 0, done.stderr.strip())
+    t.check("转储只有属主可读", (backup / "controller.dump").stat().st_mode & 0o777 == 0o600)
     shutil.copy2(controller_data(controller) / "controller.key", backup / "controller.key")
     t.check("密钥只有属主可读，拷贝出来的也是", (backup / "controller.key").stat().st_mode & 0o777 == 0o600)
 

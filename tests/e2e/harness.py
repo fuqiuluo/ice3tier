@@ -1063,8 +1063,12 @@ def controller_data(controller: Controller) -> Path:
 
 
 def dump_database(database: str, to: Path) -> subprocess.CompletedProcess:
-    """把 controller 的库备份成一个文件（`pg_dump`），部署文档里写的就是这样做。controller 开着也可以。"""
-    return subprocess.run(["pg_dump", "--format=custom", "--file", str(to), database], capture_output=True, text=True)
+    """把 controller 的库备份成一个文件（`pg_dump`），部署文档里写的就是这样做。controller 开着也可以。
+
+    转储里有代理的密码和管理令牌的哈希：和文档里一样在 `umask 077` 下写，只有属主读得到。
+    """
+    return subprocess.run(["pg_dump", "--format=custom", "--file", str(to), database],
+                          capture_output=True, text=True, umask=0o077)
 
 
 def restore_database(dump: Path) -> str:

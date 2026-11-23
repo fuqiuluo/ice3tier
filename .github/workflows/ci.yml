@@ -108,7 +108,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           shellcheck -s sh -S warning deploy/install.sh scripts/test-install.sh scripts/setup-e2e-env.sh \
-            scripts/test-postgres.sh scripts/test-compose.sh
+            scripts/test-postgres.sh scripts/check-test-postgres.sh scripts/test-compose.sh
           for pair in "write_node_service deploy/systemd/i3t.service" \
                       "write_controller_service deploy/systemd/i3t-controller.service" \
                       "write_polkit_rule deploy/polkit/50-i3t-resolved.rules"; do
@@ -356,6 +356,9 @@ jobs:
         run: docker build -f deploy/docker/Dockerfile -t ghcr.io/fuqiuluo/ice3tier-controller:latest .
       - name: Start with compose, back up and restore
         run: scripts/test-compose.sh
+      # 本机没装 PostgreSQL、只有 docker 的人走的那条路，runner 上平时走不到。
+      - name: The test database script, with docker only
+        run: scripts/check-test-postgres.sh
 
   site:
     name: site (check, build)

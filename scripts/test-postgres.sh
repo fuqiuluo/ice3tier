@@ -12,17 +12,27 @@
 #   scripts/test-postgres.sh start >> "$GITHUB_ENV"
 #
 # 服务器谁连都不用密码，只听本机，不落盘（fsync 关着）。数据放在 I3T_TEST_POSTGRES_DIR 里，
-# 默认是临时目录下的 i3t-test-postgres。它同时听两处，打印出来的两个连接串各指一处：
-#   I3T_TEST_DATABASE_URL      Unix 上是数据目录旁边的套接字（网络命名空间里的测试也连得上），Windows 上是下面那个端口
+# 默认是临时目录下的 i3t-test-postgres。这个目录由脚本自己建、自己删：指到一个已经有东西的目录上时它不动那个目录。
+# 服务器同时听两处，打印出来的两个连接串各指一处：
+#   I3T_TEST_DATABASE_URL      Unix 上是数据目录里的套接字（网络命名空间里的测试也连得上），Windows 上是下面那个端口
 #   I3T_TEST_DATABASE_TCP_URL  127.0.0.1 上的端口 I3T_TEST_POSTGRES_PORT（默认 54329）
 #
-# 用系统里装着的 PostgreSQL（initdb 和 pg_ctl）；找不到又有 docker 时用 postgres 的官方镜像。
+# 用系统里装着的 PostgreSQL（initdb 和 pg_ctl）；找不到又有 docker 时用 postgres 的官方镜像
+# （I3T_TEST_POSTGRES_VIA=docker 时不找，直接用镜像，连 psql 也用容器里的）。
 set -eu
 
 DIR=${I3T_TEST_POSTGRES_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/i3t-test-postgres}
+# 相对的路径接到当前目录上：docker 挂目录要绝对路径，删的时候也要说得清是哪一个。Windows 上盘符开头的也是绝对的。
+case "$DIR" in
+    /* | [A-Za-z]:*) ;;
+    *) DIR="$(pwd)/$DIR" ;;
+esac
 PORT=${I3T_TEST_POSTGRES_PORT:-54329}
-CONTAINER=i3t-test-postgres
+CONTAINER=${I3T_TEST_POSTGRES_CONTAINER:-i3t-test-postgres}
 IMAGE=${I3T_TEST_POSTGRES_IMAGE:-postgres:17}
+VIA=${I3T_TEST_POSTGRES_VIA:-auto}
+# 这个文件在，目录才是这个脚本建的。
+MARKER="$DIR/.i3t-test-postgres"
 # 测试一个接一个地建库、删库，不在乎断电：不等落盘，快得多。
 SETTINGS="-c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300"
 
@@ -40,6 +50,7 @@ windows() {
 
 # PostgreSQL 的程序在哪个目录。发行版多半不把 initdb、pg_ctl 放进 PATH，几个常见的位置都看一遍，版本高的优先。
 bin_dir() {
+    [ "$VIA" != docker ] || return 1
     found=""
     for candidate in \
         /usr/local/opt/postgresql@*/bin /opt/homebrew/opt/postgresql@*/bin \
@@ -54,6 +65,10 @@ bin_dir() {
     [ -n "$found" ] && printf '%s\n' "$found"
 }
 
+container_running() {
+    [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" = true ]
+}
+
 # PostgreSQL 不肯以 root 运行（容器里常是 root）：那时换成 postgres 用户来执行。
 as_server_user() {
     if [ "$(id -u)" = 0 ]; then
@@ -63,9 +78,34 @@ as_server_user() {
     fi
 }
 
-# 删掉数据目录。用 docker 起过的话，里面的套接字归容器里的 postgres 用户，目录也被它改成了只有属主能删：
-# 自己删不掉时借一个容器来删。
+# 目录里除了标记还有没有别的东西。
+has_content() {
+    for entry in "$DIR"/* "$DIR"/.[!.]* "$DIR"/..?*; do
+        # 没有匹配到东西时通配符原样留着：那不是一个文件。
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        [ "$entry" = "$MARKER" ] || return 0
+    done
+    return 1
+}
+
+# 建数据目录（已经是这个脚本的就先清空）。它要是一个已经有东西、又不是这个脚本建的目录，不碰它。
+fresh_dir() {
+    remove_dir
+    mkdir -p "$DIR"
+    : > "$MARKER"
+}
+
+# 删掉数据目录，只删这个脚本建的。用 docker 起过的话，里面的套接字归容器里的 postgres 用户，目录也被它改成了
+# 只有属主能删：自己删不掉时借一个容器来删。
 remove_dir() {
+    [ -e "$DIR" ] || return 0
+    if [ ! -e "$MARKER" ]; then
+        if has_content; then
+            die "$DIR 里有东西，又不是这个脚本建的：不删它。把 I3T_TEST_POSTGRES_DIR 指到一个没有的或者空的目录"
+        fi
+        rmdir "$DIR" 2>/dev/null || true
+        return 0
+    fi
     if rm -rf "$DIR" 2>/dev/null; then
         return 0
     fi
@@ -93,11 +133,10 @@ print_urls() {
 start_native() {
     bin=$1
     data="$DIR/data"
-    if [ -f "$data/PG_VERSION" ] && as_server_user "'$bin/pg_ctl' -D '$data' status" >/dev/null 2>&1; then
+    if [ -e "$MARKER" ] && [ -f "$data/PG_VERSION" ] && as_server_user "'$bin/pg_ctl' -D '$data' status" >/dev/null 2>&1; then
         return 0
     fi
-    remove_dir
-    mkdir -p "$DIR"
+    fresh_dir
     if [ "$(id -u)" = 0 ]; then
         id postgres >/dev/null 2>&1 || die "以 root 运行时要有 postgres 这个用户"
         chown postgres "$DIR"
@@ -115,12 +154,11 @@ start_native() {
 
 start_docker() {
     # 已经起着、套接字也在这个目录里的话就用它；目录对不上（上次用的是别的目录）就重新起。
-    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" = true ] && [ -S "$DIR/.s.PGSQL.$PORT" ]; then
+    if container_running && [ -e "$MARKER" ] && [ -S "$DIR/.s.PGSQL.$PORT" ]; then
         return 0
     fi
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    remove_dir
-    mkdir -p "$DIR"
+    fresh_dir
     # 容器里的 postgres 用户要能在这个目录里建套接字。
     chmod 777 "$DIR"
     # shellcheck disable=SC2086
@@ -129,11 +167,16 @@ start_docker() {
         || die "docker 起不了 $IMAGE"
     tries=0
     # 镜像第一次启动时先在里面初始化、重启一次：等到端口上真的答话。
-    until docker exec "$CONTAINER" psql -U postgres -h 127.0.0.1 -p "$PORT" -qAtc 'select 1' >/dev/null 2>&1; do
+    until container_psql -qAtc 'select 1' >/dev/null 2>&1; do
         tries=$((tries + 1))
         [ "$tries" -lt 120 ] || die "容器里的服务器没起来：$(docker logs --tail 20 "$CONTAINER" 2>&1)"
         sleep 0.5
     done
+}
+
+# 用容器里的 psql 连容器里的服务器。连接参数是容器里面的：宿主机上套接字的路径，容器里没有。
+container_psql() {
+    docker exec "$CONTAINER" psql -U postgres -h 127.0.0.1 -p "$PORT" -d postgres "$@"
 }
 
 start() {
@@ -148,26 +191,13 @@ start() {
 }
 
 stop() {
-    if bin=$(bin_dir) && [ -f "$DIR/data/PG_VERSION" ]; then
+    if bin=$(bin_dir) && [ -e "$MARKER" ] && [ -f "$DIR/data/PG_VERSION" ]; then
         as_server_user "'$bin/pg_ctl' -D '$DIR/data' -m immediate -w stop" >/dev/null 2>&1 || true
     fi
     if command -v docker >/dev/null 2>&1; then
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     fi
     remove_dir
-}
-
-# 找一个能用的 psql：PATH 里的，PostgreSQL 的程序目录里的，或者容器里的。
-run_psql() {
-    if command -v psql >/dev/null 2>&1; then
-        psql "$@"
-    elif bin=$(bin_dir); then
-        "$bin/psql" "$@"
-    elif [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" = true ]; then
-        docker exec "$CONTAINER" psql "$@"
-    else
-        die "找不到 psql"
-    fi
 }
 
 database() {
@@ -179,7 +209,17 @@ database() {
     esac
     # 名字后面加上进程号和时刻：同一个服务器上反复跑、几个测试同时跑都不撞。
     fresh="${name}_$$_$(date +%s)"
-    run_psql "$url" -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$fresh\"" >/dev/null
+    create="CREATE DATABASE \"$fresh\""
+    # 找一个能用的 psql：PATH 里的，PostgreSQL 的程序目录里的，都没有就用容器里的（服务器是这个脚本用 docker 起的那一个时）。
+    if [ "$VIA" != docker ] && command -v psql >/dev/null 2>&1; then
+        psql "$url" -q -v ON_ERROR_STOP=1 -c "$create" >/dev/null
+    elif bin=$(bin_dir); then
+        "$bin/psql" "$url" -q -v ON_ERROR_STOP=1 -c "$create" >/dev/null
+    elif command -v docker >/dev/null 2>&1 && container_running; then
+        container_psql -q -v ON_ERROR_STOP=1 -c "$create" >/dev/null
+    else
+        die "找不到 psql"
+    fi
     printf '%s\n' "${url%/*}/$fresh"
 }
 
