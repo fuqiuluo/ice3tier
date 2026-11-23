@@ -487,12 +487,32 @@ pub async fn echo_server() -> SocketAddr {
 /// 监听正好拿到这个端口，连过去就连上了，客户端看到的是正常结束而不是"被拒绝"之后的重置。
 /// 两头的 socket 故意不关：几个文件描述符，换来端口不会被别人拿走。用阻塞的 socket：回环上建连当场完成。
 pub async fn closed_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    closed_port_on(Ipv4Addr::LOCALHOST.into())
+}
+
+/// 和 [`closed_port`] 一样，端口在本机的 `ip` 这个地址上。
+fn closed_port_on(ip: IpAddr) -> SocketAddr {
+    let listener = std::net::TcpListener::bind((ip, 0)).unwrap();
     let holder = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (accepted, _) = listener.accept().unwrap();
     let addr = holder.local_addr().unwrap();
     std::mem::forget((holder, accepted));
     addr
+}
+
+/// 一个只在 127.0.0.1 上监听的回显服务，同一个端口号在本机的 `other` 这个地址上连过去被拒绝，
+/// 在这个测试进程结束之前一直如此。
+///
+/// 并行的测试各自让系统挑端口，同一个号可以同时分给 127.0.0.1 和别的地址：只起回环上的服务的话，偶尔有别的测试的监听
+/// 正好在 `other` 上拿到这个号，连过去就连上了。所以先把 `other` 上的这个号占住（占法见 [`closed_port`]），
+/// 再在回环上用同一个号起服务；回环上这个号已经有人用了就换一个。
+pub async fn echo_server_on_loopback_only(other: IpAddr) -> SocketAddr {
+    loop {
+        let port = closed_port_on(other).port();
+        if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            return Target { listener }.echo();
+        }
+    }
 }
 
 /// [`assert_echo`] 每次发出去多少字节。

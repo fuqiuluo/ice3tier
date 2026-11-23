@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use common::{
-    ECHO_LEN, GW, LAPTOP, NAS, PUBLIC_IP, Target, World, assert_echo, assert_reset, closed_port, drain, echo_server, eventually,
-    http_connect, node, non_loopback_address, peer_mut, proxy, socks5,
+    ECHO_LEN, GW, LAPTOP, NAS, PUBLIC_IP, Target, World, assert_echo, assert_reset, closed_port, drain, echo_server,
+    echo_server_on_loopback_only, eventually, http_connect, node, non_loopback_address, peer_mut, proxy, socks5,
 };
 use i3t_access::{ListenState, TargetCause};
 use i3t_model::netmap::{ExitRole, Forward, ForwardProtocol, ForwardTarget, ListenerProtocol, PeerExit};
@@ -92,7 +92,7 @@ i3t_lane::on_both_transports! {
         let lan = format!("{address}/32");
         world.nas.system.set_interfaces(&["127.0.0.1/8", "::1/128", lan.as_str()]);
         let on_lan_address = Target::bind(&address.to_string()).await.echo();
-        let on_loopback_only = echo_server().await;
+        let on_loopback_only = echo_server_on_loopback_only(address).await;
 
         // 监听在非回环地址上的服务：按虚拟 IP、按名字都能访问，不需要 nas 是出口，也不需要用户名。
         let mut stream = socks5(world.socks().await, None, "10.66.0.3", on_lan_address.port()).await.connected();
