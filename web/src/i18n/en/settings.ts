@@ -122,7 +122,7 @@ export const settings: Messages['settings'] = {
     publicAddr: 'Public address',
     publicAddrHint: 'Must be reachable from the nodes',
     dataDir: 'Data directory',
-    dataDirHint: 'Holds the database and controller key; copy it to back up',
+    dataDirHint: 'Holds the controller key. A backup is this key plus a dump of the database (pg_dump)',
     dataDirNone: 'None (test mode)',
     totals: 'Totals',
     totalsValue: (networks, nodes, online) =>

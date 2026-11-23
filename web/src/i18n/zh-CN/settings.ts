@@ -124,7 +124,7 @@ export const settings = {
     publicAddr: '公开地址',
     publicAddrHint: '节点必须能访问此地址',
     dataDir: '数据目录',
-    dataDirHint: '包含数据库和 controller 密钥，复制此目录即可备份',
+    dataDirHint: '存放 controller 密钥。备份要这把密钥，加上数据库的转储（pg_dump）',
     dataDirNone: '无（测试模式）',
     totals: '统计',
     totalsValue: (networks: number, nodes: number, online: number) =>

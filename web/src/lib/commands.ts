@@ -2,6 +2,7 @@ import {
   type Capability,
   CAPABILITY_CONFIG_KEY,
   CAPABILITY_FLAG,
+  CONTROLLER_IMAGE,
   CONTROLLER_SERVICE,
   INSTALL_SCRIPT,
   type InstallSystem,
@@ -50,11 +51,20 @@ function quote(value: string, windows: boolean): string {
 }
 
 /**
- * 重置管理令牌要执行的命令，一行一条，填好了这个 controller 的数据目录。重置只要数据目录，不要公开地址。
- * 数据目录是安装脚本装出来的那个时，照部署文档给三条：停服务、以服务的用户执行、再启动。
- * 别的装法不知道它是怎么跑起来的，只给执行的那一条，停和启动由用户自己做。
+ * 重置管理令牌要执行的命令，一行一条，填好了这个 controller 的数据目录。重置不要公开地址。
+ * 数据目录是安装脚本装出来的那个时，照部署文档给三条：停服务、以服务的用户执行、再启动
+ * （数据库的连接串在数据目录里，不用另外给）。数据目录是镜像里的那个时，给 `docker compose` 的三条。
+ * 别的装法不知道它是怎么跑起来的，只给执行的那一条，停和启动、数据库的连接串由用户自己照启动时的做。
  */
 export function resetTokenCommands(dataDir: string): string[] {
+  if (dataDir === CONTROLLER_IMAGE.dataDir) {
+    const { service } = CONTROLLER_IMAGE
+    return [
+      `docker compose stop ${service}`,
+      `docker compose run --rm ${service} --reset-admin-token`,
+      `docker compose start ${service}`,
+    ]
+  }
   const args = `--data-dir ${quote(dataDir, false)} --reset-admin-token`
   if (dataDir !== CONTROLLER_SERVICE.dataDir) return [`i3t-controller ${args}`]
   const { unit, user, program } = CONTROLLER_SERVICE

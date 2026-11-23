@@ -116,6 +116,14 @@ describe('其余给用户执行的命令', () => {
     ])
   })
 
+  it('重置管理令牌：用镜像跑的 controller 是 docker compose 的三条，不是宿主机上的命令', () => {
+    expect(resetTokenCommands('/data')).toEqual([
+      'docker compose stop controller',
+      'docker compose run --rm controller --reset-admin-token',
+      'docker compose start controller',
+    ])
+  })
+
   it('重置管理令牌：别的装法只给执行的那一条；目录里有 shell 会误解的字符时加引号', () => {
     expect(resetTokenCommands('/srv/i3t')).toEqual(['i3t-controller --data-dir /srv/i3t --reset-admin-token'])
     expect(resetTokenCommands('/srv/my data')).toEqual([`i3t-controller --data-dir '/srv/my data' --reset-admin-token`])

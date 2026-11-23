@@ -11,7 +11,8 @@ export const signIn: Messages['signIn'] = {
   expired: 'Session expired',
   signedOut: 'Signed out',
   lostTitle: 'Lost the token?',
-  lostBody: 'Stop the controller, then run it once as below. It prints a new token; the old one stops working.',
+  lostBody:
+    'Stop the controller, then run it once as below, with the same database connection string as usual. It prints a new token; the old one stops working.',
   lostCommand: 'i3t-controller --data-dir <data-dir> --reset-admin-token',
 }
 

@@ -27,6 +27,19 @@ describe('设置里的登录', () => {
     expect(screen.queryByText(t.signIn.lostBody)).not.toBeInTheDocument()
   })
 
+  it('用镜像跑的 controller：重置的命令是 docker compose 的三条', async () => {
+    fakeApi({ 'GET /status': makeStatus({ data_dir: '/data' }) })
+    renderWithApp(<SessionTab />, { route: '/settings/session' })
+    expect((await screen.findByTestId('reset-token-command')).textContent).toBe(
+      [
+        'docker compose stop controller',
+        'docker compose run --rm controller --reset-admin-token',
+        'docker compose start controller',
+      ].join('\n'),
+    )
+    expect(screen.getByText(s.resetService)).toBeVisible()
+  })
+
   it('别的装法：一条命令，数据目录是这个 controller 的；说明里写先停', async () => {
     fakeApi({ 'GET /status': makeStatus({ data_dir: '/srv/i3t' }) })
     renderWithApp(<SessionTab />, { route: '/settings/session' })

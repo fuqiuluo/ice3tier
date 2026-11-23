@@ -20,6 +20,15 @@ export const CONTROLLER_SERVICE = {
   dataDir: '/var/lib/i3t-controller',
 } as const
 
+/**
+ * controller 的镜像（`deploy/docker`）：容器里的数据目录，和 compose 文件里那个服务的名字。
+ * 数据目录特意不和安装脚本的一样，这样看数据目录就分得出是哪种装法。
+ */
+export const CONTROLLER_IMAGE = {
+  service: 'controller',
+  dataDir: '/data',
+} as const
+
 /** 添加节点时选的系统。Linux 和 macOS 走安装脚本；Windows 没有脚本，下载程序。 */
 export const INSTALL_SYSTEMS = ['linux', 'macos', 'windows'] as const
 export type InstallSystem = (typeof INSTALL_SYSTEMS)[number]
