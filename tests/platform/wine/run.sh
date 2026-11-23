@@ -14,6 +14,7 @@ mode=${1:?用法：run.sh wine|native <程序目录> <结果目录>}
 bin=$(realpath "${2:?缺程序目录}")
 out=$(realpath -m "${3:?缺结果目录}")
 here=$(dirname "$(realpath "$0")")
+repo=$(realpath "$here/../../..")
 image=${I3T_WINE_IMAGE:-i3t-platform-wine}
 
 docker build -q -t "$image" "$here" > /dev/null
@@ -27,6 +28,6 @@ fi
 status=0
 # 容器里是 root：写出来的结果最后改回调用者的。
 docker run --rm --network "$net" --cap-add NET_ADMIN \
-    -v "$bin:/programs:ro" -v "$here/smoke.sh:/smoke.sh:ro" -v "$out:/out" \
+    -v "$bin:/programs:ro" -v "$here/smoke.sh:/smoke.sh:ro" -v "$repo/scripts/test-postgres.sh:/test-postgres.sh:ro" -v "$out:/out" \
     "$image" bash -c "bash /smoke.sh $mode /programs /out; code=\$?; chown -R $(id -u):$(id -g) /out; exit \$code" || status=$?
 exit $status

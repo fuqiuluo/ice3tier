@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""controller 的备份与恢复：运行中备份，停掉，在备份上启动，原来的节点自己连回来。
+"""controller 的备份与恢复，照部署文档里写的做：运行中用 pg_dump 备份数据库、拷贝密钥，停掉，
+把备份恢复进一个新的库，带着密钥启动，原来的节点自己连回来。
 
     python3 tests/e2e/test_backup.py [场景名...]
 """
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import time
@@ -14,7 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lab as lablib  # noqa: E402
 from harness import (  # noqa: E402
-    Checks, Controller, Node, RestoredController, back_up, controller_data, create_groups, start_whoami, tail,
+    Checks, Controller, Node, RestoredController, controller_data, create_groups, dump_database, restore_database,
+    start_whoami, tail,
 )
 from lab import Lab, wait_until  # noqa: E402
 
@@ -65,28 +68,25 @@ def backup_and_restore(lab: Lab, work: Path, t: Checks) -> None:
     wait_until(lambda: all(controller.node(node)["online"] for node in (a, b)), what="a 和 b 上线")
     t.check("备份之前 a 和 b 互相访问得到", reaches(a, b) and reaches(b, a))
 
-    data = controller_data(controller)
-    wal = data / "controller.db-wal"
-    t.check("备份时数据库还有没写回主文件的提交（-wal 不是空的）", wal.exists() and wal.stat().st_size > 0)
+    # 备份是两样东西：数据库的一份转储，和数据目录里的密钥。
     backup = work / "backup"
-    done = back_up(controller.host, data, backup)
-    t.check("controller 运行中备份成功，不需要 --public-addr", done.returncode == 0, done.stderr.strip())
-    t.check("备份列出了写下的文件", "controller.db" in done.stdout and "controller.key" in done.stdout, done.stdout)
-    files = sorted(path.name for path in backup.iterdir()) if backup.is_dir() else []
-    t.check("备份里是数据库和密钥", files == ["controller.db", "controller.key"], str(files))
-    t.check("备份里的密钥只有属主可读", (backup / "controller.key").stat().st_mode & 0o777 == 0o600)
-    again = back_up(controller.host, data, backup)
-    unchanged = sorted(path.name for path in backup.iterdir()) == files
-    t.check("不往已经有东西的目录里写，也不动它", again.returncode != 0 and "不是空目录" in again.stderr and unchanged,
-            again.stderr.strip())
+    backup.mkdir()
+    done = dump_database(controller.database, backup / "controller.dump")
+    t.check("controller 运行中 pg_dump 成功", done.returncode == 0, done.stderr.strip())
+    shutil.copy2(controller_data(controller) / "controller.key", backup / "controller.key")
+    t.check("密钥只有属主可读，拷贝出来的也是", (backup / "controller.key").stat().st_mode & 0o777 == 0o600)
 
     # 备份之后的改动。
     create_groups(controller, "later")
     c.join(controller)
     wait_until(lambda: controller.node(c)["online"], what="c 上线")
 
+    # 恢复：转储进一个新的空库，密钥放进一个新的数据目录。
     controller.host.stop(controller.proc)
-    restored = RestoredController(controller.host, work, backup, controller.token)
+    data = work / "restored"
+    data.mkdir()
+    shutil.copy2(backup / "controller.key", data / "controller.key")
+    restored = RestoredController(controller.host, work, data, controller.token, restore_database(backup / "controller.dump"))
     t.check("备份时的管理令牌照常能用", restored.ctl("status", check=False).returncode == 0)
     t.check("a 和 b 自己连回了恢复的 controller",
             waited(lambda: all(restored.node(node)["online"] for node in (a, b)), 60, "a 和 b 重新上线"))

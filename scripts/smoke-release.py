@@ -76,9 +76,22 @@ def fetch(opener: urllib.request.OpenerDirector, url: str, timeout: float = 5.0)
         return resp.status, resp.headers.get("Content-Type", ""), resp.read()
 
 
+def test_database() -> str:
+    """controller 启动要连的数据库：测试用的 PostgreSQL（`scripts/test-postgres.sh start` 打印的那两个变量之一）。
+
+    这里只看 WebUI，库里已经有没有表都一样，所以直接用服务器上现成的那个库。
+    """
+    url = os.environ.get("I3T_TEST_DATABASE_TCP_URL") or os.environ.get("I3T_TEST_DATABASE_URL")
+    if not url:
+        raise RuntimeError("--check-webui 要启动 i3t-controller，它要一个 PostgreSQL：先执行 scripts/test-postgres.sh start，"
+                           "把它打印的 I3T_TEST_DATABASE_URL 放进环境变量")
+    return url
+
+
 def check_embedded_webui(controller_bin: Path) -> None:
     node_port = free_loopback_port()
     admin_port = free_loopback_port()
+    database = test_database()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     with tempfile.TemporaryDirectory(prefix="i3t-smoke-ctl-") as tmp:
@@ -90,7 +103,9 @@ def check_embedded_webui(controller_bin: Path) -> None:
             "--listen", f"127.0.0.1:{node_port}",
             "--admin-listen", f"127.0.0.1:{admin_port}",
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # 连接串走环境变量，不出现在进程列表里。
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env={**os.environ, "I3T_DATABASE_URL": database})
         try:
             base = f"http://127.0.0.1:{admin_port}"
             deadline = time.monotonic() + 30.0

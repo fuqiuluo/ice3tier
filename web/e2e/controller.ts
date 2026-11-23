@@ -23,6 +23,9 @@ import { kitDir } from './release'
  * 节点更新的测试要它），仓库里的 `target/agent-web/release`、`target/release` 和 `target/lead/release`，
  * 用第一个两样程序都在的目录。
  * 界面用的是 `pnpm build` 的产物，由 controller 自己从 `--static-dir` 提供，和正式部署时一样。
+ *
+ * controller 的数据存在 PostgreSQL 里：每个 controller 在测试用的服务器上用一个新的空库。服务器在哪里由环境变量
+ * `I3T_TEST_DATABASE_URL` 说，先在仓库的根目录执行 `export $(scripts/test-postgres.sh start)`。
  */
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -168,6 +171,11 @@ export class Controller {
     if (!existsSync(join(dist, 'index.html'))) throw new Error('web/dist 里没有构建产物，先执行 pnpm build')
 
     const dir = mkdtempSync(join(tmpdir(), 'i3t-web-e2e-'))
+    const created = spawnSync('sh', [join(repoRoot, 'scripts', 'test-postgres.sh'), 'database', 'web_e2e'], {
+      encoding: 'utf8',
+    })
+    if (created.status !== 0) throw new Error(`建不了测试用的数据库：${created.stderr.trim()}`)
+    const database = created.stdout.trim()
     const nodePort = await freePort()
     const adminPort = await freePort()
     const child = spawn(
@@ -184,7 +192,7 @@ export class Controller {
         '--static-dir',
         dist,
       ],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, I3T_DATABASE_URL: database } },
     )
     let stdout = ''
     let stderr = ''

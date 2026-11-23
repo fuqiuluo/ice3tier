@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 在一个容器里把三个程序走一遍：版本和帮助、controller、建网络和注册令牌、两个节点加入并上线、一个当出口、
+# 在一个容器里把三个程序走一遍：版本和帮助、controller（数据库是容器里起的一个 PostgreSQL）、建网络和注册令牌、
+# 两个节点加入并上线、一个当出口、
 # 另一个上经它出去的代理（SOCKS5、HTTP CONNECT、明文 HTTP 转发），状态命令，正常停下，再在同样的目录上启动一次。
 #
 #   smoke.sh wine   <有 i3t.exe、i3t-controller.exe、i3tctl.exe 的目录> <结果目录>
@@ -126,6 +127,13 @@ done
 expect "i3t key without --state-dir" "$out/default-key.txt" '^[A-Za-z0-9_-]{43}$' run_program i3t key
 check "  ... writes the key into the platform's default directory ($default_dir)" 'ls -la "$default_dir"' test -s "$default_dir/node.key"
 
+# controller 的数据库：在容器里起一个测试用的 PostgreSQL，在上面建一个空库。经回环的端口连：Windows 版的程序不认 Unix 套接字。
+# 连接串放在环境变量里，Wine 里的程序照样读得到；第 7 步在同一个库上再启动一次。
+postgres=$(sh /test-postgres.sh start 2> "$out/postgres.txt" | sed -n 's/^I3T_TEST_DATABASE_TCP_URL=//p')
+I3T_DATABASE_URL=$(I3T_TEST_DATABASE_URL=$postgres sh /test-postgres.sh database smoke 2>> "$out/postgres.txt")
+export I3T_DATABASE_URL
+check "a PostgreSQL for the controller is running" 'cat "$out/postgres.txt"' test -n "$I3T_DATABASE_URL"
+
 ctl() { run_program i3tctl --url "http://$ADMIN" --token "$TOKEN" "$@"; }
 start_controller() { # 日志名
     start_bg "$1" i3t-controller --data-dir "$(winpath controller)" --public-addr "$CONTROLLER" --listen "$CONTROLLER" --admin-listen "$ADMIN"
@@ -233,10 +241,8 @@ for dir in controller a b; do ls -la "$(hostpath "$dir")" > "$out/files-$dir-aft
 check "node a removed its local.json on stop" 'cat "$out/files-a-after-stop.txt"' test ! -e "$(hostpath a)/local.json"
 check "node a's cached netmap (written by replacing the file) is the latest one" 'head -c 300 "$(hostpath a)/netmap.json"' \
     bash -c "python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))[\"version\"] > 1 else 1)' '$(hostpath a)/netmap.json'"
-db=$(hostpath controller)/controller.db
-check "controller database passes sqlite's integrity check" 'sqlite3 "$db" "pragma integrity_check"' \
-    bash -c "[ \"\$(sqlite3 '$db' 'pragma integrity_check')\" = ok ]"
-check "no -wal left behind after a clean stop" 'cat "$out/files-controller-after-stop.txt"' test ! -s "$db-wal"
+check "both nodes are in the controller's database after a clean stop" 'psql "$I3T_DATABASE_URL" -Atc "select id, name from nodes"' \
+    bash -c "[ \"\$(psql '$I3T_DATABASE_URL' -Atc 'select count(*) from nodes')\" = 2 ]"
 
 # 7. 同样的目录上再启动一次
 check "controller starts again on the same data directory" 'tail -5 "$out/controller-2.log"' start_controller controller-2

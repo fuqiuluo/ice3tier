@@ -704,7 +704,7 @@ def idle_held_offline(lab: Lab, work: Path, t: Checks) -> None:
     t.check("controller 停了、没有 relay：空闲的连接留着，并且说明了原因", closed not in since and held in since, tail(since, 8))
     t.check("留着的连接照常能用", a.curl(url, via=b, timeout=6).stdout == expect)
 
-    RestoredController(controller.host, work, controller_data(controller), controller.token)
+    RestoredController(controller.host, work, controller_data(controller), controller.token, controller.database)
     try:
         wait_until(lambda: closed in a.read_log()[mark:], timeout=60, what="controller 回来之后回收")
     except TimeoutError:

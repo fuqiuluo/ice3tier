@@ -226,7 +226,7 @@ def trial(pair: str, variant: str, rep: int, rtt_ms: float, work: Path) -> Row:
             row.direct_back_s = round(back[0] - begin, 3) if back else None
             if variant == "relay-no-ctl":
                 # 种类只有现问节点才知道：把 controller 在同一份数据上重新起来，等两个节点重新连上。
-                controller = RestoredController(controller.host, work, controller_data(controller), controller.token)
+                controller = RestoredController(controller.host, work, controller_data(controller), controller.token, controller.database)
                 lablib.wait_until(lambda: all(controller.ctl("node", "show", str(node.id))["online"] for node in (a, b)),
                                   timeout=40, what="两个节点重新连上 controller")
             path = controller.ctl("path", str(a.id), str(b.id))

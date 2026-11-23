@@ -80,6 +80,30 @@ def binary(name: str) -> str:
     return str(path)
 
 
+def scratch_database(name: str = "e2e") -> str:
+    """测试用的 PostgreSQL 上的一个新的空库，返回连到它的连接串。
+
+    服务器在哪里由环境变量 `I3T_TEST_DATABASE_URL` 说，见 `scripts/test-postgres.sh`。要是经 Unix 套接字连的那一种：
+    实验环境里的主机各有各的网络命名空间，连不到本机的端口，文件系统却是同一个。
+    """
+    done = subprocess.run([str(REPO / "scripts" / "test-postgres.sh"), "database", name], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"建不了测试用的数据库：{done.stderr.strip()}")
+    return done.stdout.strip()
+
+
+def start_controller(host: Host, data: Path, database: str, address: str, out: Path, log: Path) -> subprocess.Popen:
+    """在 `host` 上启动 controller，等它说已启动。管理令牌打在标准输出上，日志在标准错误上，分开收。"""
+    proc = subprocess.Popen(
+        host.cmd(binary("i3t-controller"), "--data-dir", str(data), "--database-url", database, "--public-addr", address),
+        stdout=out.open("w"), stderr=log.open("w"))
+    host._procs.append(proc)
+    wait_until(lambda: "已启动" in log.read_text(errors="replace") or proc.poll() is not None, what="controller 启动")
+    if proc.poll() is not None:
+        raise RuntimeError(f"controller 启动失败：\n{log.read_text(errors='replace')[-2000:]}")
+    return proc
+
+
 def start_whoami(host: Host, port: int = 80, bind: str = "0.0.0.0") -> None:
     host.spawn(sys.executable, "-c", WHOAMI, bind, str(port))
     wait_until(lambda: f":{port} " in host.run("ss", "-lnt").stdout, what=f"{host.name} 上的 HTTP 服务启动")
@@ -93,15 +117,9 @@ class Controller:
         self.log = work / "controller.log"
         self.out = work / "controller.out"
         self.address = f"{host.ip}:20331"
-        data = work / "controller"
-        # 管理令牌打在标准输出上，日志在标准错误上，分开收。
-        self.proc = subprocess.Popen(
-            host.cmd(binary("i3t-controller"), "--data-dir", str(data), "--public-addr", self.address),
-            stdout=self.out.open("w"), stderr=self.log.open("w"))
-        host._procs.append(self.proc)
-        wait_until(lambda: "已启动" in self.log.read_text(errors="replace") or self.proc.poll() is not None, what="controller 启动")
-        if self.proc.poll() is not None:
-            raise RuntimeError(f"controller 启动失败：\n{self.log.read_text(errors='replace')[-2000:]}")
+        # 网络、节点和设置在这个库里；数据目录里只有 controller 的密钥和更新包的缓存。
+        self.database = scratch_database()
+        self.proc = start_controller(host, work / "controller", self.database, self.address, self.out, self.log)
         tokens = [line.strip() for line in self.out.read_text().splitlines() if line.startswith("    ")]
         if len(tokens) != 1:
             raise RuntimeError(f"没有在 controller 的输出里找到管理令牌：{self.out.read_text()!r}")
@@ -1037,36 +1055,41 @@ def leaked(host: Host) -> int:
     return int(found.group(1)) if found else -1
 
 
-# 下面是备份与恢复的场景（test_backup.py）用的。
+# 下面是 controller 重启、备份与恢复的场景用的。
 
 def controller_data(controller: Controller) -> Path:
     """`Controller` 启动时用的数据目录。"""
     return controller.out.parent / "controller"
 
 
-def back_up(host: Host, data: Path, to: Path) -> subprocess.CompletedProcess:
-    """在 `host` 上把数据目录 `data` 备份到 `to`（`i3t-controller --backup-to`）。controller 开着也可以。"""
-    return host.run(binary("i3t-controller"), "--data-dir", str(data), "--backup-to", str(to), check=False)
+def dump_database(database: str, to: Path) -> subprocess.CompletedProcess:
+    """把 controller 的库备份成一个文件（`pg_dump`），部署文档里写的就是这样做。controller 开着也可以。"""
+    return subprocess.run(["pg_dump", "--format=custom", "--file", str(to), database], capture_output=True, text=True)
+
+
+def restore_database(dump: Path) -> str:
+    """把 `dump_database` 写的文件恢复进一个新的空库（`pg_restore`），返回连到它的连接串。"""
+    database = scratch_database("e2e_restored")
+    done = subprocess.run(["pg_restore", "--no-owner", "--exit-on-error", "--dbname", database, str(dump)],
+                          capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"pg_restore 失败：{done.stderr.strip()}")
+    return database
 
 
 class RestoredController(Controller):
-    """在一个备份上启动的 controller，地址和原来的一样。
+    """在已有的数据目录和库上启动的 controller（重启，或者从备份恢复），地址和原来的一样。
 
-    管理令牌是备份时的那个（备份里有它的哈希），启动时不再打出来，所以由调用方给。
+    管理令牌是原来的那个（库里有它的哈希），启动时不再打出来，所以由调用方给。
     """
 
-    def __init__(self, host: Host, work: Path, data: Path, token: str) -> None:
+    def __init__(self, host: Host, work: Path, data: Path, token: str, database: str) -> None:
         self.host = host
         self.log = work / "restored.log"
         self.out = work / "restored.out"
         self.address = f"{host.ip}:20331"
-        self.proc = subprocess.Popen(
-            host.cmd(binary("i3t-controller"), "--data-dir", str(data), "--public-addr", self.address),
-            stdout=self.out.open("w"), stderr=self.log.open("w"))
-        host._procs.append(self.proc)
-        wait_until(lambda: "已启动" in self.log.read_text(errors="replace") or self.proc.poll() is not None, what="恢复的 controller 启动")
-        if self.proc.poll() is not None:
-            raise RuntimeError(f"恢复的 controller 启动失败：\n{self.log.read_text(errors='replace')[-2000:]}")
+        self.database = database
+        self.proc = start_controller(host, data, database, self.address, self.out, self.log)
         self.token = token
 
 

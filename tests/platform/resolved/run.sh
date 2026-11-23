@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 虚拟网卡的名字经一个真的 systemd-resolved 走。两个容器接在一个 --internal 的 Docker 网络上（不通外面）：
 #
-# - a：以 systemd 为 1 号进程（--privileged），开着 systemd-resolved；跑 controller 和节点 a，节点 a 的虚拟网卡默认装上；
+# - a：以 systemd 为 1 号进程（--privileged），开着 systemd-resolved；跑 controller（和它的 PostgreSQL）、节点 a，
+#   节点 a 的虚拟网卡默认装上；
 # - b：只跑节点 b 和一个 HTTP 服务（8080 端口，回答它看到的来源地址），有 CAP_NET_ADMIN 和 /dev/net/tun，也装上虚拟网卡。
 #   b 在 Docker 的名字服务里另有一个名字
 #   web.example.test，用来确认网络的域名之外的名字照旧经容器原来的解析器。
@@ -78,8 +79,15 @@ wait_for 30 bash -c "docker exec $a resolvectl status > /dev/null 2>&1"
 save resolvectl-before.txt "$a" resolvectl status
 save resolv-conf.txt "$a" sh -c 'cat /etc/resolv.conf; grep hosts /etc/nsswitch.conf'
 
+# controller 的数据库：镜像里装着的 PostgreSQL，systemd 已经把它起来了。给 controller 建一个用户和一个库。
+check "postgresql is running in a" 'ina systemctl status "postgresql*" --no-pager' \
+    wait_for 60 bash -c "docker exec $a runuser -u postgres -- pg_isready -q"
+ina runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 -c "CREATE ROLE i3t LOGIN PASSWORD 'i3t'" -c "CREATE DATABASE i3t OWNER i3t" \
+    > "$out/postgres-setup.txt" 2>&1
+
 # controller 和节点
-ina sh -c "I3T_LANG=en setsid /programs/i3t-controller --data-dir /srv/controller --public-addr $ip_a:20331 --listen 0.0.0.0:20331 \
+ina sh -c "I3T_LANG=en I3T_DATABASE_URL=postgres://i3t:i3t@127.0.0.1/i3t \
+    setsid /programs/i3t-controller --data-dir /srv/controller --public-addr $ip_a:20331 --listen 0.0.0.0:20331 \
     > /srv/controller.out 2> /srv/controller.log < /dev/null &"
 check "controller starts in a" 'ina tail -5 /srv/controller.log' wait_for 30 bash -c "docker exec $a grep -q 'controller 已启动' /srv/controller.log"
 token=$(ina sed -n 's/^    \([A-Za-z0-9_-]\{20,\}\)$/\1/p' /srv/controller.out | head -1)
