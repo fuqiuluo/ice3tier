@@ -110,6 +110,9 @@ pub struct Ui {
     #[cfg_attr(target_os = "linux", expect(dead_code, reason = "只在 Linux 以外的系统上说"))]
     pub tune_linux_only: &'static str,
     pub bad_log_env: fn(&str, &str, &str) -> String,
+    // 只有 Windows 的服务把日志写进文件，这句话只有那里用得到。参数是环境变量的值和默认的上限（MiB）。
+    #[cfg_attr(not(windows), expect(dead_code, reason = "只在 Windows 上说"))]
+    pub bad_log_size_env: fn(&str, u64) -> String,
     pub no_state_dir: &'static str,
 
     pub state_dir: &'static str,
@@ -313,6 +316,9 @@ static ZH: Texts = Texts {
         handshake_timeout: |secs| format!("{secs} 秒内没有和 controller 握手成功"),
         tune_linux_only: "i3t tune 只支持 Linux",
         bad_log_env: |filter, error, level| format!("I3T_LOG 的值 {filter:?} 不对（{error}），用配置文件里的 {level}"),
+        bad_log_size_env: |size, default| {
+            format!("I3T_LOG_MAX_SIZE 的值 {size:?} 不对（要字节数，可以带 K、M、G，比如 64M），用默认的 {default} MiB")
+        },
         no_state_dir: "找不到放状态目录的位置：用 --state-dir 指定",
 
         state_dir: "状态目录",
@@ -498,6 +504,11 @@ static EN: Texts = Texts {
         handshake_timeout: |secs| format!("No handshake with the controller within {secs} s"),
         tune_linux_only: "i3t tune supports Linux only",
         bad_log_env: |filter, error, level| format!("I3T_LOG value {filter:?} is invalid ({error}); using {level} from the configuration"),
+        bad_log_size_env: |size, default| {
+            format!(
+                "I3T_LOG_MAX_SIZE value {size:?} is invalid (a number of bytes, optionally with K, M or G, such as 64M); using the default, {default} MiB"
+            )
+        },
         no_state_dir: "No place for the state directory: give one with --state-dir",
 
         state_dir: "State directory",

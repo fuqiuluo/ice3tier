@@ -365,7 +365,13 @@ fn runs_as_service(state: &StateDir) -> bool {
 /// 服务控制管理器启动的节点：日志写进状态目录里的文件（服务没有终端），停止的通知来自 SCM。
 #[cfg(windows)]
 fn run_as_service(state: StateDir, version: Version, r#static: Option<PathBuf>) -> anyhow::Result<ExitCode> {
-    let log = std::sync::Arc::new(log_file::LogFile::open(state.path().join(SERVICE_LOG), log_file::FILE_LIMIT));
+    // 一个日志文件的上限有默认值，可以用环境变量改。给的值读不懂就用默认的，在日志里说一声。
+    let setting = std::env::var_os(log_file::LIMIT_ENV).map(|value| value.to_string_lossy().into_owned());
+    let limit = log_file::limit(setting.as_deref());
+    let log = std::sync::Arc::new(log_file::LogFile::open(state.path().join(SERVICE_LOG), limit.unwrap_or(log_file::DEFAULT_LIMIT)));
+    if let (None, Some(setting)) = (limit, &setting) {
+        log.append_line(&format!("i3t: {}", (texts().ui.bad_log_size_env)(setting, log_file::DEFAULT_LIMIT >> 20)));
+    }
     let job = move |stop: service::Stop| match run_node(&state, &version, r#static, &LogTo::File(std::sync::Arc::clone(&log)), stop) {
         Ok(Outcome::Stopped) => 0,
         Ok(Outcome::Restart) => u32::from(RESTART_EXIT_CODE),

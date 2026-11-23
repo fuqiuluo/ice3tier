@@ -6,9 +6,32 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// 一个日志文件最多这么大。
+/// 一个日志文件最多这么大，除非用环境变量 `I3T_LOG_MAX_SIZE` 另外给了。
+pub const DEFAULT_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// 改一个日志文件的上限用的环境变量。
 #[cfg(windows)]
-pub const FILE_LIMIT: u64 = 16 * 1024 * 1024;
+pub const LIMIT_ENV: &str = "I3T_LOG_MAX_SIZE";
+
+/// 一个日志文件的上限。`setting` 是环境变量 `I3T_LOG_MAX_SIZE` 的值：没有设就是 [`DEFAULT_LIMIT`]，设了但读不懂是 `None`。
+pub fn limit(setting: Option<&str>) -> Option<u64> {
+    setting.map_or(Some(DEFAULT_LIMIT), parse_size)
+}
+
+/// 读一个大小：字节数，后面可以带 `K`、`M`、`G`（不分大小写，按 1024 进位；写成 `MB`、`MiB` 也认），比如 `64M`。
+/// 零、放不进 `u64` 的和别的写法都读不懂。
+fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.find(|digit: char| !digit.is_ascii_digit()).unwrap_or(text.len()));
+    let shift = match unit.trim_start().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        _ => return None,
+    };
+    number.parse::<u64>().ok()?.checked_mul(1 << shift).filter(|&size| size > 0)
+}
 
 /// 日志文件打不开、过大的归档处理不了的时候，过这么久再试。
 const RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -287,6 +310,27 @@ mod tests {
     fn write(log: &LogFile, record: &str) {
         let mut writer = log;
         writer.write_all(record.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn the_limit_is_16_mib_unless_the_environment_gives_another() {
+        assert_eq!(limit(None), Some(16 * 1024 * 1024), "没有设环境变量");
+        for (setting, bytes) in [
+            ("1048576", 1 << 20),
+            ("512K", 512 << 10),
+            ("64M", 64 << 20),
+            ("64m", 64 << 20),
+            ("64MB", 64 << 20),
+            ("64 MiB", 64 << 20),
+            (" 2G ", 2 << 30),
+            ("100b", 100),
+        ] {
+            assert_eq!(limit(Some(setting)), Some(bytes), "{setting:?}");
+        }
+        // 读不懂的不猜：由调用的一方改用默认值，并在日志里说一声。
+        for setting in ["", "M", "0", "0M", "-1", "1.5M", "64T", "64 M B", "64ib", "big", "99999999999999999999", "17179869184G"] {
+            assert_eq!(limit(Some(setting)), None, "{setting:?}");
+        }
     }
 
     #[test]
