@@ -411,11 +411,95 @@ if [ "$os" = "Linux" ]; then
         sleep 1
     done
 
+    step "/etc/i3t/controller.env stays root's and private when the address is set again"
+    # What an admin puts there by hand may be a secret; an older install left the file readable by everyone.
+    [ "$(sudo stat -c '%a %U' /etc/i3t/controller.env)" = "600 root" ] || fail "controller.env is not root's and private after install"
+    sudo chmod 644 /etc/i3t/controller.env
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 >/dev/null
+    [ "$(sudo stat -c '%a %U' /etc/i3t/controller.env)" = "600 root" ] || fail "setting the address again left controller.env readable by others"
+    sudo chmod 644 /etc/i3t/controller.env
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller >/dev/null
+    [ "$(sudo stat -c '%a %U' /etc/i3t/controller.env)" = "600 root" ] || fail "a plain upgrade left controller.env readable by others"
+
+    step "one place says which database: a second one is refused"
+    echo "I3T_DATABASE_URL=$ctl_database" | sudo tee -a /etc/i3t/controller.env >/dev/null
+    if sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url "$(new_database install_other)" >"$work/ctl-two.out" 2>&1; then
+        fail "a second place for the database was accepted"
+    fi
+    grep -q '/etc/i3t/controller.env' "$work/ctl-two.out" || fail "the refusal does not name controller.env: $(cat "$work/ctl-two.out")"
+    [ "$(sudo cat /var/lib/i3t-controller/database.url)" = "$ctl_database" ] || fail "database.url was rewritten by a refused run"
+    sudo sed -i '/^I3T_DATABASE_URL=/d' /etc/i3t/controller.env
+
+    step "a controller that was set up here is not replaced by one that cannot start"
+    # Stopped by hand, and its database setting gone or empty: the script still knows a controller lives here.
+    sudo systemctl stop i3t-controller
+    sudo sh -c ': > /var/lib/i3t-controller/database.url'
+    if sudo sh "$repo/deploy/install.sh" --from "$dir" --controller >"$work/ctl-stopped.out" 2>&1; then
+        fail "a stopped controller without a database was upgraded anyway"
+    fi
+    grep -q -- '--database-url' "$work/ctl-stopped.out" || fail "the refusal does not name --database-url: $(cat "$work/ctl-stopped.out")"
+
     step "uninstall controller --purge"
     sudo sh "$repo/deploy/install.sh" --uninstall --controller --purge
     for path in /usr/local/bin/i3t-controller /usr/local/bin/i3tctl /var/lib/i3t-controller /etc/i3t /etc/systemd/system/i3t-controller.service; do
         [ ! -e "$path" ] || fail "$path is still there"
     done
+
+    step "a first start that cannot reach its database, then one that can: the token is shown on the second"
+    # Nothing listens on port 1. The controller connects before it creates its key, so the retry is a first start.
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 \
+        --database-url postgres://i3t@127.0.0.1:1/i3t >"$work/ctl-nodb.out" 2>&1 || true
+    [ -z "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-nodb.out")" ] || fail "a token without a database?"
+    sudo test ! -e /var/lib/i3t-controller/controller.key || fail "a key was created although the database could not be reached"
+    retry_database=$(new_database install_retry)
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url "$retry_database" >"$work/ctl-retry.out" 2>&1 \
+        || fail "the retry failed: $(cat "$work/ctl-retry.out")"
+    [ -n "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-retry.out")" ] \
+        || fail "the retry did not show the admin token: $(cat "$work/ctl-retry.out")"
+    sudo sh "$repo/deploy/install.sh" --uninstall --controller --purge >/dev/null
+
+    step "this script installs release 0.1.34, which takes no database, even from a noexec temporary directory"
+    # The script may be newer than the programs it is given. 0.1.34 keeps its data in a file: it is installed as it
+    # always was. With the temporary directory mounted noexec the copy there cannot be asked whether it takes a
+    # database, so the one it was copied from is.
+    case "$(uname -m)" in
+        x86_64) old_arch=x86_64 old_sums="7e867bdec23e05f86d200209ed43927c9758eb74d50b8371ac9ea0ebf181f9b5 7730ef4421faa46051d3fc5782311cb315678583a5edd348189e1244682243a6" ;;
+        aarch64 | arm64) old_arch=aarch64 old_sums="0db2ae42e4367d928d0124cf8e5e7bdc109ee5e9b4154148e6690e4e5ef8e24b e7a60a0708120392ab1ed3baaddeea806c01f41f9e309fce09ead1c413a42d67" ;;
+        *) fail "no 0.1.34 release for $(uname -m)" ;;
+    esac
+    mkdir "$work/old"
+    for program in i3t-controller i3tctl; do
+        curl -fsSL --retry 3 -o "$work/old/$program" \
+            "https://github.com/fuqiuluo/ice3tier/releases/download/v0.1.34/${program}-linux-${old_arch}" \
+            || fail "could not download ${program} 0.1.34"
+        chmod 755 "$work/old/$program"
+    done
+    [ "$(sha256sum "$work/old/i3t-controller" "$work/old/i3tctl" | cut -d' ' -f1 | tr '\n' ' ')" = "$old_sums " ] \
+        || fail "the downloaded 0.1.34 programs are not the released ones"
+    noexec=$(sudo mktemp -d)
+    sudo mount -t tmpfs -o noexec,mode=1777 tmpfs "$noexec"
+    old_database=$(new_database install_old)
+    TMPDIR="$noexec" sh "$repo/deploy/install.sh" --from "$work/old" --controller --public-addr 127.0.0.1:20331 \
+        --database-url "$old_database" >"$work/ctl-old.out" 2>&1 || fail "installing 0.1.34 failed: $(cat "$work/ctl-old.out")"
+    sudo umount "$noexec"
+    sudo rmdir "$noexec"
+    [ "$(/usr/local/bin/i3t-controller --version)" = "i3t-controller 0.1.34" ] || fail "not 0.1.34: $(/usr/local/bin/i3t-controller --version)"
+    old_token=$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-old.out" | head -n 1)
+    [ -n "$old_token" ] || fail "0.1.34 did not print its admin token: $(cat "$work/ctl-old.out")"
+    sudo test -f /var/lib/i3t-controller/controller.db || fail "0.1.34 did not create its database file"
+    [ "$(sudo cat /var/lib/i3t-controller/database.url)" = "$old_database" ] || fail "the connection string was not kept for later"
+
+    step "upgrading it to this build: the database was given earlier, and the new admin token is shown"
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller >"$work/ctl-new.out" 2>&1 || fail "the upgrade failed: $(cat "$work/ctl-new.out")"
+    new_token=$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-new.out" | head -n 1)
+    [ -n "$new_token" ] && [ "$new_token" != "$old_token" ] || fail "the new admin token was not shown: $(cat "$work/ctl-new.out")"
+    i=0
+    until I3T_ADMIN_TOKEN="$new_token" "$dir/i3tctl" --json status >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -lt 30 ] || fail "the upgraded controller does not answer with its new token"
+        sleep 1
+    done
+    sudo sh "$repo/deploy/install.sh" --uninstall --controller --purge >/dev/null
 fi
 
 step "ok"
