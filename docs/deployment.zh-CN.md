@@ -52,13 +52,12 @@ docker compose logs controller   # 管理令牌只在第一次启动时打印一
 
 它把 controller 和它用的 PostgreSQL 一起启动。这份指南后面的 `docker compose` 命令都在这个目录里执行。设置写在 `compose.yaml` 旁边的 `.env` 文件里：
 
-| 设置                    | 含义                                                                     |
-| ----------------------- | ------------------------------------------------------------------------ |
-| `I3T_PUBLIC_ADDR`       | 必填：节点连它用的地址                                                   |
-| `I3T_VERSION`           | 要运行的版本，不带 `v`，比如 `0.1.35`。默认 `latest`                     |
-| `I3T_POSTGRES_PASSWORD` | 数据库的密码，默认 `i3t`。数据库的端口不对外发布，只有 controller 连得到 |
+| 设置              | 含义                                                 |
+| ----------------- | ---------------------------------------------------- |
+| `I3T_PUBLIC_ADDR` | 必填：节点连它用的地址                               |
+| `I3T_VERSION`     | 要运行的版本，不带 `v`，比如 `0.1.35`。默认 `latest` |
 
-镜像是 `ghcr.io/fuqiuluo/ice3tier-controller`（linux amd64 和 arm64），里面有 `i3t-controller` 和 `i3tctl`。TCP 和 UDP 的 20331 发布在所有地址上，Web 界面的 20332 端口只发布在服务器的 `127.0.0.1` 上。数据在两个命名卷里：`postgres` 是数据库，`controller` 是 controller 的密钥和更新包的缓存。
+镜像是 `ghcr.io/fuqiuluo/ice3tier-controller`（linux amd64 和 arm64），里面有 `i3t-controller` 和 `i3tctl`。TCP 和 UDP 的 20331 发布在所有地址上，Web 界面的 20332 端口只发布在服务器的 `127.0.0.1` 上。数据库没有密码要设，也不听网络：它只听一个 Unix 套接字，套接字在只有这两个容器挂着的卷里。数据在两个命名卷里：`postgres` 是数据库，`controller` 是 controller 的密钥和更新包的缓存。第三个卷 `postgres-socket` 里只有那个套接字。
 
 **用安装脚本。** 脚本不装 PostgreSQL：要先有一个数据库，16 或更新的版本。在同一台机器上建一个的话，Debian 或 Ubuntu 上：
 
@@ -232,16 +231,16 @@ ssh <节点>.<网络>.i3t        # 按名字，比如 nas.home.i3t
 
 ```sh
 # Docker
-docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
-docker compose exec -T controller cat /data/controller.key > controller.key
-chmod 600 controller.key
+(umask 077
+ docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
+ docker compose exec -T controller cat /data/controller.key > controller.key)
 
 # 安装脚本
-sudo sh -c 'pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo sh -c 'umask 077; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
 sudo cp /var/lib/i3t-controller/controller.key controller.key
 ```
 
-转储里有全部的网络、节点和设置，以及管理令牌。两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
+转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令写出来的文件只有属主可读，保存时也别放宽。两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
 
 恢复在一台新的服务器上做，公网地址和原来的一样。
 
@@ -269,6 +268,8 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 ```
 
 在原来的服务器上恢复的话：先停服务（`sudo systemctl stop i3t-controller`），把库删掉、重新建一个空的，执行上面 `pg_restore` 和 `sudo install` 那两条，再启动服务。
+
+密钥要在 controller 启动之前放好：库已经是某个 controller 的了，没有它的密钥 controller 不启动，也不会生成一把新的。
 
 备份时的管理令牌照样能用。只要公网地址仍然指向 controller，节点会自己连回来。备份之后才加入的节点要用新的令牌重新加入。
 

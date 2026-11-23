@@ -10,19 +10,19 @@ A backup is two files: a dump of the database, and the controller's key `control
 With Docker:
 
 ```sh
-docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
-docker compose exec -T controller cat /data/controller.key > controller.key
-chmod 600 controller.key
+(umask 077
+ docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
+ docker compose exec -T controller cat /data/controller.key > controller.key)
 ```
 
 With the install script:
 
 ```sh
-sudo sh -c 'pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo sh -c 'umask 077; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
 sudo cp /var/lib/i3t-controller/controller.key controller.key
 ```
 
-The dump holds all networks, nodes and settings and the admin token.
+The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them readable by their owner only; keep them that way.
 
 :::caution
 Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
@@ -59,5 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 ```
 
 To restore on the same server: stop the service (`sudo systemctl stop i3t-controller`), drop the database and create it again empty, run the `pg_restore` and `sudo install` lines above, then start the service.
+
+Put the key in place before the controller starts: on a database that already belongs to a controller, it refuses to start without that controller's key rather than make a new one.
 
 The admin token from the time of the backup keeps working. Nodes reconnect by themselves as long as the public address still leads to the controller. Nodes that joined after the backup was made have to join again with a new token.

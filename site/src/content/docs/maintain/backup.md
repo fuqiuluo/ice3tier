@@ -10,19 +10,19 @@ description: 备份 controller 的数据，在原来的或新的服务器上恢�
 用 Docker 装的：
 
 ```sh
-docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
-docker compose exec -T controller cat /data/controller.key > controller.key
-chmod 600 controller.key
+(umask 077
+ docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
+ docker compose exec -T controller cat /data/controller.key > controller.key)
 ```
 
 用安装脚本装的：
 
 ```sh
-sudo sh -c 'pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo sh -c 'umask 077; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
 sudo cp /var/lib/i3t-controller/controller.key controller.key
 ```
 
-转储里有全部的网络、节点和设置，以及管理令牌。
+转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令写出来的文件只有属主可读，保存时也别放宽。
 
 :::caution
 两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
@@ -59,5 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 ```
 
 在原来的服务器上恢复的话：先停服务（`sudo systemctl stop i3t-controller`），把库删掉、重新建一个空的，执行上面 `pg_restore` 和 `sudo install` 那两条，再启动服务。
+
+密钥要在 controller 启动之前放好：库已经是某个 controller 的了，没有它的密钥 controller 不启动，也不会生成一把新的。
 
 备份时的管理令牌照样能用。只要公网地址仍然指向 controller，节点会自己连回来。备份之后才加入的节点要用新的令牌重新加入。

@@ -120,10 +120,9 @@ controller 把网络、节点和所有设置都存在 PostgreSQL 数据库里。
 | --- | --- |
 | `I3T_PUBLIC_ADDR` | 必填：节点连它用的地址 |
 | `I3T_VERSION` | 要运行的版本，不带 `v`，比如 `0.1.35`。默认 `latest` |
-| `I3T_POSTGRES_PASSWORD` | 数据库的密码，默认 `i3t`。数据库的端口不对外发布，只有 controller 连得到 |
 
-镜像是 `ghcr.io/fuqiuluo/ice3tier-controller`（linux amd64 和 arm64），里面有 `i3t-controller` 和 `i3tctl`。TCP 和 UDP 的 20331 发布在所有地址上，Web 界面的 20332 端口只发布在服务器的 `127.0.0.1` 上。
+镜像是 `ghcr.io/fuqiuluo/ice3tier-controller`（linux amd64 和 arm64），里面有 `i3t-controller` 和 `i3tctl`。TCP 和 UDP 的 20331 发布在所有地址上，Web 界面的 20332 端口只发布在服务器的 `127.0.0.1` 上。数据库没有密码要设，也不听网络：它只听一个 Unix 套接字，套接字在只有这两个容器挂着的卷里。
 
-数据在两个命名卷里：`postgres` 是数据库，`controller` 是 controller 的密钥和更新包的缓存。
+数据在两个命名卷里：`postgres` 是数据库，`controller` 是 controller 的密钥和更新包的缓存。第三个卷 `postgres-socket` 里只有那个套接字。
 
 下一步：[添加节点](../nodes/)。

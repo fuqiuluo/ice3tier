@@ -52,13 +52,12 @@ docker compose logs controller   # the admin token is printed once, on the first
 
 This starts the controller together with its PostgreSQL. Run the later `docker compose` commands of this guide in the same directory. The settings are in the `.env` file next to `compose.yaml`:
 
-| Setting                 | Meaning                                                                                              |
-| ----------------------- | ---------------------------------------------------------------------------------------------------- |
-| `I3T_PUBLIC_ADDR`       | Required: the address nodes use                                                                      |
-| `I3T_VERSION`           | Version to run, without `v`, for example `0.1.35`. Default `latest`                                  |
-| `I3T_POSTGRES_PASSWORD` | Database password, default `i3t`. The database port is not published; only the controller reaches it |
+| Setting           | Meaning                                                             |
+| ----------------- | ------------------------------------------------------------------- |
+| `I3T_PUBLIC_ADDR` | Required: the address nodes use                                     |
+| `I3T_VERSION`     | Version to run, without `v`, for example `0.1.35`. Default `latest` |
 
-The image is `ghcr.io/fuqiuluo/ice3tier-controller` (linux amd64 and arm64), with `i3t-controller` and `i3tctl` in it. TCP and UDP 20331 are published on all addresses, the web UI's port 20332 only on `127.0.0.1` of the server. The data is in two named volumes: `postgres` holds the database, `controller` the controller's key and the cache of update packages.
+The image is `ghcr.io/fuqiuluo/ice3tier-controller` (linux amd64 and arm64), with `i3t-controller` and `i3tctl` in it. TCP and UDP 20331 are published on all addresses, the web UI's port 20332 only on `127.0.0.1` of the server. The database has no password to set and does not listen on the network: it listens on a Unix socket in a volume that only the two containers mount. The data is in two named volumes: `postgres` holds the database, `controller` the controller's key and the cache of update packages. A third one, `postgres-socket`, holds only that socket.
 
 **With the install script.** The script does not install PostgreSQL: you need a database, version 16 or newer. To create one on the same machine, on Debian or Ubuntu:
 
@@ -232,16 +231,16 @@ A backup is two files: a dump of the database, and the controller's key `control
 
 ```sh
 # Docker
-docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
-docker compose exec -T controller cat /data/controller.key > controller.key
-chmod 600 controller.key
+(umask 077
+ docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
+ docker compose exec -T controller cat /data/controller.key > controller.key)
 
 # Install script
-sudo sh -c 'pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo sh -c 'umask 077; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
 sudo cp /var/lib/i3t-controller/controller.key controller.key
 ```
 
-The dump holds all networks, nodes and settings and the admin token. Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
+The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them readable by their owner only; keep them that way. Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
 
 Restore on a new server, with the same public address as before.
 
@@ -269,6 +268,8 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 ```
 
 To restore on the same server: stop the service (`sudo systemctl stop i3t-controller`), drop the database and create it again empty, run the `pg_restore` and `sudo install` lines above, then start the service.
+
+Put the key in place before the controller starts: on a database that already belongs to a controller, it refuses to start without that controller's key rather than make a new one.
 
 The admin token from the time of the backup keeps working. Nodes reconnect by themselves as long as the public address still leads to the controller. Nodes that joined after the backup was made have to join again with a new token.
 
