@@ -201,9 +201,12 @@ impl Inner {
         }
         *self.admin_token.lock().expect("admin token mutex poisoned") = admin_token_hash(&self.store)?;
         for network in networks {
-            // 没做成的节点 `refresh` 自己排了重试，不用为它们从头再来。
-            if let Err(error) = self.refresh(network.id, Seeds::All, None) {
-                tracing::warn!(network = %network.id, %error, "照数据库重算网络没有全做成，没做成的节点稍后再试");
+            match self.refresh(network.id, Seeds::All, None) {
+                Ok(()) => {}
+                // 整个数据库又读写不了了：剩下的网络也是一样的结果，下次从头再来。
+                Err(error) if error.is_database_wide() => return Err(error),
+                // 没做成的节点 `refresh` 自己排了重试，不用为它们从头再来。
+                Err(error) => tracing::warn!(network = %network.id, %error, "照数据库重算网络没有全做成，没做成的节点稍后再试"),
             }
         }
         self.roll_out()

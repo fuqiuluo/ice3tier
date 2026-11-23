@@ -592,8 +592,9 @@ fn two_networks_with_changes_due(
     (lab, networks, members)
 }
 
-/// 测试里等锁肯等的时间。存储等满一次之后，接下来同样长的一段里不再等。
-const LOCK_PATIENCE: Duration = Duration::from_millis(100);
+/// 测试里等锁肯等的时间。存储等满一次之后，接下来同样长的一段里不再等：几处断言说的是"这一段里马上失败"，
+/// 所以它要长到慢的机器也来得及在这一段里走到那一步。
+const LOCK_PATIENCE: Duration = Duration::from_secs(1);
 
 #[test]
 fn a_locked_table_is_waited_for_once_however_many_nodes_and_networks_are_due() {
