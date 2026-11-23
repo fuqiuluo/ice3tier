@@ -5,20 +5,59 @@ description: Install the controller on a server, open the web UI and create the 
 
 import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 
+The controller keeps networks, nodes and all settings in a PostgreSQL database. There are two ways to install it: with Docker, which brings its own PostgreSQL, or with the install script and a PostgreSQL of your own.
+
 <Steps>
 
 1. **Install.** On the server:
 
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
-     sh -s -- --controller --public-addr <public-address>:20331
-   ```
+   <Tabs syncKey="controller">
+     <TabItem label="Docker">
+       ```sh
+       curl -fsSLO https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/docker/compose.yaml
+       echo 'I3T_PUBLIC_ADDR=<public-address>:20331' > .env
+       docker compose up -d
+       ```
+
+       This starts the controller together with its PostgreSQL. Run the `docker compose` commands of the later pages in the same directory.
+     </TabItem>
+     <TabItem label="Install script">
+       The script does not install PostgreSQL: you need a database, version 16 or newer. To create one on the same machine, on Debian or Ubuntu:
+
+       ```sh
+       sudo apt-get install -y postgresql
+       sudo -u postgres psql -c "CREATE ROLE i3t LOGIN PASSWORD '<password>'" \
+         -c "CREATE DATABASE i3t OWNER i3t"
+       ```
+
+       Its connection string is `postgres://i3t:<password>@127.0.0.1/i3t`. Then install the controller:
+
+       ```sh
+       curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+         sh -s -- --controller --public-addr <public-address>:20331 \
+           --database-url postgres://<user>:<password>@<host>/<database>
+       ```
+
+       The script installs `i3t-controller` and `i3tctl` into `/usr/local/bin`, creates the systemd service `i3t-controller` (its own system user, started at boot) and starts it. It writes the connection string to `/var/lib/i3t-controller/database.url`, readable only by the service's user.
+
+       The connection to the database is not encrypted: keep the database on the same machine or on a trusted private network.
+     </TabItem>
+   </Tabs>
 
    `<public-address>` is the IP address or domain name nodes use to reach this machine. It is written into every enrollment token, so choose one that will not change. With a domain name you can move the controller to another machine later.
 
-   The script installs `i3t-controller` and `i3tctl` into `/usr/local/bin`, creates the systemd service `i3t-controller` (its own system user, started at boot) and starts it.
+2. **Save the admin token.** It is printed once, on the first start:
 
-2. **Save the admin token.** At the end the script prints the admin token:
+   <Tabs syncKey="controller">
+     <TabItem label="Docker">
+       ```sh
+       docker compose logs controller
+       ```
+     </TabItem>
+     <TabItem label="Install script">
+       The script prints it at the end.
+     </TabItem>
+   </Tabs>
 
    ```
    Admin token (shown only once):
@@ -30,9 +69,18 @@ import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 
 3. **Check the service.**
 
-   ```sh
-   systemctl status i3t-controller
-   ```
+   <Tabs syncKey="controller">
+     <TabItem label="Docker">
+       ```sh
+       docker compose ps
+       ```
+     </TabItem>
+     <TabItem label="Install script">
+       ```sh
+       systemctl status i3t-controller
+       ```
+     </TabItem>
+   </Tabs>
 
 4. **Create a network.**
 
@@ -53,9 +101,29 @@ import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
        export I3T_ADMIN_TOKEN=<admin-token>
        i3tctl network create home
        ```
+
+       With Docker, `i3tctl` is inside the controller's container. Write every `i3tctl` command of these pages like this:
+
+       ```sh
+       docker compose exec controller i3tctl --token <admin-token> network create home
+       ```
      </TabItem>
    </Tabs>
 
 </Steps>
+
+## Docker settings
+
+The settings are in the `.env` file next to `compose.yaml`:
+
+| Setting | Meaning |
+| --- | --- |
+| `I3T_PUBLIC_ADDR` | Required: the address nodes use |
+| `I3T_VERSION` | Version to run, without `v`, for example `0.1.35`. Default `latest` |
+| `I3T_POSTGRES_PASSWORD` | Database password, default `i3t`. The database port is not published; only the controller reaches it |
+
+The image is `ghcr.io/fuqiuluo/ice3tier-controller` (linux amd64 and arm64), with `i3t-controller` and `i3tctl` in it. TCP and UDP 20331 are published on all addresses, the web UI's port 20332 only on `127.0.0.1` of the server.
+
+The data is in two named volumes: `postgres` holds the database, `controller` the controller's key and the cache of update packages.
 
 Next: [Add nodes](../nodes/).

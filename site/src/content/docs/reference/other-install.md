@@ -21,7 +21,8 @@ sh install.sh --from . --token <注册令牌>
 装 controller 的话，下载 `i3t-controller-<平台>` 和 `i3tctl-<平台>`，执行：
 
 ```sh
-sh install.sh --from . --controller --public-addr <公网地址>:20331
+sh install.sh --from . --controller --public-addr <公网地址>:20331 \
+  --database-url postgres://<用户>:<密码>@<主机>/<库名>
 ```
 
 有和 GitHub Releases 目录结构相同的镜像的话，改用 `--release-base <地址>`。
@@ -47,10 +48,13 @@ i3tctl update set --source <地址或目录>
 不用安装脚本、直接运行的话，顺序相同：
 
 ```sh
-i3t-controller --data-dir /var/lib/i3t-controller --public-addr <公网地址>:20331
+i3t-controller --data-dir /var/lib/i3t-controller \
+  --database-url postgres://<用户>:<密码>@<主机>/<库名> --public-addr <公网地址>:20331
 echo <注册令牌> | i3t join
 i3t run
 ```
+
+controller 的数据目录里是它的密钥 `controller.key` 和更新包的缓存；网络、节点和设置都在 PostgreSQL 数据库里，16 或更新的版本。连接串写成 `postgres://用户:密码@主机[:端口]/库名`，也可以写成 `host=… user=… dbname=…` 的形式。`i3t-controller` 先看选项 `--database-url`，再看环境变量 `I3T_DATABASE_URL`，最后读数据目录里只有一行的 `database.url` 文件。连接串里有密码，所以最好用环境变量或者文件，不要写在命令行上。到数据库的连接不加密：数据库要放在同一台机器上，或者可信的内网里。
 
 systemd 单元和 polkit 规则文件在 [`deploy/systemd`](https://github.com/fuqiuluo/ice3tier/tree/main/deploy/systemd) 与 [`deploy/polkit`](https://github.com/fuqiuluo/ice3tier/tree/main/deploy/polkit)。
 
@@ -73,4 +77,4 @@ cd ice3tier
 cargo build --release
 ```
 
-程序在 `target/release/` 下。
+程序在 `target/release/` 下。controller 的 Docker 镜像用 [`deploy/docker/Dockerfile`](https://github.com/fuqiuluo/ice3tier/blob/main/deploy/docker/Dockerfile) 构建。

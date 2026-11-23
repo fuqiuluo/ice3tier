@@ -15,12 +15,13 @@ These pages take you from nothing to a working network. Follow them in order: **
 | Part | Where | How many |
 | --- | --- | --- |
 | Controller (`i3t-controller`) and `i3tctl` | A Linux machine every node can reach, usually a server with a public address | One |
+| PostgreSQL database | Next to the controller, which keeps its data in it | One |
 | Node (`i3t`) | Every machine you want in the network | One per machine |
 | Relay | A node that other nodes can reach | At least one |
 
 ## Machines
 
-- **Controller machine**: Linux (x86_64 or aarch64) with systemd, and an IP address or domain name that every node can reach.
+- **Controller machine**: Linux (x86_64 or aarch64), and an IP address or domain name that every node can reach. Either Docker with `docker compose`, or systemd and a PostgreSQL database, version 16 or newer.
 - **Node machines**: Linux (x86_64, aarch64), macOS (Apple silicon, Intel) or Windows (x86_64).
 - Root or `sudo` on each machine.
 - The install script downloads from GitHub. If a machine cannot reach it, see [Without access to GitHub](../../reference/other-install/#without-access-to-github).

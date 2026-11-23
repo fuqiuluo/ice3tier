@@ -42,5 +42,14 @@ sudo i3t hosts --apply
 ## 安装时没有看到管理令牌
 
 ```sh
-sudo journalctl -u i3t-controller --no-pager
+docker compose logs controller                  # Docker
+sudo journalctl -u i3t-controller --no-pager    # 安装脚本
 ```
+
+## 安装脚本要求给 `--database-url`
+
+controller 要一个 PostgreSQL 数据库，见 [安装 controller](../../deploy/controller/)。从 0.1.34 或更早的版本升级时也要给一次，见 [升级](../../maintain/upgrade/)。
+
+## controller 连不上数据库
+
+确认 PostgreSQL 在运行，以及 `/var/lib/i3t-controller/database.url` 里的连接串是对的。

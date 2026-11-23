@@ -5,20 +5,59 @@ description: 在服务器上装好 controller，打开 Web 界面，新建第一
 
 import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 
+controller 把网络、节点和所有设置都存在 PostgreSQL 数据库里。有两种装法：用 Docker，自带 PostgreSQL；或者用安装脚本，PostgreSQL 自己准备。
+
 <Steps>
 
 1. **安装。** 在服务器上：
 
-   ```sh
-   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
-     sh -s -- --controller --public-addr <公网地址>:20331
-   ```
+   <Tabs syncKey="controller">
+     <TabItem label="Docker">
+       ```sh
+       curl -fsSLO https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/docker/compose.yaml
+       echo 'I3T_PUBLIC_ADDR=<公网地址>:20331' > .env
+       docker compose up -d
+       ```
+
+       它把 controller 和它用的 PostgreSQL 一起启动。之后各页里的 `docker compose` 命令都在这个目录里执行。
+     </TabItem>
+     <TabItem label="安装脚本">
+       脚本不装 PostgreSQL：要先有一个数据库，16 或更新的版本。在同一台机器上建一个的话，Debian 或 Ubuntu 上：
+
+       ```sh
+       sudo apt-get install -y postgresql
+       sudo -u postgres psql -c "CREATE ROLE i3t LOGIN PASSWORD '<密码>'" \
+         -c "CREATE DATABASE i3t OWNER i3t"
+       ```
+
+       它的连接串是 `postgres://i3t:<密码>@127.0.0.1/i3t`。然后安装 controller：
+
+       ```sh
+       curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+         sh -s -- --controller --public-addr <公网地址>:20331 \
+           --database-url postgres://<用户>:<密码>@<主机>/<库名>
+       ```
+
+       脚本把 `i3t-controller` 和 `i3tctl` 装到 `/usr/local/bin`，建好 systemd 服务 `i3t-controller`（专用的系统用户，开机自启）并启动它。连接串写进 `/var/lib/i3t-controller/database.url`，只有这个服务的用户可读。
+
+       到数据库的连接不加密：数据库要放在同一台机器上，或者可信的内网里。
+     </TabItem>
+   </Tabs>
 
    `<公网地址>` 是节点连这台机器用的 IP 或域名。它会写进每一个注册令牌，所以要选一个不会变的。用域名的话，以后可以把 controller 搬到别的机器上。
 
-   脚本把 `i3t-controller` 和 `i3tctl` 装到 `/usr/local/bin`，建好 systemd 服务 `i3t-controller`（专用的系统用户，开机自启）并启动它。
+2. **存好管理令牌。** 它只在第一次启动时打印一次：
 
-2. **存好管理令牌。** 脚本最后打印管理令牌：
+   <Tabs syncKey="controller">
+     <TabItem label="Docker">
+       ```sh
+       docker compose logs controller
+       ```
+     </TabItem>
+     <TabItem label="安装脚本">
+       脚本最后把它打印出来。
+     </TabItem>
+   </Tabs>
 
    ```
    管理令牌（只显示这一次）：
@@ -30,9 +69,18 @@ import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
 
 3. **查看服务状态。**
 
-   ```sh
-   systemctl status i3t-controller
-   ```
+   <Tabs syncKey="controller">
+     <TabItem label="Docker">
+       ```sh
+       docker compose ps
+       ```
+     </TabItem>
+     <TabItem label="安装脚本">
+       ```sh
+       systemctl status i3t-controller
+       ```
+     </TabItem>
+   </Tabs>
 
 4. **新建网络。**
 
@@ -53,9 +101,29 @@ import { Steps, Tabs, TabItem } from '@astrojs/starlight/components'
        export I3T_ADMIN_TOKEN=<管理令牌>
        i3tctl network create home
        ```
+
+       用 Docker 装的话，`i3tctl` 在 controller 的容器里。各页里的 `i3tctl` 命令都这样写：
+
+       ```sh
+       docker compose exec controller i3tctl --token <管理令牌> network create home
+       ```
      </TabItem>
    </Tabs>
 
 </Steps>
+
+## Docker 的设置
+
+设置写在 `compose.yaml` 旁边的 `.env` 文件里：
+
+| 设置 | 含义 |
+| --- | --- |
+| `I3T_PUBLIC_ADDR` | 必填：节点连它用的地址 |
+| `I3T_VERSION` | 要运行的版本，不带 `v`，比如 `0.1.35`。默认 `latest` |
+| `I3T_POSTGRES_PASSWORD` | 数据库的密码，默认 `i3t`。数据库的端口不对外发布，只有 controller 连得到 |
+
+镜像是 `ghcr.io/fuqiuluo/ice3tier-controller`（linux amd64 和 arm64），里面有 `i3t-controller` 和 `i3tctl`。TCP 和 UDP 的 20331 发布在所有地址上，Web 界面的 20332 端口只发布在服务器的 `127.0.0.1` 上。
+
+数据在两个命名卷里：`postgres` 是数据库，`controller` 是 controller 的密钥和更新包的缓存。
 
 下一步：[添加节点](../nodes/)。

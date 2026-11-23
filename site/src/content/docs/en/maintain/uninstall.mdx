@@ -36,9 +36,20 @@ i3tctl node delete <node>
 
 ## Controller
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
-  sh -s -- --uninstall --controller
-```
+<Tabs syncKey="controller">
+  <TabItem label="Docker">
+    ```sh
+    docker compose down
+    ```
 
-Add `--purge` to delete its data and configuration as well.
+    Add `--volumes` to delete the database and the controller's key as well.
+  </TabItem>
+  <TabItem label="Install script">
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+      sh -s -- --uninstall --controller
+    ```
+
+    Add `--purge` to delete its key and settings as well. The script never touches the PostgreSQL database, with or without `--purge`. Drop it yourself if you want it gone.
+  </TabItem>
+</Tabs>

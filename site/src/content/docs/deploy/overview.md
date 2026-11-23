@@ -15,12 +15,13 @@ description: 要部署什么、机器要满足什么、要放行哪些端口。
 | 组成 | 放在哪里 | 数量 |
 | --- | --- | --- |
 | controller（`i3t-controller`）和 `i3tctl` | 一台各个节点都连得上的 Linux 机器，通常是有公网地址的服务器 | 一个 |
+| PostgreSQL 数据库 | 和 controller 放在一起，它的数据存在里面 | 一个 |
 | 节点（`i3t`） | 每一台要组网的机器 | 每台一个 |
 | 中继 | 一个别的节点连得上的节点 | 至少一个 |
 
 ## 机器
 
-- **放 controller 的机器**：Linux（x86_64 或 aarch64），有 systemd，有一个各个节点都连得上的 IP 或域名。
+- **放 controller 的机器**：Linux（x86_64 或 aarch64），有一个各个节点都连得上的 IP 或域名。要么装了 Docker（带 `docker compose`），要么有 systemd 和一个 PostgreSQL 数据库（16 或更新的版本）。
 - **节点的机器**：Linux（x86_64、aarch64）、macOS（Apple 芯片、Intel）或 Windows（x86_64）。
 - 每台机器上要有 root 或 `sudo`。
 - 安装脚本从 GitHub 下载。机器连不上 GitHub 的话，见 [连不上 GitHub 时](../../reference/other-install/#连不上-github-时)。

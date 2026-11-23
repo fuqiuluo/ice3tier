@@ -15,12 +15,13 @@
 | 组成                                    | 放在哪里                                           | 数量       |
 | --------------------------------------- | -------------------------------------------------- | ---------- |
 | controller（`i3t-controller`）和 `i3tctl` | 一台各个节点都连得上的 Linux 机器，通常是有公网地址的服务器 | 一个       |
+| PostgreSQL 数据库                       | 和 controller 放在一起，它的数据存在里面           | 一个       |
 | 节点（`i3t`）                           | 每一台要组网的机器                                 | 每台一个   |
 | 中继                                    | 一个别的节点连得上的节点     | 至少一个   |
 
 ## 开始之前
 
-- **放 controller 的机器**：Linux（x86_64 或 aarch64），有 systemd，有一个各个节点都连得上的 IP 或域名。
+- **放 controller 的机器**：Linux（x86_64 或 aarch64），有一个各个节点都连得上的 IP 或域名。要么装了 Docker（带 `docker compose`），要么有 systemd 和一个 PostgreSQL 数据库（16 或更新的版本）。
 - **节点的机器**：Linux（x86_64、aarch64）、macOS（Apple 芯片、Intel）或 Windows（x86_64）。
 - 每台机器上要有 root 或 `sudo`。
 - 安装脚本从 GitHub 下载。机器连不上 GitHub 的话，见 [连不上 GitHub 时](#连不上-github-时)。
@@ -36,15 +37,45 @@
 
 ## 第 1 步：安装 controller
 
-在服务器上：
+controller 把网络、节点和所有设置都存在 PostgreSQL 数据库里。有两种装法：用 Docker，自带 PostgreSQL；或者用安装脚本，PostgreSQL 自己准备。
+
+两种装法里，`<公网地址>` 都是节点连这台机器用的 IP 或域名。它会写进每一个注册令牌，所以要选一个不会变的。用域名的话，以后可以把 controller 搬到别的机器上。
+
+**用 Docker。** 在服务器上：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <公网地址>:20331
+curl -fsSLO https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/docker/compose.yaml
+echo 'I3T_PUBLIC_ADDR=<公网地址>:20331' > .env
+docker compose up -d
+docker compose logs controller   # 管理令牌只在第一次启动时打印一次
 ```
 
-`<公网地址>` 是节点连这台机器用的 IP 或域名。它会写进每一个注册令牌，所以要选一个不会变的。用域名的话，以后可以把 controller 搬到别的机器上。
+它把 controller 和它用的 PostgreSQL 一起启动。这份指南后面的 `docker compose` 命令都在这个目录里执行。设置写在 `compose.yaml` 旁边的 `.env` 文件里：
 
-脚本把 `i3t-controller` 和 `i3tctl` 装到 `/usr/local/bin`，建好 systemd 服务 `i3t-controller`（专用的系统用户，开机自启）并启动它，最后打印管理令牌：
+| 设置                    | 含义                                                                     |
+| ----------------------- | ------------------------------------------------------------------------ |
+| `I3T_PUBLIC_ADDR`       | 必填：节点连它用的地址                                                   |
+| `I3T_VERSION`           | 要运行的版本，不带 `v`，比如 `0.1.35`。默认 `latest`                     |
+| `I3T_POSTGRES_PASSWORD` | 数据库的密码，默认 `i3t`。数据库的端口不对外发布，只有 controller 连得到 |
+
+镜像是 `ghcr.io/fuqiuluo/ice3tier-controller`（linux amd64 和 arm64），里面有 `i3t-controller` 和 `i3tctl`。TCP 和 UDP 的 20331 发布在所有地址上，Web 界面的 20332 端口只发布在服务器的 `127.0.0.1` 上。数据在两个命名卷里：`postgres` 是数据库，`controller` 是 controller 的密钥和更新包的缓存。
+
+**用安装脚本。** 脚本不装 PostgreSQL：要先有一个数据库，16 或更新的版本。在同一台机器上建一个的话，Debian 或 Ubuntu 上：
+
+```sh
+sudo apt-get install -y postgresql
+sudo -u postgres psql -c "CREATE ROLE i3t LOGIN PASSWORD '<密码>'" -c "CREATE DATABASE i3t OWNER i3t"
+```
+
+它的连接串是 `postgres://i3t:<密码>@127.0.0.1/i3t`。然后安装 controller：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <公网地址>:20331 --database-url postgres://<用户>:<密码>@<主机>/<库名>
+```
+
+脚本把 `i3t-controller` 和 `i3tctl` 装到 `/usr/local/bin`，建好 systemd 服务 `i3t-controller`（专用的系统用户，开机自启）并启动它。连接串写进 `/var/lib/i3t-controller/database.url`，只有这个服务的用户可读。到数据库的连接不加密：数据库要放在同一台机器上，或者可信的内网里。
+
+两种装法都在第一次启动时打印管理令牌：在 `docker compose logs controller` 里，或者在脚本的最后。
 
 ```
 管理令牌（只显示这一次）：
@@ -57,7 +88,8 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 查看服务状态：
 
 ```sh
-systemctl status i3t-controller
+docker compose ps                  # Docker
+systemctl status i3t-controller    # 安装脚本
 ```
 
 ## 第 2 步：打开 Web 界面，新建网络
@@ -75,6 +107,12 @@ ssh -L 20332:127.0.0.1:20332 <用户>@<服务器>
 ```sh
 export I3T_ADMIN_TOKEN=<管理令牌>
 i3tctl network create home
+```
+
+用 Docker 装的话，`i3tctl` 在 controller 的容器里。这份指南里的 `i3tctl` 命令都这样写：
+
+```sh
+docker compose exec controller i3tctl --token <管理令牌> network create home
 ```
 
 ## 第 3 步：添加节点
@@ -174,39 +212,75 @@ ssh <节点>.<网络>.i3t        # 按名字，比如 nas.home.i3t
 ### 升级
 
 - **节点自己更新。** controller 取来带签名的新版本交给节点，节点验签、安装、重启。`i3tctl update show` 查看状态。要手动升级一个节点，在它上面再执行一次安装脚本，已有的加入信息会保留。
-- **controller 要手动升级。** 在服务器上再执行一次脚本，数据和设置都保留：
+- **controller 要手动升级。** 在服务器上执行，数据和设置都保留：
 
   ```sh
+  # Docker
+  docker compose pull && docker compose up -d
+
+  # 安装脚本：再执行一次
   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller
   ```
+
+- **从 0.1.34 或更早的版本升级。** controller 现在要 PostgreSQL，原来的数据不会带过来：它从空的开始。网络要重新建，每个节点要用新的注册令牌重新加入。原来的 `controller.db` 留在原处，不再读它。用安装脚本的话，这一次要像 [第 1 步](#第-1-步安装-controller) 那样带上 `--database-url`，以后升级不用再带。
 
 每一版要升级哪些部分，见 [CHANGELOG.md](../CHANGELOG.md)。
 
 ### 备份和恢复
 
-备份不用停 controller：
+备份是两个文件：数据库的转储，和 controller 的密钥 `controller.key`。备份不用停 controller：
 
 ```sh
-sudo /usr/local/bin/i3t-controller --data-dir /var/lib/i3t-controller --backup-to /root/i3t-controller-backup
+# Docker
+docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
+docker compose exec -T controller cat /data/controller.key > controller.key
+chmod 600 controller.key
+
+# 安装脚本
+sudo sh -c 'pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo cp /var/lib/i3t-controller/controller.key controller.key
 ```
 
-目标要是一个新的或者空的目录。备份里有全部的网络、节点和设置，以及管理令牌和 controller 的密钥。不要只拷贝 `controller.db`：最近的改动可能还在它旁边的文件里。
+转储里有全部的网络、节点和设置，以及管理令牌。两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
 
-恢复，在原来的服务器上，或者在一台按第 1 步装好 controller 的新服务器上：
+恢复在一台新的服务器上做，公网地址和原来的一样。
+
+用 Docker 的话：
 
 ```sh
-sudo systemctl stop i3t-controller
-sudo mv /var/lib/i3t-controller /var/lib/i3t-controller.old
-sudo cp -a /root/i3t-controller-backup /var/lib/i3t-controller
-sudo chown -R i3t-controller: /var/lib/i3t-controller
-sudo systemctl start i3t-controller
+curl -fsSLO https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/docker/compose.yaml
+echo 'I3T_PUBLIC_ADDR=<公网地址>:20331' > .env
+docker compose up -d --wait postgres
+docker compose exec -T postgres pg_restore --username i3t --dbname i3t --no-owner < controller.dump
+docker compose run --rm -T --entrypoint sh controller -c 'umask 077; cat > /data/controller.key' < controller.key
+docker compose up -d
 ```
 
-只要公网地址仍然指向 controller，节点会自己连回来。备份之后才加入的节点要用新的令牌重新加入。
+在原来的服务器上恢复的话，前两行换成 `docker compose down --volumes`：它会删掉现有的数据库和密钥。
+
+用安装脚本的话，先按第 1 步建一个空的数据库，然后：
+
+```sh
+pg_restore --no-owner --dbname postgres://i3t:<密码>@127.0.0.1/i3t controller.dump
+# 先装上但不启动，把密钥放好，再启动
+curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --database-url postgres://i3t:<密码>@127.0.0.1/i3t
+sudo install -o i3t-controller -g i3t-controller -m 600 controller.key /var/lib/i3t-controller/controller.key
+curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <公网地址>:20331
+```
+
+在原来的服务器上恢复的话：先停服务（`sudo systemctl stop i3t-controller`），把库删掉、重新建一个空的，执行上面 `pg_restore` 和 `sudo install` 那两条，再启动服务。
+
+备份时的管理令牌照样能用。只要公网地址仍然指向 controller，节点会自己连回来。备份之后才加入的节点要用新的令牌重新加入。
 
 ### 管理令牌丢了
 
 ```sh
+# Docker
+docker compose stop controller
+docker compose run --rm controller --reset-admin-token
+docker compose start controller
+
+# 安装脚本
 sudo systemctl stop i3t-controller
 sudo -u i3t-controller /usr/local/bin/i3t-controller --data-dir /var/lib/i3t-controller --reset-admin-token
 sudo systemctl start i3t-controller
@@ -220,9 +294,14 @@ sudo systemctl start i3t-controller
 # 节点。加 --purge 连它的身份和设置一起删
 curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --uninstall
 
-# controller。加 --purge 连它的数据和配置一起删
+# controller，用 Docker 装的。加 --volumes 连数据库和 controller 的密钥一起删
+docker compose down
+
+# controller，用安装脚本装的。加 --purge 连它的密钥和设置一起删
 curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --uninstall --controller
 ```
+
+安装脚本不会动 PostgreSQL 数据库，加不加 `--purge` 都一样。想删的话自己删。
 
 卸载节点之后，在 Web 界面里把它删掉，或者执行 `i3tctl node delete <节点>`。
 
@@ -241,7 +320,7 @@ curl -fLO https://github.com/fuqiuluo/ice3tier/releases/latest/download/i3t-linu
 sh install.sh --from . --token <注册令牌>
 ```
 
-装 controller 的话，下载 `i3t-controller-<平台>` 和 `i3tctl-<平台>`，执行 `sh install.sh --from . --controller --public-addr <公网地址>:20331`。
+装 controller 的话，下载 `i3t-controller-<平台>` 和 `i3tctl-<平台>`，执行 `sh install.sh --from . --controller --public-addr <公网地址>:20331 --database-url postgres://<用户>:<密码>@<主机>/<库名>`。
 
 有和 GitHub Releases 目录结构相同的镜像的话，改用 `--release-base <地址>`。节点的更新是从 controller 取的，所以之后只有 controller 需要一个连得上的发布源，用 `i3tctl update set --source <地址或目录>` 修改。
 
@@ -255,7 +334,9 @@ sh install.sh --from . --token <注册令牌>
 | 两个节点都在线，互相却不通                             | 它们之间没有直连的路，也没有两边都连得上的中继，见 [第 4 步](#第-4-步配置中继)。`sudo i3t status` 里有到每个节点的路由 |
 | 开着 firewalld，别的节点连不到这台机器                 | `sudo firewall-cmd --permanent --zone=trusted --add-interface=i3t0 && sudo firewall-cmd --reload`   |
 | 名字解析不了                                           | `sudo i3t hosts --apply`，或者直接用虚拟 IP                                                         |
-| 安装时没有看到管理令牌                                 | `sudo journalctl -u i3t-controller --no-pager`                                                      |
+| 安装时没有看到管理令牌                                 | `sudo journalctl -u i3t-controller --no-pager`；用 Docker 装的是 `docker compose logs controller`   |
+| 安装脚本要求给 `--database-url`                        | controller 要一个 PostgreSQL 数据库，见 [第 1 步](#第-1-步安装-controller)                          |
+| controller 连不上数据库                                | 确认 PostgreSQL 在运行，以及 `/var/lib/i3t-controller/database.url` 里的连接串是对的                |
 
 ## 参考
 
@@ -263,7 +344,7 @@ sh install.sh --from . --token <注册令牌>
 
 | 内容                    | 位置                                                                                 |
 | ----------------------- | ------------------------------------------------------------------------------------ |
-| controller 的数据       | `/var/lib/i3t-controller`                                                            |
+| controller 的数据       | `/var/lib/i3t-controller`（`controller.key`、`database.url`、更新包的缓存）          |
 | controller 的设置       | `/etc/i3t/controller.env`（`I3T_PUBLIC_ADDR`、`I3T_CONTROLLER_ARGS`）                |
 | controller 和命令行程序 | `/usr/local/bin/i3t-controller`、`/usr/local/bin/i3tctl`                             |
 | 节点的状态和设置        | `/var/lib/i3t`（设置在 `config.toml` 里）                                            |
@@ -276,6 +357,7 @@ sh install.sh --from . --token <注册令牌>
 | --------------------------- | ------------------------------------------------------ |
 | `--controller`              | 安装 controller 和 `i3tctl`，不装节点                  |
 | `--public-addr <主机:端口>` | controller：节点连它用的地址；同时启动服务             |
+| `--database-url <连接串>`   | controller：用的数据库。也可以用 `I3T_DATABASE_URL`    |
 | `--token <令牌>`            | 节点：加入并启动。也可以用环境变量 `I3T_TOKEN`         |
 | `--can-relay`、`--can-exit` | 节点：加入时声明可以作为中继、出口                     |
 | `--no-vnet`                 | 节点：不要虚拟网卡                                     |
@@ -284,3 +366,5 @@ sh install.sh --from . --token <注册令牌>
 | `--release-base <地址>`     | 从目录结构和 GitHub Releases 相同的镜像下载            |
 | `--from <目录>`             | 用本地目录里的程序安装，不下载                         |
 | `--uninstall`、`--purge`    | 删掉服务和程序；加 `--purge` 连状态和设置一起删        |
+
+controller 的数据目录里是它的密钥 `controller.key` 和更新包的缓存；网络、节点和设置都在数据库里。数据库的连接串写成 `postgres://用户:密码@主机[:端口]/库名`，也可以写成 `host=… user=… dbname=…` 的形式。`i3t-controller` 先看选项 `--database-url`，再看环境变量 `I3T_DATABASE_URL`，最后读数据目录里只有一行的 `database.url` 文件。连接串里有密码，所以最好用环境变量或者文件，不要写在命令行上。

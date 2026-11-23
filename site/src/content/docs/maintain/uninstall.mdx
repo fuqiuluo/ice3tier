@@ -36,9 +36,20 @@ i3tctl node delete <节点>
 
 ## controller
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
-  sh -s -- --uninstall --controller
-```
+<Tabs syncKey="controller">
+  <TabItem label="Docker">
+    ```sh
+    docker compose down
+    ```
 
-加 `--purge` 连它的数据和配置一起删。
+    加 `--volumes` 连数据库和 controller 的密钥一起删。
+  </TabItem>
+  <TabItem label="安装脚本">
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
+      sh -s -- --uninstall --controller
+    ```
+
+    加 `--purge` 连它的密钥和设置一起删。脚本不会动 PostgreSQL 数据库，加不加 `--purge` 都一样，想删的话自己删。
+  </TabItem>
+</Tabs>

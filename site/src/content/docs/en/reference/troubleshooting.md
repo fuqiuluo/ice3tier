@@ -42,5 +42,14 @@ Or use the virtual IP.
 ## The admin token did not show up during install
 
 ```sh
-sudo journalctl -u i3t-controller --no-pager
+docker compose logs controller                  # Docker
+sudo journalctl -u i3t-controller --no-pager    # install script
 ```
+
+## The install script asks for `--database-url`
+
+The controller needs a PostgreSQL database: see [Install the controller](../../deploy/controller/). An upgrade from 0.1.34 or older needs it once as well: see [Upgrading](../../maintain/upgrade/).
+
+## The controller cannot connect to the database
+
+Check that PostgreSQL is running and that the connection string in `/var/lib/i3t-controller/database.url` is right.

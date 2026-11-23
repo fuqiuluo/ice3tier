@@ -11,6 +11,7 @@ Linux and macOS use `install.sh`:
 | --- | --- |
 | `--controller` | Install the controller and `i3tctl` instead of the node |
 | `--public-addr <host:port>` | Controller: the address nodes use; also starts the service |
+| `--database-url <url>` | Controller: the PostgreSQL database it keeps its data in. `I3T_DATABASE_URL` works too |
 | `--token <token>` | Node: join and start. `I3T_TOKEN` works too |
 | `--can-relay`, `--can-exit` | Node: declare when joining that it may be a relay or an exit |
 | `--no-vnet` | Node: no virtual network adapter |
@@ -37,7 +38,7 @@ Files `install.sh` creates:
 
 | What | Where |
 | --- | --- |
-| Controller data | `/var/lib/i3t-controller` |
+| Controller data | `/var/lib/i3t-controller` (`controller.key`, `database.url`, update cache) |
 | Controller settings | `/etc/i3t/controller.env` (`I3T_PUBLIC_ADDR`, `I3T_CONTROLLER_ARGS`) |
 | Controller and command line programs | `/usr/local/bin/i3t-controller`, `/usr/local/bin/i3tctl` |
 | Node state and settings | `/var/lib/i3t` (settings in `config.toml`) |

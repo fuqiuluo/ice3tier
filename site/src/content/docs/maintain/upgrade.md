@@ -17,7 +17,15 @@ i3tctl update show
 
 ## controller
 
-controller 要手动升级。在服务器上再执行一次脚本，数据和设置都保留：
+controller 要手动升级，数据和设置都保留。
+
+用 Docker 装的：
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+用安装脚本装的，在服务器上再执行一次脚本：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
@@ -25,3 +33,9 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 ```
 
 每一版要升级哪些部分，见 [CHANGELOG](https://github.com/fuqiuluo/ice3tier/blob/main/CHANGELOG.md)。
+
+## 从 0.1.34 或更早的版本升级
+
+controller 现在要 PostgreSQL，原来的数据不会带过来：它从空的开始。网络要重新建，每个节点要用新的注册令牌重新加入。原来的 `controller.db` 留在原处，不再读它。
+
+用安装脚本升级的话，这一次要像 [安装 controller](../../deploy/controller/) 那样带上 `--database-url`，以后升级不用再带。

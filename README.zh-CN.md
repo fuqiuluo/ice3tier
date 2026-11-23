@@ -55,13 +55,22 @@ ice3tier 把你自己的机器连成一个私有网络。每个节点有一块�
 
 先部署 controller，再装节点：节点要拿 controller 发的令牌才能加入。每一步的细节，以及端口、Windows、升级和备份，见 [部署指南](docs/deployment.zh-CN.md)。
 
-**1. 安装 controller**，放在一台各个节点都连得上的 Linux 服务器上，放行 TCP 和 UDP 的 20331 端口：
+**1. 安装 controller**，放在一台各个节点都连得上的 Linux 服务器上，放行 TCP 和 UDP 的 20331 端口。用 Docker 的话，连它存数据用的 PostgreSQL 一起启动：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <公网地址>:20331
+curl -fsSLO https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/docker/compose.yaml
+echo 'I3T_PUBLIC_ADDR=<公网地址>:20331' > .env
+docker compose up -d
+docker compose logs controller   # 管理令牌只在第一次启动时打印一次
 ```
 
-它装成 systemd 服务，并打印一次管理令牌，登录 Web 界面和 `i3tctl` 都用它。Web 界面只监听 `127.0.0.1:20332`，从别的机器打开要用 SSH 转发端口：
+自己有 PostgreSQL（16 或更新）的话，也可以装成 systemd 服务，脚本会打印一次管理令牌：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <公网地址>:20331 --database-url postgres://<用户>:<密码>@<主机>/<库名>
+```
+
+登录 Web 界面和 `i3tctl` 都用这个令牌。Web 界面只监听 `127.0.0.1:20332`，从别的机器打开要用 SSH 转发端口：
 
 ```sh
 ssh -L 20332:127.0.0.1:20332 <controller 所在的机器>
@@ -74,6 +83,8 @@ export I3T_ADMIN_TOKEN=<管理令牌>
 i3tctl network create home
 i3tctl token create   # 每台机器用一个
 ```
+
+用 Docker 装的话，`i3tctl` 在 controller 的容器里：`docker compose exec controller i3tctl --token <管理令牌> network create home`。
 
 **3. 在每台机器上安装节点。** Linux 和 macOS：
 
@@ -111,10 +122,12 @@ curl -x socks5h://127.0.0.1:1080 https://example.com
 不用安装脚本、直接运行的话，顺序相同：
 
 ```sh
-i3t-controller --data-dir /var/lib/i3t-controller --public-addr <公网地址>:20331
+i3t-controller --data-dir /var/lib/i3t-controller --database-url postgres://<用户>:<密码>@<主机>/<库名> --public-addr <公网地址>:20331
 echo <注册令牌> | i3t join
 i3t run
 ```
+
+连接串里有数据库的密码。不想把它写在命令行上的话，放进环境变量 `I3T_DATABASE_URL`，或者写进数据目录里名叫 `database.url` 的文件。
 
 systemd 单元和 polkit 规则文件在 [`deploy/systemd`](deploy/systemd) 与 [`deploy/polkit`](deploy/polkit)。
 
@@ -129,7 +142,7 @@ cd ice3tier
 cargo build --release
 ```
 
-程序在 `target/release/` 下。
+程序在 `target/release/` 下。controller 的 Docker 镜像用 [`deploy/docker/Dockerfile`](deploy/docker/Dockerfile) 构建。
 
 ## 平台支持
 
@@ -141,7 +154,10 @@ cargo build --release
 
 ## 开发
 
+controller 的测试要一个 PostgreSQL。`scripts/test-postgres.sh start` 起一个用完就扔的（用系统里装着的 PostgreSQL，或者 Docker），并打印要导出的环境变量：
+
 ```sh
+export $(scripts/test-postgres.sh start)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```

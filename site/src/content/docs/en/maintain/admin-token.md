@@ -3,7 +3,15 @@ title: Lost admin token
 description: Reset the admin token.
 ---
 
-On the server:
+On the server. With Docker:
+
+```sh
+docker compose stop controller
+docker compose run --rm controller --reset-admin-token
+docker compose start controller
+```
+
+With the install script:
 
 ```sh
 sudo systemctl stop i3t-controller
@@ -17,5 +25,6 @@ It prints a new token; the old one stops working.
 If the admin token did not show up during install, it is still in the service's log:
 
 ```sh
-sudo journalctl -u i3t-controller --no-pager
+docker compose logs controller                  # Docker
+sudo journalctl -u i3t-controller --no-pager    # install script
 ```

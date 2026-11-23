@@ -1,11 +1,13 @@
 # ice3tier control plane: the controller and the PostgreSQL database it stores everything in.
 #
-# Start (replace the address with one every node can reach):
-#   I3T_PUBLIC_ADDR=<public address>:20331 docker compose up -d
+# Start (replace the address with one every node can reach). The address goes into a .env file next to this file,
+# so that later docker compose commands find it too:
+#   echo 'I3T_PUBLIC_ADDR=<public address>:20331' > .env
+#   docker compose up -d
 # The admin token is printed once, on the first start:
 #   docker compose logs controller
 #
-# Settings, from the environment or a .env file next to this file:
+# Settings, from that .env file or the environment:
 #   I3T_PUBLIC_ADDR        required: HOST:PORT nodes use to reach the controller
 #   I3T_VERSION            controller version to run (default: latest)
 #   I3T_POSTGRES_PASSWORD  database password (default: i3t; the database is reachable only from the controller)

@@ -11,6 +11,7 @@ Linux 和 macOS 用 `install.sh`：
 | --- | --- |
 | `--controller` | 安装 controller 和 `i3tctl`，不装节点 |
 | `--public-addr <主机:端口>` | controller：节点连它用的地址；同时启动服务 |
+| `--database-url <连接串>` | controller：它用的 PostgreSQL 数据库。也可以用环境变量 `I3T_DATABASE_URL` |
 | `--token <令牌>` | 节点：加入并启动。也可以用环境变量 `I3T_TOKEN` |
 | `--can-relay`、`--can-exit` | 节点：加入时声明可以作为中继、出口 |
 | `--no-vnet` | 节点：不要虚拟网卡 |
@@ -37,7 +38,7 @@ Windows 用 `install.ps1`，选项写成环境变量，只对这一次执行有�
 
 | 内容 | 位置 |
 | --- | --- |
-| controller 的数据 | `/var/lib/i3t-controller` |
+| controller 的数据 | `/var/lib/i3t-controller`（`controller.key`、`database.url`、更新包的缓存） |
 | controller 的设置 | `/etc/i3t/controller.env`（`I3T_PUBLIC_ADDR`、`I3T_CONTROLLER_ARGS`） |
 | controller 和命令行程序 | `/usr/local/bin/i3t-controller`、`/usr/local/bin/i3tctl` |
 | 节点的状态和设置 | `/var/lib/i3t`（设置在 `config.toml` 里） |

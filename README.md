@@ -55,13 +55,22 @@ ice3tier connects the machines you own into one private network. Every node gets
 
 Deploy the controller first, then the nodes: a node joins with a token that the controller issues. The [deployment guide](docs/deployment.md) covers every step in detail, with ports, Windows, upgrades and backups.
 
-**1. Install the controller** on a Linux server that every node can reach, with TCP and UDP port 20331 open:
+**1. Install the controller** on a Linux server that every node can reach, with TCP and UDP port 20331 open. With Docker, this starts it together with the PostgreSQL database it keeps its data in:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <public-address>:20331
+curl -fsSLO https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/docker/compose.yaml
+echo 'I3T_PUBLIC_ADDR=<public-address>:20331' > .env
+docker compose up -d
+docker compose logs controller   # the admin token is printed once, on the first start
 ```
 
-It runs as a systemd service and prints the admin token once. Use the token to sign in to the web UI and `i3tctl`. The web UI listens on `127.0.0.1:20332` only. To open it from another machine, forward the port over SSH:
+Or, with a PostgreSQL (16 or newer) of your own, install it as a systemd service; the script prints the admin token once:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --public-addr <public-address>:20331 --database-url postgres://<user>:<password>@<host>/<database>
+```
+
+Use the token to sign in to the web UI and `i3tctl`. The web UI listens on `127.0.0.1:20332` only. To open it from another machine, forward the port over SSH:
 
 ```sh
 ssh -L 20332:127.0.0.1:20332 <controller-host>
@@ -74,6 +83,8 @@ export I3T_ADMIN_TOKEN=<admin-token>
 i3tctl network create home
 i3tctl token create   # one token per machine
 ```
+
+With Docker, `i3tctl` is inside the controller's container: `docker compose exec controller i3tctl --token <admin-token> network create home`.
 
 **3. Install a node on each machine.** On Linux and macOS:
 
@@ -111,10 +122,12 @@ Download the programs for your platform from the [latest release](https://github
 Run them without the install script, in the same order:
 
 ```sh
-i3t-controller --data-dir /var/lib/i3t-controller --public-addr <public-address>:20331
+i3t-controller --data-dir /var/lib/i3t-controller --database-url postgres://<user>:<password>@<host>/<database> --public-addr <public-address>:20331
 echo <enrollment-token> | i3t join
 i3t run
 ```
+
+The connection string contains the database password. To keep it off the command line, set the environment variable `I3T_DATABASE_URL`, or write it into a file named `database.url` in the data directory.
 
 Raw systemd units and the polkit rule are in [`deploy/systemd`](deploy/systemd) and [`deploy/polkit`](deploy/polkit).
 
@@ -129,7 +142,7 @@ cd ice3tier
 cargo build --release
 ```
 
-The programs are in `target/release/`.
+The programs are in `target/release/`. The controller's Docker image is built from [`deploy/docker/Dockerfile`](deploy/docker/Dockerfile).
 
 ## Platform support
 
@@ -141,7 +154,10 @@ The programs are in `target/release/`.
 
 ## Development
 
+The controller's tests need a PostgreSQL. `scripts/test-postgres.sh start` starts a throwaway one, from an installed PostgreSQL or with Docker, and prints the variables to export:
+
 ```sh
+export $(scripts/test-postgres.sh start)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```

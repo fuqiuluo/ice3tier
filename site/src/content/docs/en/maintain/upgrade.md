@@ -17,7 +17,15 @@ To upgrade a node by hand, run the install script on it again; it keeps its enro
 
 ## Controller
 
-The controller is upgraded by hand. Run the script again on the server. Data and settings are kept:
+The controller is upgraded by hand. Data and settings are kept.
+
+With Docker:
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+With the install script, run it again on the server:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
@@ -25,3 +33,9 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 ```
 
 The [CHANGELOG](https://github.com/fuqiuluo/ice3tier/blob/main/CHANGELOG.md) says which parts each release asks you to upgrade.
+
+## From 0.1.34 or older
+
+The controller now needs PostgreSQL, and the old data is not carried over: it starts empty. Create the networks again; every node has to join again with a new enrollment token. The old `controller.db` stays where it is and is no longer read.
+
+With the install script, pass `--database-url` as in [Install the controller](../../deploy/controller/) this once; later upgrades need nothing extra.
