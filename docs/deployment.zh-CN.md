@@ -231,16 +231,16 @@ ssh <节点>.<网络>.i3t        # 按名字，比如 nas.home.i3t
 
 ```sh
 # Docker
-(umask 077
+(set -e; umask 077; rm -f controller.dump controller.key
  docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
  docker compose exec -T controller cat /data/controller.key > controller.key)
 
 # 安装脚本
-sudo sh -c 'umask 077; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
-sudo cp /var/lib/i3t-controller/controller.key controller.key
+sudo sh -c 'set -e; umask 077; rm -f controller.dump; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo install -m 600 /var/lib/i3t-controller/controller.key controller.key
 ```
 
-转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令写出来的文件只有属主可读，保存时也别放宽。两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
+转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令把它们重新写出来，只有属主可读（用安装脚本装的，属主是 root），保存时也别放宽。两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
 
 恢复在一台新的服务器上做，公网地址和原来的一样。
 
@@ -260,7 +260,7 @@ docker compose up -d
 用安装脚本的话，先按第 1 步建一个空的数据库，然后：
 
 ```sh
-pg_restore --no-owner --dbname postgres://i3t:<密码>@127.0.0.1/i3t controller.dump
+sudo pg_restore --no-owner --dbname postgres://i3t:<密码>@127.0.0.1/i3t controller.dump
 # 先装上但不启动，把密钥放好，再启动
 curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller --database-url postgres://i3t:<密码>@127.0.0.1/i3t
 sudo install -o i3t-controller -g i3t-controller -m 600 controller.key /var/lib/i3t-controller/controller.key

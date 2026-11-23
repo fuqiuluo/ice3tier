@@ -10,7 +10,7 @@ A backup is two files: a dump of the database, and the controller's key `control
 With Docker:
 
 ```sh
-(umask 077
+(set -e; umask 077; rm -f controller.dump controller.key
  docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
  docker compose exec -T controller cat /data/controller.key > controller.key)
 ```
@@ -18,11 +18,11 @@ With Docker:
 With the install script:
 
 ```sh
-sudo sh -c 'umask 077; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
-sudo cp /var/lib/i3t-controller/controller.key controller.key
+sudo sh -c 'set -e; umask 077; rm -f controller.dump; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo install -m 600 /var/lib/i3t-controller/controller.key controller.key
 ```
 
-The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them readable by their owner only; keep them that way.
+The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them anew, readable by their owner only (with the install script that is root); keep them that way.
 
 :::caution
 Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
@@ -48,7 +48,7 @@ To restore on the same server, run `docker compose down --volumes` in place of t
 With the install script, first create an empty database as in [Install the controller](../../deploy/controller/), then:
 
 ```sh
-pg_restore --no-owner --dbname postgres://i3t:<password>@127.0.0.1/i3t controller.dump
+sudo pg_restore --no-owner --dbname postgres://i3t:<password>@127.0.0.1/i3t controller.dump
 # install without starting, put the key in place, then start
 curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
   sh -s -- --controller --database-url postgres://i3t:<password>@127.0.0.1/i3t

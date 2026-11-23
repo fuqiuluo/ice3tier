@@ -10,7 +10,7 @@ description: 备份 controller 的数据，在原来的或新的服务器上恢�
 用 Docker 装的：
 
 ```sh
-(umask 077
+(set -e; umask 077; rm -f controller.dump controller.key
  docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
  docker compose exec -T controller cat /data/controller.key > controller.key)
 ```
@@ -18,11 +18,11 @@ description: 备份 controller 的数据，在原来的或新的服务器上恢�
 用安装脚本装的：
 
 ```sh
-sudo sh -c 'umask 077; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
-sudo cp /var/lib/i3t-controller/controller.key controller.key
+sudo sh -c 'set -e; umask 077; rm -f controller.dump; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+sudo install -m 600 /var/lib/i3t-controller/controller.key controller.key
 ```
 
-转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令写出来的文件只有属主可读，保存时也别放宽。
+转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令把它们重新写出来，只有属主可读（用安装脚本装的，属主是 root），保存时也别放宽。
 
 :::caution
 两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
@@ -48,7 +48,7 @@ docker compose up -d
 用安装脚本的话，先按 [安装 controller](../../deploy/controller/) 建一个空的数据库，然后：
 
 ```sh
-pg_restore --no-owner --dbname postgres://i3t:<密码>@127.0.0.1/i3t controller.dump
+sudo pg_restore --no-owner --dbname postgres://i3t:<密码>@127.0.0.1/i3t controller.dump
 # 先装上但不启动，把密钥放好，再启动
 curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh |
   sh -s -- --controller --database-url postgres://i3t:<密码>@127.0.0.1/i3t
