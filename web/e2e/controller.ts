@@ -215,19 +215,25 @@ export class Controller {
     child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()))
     child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
     let exited: number | null = null
-    child.on('exit', (code) => (exited = code ?? -1))
+    // `close` 在它的输出都读完之后才来，`exit` 可能比最后一段标准错误早：下面要看标准错误里说了什么。
+    child.on('close', (code) => (exited = code ?? -1))
+    /** controller 已经退出的话抛出来。没绑上端口的单独认出来，好换一组端口重来。 */
+    const failIfExited = () => {
+      if (exited === null) return
+      const message = `controller 启动后就退出了（${exited}）：\n${stderr}`
+      throw /Address already in use/.test(stderr) ? new PortTaken(message) : new Error(message)
+    }
 
     const baseUrl = `http://127.0.0.1:${adminPort}`
     try {
       // 令牌单独占一行，前面有缩进：43 个 base64url 字符。
       const adminToken = await waitFor('controller 打印管理令牌', () => {
-        if (exited !== null) {
-          const message = `controller 启动后就退出了（${exited}）：\n${stderr}`
-          throw /Address already in use/.test(stderr) ? new PortTaken(message) : new Error(message)
-        }
+        failIfExited()
         return /^\s+([A-Za-z0-9_-]{43})\s*$/m.exec(stdout)?.[1]
       })
       await waitFor('管理 API 开始应答', async () => {
+        // 令牌是先打出来的，端口后绑：绑不上多半到这一步才看得出来。
+        failIfExited()
         try {
           const response = await fetch(`${baseUrl}/api/v1/status`, {
             headers: { Authorization: `Bearer ${adminToken}` },
