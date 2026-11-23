@@ -67,6 +67,8 @@ pub use routes::RouteAnswers;
 pub const ALPN: &[u8] = b"i3t-ctl/1";
 
 const KEY_FILE: &str = "controller.key";
+/// 用 SQLite 的版本（0.1.34 和更早）留在数据目录里的数据库文件。
+const OLD_DATABASE_FILE: &str = "controller.db";
 const ADMIN_TOKEN_META: &str = "admin_token_hash";
 
 /// 删掉的节点的虚拟 IP 和名字多久之后才能再分出去。
@@ -249,6 +251,11 @@ impl Controller {
         fs::create_dir_all(data_dir).map_err(|source| Error::Io { path: data_dir.to_owned(), source })?;
         let key = load_or_create_key(&data_dir.join(KEY_FILE))?;
         let store = Store::open(database)?;
+        // 早先的版本把数据存在数据目录里的这个文件里。现在不读它了：升级上来的人看到一个空的 controller 时，日志里有原因。
+        let old = data_dir.join(OLD_DATABASE_FILE);
+        if old.exists() {
+            tracing::warn!(path = %old.display(), "数据目录里有旧版本的数据库文件：这个版本的数据在 PostgreSQL 里，不再读它，里面的数据也不会搬过来");
+        }
         let mut controller = Self::new(store, key, public_addr, Timing::default())?.with_release_cache(data_dir.join(update::CACHE_DIR));
         controller.data_dir = Some(data_dir.to_owned());
         let admin_token = if controller.has_admin_token() { None } else { Some(controller.issue_admin_token()?) };
