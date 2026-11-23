@@ -365,7 +365,7 @@ fn runs_as_service(state: &StateDir) -> bool {
 /// 服务控制管理器启动的节点：日志写进状态目录里的文件（服务没有终端），停止的通知来自 SCM。
 #[cfg(windows)]
 fn run_as_service(state: StateDir, version: Version, r#static: Option<PathBuf>) -> anyhow::Result<ExitCode> {
-    let log = std::sync::Arc::new(log_file::LogFile::new(state.path().join(SERVICE_LOG), log_file::FILE_LIMIT));
+    let log = std::sync::Arc::new(log_file::LogFile::open(state.path().join(SERVICE_LOG), log_file::FILE_LIMIT));
     let job = move |stop: service::Stop| match run_node(&state, &version, r#static, &LogTo::File(std::sync::Arc::clone(&log)), stop) {
         Ok(Outcome::Stopped) => 0,
         Ok(Outcome::Restart) => u32::from(RESTART_EXIT_CODE),
