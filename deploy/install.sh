@@ -1388,6 +1388,19 @@ show_first_start() {
     warn "the admin token did not show up; check: sudo journalctl -u i3t-controller --no-pager"
 }
 
+# Restarts the controller service. `$1` is 1 when this start is the first one on an empty database: its output has
+# the one-time admin token in it, so it is shown.
+restart_controller() {
+    since=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+    $SUDO systemctl restart i3t-controller
+    if [ "$1" -eq 1 ]; then
+        invocation=$($SUDO systemctl show -p InvocationID --value i3t-controller 2>/dev/null || true)
+        show_first_start "$invocation" "$since"
+    else
+        log "i3t-controller upgraded and running"
+    fi
+}
+
 # Whether the installed controller already knows which database to use: the file this script writes, or a setting
 # someone put into /etc/i3t/controller.env by hand.
 controller_has_database() {
@@ -1404,16 +1417,29 @@ install_controller() {
 "*) die "invalid --database-url value (it must be a single line)" ;;
     esac
 
-    # Stop before touching anything when the controller is going to be (re)started without a database:
-    # this version cannot start without one, and an older install has none configured.
-    if has_systemd && [ -z "$DATABASE_URL" ] && ! controller_has_database; then
+    fetch_binary "i3t-controller" "${WORK}/i3t-controller"
+    fetch_binary "i3tctl" "${WORK}/i3tctl"
+
+    # Releases up to 0.1.34 keep their data in a file and take no database. This script may be newer than the release
+    # it installs, so ask the program that is about to be installed. When it cannot be asked (a temporary directory
+    # mounted noexec), assume it needs one, as every later release does.
+    needs_database=1
+    chmod 0755 "${WORK}/i3t-controller"
+    if controller_help=$("${WORK}/i3t-controller" --help 2>/dev/null) \
+        && ! printf '%s\n' "$controller_help" | grep -q -- '--database-url'; then
+        needs_database=0
+    fi
+
+    # Stop before installing anything when the controller is going to be (re)started without a database:
+    # it cannot start without one, and an older install has none configured.
+    if [ "$needs_database" -eq 1 ] && has_systemd && [ -z "$DATABASE_URL" ] && ! controller_has_database; then
         if [ -n "$PUBLIC_ADDR" ] || $SUDO systemctl is-active -q i3t-controller 2>/dev/null; then
             die "the controller stores its data in PostgreSQL: pass --database-url postgres://USER:PASSWORD@HOST/DBNAME (or set I3T_DATABASE_URL). This script does not install PostgreSQL; deploy/docker/compose.yaml starts the controller together with one. Data of an older install (/var/lib/i3t-controller/controller.db) is not carried over."
         fi
     fi
-
-    fetch_binary "i3t-controller" "${WORK}/i3t-controller"
-    fetch_binary "i3tctl" "${WORK}/i3tctl"
+    if [ "$needs_database" -eq 0 ] && [ -n "$DATABASE_URL" ]; then
+        warn "this release of the controller keeps its data in a file and does not use PostgreSQL; the connection string is saved for the release that does"
+    fi
 
     $SUDO install -d -m 0755 /usr/local/bin
     log "Installing i3t-controller and i3tctl to /usr/local/bin"
@@ -1423,7 +1449,9 @@ install_controller() {
     if ! has_systemd; then
         log "Installed /usr/local/bin/i3t-controller and /usr/local/bin/i3tctl (systemd not detected)"
         printf '\nNext steps:\n'
-        printf '  export I3T_DATABASE_URL=postgres://USER:PASSWORD@HOST/DBNAME\n'
+        if [ "$needs_database" -eq 1 ]; then
+            printf '  export I3T_DATABASE_URL=postgres://USER:PASSWORD@HOST/DBNAME\n'
+        fi
         printf '  i3t-controller --data-dir /var/lib/i3t-controller --public-addr <public-address>:20331\n'
         return
     fi
@@ -1433,9 +1461,12 @@ install_controller() {
     write_controller_service "${WORK}/i3t-controller.service"
     $SUDO install -D -m 0644 "${WORK}/i3t-controller.service" /etc/systemd/system/i3t-controller.service
 
-    # The key is created on the first start, together with the admin token.
+    # The admin token is printed when the controller first starts on an empty database: on a new install (no key
+    # yet), and when an install that kept its data in a file gets its database.
     first_start=0
     if ! $SUDO test -f /var/lib/i3t-controller/controller.key; then
+        first_start=1
+    elif [ "$needs_database" -eq 1 ] && [ -n "$DATABASE_URL" ] && ! controller_has_database; then
         first_start=1
     fi
 
@@ -1476,23 +1507,15 @@ EOF
     if [ -n "$PUBLIC_ADDR" ]; then
         log "Enabling and starting i3t-controller.service"
         $SUDO systemctl enable i3t-controller >/dev/null
-        since=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-        $SUDO systemctl restart i3t-controller
-        if [ "$first_start" -eq 1 ]; then
-            invocation=$($SUDO systemctl show -p InvocationID --value i3t-controller 2>/dev/null || true)
-            show_first_start "$invocation" "$since"
-        else
-            log "i3t-controller upgraded and running"
-        fi
+        restart_controller "$first_start"
     elif $SUDO systemctl is-active -q i3t-controller 2>/dev/null; then
         log "Restarting i3t-controller.service"
-        $SUDO systemctl restart i3t-controller
-        log "i3t-controller upgraded and running"
+        restart_controller "$first_start"
     else
         log "Installation complete!"
         printf '\nNext steps:\n'
         printf '  Edit /etc/i3t/controller.env and set I3T_PUBLIC_ADDR=<public-address>:20331\n'
-        if ! controller_has_database; then
+        if [ "$needs_database" -eq 1 ] && ! controller_has_database; then
             printf '  Run this script again with --controller --database-url postgres://USER:PASSWORD@HOST/DBNAME\n'
         fi
         printf '  sudo systemctl enable --now i3t-controller\n'

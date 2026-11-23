@@ -38,4 +38,4 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 
 controller 现在要 PostgreSQL，原来的数据不会带过来：它从空的开始。网络要重新建，每个节点要用新的注册令牌重新加入。原来的 `controller.db` 留在原处，不再读它。
 
-用安装脚本升级的话，这一次要像 [安装 controller](../../deploy/controller/) 那样带上 `--database-url`，以后升级不用再带。
+用安装脚本升级的话，这一次要像 [安装 controller](../../deploy/controller/) 那样带上 `--database-url`，以后升级不用再带。管理令牌也是新的，脚本最后会把它打印出来。

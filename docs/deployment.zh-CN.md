@@ -222,7 +222,7 @@ ssh <节点>.<网络>.i3t        # 按名字，比如 nas.home.i3t
   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller
   ```
 
-- **从 0.1.34 或更早的版本升级。** controller 现在要 PostgreSQL，原来的数据不会带过来：它从空的开始。网络要重新建，每个节点要用新的注册令牌重新加入。原来的 `controller.db` 留在原处，不再读它。用安装脚本的话，这一次要像 [第 1 步](#第-1-步安装-controller) 那样带上 `--database-url`，以后升级不用再带。
+- **从 0.1.34 或更早的版本升级。** controller 现在要 PostgreSQL，原来的数据不会带过来：它从空的开始。网络要重新建，每个节点要用新的注册令牌重新加入。原来的 `controller.db` 留在原处，不再读它。用安装脚本的话，这一次要像 [第 1 步](#第-1-步安装-controller) 那样带上 `--database-url`，以后升级不用再带。管理令牌也是新的，脚本最后会把它打印出来。
 
 每一版要升级哪些部分，见 [CHANGELOG.md](../CHANGELOG.md)。
 

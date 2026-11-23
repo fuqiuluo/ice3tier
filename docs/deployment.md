@@ -222,7 +222,7 @@ From here on everything is done in the web UI or with `i3tctl`: exits and proxie
   curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/install.sh | sh -s -- --controller
   ```
 
-- **From 0.1.34 or older.** The controller now needs PostgreSQL, and the old data is not carried over: it starts empty. Create the networks again; every node has to join again with a new enrollment token. The old `controller.db` stays where it is and is no longer read. With the install script, pass `--database-url` as in [step 1](#step-1-install-the-controller) this once; later upgrades need nothing extra.
+- **From 0.1.34 or older.** The controller now needs PostgreSQL, and the old data is not carried over: it starts empty. Create the networks again; every node has to join again with a new enrollment token. The old `controller.db` stays where it is and is no longer read. With the install script, pass `--database-url` as in [step 1](#step-1-install-the-controller) this once; later upgrades need nothing extra. The admin token is new as well: the script prints it at the end.
 
 [CHANGELOG.md](../CHANGELOG.md) says which parts each release asks you to upgrade.
 

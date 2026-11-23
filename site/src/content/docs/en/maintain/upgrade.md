@@ -38,4 +38,4 @@ The [CHANGELOG](https://github.com/fuqiuluo/ice3tier/blob/main/CHANGELOG.md) say
 
 The controller now needs PostgreSQL, and the old data is not carried over: it starts empty. Create the networks again; every node has to join again with a new enrollment token. The old `controller.db` stays where it is and is no longer read.
 
-With the install script, pass `--database-url` as in [Install the controller](../../deploy/controller/) this once; later upgrades need nothing extra.
+With the install script, pass `--database-url` as in [Install the controller](../../deploy/controller/) this once; later upgrades need nothing extra. The admin token is new as well: the script prints it at the end.
