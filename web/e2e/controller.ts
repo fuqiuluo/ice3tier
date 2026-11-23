@@ -69,6 +69,9 @@ interface Running {
   group: boolean
 }
 
+/** controller 没有绑上交给它的端口：有别的进程先占了。 */
+class PortTaken extends Error {}
+
 function freePort(): Promise<number> {
   return new Promise((resolvePort, reject) => {
     const server = createServer()
@@ -164,8 +167,21 @@ export class Controller {
   /**
    * 启动一个全新的、空的 controller。管理令牌从它第一次启动时打印的内容里取。
    * `bins` 指定程序所在的目录；节点更新的测试要用认测试钥匙的那一组。
+   *
+   * 端口是先挑好再交给它去绑的，中间隔着一小会儿，挑的时候也只试了 TCP（节点端口它 TCP、UDP 都要）：
+   * 偶尔会被别的进程拿走。那样就换一组端口从头再来。
    */
   static async start(options: { bins?: string } = {}): Promise<Controller> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await Controller.startOnce(options)
+      } catch (error) {
+        if (!(error instanceof PortTaken) || attempt >= 5) throw error
+      }
+    }
+  }
+
+  private static async startOnce(options: { bins?: string }): Promise<Controller> {
     const bins = options.bins ?? binDir()
     const dist = join(webRoot, 'dist')
     if (!existsSync(join(dist, 'index.html'))) throw new Error('web/dist 里没有构建产物，先执行 pnpm build')
@@ -205,7 +221,10 @@ export class Controller {
     try {
       // 令牌单独占一行，前面有缩进：43 个 base64url 字符。
       const adminToken = await waitFor('controller 打印管理令牌', () => {
-        if (exited !== null) throw new Error(`controller 启动后就退出了（${exited}）：\n${stderr}`)
+        if (exited !== null) {
+          const message = `controller 启动后就退出了（${exited}）：\n${stderr}`
+          throw /Address already in use/.test(stderr) ? new PortTaken(message) : new Error(message)
+        }
         return /^\s+([A-Za-z0-9_-]{43})\s*$/m.exec(stdout)?.[1]
       })
       await waitFor('管理 API 开始应答', async () => {
