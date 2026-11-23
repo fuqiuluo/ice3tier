@@ -5,7 +5,7 @@
 //! 所以并行的测试互不相干。丢掉时连同里面的表一起删。
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio_postgres::Config;
 
@@ -18,6 +18,10 @@ pub const TEST_DATABASE_ENV: &str = "I3T_TEST_DATABASE_URL";
 const HOW_TO: &str = "这些测试要一个 PostgreSQL。起一个用完就扔的，再把连接串放进环境变量，比如：\n\n    \
     docker run -d --rm -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:5432:5432 postgres:17\n    \
     export I3T_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres\n";
+
+/// 连测试服务器肯等多久。几百个测试同时来连的时候它答得慢（Windows 上每条连接要起一个进程，CI 的机器上排得过
+/// 平时的十秒），那不是连不上；真连不上的时候多等这一会儿也无妨。
+const CONNECT_PATIENCE: Duration = Duration::from_secs(60);
 
 /// 同一个进程里的第几个。
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -36,7 +40,8 @@ impl Scratch {
     #[must_use]
     pub fn new() -> Self {
         let url = std::env::var(TEST_DATABASE_ENV).unwrap_or_else(|_| panic!("没有设 {TEST_DATABASE_ENV}。{HOW_TO}"));
-        let Database(server) = url.parse().unwrap_or_else(|error| panic!("{TEST_DATABASE_ENV} 写得不对：{error:?}"));
+        let Database(mut server) = url.parse().unwrap_or_else(|error| panic!("{TEST_DATABASE_ENV} 写得不对：{error:?}"));
+        server.connect_timeout(CONNECT_PATIENCE);
         // 进程号加序号在一台机器上不重样；再加上时刻，几台机器共用一个测试服务器时也不撞。
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.subsec_nanos());
         let schema = format!("i3t_test_{}_{}_{nanos:08x}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
