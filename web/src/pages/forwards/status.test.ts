@@ -53,5 +53,12 @@ describe('一条转发的状态', () => {
       detail: s.accessDeniedDetail('laptop', 'gw-home'),
     })
     expect(forwardStatusView(makeForward(1, 'web', { status: 'target_not_declared' }), NODES).tone).toBe('warn')
+    expect(forwardStatusView(makeForward(1, 'web', { status: 'target_not_allowed' }), NODES)).toMatchObject({
+      tone: 'danger',
+      needsAttention: true,
+      linkToRules: false,
+      label: s.targetNotAllowed,
+      detail: s.targetNotAllowedDetail,
+    })
   })
 })

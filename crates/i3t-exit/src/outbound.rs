@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use i3t_access::OwnListener;
+use i3t_access::OwnListeners;
 use i3t_model::Netmap;
 use i3t_model::control::exit_test::{ConnectStep, ExitTestCause, ExitTestResult, ExitVia, ResolveStep};
 use i3t_model::netmap::{self, ExitRole, ForwardProtocol, IpFamily, Network};
@@ -58,16 +58,13 @@ pub struct Outbound<S = Os> {
 /// 本节点自己对外的地址从哪里问，见 [`Outbound::with_own_endpoints`]。
 type OwnEndpoints = Box<dyn Fn() -> Vec<SocketAddr> + Send + Sync>;
 
-/// 本节点的程序自己的监听从哪里问，见 [`Outbound::with_own_listeners`]。
-type OwnListeners = Box<dyn Fn() -> Vec<OwnListener> + Send + Sync>;
-
 struct Inner<S> {
     system: S,
     netmap: watch::Receiver<Arc<Netmap>>,
     dns: Mutex<DnsCache>,
     interfaces: Mutex<Option<Interfaces>>,
     own_endpoints: Option<OwnEndpoints>,
-    own_listeners: Option<OwnListeners>,
+    own_listeners: OwnListeners,
     lookups: Lookups,
 }
 
@@ -149,7 +146,7 @@ impl<S: System> Outbound<S> {
             dns: Mutex::default(),
             interfaces: Mutex::new(None),
             own_endpoints: None,
-            own_listeners: None,
+            own_listeners: OwnListeners::default(),
             lookups: Lookups::default(),
         };
         Self { inner: Arc::new(inner) }
@@ -171,24 +168,25 @@ impl<S: System> Outbound<S> {
         self
     }
 
-    /// 本节点的程序自己的监听从哪里问：装配时交进来入口的监听（`i3t_access::Access::own_listeners`），
-    /// 加上程序里别处的（虚拟网卡的名字服务）。
+    /// 本节点的程序自己在监听的地址的那张表：装配时交进来入口的那一份（`i3t_access::Access::own_listeners`），
+    /// 入口的代理、组网入口和端口转发，还有装配层登记的虚拟网卡的名字服务都在里面。
     ///
-    /// 别的节点访问"本节点的端口"时，出口不去连这些地址（[`OwnListener`] 的文档）；其中监听在全部地址上的端口转发，
-    /// 出口自己按那条转发接住，来源按发起节点算。不设时出口只认得 netmap 里写明了端口的端口转发。
+    /// 别的节点访问"本节点的端口"或者出口所在局域网里的地址时，出口不去连表里的地址（[`OwnListeners`] 所在模块的文档）；
+    /// 其中监听在全部地址上的端口转发，访问本节点的端口时由出口自己按那条转发接住，来源按发起节点算。
+    /// 不设时表是空的，出口只认得 netmap 里写明了端口的端口转发。
     ///
     /// # Panics
     ///
     /// 在克隆之后调用：克隆出来的是同一个拨号器，这个设置要在交出去之前定下来。
     #[must_use]
-    pub fn with_own_listeners(mut self, own: impl Fn() -> Vec<OwnListener> + Send + Sync + 'static) -> Self {
-        Arc::get_mut(&mut self.inner).expect("with_own_listeners 要在克隆拨号器之前调用").own_listeners = Some(Box::new(own));
+    pub fn with_own_listeners(mut self, own: OwnListeners) -> Self {
+        Arc::get_mut(&mut self.inner).expect("with_own_listeners 要在克隆拨号器之前调用").own_listeners = own;
         self
     }
 
-    /// 本节点的程序自己现在在监听的地址。
-    pub(crate) fn own_listeners(&self) -> Vec<OwnListener> {
-        self.inner.own_listeners.as_ref().map(|own| own()).unwrap_or_default()
+    /// 本节点的程序自己在监听的地址。
+    pub(crate) fn own_listeners(&self) -> &OwnListeners {
+        &self.inner.own_listeners
     }
 
     /// 互联网目标：本节点必须是出口，端口要在允许的范围里，解析出来的每一个地址都要过出站策略。
@@ -252,16 +250,16 @@ impl<S: System> Outbound<S> {
 
     /// 局域网目标：本节点必须是出口并且打开了局域网开关，地址必须在本机某块网卡直连的网段里。端口不受限制。
     pub(crate) async fn lan(&self, netmap: &Netmap, addr: SocketAddr) -> Result<TcpStream, Reply> {
-        let target = self.lan_target(netmap, addr)?;
+        let target = self.lan_target(netmap, addr, ForwardProtocol::Tcp)?;
         self.connect_first([target], CONNECT_TIMEOUT, Via::Direct).await
     }
 
-    /// 局域网目标的检查。通过的话返回可以去连的地址，流和数据报用的是同一份检查。
-    pub(crate) fn lan_target(&self, netmap: &Netmap, addr: SocketAddr) -> Result<SocketAddr, Reply> {
-        Ok(self.lan_check(netmap, addr)?)
+    /// 局域网目标的检查。通过的话返回可以去连的地址，流和数据报用的是同一份检查；`protocol` 是要建连接还是发报文。
+    pub(crate) fn lan_target(&self, netmap: &Netmap, addr: SocketAddr, protocol: ForwardProtocol) -> Result<SocketAddr, Reply> {
+        Ok(self.lan_check(netmap, addr, protocol)?)
     }
 
-    fn lan_check(&self, netmap: &Netmap, addr: SocketAddr) -> Result<SocketAddr, Stop> {
+    fn lan_check(&self, netmap: &Netmap, addr: SocketAddr, protocol: ForwardProtocol) -> Result<SocketAddr, Stop> {
         match &netmap.me.exit {
             None => return Err(Stop::NotEnabled),
             Some(ExitRole { lan: false, .. }) => return Err(Stop::LanNotEnabled),
@@ -275,6 +273,9 @@ impl<S: System> Outbound<S> {
             Some("覆盖网的地址不算局域网")
         } else if !attached {
             Some("目标不在本机网卡直连的网段里")
+        } else if self.inner.own_listeners.receives(protocol, SocketAddr::new(ip, addr.port())) {
+            // 本机在那个网段里的地址也算局域网里的地址。程序自己的监听在上面的话，和访问本节点的端口时一样不去连。
+            Some("目标是这个节点自己的代理或者端口转发的监听，出口不从本机去连它")
         } else {
             None
         };
@@ -306,7 +307,7 @@ impl<S: System> Outbound<S> {
         };
         let (targets, via) = match lan {
             // 局域网目标不经上游代理（[`Outbound::lan`]）。
-            Some(addr) => match self.lan_check(&netmap, addr) {
+            Some(addr) => match self.lan_check(&netmap, addr, ForwardProtocol::Tcp) {
                 Ok(target) => {
                     result.via = ExitVia::Direct;
                     (vec![target], Via::Direct)
@@ -384,9 +385,7 @@ impl<S: System> Outbound<S> {
         if addresses.is_empty() {
             return Err(Reply::new(Status::Unreachable, "这个节点没有非回环的地址，它上面的服务不可达"));
         }
-        let listeners = self.own_listeners();
-        let targets: Vec<SocketAddr> =
-            addresses.into_iter().filter(|addr| !listeners.iter().any(|listener| listener.receives(protocol, *addr))).collect();
+        let targets: Vec<SocketAddr> = addresses.into_iter().filter(|addr| !self.inner.own_listeners.receives(protocol, *addr)).collect();
         if targets.is_empty() {
             return Err(Reply::new(
                 Status::PolicyDenied,

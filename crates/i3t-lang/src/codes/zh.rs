@@ -355,6 +355,7 @@ const fn forward_status(status: ForwardStatus) -> &'static str {
         ForwardStatus::Disabled => "已停用",
         ForwardStatus::ForwardTargetOff => "目标的转发开关关着",
         ForwardStatus::AccessDenied => "访问规则不允许",
+        ForwardStatus::TargetNotAllowed => "目标地址不能用",
         ForwardStatus::ListenerOffline => "监听节点离线",
         ForwardStatus::TargetOffline => "目标节点离线",
         ForwardStatus::Active => "生效",

@@ -1,7 +1,9 @@
 //! 用量和状态：出口的用量和健康、监听的状态、自动挑端口的端口转发、服务等级、
 //! 注册令牌的记录、操作记录里提到的东西、"最近在线"。
 
-use i3t_model::admin::{CreateEnrollToken, ExitHealth, ForwardInput, LogRef, ProxyStatus, RefKind, TokenState, UpdateNetwork};
+use i3t_model::admin::{
+    CreateEnrollToken, ExitHealth, ForwardInput, ForwardStatus, LogRef, ProxyStatus, RefKind, TokenState, UpdateNetwork,
+};
 use i3t_model::control::{
     BindCause, Declared, ExitObservation, ExitReport, ForwardReport, ListenState, ListenTraffic, ListenerReport, ProxyReport, QuotaUsage,
     Report, TargetCause, TargetFailureReport, ToController,
@@ -393,7 +395,18 @@ fn a_forward_cannot_point_at_a_cloud_metadata_address_or_into_the_networks_own_r
         Err(error) => Some(error.to_string()),
     };
 
-    for metadata in ["169.254.169.254:80", "100.100.100.200:80", "168.63.129.16:53", "[fd00:ec2::254]:80", "[::ffff:169.254.169.254]:80"] {
+    let metadata = [
+        "169.254.169.254:80",
+        "100.100.100.200:80",
+        "168.63.129.16:53",
+        "[fd00:ec2::254]:80",
+        "[fd20:ce::254]:80",
+        "169.254.170.2:80",
+        "169.254.170.23:80",
+        "[fd00:ec2::23]:80",
+        "[::ffff:169.254.169.254]:80",
+    ];
+    for metadata in metadata {
         assert!(refusal(metadata).is_some_and(|message| message.contains("元数据")), "{metadata}");
     }
     let vip = lab.controller.node(network.id, target).unwrap().node.virtual_ip;
@@ -412,6 +425,40 @@ fn a_forward_cannot_point_at_a_cloud_metadata_address_or_into_the_networks_own_r
         lab.controller.forwards(network.id).unwrap().iter().find(|entry| entry.id == kept.id).unwrap().target_addr,
         towards("127.0.0.1:8080").target_addr
     );
+
+    // 同一个地址只存一种写法：映射成 IPv6 的存成里面的 IPv4 地址，和已有的监听地址撞了也认得出来。
+    let mapped =
+        ForwardInput { target_addr: "[::ffff:127.0.0.1]:8080".parse().unwrap(), ..forward(listen, target, "[::ffff:192.168.1.5]:8443") };
+    let stored = lab.controller.create_forward(network.id, mapped).unwrap();
+    assert_eq!((stored.bind, stored.target_addr), ("192.168.1.5:8443".parse().unwrap(), "127.0.0.1:8080".parse().unwrap()));
+    assert!(lab.controller.create_forward(network.id, forward(listen, target, "192.168.1.5:8443")).is_err(), "同一个监听地址");
+}
+
+#[test]
+fn a_forward_configured_earlier_towards_an_address_nodes_never_dial_is_not_delivered_and_can_be_switched_off() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let listen = lab.join_offline(network.id, &[], Declared::default());
+    let target = lab.join_offline(network.id, &[], CAN_DO_ALL);
+    lab.switch_on_forward_target(network.id, target);
+    // 配的时候这个地址在网络的地址段外面；后来地址段扩大，把它包了进去。
+    let input = ForwardInput { target_addr: "10.67.0.1:80".parse().unwrap(), ..forward(listen, target, "127.0.0.1:0") };
+    let earlier = lab.controller.create_forward(network.id, input.clone()).unwrap();
+    assert_eq!(lab.netmap(target).me.forward_targets.len(), 1);
+    let wider = UpdateNetwork { cidr: Some("10.64.0.0/14".parse().unwrap()), ..UpdateNetwork::default() };
+    lab.controller.update_network(network.id, &wider).unwrap();
+
+    let status = |lab: &Lab| lab.controller.forwards(network.id).unwrap().into_iter().find(|entry| entry.id == earlier.id).unwrap().status;
+    assert_eq!(status(&lab), ForwardStatus::TargetNotAllowed);
+    assert!(lab.netmap(listen).me.forwards.is_empty() && lab.netmap(target).me.forward_targets.is_empty(), "不再下发给两头");
+
+    // 原地停用可以，再启用过不了；改成节点会去连的地址就恢复。
+    let off = ForwardInput { enabled: false, ..input.clone() };
+    assert_eq!(lab.controller.replace_forward(network.id, earlier.id, off).unwrap().status, ForwardStatus::Disabled);
+    assert!(lab.controller.replace_forward(network.id, earlier.id, input.clone()).is_err());
+    let fixed = ForwardInput { target_addr: "127.0.0.1:80".parse().unwrap(), ..input };
+    lab.controller.replace_forward(network.id, earlier.id, fixed).unwrap();
+    assert_eq!((lab.netmap(listen).me.forwards.len(), lab.netmap(target).me.forward_targets.len()), (1, 1));
 }
 
 #[test]

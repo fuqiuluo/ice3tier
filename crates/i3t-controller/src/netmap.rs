@@ -7,14 +7,15 @@
 //! 这里算出来的内容不带版本号。版本号由下发的一方管：内容的摘要变了才加一。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use i3t_model::Netmap;
 use i3t_model::admin::{GroupId, NetworkId, PairSetting, Rule};
 use i3t_model::netmap::{
-    Forward, ForwardTarget, LaneMode, LocalNode, Network, Peer, PeerExit, Proxy, Reach, Relay, RelayClient, RelayRole,
+    Forward, ForwardTarget, LaneMode, LocalNode, Network, Peer, PeerExit, Proxy, Reach, Relay, RelayClient, RelayRole, is_cloud_metadata,
 };
 use i3t_proto::NodeId;
+use ipnet::Ipv4Net;
 
 use crate::access::AccessMap;
 use crate::store::{ForwardRecord, GroupRecord, NetworkRecord, NodeRecord, ProxyRecord, Store, StoreError};
@@ -22,6 +23,26 @@ use crate::{node_addresses, relay_reach};
 
 /// 下发给对端的候选端点最多这么多个。正常的节点只有几个；多出来的没有用，只会让每个对端都去探测。
 pub(crate) const MAX_ENDPOINTS: usize = 16;
+
+/// 端口转发指向的地址里，目标节点不会去连的两种（节点自己也查）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Undialable {
+    /// 云平台发凭据的地址。
+    CloudMetadata,
+    /// 落在网络自己的地址段里：到那里的连接是到那个节点开的流。
+    Overlay,
+}
+
+impl Undialable {
+    /// `addr` 当端口转发指向的地址时，目标节点为什么不会去连；会去连的是 `None`。`cidr` 是网络的地址段。
+    pub(crate) fn of(cidr: Ipv4Net, addr: SocketAddr) -> Option<Self> {
+        match addr.ip().to_canonical() {
+            ip if is_cloud_metadata(ip) => Some(Self::CloudMetadata),
+            IpAddr::V4(ip) if cidr.contains(&ip) => Some(Self::Overlay),
+            IpAddr::V4(_) | IpAddr::V6(_) => None,
+        }
+    }
+}
 
 /// 算 netmap 要用的、存储里没有的事：controller 从节点的连接和上报里知道的。
 pub trait NodeFacts {
@@ -135,13 +156,17 @@ impl NetworkView {
             .collect()
     }
 
-    /// 一条端口转发现在该不该下发：启用了，目标节点的开关（可以作为端口转发的目标）打开着，并且监听节点被允许访问目标节点。
+    /// 一条端口转发现在该不该下发：启用了，目标节点的开关（可以作为端口转发的目标）打开着，监听节点被允许访问目标节点，
+    /// 并且指向的地址是目标节点会去连的。
+    ///
+    /// 最后一条现在在新建和修改时就查，这里再查是为了以前配下的：还没有更新的节点自己不查，不能再把那样的转发下发给它。
     #[must_use]
     pub fn forward_is_deliverable(&self, access: &AccessMap<'_>, forward: &ForwardRecord) -> bool {
         let config = &forward.config;
         let switched_on = self.nodes.get(&config.target_node).is_some_and(|target| target.forward_target);
         let permitted = config.listen_node == config.target_node || access.allows(config.listen_node, config.target_node);
-        config.enabled && switched_on && self.nodes.contains_key(&config.listen_node) && permitted
+        let dialable = Undialable::of(self.network.cidr, config.target_addr).is_none();
+        config.enabled && switched_on && self.nodes.contains_key(&config.listen_node) && permitted && dialable
     }
 
     fn reach_of(&self, node: &NodeRecord) -> Reach {

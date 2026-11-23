@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use i3t_access::OwnListener;
+use i3t_access::{Claim, OwnListener, OwnListeners};
 use i3t_conn::Endpoint;
 use i3t_model::Netmap;
 use i3t_model::control::{Firewall, NameService, RuleState, VnetCause, VnetReport, VnetState};
@@ -45,13 +45,11 @@ const RECHECK: Duration = Duration::from_secs(5);
 pub(crate) struct Status {
     pub(crate) state: VnetState,
     pub(crate) firewall: Firewall,
-    /// 名字服务在这个地址上答查询；没有开起来（或者网卡没装着）时是 `None`。
-    name_service: Option<SocketAddr>,
 }
 
 impl Status {
     fn of(state: VnetState) -> Self {
-        Self { state, firewall: Firewall::default(), name_service: None }
+        Self { state, firewall: Firewall::default() }
     }
 }
 
@@ -65,7 +63,15 @@ pub(crate) struct Vnet {
 
 impl Vnet {
     /// 按本机配置（`[network]`）开始。装的过程在自己的任务里，状态从 [`report`](Self::report) 看。
-    pub(crate) fn start(network: Network, netmap: watch::Receiver<Arc<Netmap>>, endpoint: Arc<Endpoint>) -> Self {
+    ///
+    /// 名字服务开着的时候登记在 `own_listeners` 里：它只答本机来的查询，认的是来源地址，而出口替别的节点连
+    /// "本节点的端口"时用的正是本机的地址，所以出口要知道这个监听在哪里、绕开它。
+    pub(crate) fn start(
+        network: Network,
+        netmap: watch::Receiver<Arc<Netmap>>,
+        endpoint: Arc<Endpoint>,
+        own_listeners: OwnListeners,
+    ) -> Self {
         let counters = Arc::new(Counters::default());
         let (stop_tx, stop) = oneshot::channel();
         let (status_tx, status) = watch::channel(Status::of(VnetState::Off));
@@ -80,6 +86,7 @@ impl Vnet {
             let parts = Parts {
                 netmap,
                 endpoint,
+                own_listeners,
                 counters: Arc::clone(&counters),
                 firewall: network.firewall,
                 mtu: network.mtu,
@@ -92,7 +99,7 @@ impl Vnet {
 
     /// 现在的状态和这次运行以来的计数。
     pub(crate) fn report(&self) -> VnetReport {
-        let Status { state, firewall, name_service: _ } = self.status.borrow().clone();
+        let Status { state, firewall } = self.status.borrow().clone();
         let traffic = self.counters.snapshot();
         VnetReport {
             state,
@@ -103,15 +110,6 @@ impl Vnet {
             received_bytes: traffic.received_bytes,
             dropped: traffic.dropped,
         }
-    }
-
-    /// 名字服务现在的监听（本节点虚拟 IP 的 53 端口，UDP）；没有开着时是 `None`。
-    ///
-    /// 名字服务只答本机来的查询，认的是来源地址。出口替别的节点连"本节点的端口"时用的是本机的地址，所以要知道这个监听在哪里，
-    /// 绕开它（`i3t_exit::Outbound::with_own_listeners`）。
-    pub(crate) fn name_listener(&self) -> Option<OwnListener> {
-        let local = self.status.borrow().name_service?;
-        Some(OwnListener { protocol: ForwardProtocol::Udp, local, forward: None })
     }
 
     /// 拆掉装进系统里的东西，等拆完。再调用什么也不做。
@@ -177,6 +175,8 @@ async fn remove_legacy() {
 struct Parts {
     netmap: watch::Receiver<Arc<Netmap>>,
     endpoint: Arc<Endpoint>,
+    /// 节点的程序自己在监听的地址的那张表，名字服务登记在里面。
+    own_listeners: OwnListeners,
     counters: Arc<Counters>,
     firewall: bool,
     /// 网卡的 MTU（本机配置的 `[network] mtu`）。
@@ -328,7 +328,14 @@ struct Session {
     domain: String,
     firewall: bool,
     status: Status,
-    names: Option<JoinHandle<()>>,
+    names: Option<NameResponder>,
+}
+
+/// 开着的名字服务：回答查询的任务（socket 在它手里），和它在"程序自己的监听"里的登记。
+struct NameResponder {
+    task: JoinHandle<()>,
+    /// 任务停下、socket 关掉之后才撤销（[`Session::close`]）。
+    _claim: Claim,
 }
 
 impl Session {
@@ -374,11 +381,10 @@ impl Session {
         } else {
             Firewall::default()
         };
-        let (names, responder) = start_names(parts.netmap.clone(), own, &device_name, &netmap.network.domain).await;
+        let (names, responder) = start_names(parts, own, &device_name, &netmap.network.domain).await;
         let engine = Engine::new(Arc::new(tun), Arc::clone(&parts.endpoint), parts.netmap.clone(), Arc::clone(&parts.counters));
         let engine = tokio::spawn(engine.run());
-        let name_service = responder.as_ref().map(|_| SocketAddr::from((own, i3t_vnet::DNS_PORT)));
-        let status = Status { state: VnetState::Installed { device: device_name.clone(), mtu, names }, firewall, name_service };
+        let status = Status { state: VnetState::Installed { device: device_name.clone(), mtu, names }, firewall };
         let session = Self { device_name, plan, domain: netmap.network.domain.clone(), firewall: parts.firewall, status, names: responder };
         Ok((session, engine))
     }
@@ -399,7 +405,7 @@ impl Session {
             engine.abort();
         }
         if let Some(names) = &self.names {
-            names.abort();
+            names.task.abort();
         }
         let (platform, device) = (Platform::CURRENT, self.device_name.clone());
         if platform == Platform::Linux {
@@ -412,6 +418,11 @@ impl Session {
                 Ok(()) => {}
                 Err(error) => tracing::warn!(%error, "虚拟网卡的防火墙规则没有全部拆掉，下次启动时会拆掉"),
             }
+        }
+        // 名字服务的 socket 真的关掉之后，才把它从"程序自己的监听"里撤掉。
+        if let Some(NameResponder { task, _claim }) = self.names {
+            // 任务是被取消的，它的结果只会是"已取消"。
+            let _ = task.await;
         }
         // 等搬包的任务真的停下来：网卡在它手里，它停了网卡才丢掉。
         if let Some(engine) = engine {
@@ -449,13 +460,10 @@ fn device_cause(error: DeviceError) -> VnetCause {
 
 /// 开名字服务（本节点虚拟 IP 的 53 端口），Linux 上再让 systemd-resolved 把网络的域名交给它。
 /// Windows 和 macOS 上不碰系统的解析器，名字用 `i3t hosts`。
-async fn start_names(
-    netmap: watch::Receiver<Arc<Netmap>>,
-    own: Ipv4Addr,
-    device: &str,
-    domain: &str,
-) -> (NameService, Option<JoinHandle<()>>) {
+async fn start_names(parts: &Parts, own: Ipv4Addr, device: &str, domain: &str) -> (NameService, Option<NameResponder>) {
     let address = SocketAddr::from((own, i3t_vnet::DNS_PORT));
+    // 先登记再绑：绑上的那一刻起它就在答查询，出口得在那之前就知道这个地址不能从本机去连。绑不上时登记随凭据撤销。
+    let claim = parts.own_listeners.claim(OwnListener { protocol: ForwardProtocol::Udp, local: address, forward: None });
     let socket = match UdpSocket::bind(address).await {
         Ok(socket) => socket,
         Err(error) => {
@@ -463,8 +471,8 @@ async fn start_names(
             return (NameService::Failed { cause: bind_cause(address, &error) }, None);
         }
     };
-    let responder = tokio::spawn(answer_names(socket, netmap, own));
-    (configure_resolver(device, domain, own).await, Some(responder))
+    let task = tokio::spawn(answer_names(socket, parts.netmap.clone(), own));
+    (configure_resolver(device, domain, own).await, Some(NameResponder { task, _claim: claim }))
 }
 
 async fn configure_resolver(device: &str, domain: &str, own: Ipv4Addr) -> NameService {
@@ -617,7 +625,7 @@ mod tests {
         let key = Arc::new(i3t_crypto::NodeKey::generate().unwrap());
         let config = i3t_conn::EndpointConfig { key, bind: "127.0.0.1:0".parse().unwrap(), netmap: rx.clone(), addr_servers: Vec::new() };
         let endpoint = Arc::new(Endpoint::bind(config).unwrap());
-        let vnet = Vnet::start(Network { enabled: false, ..Network::default() }, rx, endpoint);
+        let vnet = Vnet::start(Network { enabled: false, ..Network::default() }, rx, endpoint, OwnListeners::default());
         assert_eq!(vnet.report().state, VnetState::Off);
         assert_eq!(vnet.report().firewall, Firewall::default());
         vnet.stop().await;

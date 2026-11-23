@@ -15,7 +15,7 @@ use common::{
     peer_mut, proxy, socks5, udp_associate, udp_echo_server,
 };
 use i3t_access::{OwnListener, TargetCause};
-use i3t_model::netmap::{Forward, ForwardProtocol, ForwardTarget, ListenerProtocol, ProxyProtocol};
+use i3t_model::netmap::{ExitRole, Forward, ForwardProtocol, ForwardTarget, ListenerProtocol, PeerExit, ProxyProtocol};
 use ipnet::IpNet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -171,7 +171,7 @@ async fn a_udp_port_the_program_itself_listens_on_is_never_sent_to_from_this_mac
     world.nas.system.redirect("192.168.77.5:53", udp_echo_server().await);
     world.nas.system.redirect("10.66.0.3:5353", udp_echo_server().await);
     let name_service = |ip: &str| OwnListener { protocol: UDP, local: format!("{ip}:53").parse().unwrap(), forward: None };
-    *world.nas.other_listeners.lock().unwrap() = vec![name_service("10.66.0.3")];
+    let _on_nas = world.nas.own_listeners.claim(name_service("10.66.0.3"));
 
     let client = udp_associate(world.socks().await, None).await;
     // 别的节点发往 nas 的 53 端口：绕开名字服务，发到下一个地址上（那里有这台机器自己的 DNS 服务的话，答的是它）。
@@ -187,7 +187,7 @@ async fn a_udp_port_the_program_itself_listens_on_is_never_sent_to_from_this_mac
     // gw 只有虚拟 IP 这一个非回环的 IPv4 地址（纯 IPv6 的宿主机）：没有别的地址可发，丢掉。
     world.gw.system.set_interfaces(&["127.0.0.1/8", "10.66.0.2/16"]);
     world.gw.system.redirect("10.66.0.2:53", names.addr());
-    *world.gw.other_listeners.lock().unwrap() = vec![name_service("10.66.0.2")];
+    let _on_gw = world.gw.own_listeners.claim(name_service("10.66.0.2"));
     client.send("10.66.0.2", 53, b"query").await;
     names.assert_untouched(QUIET).await;
     client.assert_silent(QUIET).await;
@@ -195,9 +195,80 @@ async fn a_udp_port_the_program_itself_listens_on_is_never_sent_to_from_this_mac
 }
 
 #[tokio::test]
+async fn the_exits_own_address_on_its_lan_does_not_lead_to_what_the_program_itself_listens_on() {
+    let world = World::new().await;
+    // gw 打开了局域网开关。它自己在那个网段里的地址 192.168.77.5 也是"局域网里的地址"。
+    world.laptop.update(|netmap| peer_mut(netmap, GW).exit = Some(PeerExit { lan: true, class: None, optimistic: None })).await;
+    world.gw.update(|netmap| netmap.me.exit = Some(ExitRole { lan: true, ..ExitRole::default() })).await;
+    let trap = Target::bind("127.0.0.1").await;
+    let udp_trap = UdpTarget::bind("127.0.0.1").await;
+    for held in ["192.168.77.5:8080", "192.168.77.5:8081"] {
+        world.gw.system.redirect(held, trap.addr());
+    }
+    world.gw.system.redirect("192.168.77.5:5353", udp_trap.addr());
+    world.gw.system.redirect("192.168.77.5:9090", echo_server().await);
+    world.gw.system.redirect("192.168.77.5:5354", udp_echo_server().await);
+    // 这个程序自己的监听：那个地址上的一个代理，全部地址上的一条转发，那个地址上的一条 UDP 转发。
+    let listener = |protocol, local: &str| OwnListener { protocol, local: local.parse().unwrap(), forward: None };
+    let _held = [
+        world.gw.own_listeners.claim(listener(TCP, "192.168.77.5:8080")),
+        world.gw.own_listeners.claim(listener(TCP, "0.0.0.0:8081")),
+        world.gw.own_listeners.claim(listener(UDP, "192.168.77.5:5353")),
+    ];
+
+    // 别的节点把它们当成局域网目标来访问：出口不去连。连了的话，来源是 gw 自己在这个网段里的地址。
+    for port in [8080, 8081] {
+        assert_eq!(socks5(world.socks().await, None, "192.168.77.5", port).await.failed(), 2, "{port}");
+    }
+    let client = udp_associate(world.socks().await, None).await;
+    client.send("192.168.77.5", 5353, b"query").await;
+    client.assert_silent(QUIET).await;
+    trap.assert_untouched(QUIET).await;
+    udp_trap.assert_untouched(QUIET).await;
+    assert!(world.gw.system.connected().is_empty() && world.gw.system.udp_destinations().is_empty());
+
+    // 同一个地址上别的程序的服务照常可达，TCP 和 UDP 都是。
+    let mut stream = socks5(world.socks().await, None, "192.168.77.5", 9090).await.connected();
+    assert_echo(&mut stream).await;
+    client.send("192.168.77.5", 5354, b"other service").await;
+    assert_eq!(client.recv().await.1, b"other service");
+}
+
+#[tokio::test]
+async fn a_udp_port_that_turns_into_a_listener_of_the_program_stops_being_sent_to_at_once() {
+    let world = World::new().await;
+    world.nas.system.redirect("192.168.77.5:5353", udp_echo_server().await);
+    let client = udp_associate(world.socks().await, None).await;
+    client.send("10.66.0.3", 5353, b"before").await;
+    assert_eq!(client.recv().await.1, b"before");
+
+    // 这个端口上开了一个程序自己的监听（比如一条刚绑上的 UDP 转发）：记着的"可以发"不再作数，下一个报文就不发了，
+    // 不用等那个结论过期，netmap 也没有变。
+    let held = world.nas.own_listeners.claim(OwnListener { protocol: UDP, local: "192.168.77.5:5353".parse().unwrap(), forward: None });
+    client.send("10.66.0.3", 5353, b"after").await;
+    client.assert_silent(QUIET).await;
+    assert_eq!(world.nas.system.udp_destinations().len(), 1, "只有一开始那一次");
+
+    // 监听关掉之后又可以发。
+    drop(held);
+    client.send("10.66.0.3", 5353, b"again").await;
+    assert_eq!(client.recv().await.1, b"again");
+}
+
+#[tokio::test]
 async fn a_forward_never_reaches_a_cloud_metadata_address_whichever_way_it_is_used() {
     let world = World::new().await;
-    let metadata = ["169.254.169.254:80", "100.100.100.200:80", "168.63.129.16:80", "[fd00:ec2::254]:80", "[::ffff:169.254.169.254]:80"];
+    let metadata = [
+        "169.254.169.254:80",
+        "100.100.100.200:80",
+        "168.63.129.16:80",
+        "[fd00:ec2::254]:80",
+        "[fd20:ce::254]:80",
+        "169.254.170.2:80",
+        "169.254.170.23:80",
+        "[fd00:ec2::23]:80",
+        "[::ffff:169.254.169.254]:80",
+    ];
     // 万一出口去连了，连到的是这个测试服务，测试看得见。
     let trap = Target::bind("127.0.0.1").await;
     for address in metadata {

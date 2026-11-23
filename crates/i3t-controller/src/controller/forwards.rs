@@ -3,14 +3,15 @@
 use std::net::IpAddr;
 
 use i3t_model::admin::{Forward, ForwardInput, ForwardStatus, LogRef, NetworkId, RefKind, action};
-use i3t_model::netmap::{ForwardProtocol, is_cloud_metadata};
+use i3t_model::netmap::ForwardProtocol;
 use serde_json::{Value, json};
 
 use super::nodes::{is_connectable, require_node};
 use super::{Controller, Inner, Seeds, naming};
 use crate::access::AccessMap;
 use crate::error::{Entity, Error, InField};
-use crate::netmap::NetworkView;
+use crate::netmap::{NetworkView, Undialable};
+use crate::node_addresses::canonical;
 use crate::store::{ForwardRecord, Store};
 
 impl Controller {
@@ -112,6 +113,8 @@ impl Inner {
             ForwardStatus::Disabled
         } else if !switched_on {
             ForwardStatus::ForwardTargetOff
+        } else if Undialable::of(view.network.cidr, config.target_addr).is_some() {
+            ForwardStatus::TargetNotAllowed
         } else if !view.forward_is_deliverable(access, record) {
             ForwardStatus::AccessDenied
         } else if !self.is_online(config.listen_node) {
@@ -143,6 +146,8 @@ impl Inner {
 /// 检查一条转发的配置。`replacing` 是正在被替换的那一条，查冲突时不和它自己比。
 fn check(store: &Store, network: NetworkId, replacing: Option<&ForwardRecord>, mut config: ForwardInput) -> Result<ForwardInput, Error> {
     config.name = naming::title("端口转发", &config.name, false).in_field("name")?;
+    // 同一个地址只存一种写法：IPv4 映射的 IPv6 地址存成它里面的 IPv4 地址，后面的比较和节点上的判断才对得上。
+    (config.bind, config.target_addr) = (canonical(config.bind), canonical(config.target_addr));
     let listener = require_node(store, network, config.listen_node).in_field("listen_node")?;
     let target = require_node(store, network, config.target_node).in_field("target_node")?;
     // 目标节点的开关要打开：一台机器的回环和局域网经转发对外，要管理员对这台机器明确地点过头。
@@ -153,7 +158,7 @@ fn check(store: &Store, network: NetworkId, replacing: Option<&ForwardRecord>, m
     }
     // 端口写 0 是让监听节点自己挑一个空闲的端口（挑定之后重启不变，挑的是哪个看它的上报）。
     // 虚拟 IP 上的转发不占操作系统的端口，没有"空闲的端口"可挑，要写明。
-    if config.bind.port() == 0 && config.bind.ip().to_canonical() == IpAddr::V4(listener.virtual_ip) {
+    if config.bind.port() == 0 && config.bind.ip() == IpAddr::V4(listener.virtual_ip) {
         return Err(Error::invalid_field("bind", "zero_port", "监听在虚拟 IP 上的端口转发要写明端口，不能是 0"));
     }
     // PROXY protocol 的头是给 TCP 的服务读的：v1 没有 UDP 的写法，v2 的要加在每个报文前面，认它的 UDP 服务几乎没有。
@@ -167,29 +172,30 @@ fn check(store: &Store, network: NetworkId, replacing: Option<&ForwardRecord>, m
             format!("目标地址 {} 不是一个能连上的地址", config.target_addr),
         ));
     }
-    // 下面两种地址目标节点不会去连（它自己也查），这里就不收：配上了也只是一条不通的转发。
-    let target_ip = config.target_addr.ip().to_canonical();
-    if is_cloud_metadata(target_ip) {
-        return Err(Error::invalid_field(
-            "target_addr",
-            "cloud_metadata",
-            format!("目标地址 {} 是云平台的元数据地址，端口转发不能指向它", config.target_addr),
-        ));
-    }
+    // 目标节点不会去连的地址（它自己也查）不收：配上了也只是一条不通的转发。只查启用的：停用的不下发，
+    // 以前配下的这种转发因此可以原地停用，再启用时照样过不了这一条。
     let cidr = store.network(network)?.ok_or(Error::NotFound(Entity::Network))?.cidr;
-    if matches!(target_ip, IpAddr::V4(ip) if cidr.contains(&ip)) {
-        return Err(Error::invalid_field(
-            "target_addr",
-            "overlay_address",
-            format!("目标地址 {} 在网络的虚拟地址段 {cidr} 里：这里填目标节点自己去连的地址（回环或者它所在的局域网）", config.target_addr),
-        ));
+    if let Some(undialable) = Undialable::of(cidr, config.target_addr).filter(|_| config.enabled) {
+        let (what, message) = match undialable {
+            Undialable::CloudMetadata => {
+                ("cloud_metadata", format!("目标地址 {} 是云平台发凭据的地址（实例元数据），端口转发不能指向它", config.target_addr))
+            }
+            Undialable::Overlay => (
+                "overlay_address",
+                format!(
+                    "目标地址 {} 在网络的虚拟地址段 {cidr} 里：这里填目标节点自己去连的地址（回环或者它所在的局域网）",
+                    config.target_addr
+                ),
+            ),
+        };
+        return Err(Error::invalid_field("target_addr", what, message));
     }
     // 端口写 0 的各挑各的端口，不算冲突。
     let clash = store.forwards(network)?.into_iter().find(|other| {
         Some(other.id) != replacing.map(|before| before.id)
             && other.config.listen_node == config.listen_node
             && other.config.protocol == config.protocol
-            && other.config.bind == config.bind
+            && canonical(other.config.bind) == config.bind
             && config.bind.port() != 0
     });
     match clash {

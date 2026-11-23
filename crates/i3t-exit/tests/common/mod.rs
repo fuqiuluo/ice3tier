@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use i3t_access::{Access, AccessStatus, ListenState, OwnListener};
+use i3t_access::{Access, AccessStatus, ListenState, OwnListeners};
 use i3t_exit::{Exit, Os, Outbound, ResolveError, System};
 use i3t_flow::memory::{MemoryAcceptor, MemoryConnector, MemoryMesh};
 use i3t_lane::testing::LaneMesh;
@@ -285,8 +285,9 @@ pub struct Node {
     pub system: FakeSystem,
     /// 数据面报出来的本节点的候选端点（反射地址、端口映射拿到的地址）。测试往里放什么，出口就认为自己对外是什么地址。
     pub own_endpoints: Arc<Mutex<Vec<SocketAddr>>>,
-    /// 节点程序里入口之外的监听（虚拟网卡的名字服务）。测试往里放什么，出口就当它是这个程序自己在监听的地址。
-    pub other_listeners: Arc<Mutex<Vec<OwnListener>>>,
+    /// 这个节点的程序自己在监听的地址：入口的监听登记在里面。测试再往里登记什么（比如虚拟网卡的名字服务），
+    /// 出口就当它也是这个程序自己的监听。
+    pub own_listeners: OwnListeners,
     pub access: Arc<Access<LaneConnector<MemoryConnector>>>,
     pub exit: Arc<Exit<FakeSystem, LaneConnector<MemoryConnector>>>,
     /// 本节点的 lane：看和哪个对端之间经过了多少字节。
@@ -309,26 +310,19 @@ impl Node {
         let (sender, receiver) = watch::channel(Arc::new(netmap));
         let system = FakeSystem::default();
         let own_endpoints: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
-        let other_listeners: Arc<Mutex<Vec<OwnListener>>> = Arc::default();
         let mut access = Access::new(Arc::clone(&connector), receiver.clone());
         if let Some(udp_idle) = udp_idle {
             access = access.with_udp_idle_timeout(udp_idle);
         }
         let access = Arc::new(access);
-        // 和节点程序的装配一样：出口认得入口的监听，加上程序里别处的。
+        // 和节点程序的装配一样：出口查的是入口登记监听的那张表。
+        let own_listeners = access.own_listeners();
         let outbound = Outbound::new(receiver.clone(), system.clone())
             .with_own_endpoints({
                 let own_endpoints = Arc::clone(&own_endpoints);
                 move || own_endpoints.lock().unwrap().clone()
             })
-            .with_own_listeners({
-                let (access, others) = (Arc::downgrade(&access), Arc::clone(&other_listeners));
-                move || {
-                    let mut listeners = access.upgrade().map(|access| access.own_listeners()).unwrap_or_default();
-                    listeners.extend(others.lock().unwrap().iter().copied());
-                    listeners
-                }
-            });
+            .with_own_listeners(own_listeners.clone());
         let mut exit =
             Exit::new(receiver, outbound, connector).with_opener(access.datagram_opener()).with_forward_health(access.forward_health());
         if let Some(udp_idle) = udp_idle {
@@ -343,7 +337,7 @@ impl Node {
             let exit = Arc::clone(&exit);
             async move { i3t_flow::serve(&acceptor, exit).await }
         });
-        Self { id, system, own_endpoints, other_listeners, access, exit, lanes, netmap: sender }
+        Self { id, system, own_endpoints, own_listeners, access, exit, lanes, netmap: sender }
     }
 
     /// 改这个节点的 netmap 并下发（版本号加一），等入口把监听调整完。

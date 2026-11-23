@@ -460,6 +460,7 @@ const fn forward_status(status: ForwardStatus) -> &'static str {
         ForwardStatus::Disabled => "disabled",
         ForwardStatus::ForwardTargetOff => "target switched off",
         ForwardStatus::AccessDenied => "no access",
+        ForwardStatus::TargetNotAllowed => "target address not allowed",
         ForwardStatus::ListenerOffline => "listener offline",
         ForwardStatus::TargetOffline => "target offline",
         ForwardStatus::Active => "in effect",

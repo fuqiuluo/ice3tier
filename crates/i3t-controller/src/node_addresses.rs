@@ -60,7 +60,8 @@ pub(crate) fn warnings(node: &NodeRecord, cidr: Ipv4Net) -> Vec<NodeWarning> {
     local.iter().map(|ip| ip.to_canonical()).filter(|ip| in_range(*ip, cidr)).map(|address| NodeWarning::RangeOverlap { address }).collect()
 }
 
-fn canonical(address: SocketAddr) -> SocketAddr {
+/// 同一个地址只有一种写法：IPv4 映射的 IPv6 地址写成它里面的 IPv4 地址。
+pub(crate) fn canonical(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(address.ip().to_canonical(), address.port())
 }
 

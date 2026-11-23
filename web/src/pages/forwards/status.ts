@@ -76,6 +76,14 @@ export function forwardStatusView(
         needsAttention: true,
         linkToRules: true,
       }
+    case 'target_not_allowed':
+      return {
+        ...base,
+        tone: 'danger',
+        label: s.targetNotAllowed,
+        detail: s.targetNotAllowedDetail,
+        needsAttention: true,
+      }
     case 'listener_offline':
       return { ...base, tone: 'idle', label: s.listenerOffline, detail: s.listenerOfflineDetail(listenName) }
     case 'target_offline':

@@ -28,6 +28,7 @@ use crate::first_data::{self, FIRST_BYTE_WAIT};
 use crate::forward_health::{ForwardHealth, TargetCause};
 use crate::manager::{Connection, PortBook, allowed, virtual_ip_admits};
 use crate::message::{Parsed, Parser};
+use crate::own_listeners::OwnListeners;
 use crate::route::{self, Route};
 use crate::routes::{RouteAtStart, RouteSpan, SharedRoutes};
 use crate::usage::{ExitTally, IngressMeter, Usage};
@@ -65,6 +66,8 @@ pub(crate) struct Shared<C: Datagrams> {
     pub udp_idle_timeout: Duration,
     /// 端口转发的目标最近连不上的记录。
     pub forward_health: ForwardHealth,
+    /// 本节点的程序自己在监听的地址，每个监听绑定时登记在里面。
+    pub own_listeners: OwnListeners,
     /// 到各个对端现在走哪条路，写进每条流结束时的摘要。
     pub routes: SharedRoutes,
     /// 代理连接在完成握手之前占的名额。

@@ -658,6 +658,7 @@ export type ForwardStatus =
   | 'forward_target_off'
   | 'target_not_declared'
   | 'access_denied'
+  | 'target_not_allowed'
   | 'listener_offline'
   | 'target_offline'
   | 'active'

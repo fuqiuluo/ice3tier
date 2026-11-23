@@ -63,6 +63,8 @@ export const forwards = {
     unknown: '未知',
     accessDenied: '策略不允许',
     accessDeniedDetail: (listen: string, target: string) => `${listen} 无权访问 ${target}`,
+    targetNotAllowed: '目标地址不可用',
+    targetNotAllowedDetail: '目标地址是云平台的元数据地址或在网络地址段内，未下发',
     listenerOffline: '监听节点离线',
     listenerOfflineDetail: (listen: string) => `${listen} 上线后恢复`,
     targetOffline: '目标节点离线',

@@ -1482,6 +1482,9 @@ pub enum ForwardStatus {
     ForwardTargetOff,
     /// 访问规则不允许监听节点访问目标节点，转发没有下发。
     AccessDenied,
+    /// 指向的地址节点不会去连（云平台发凭据的地址，或者落在网络自己的地址段里），转发没有下发。
+    /// 现在配不出这样的转发，以前配下的才会是这个状态：改掉地址、停用或者删掉它。
+    TargetNotAllowed,
     ListenerOffline,
     TargetOffline,
     /// 已经下发，两端都在线。

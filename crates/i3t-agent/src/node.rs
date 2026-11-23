@@ -228,8 +228,8 @@ pub async fn run(
         .with_port_book(ports)
         .with_routes(Arc::clone(&routes));
     let access = Arc::new(access);
-    // 虚拟网卡：默认打开，装不上时说为什么，别的照常。
-    let vnet = Arc::new(Vnet::start(config.network, local_rx.clone(), Arc::clone(&endpoint)));
+    // 虚拟网卡：默认打开，装不上时说为什么，别的照常。它的名字服务登记进入口的那张"程序自己的监听"的表。
+    let vnet = Arc::new(Vnet::start(config.network, local_rx.clone(), Arc::clone(&endpoint), access.own_listeners()));
     // 出口不替别人连本节点自己对外的地址（反射地址、路由器映射出来的地址），这些地址数据面最清楚。
     // 两份都要：候选端点里有本机网卡上的地址，"别人看到的地址"在只经 relay 的节点上也有。
     // 别的节点访问本节点的端口时，出口也不去连这个程序自己的监听（入口的代理和端口转发、虚拟网卡的名字服务）：
@@ -239,14 +239,7 @@ pub async fn run(
             let endpoint = Arc::downgrade(&endpoint);
             move || endpoint.upgrade().map(|endpoint| [endpoint.endpoints(), endpoint.public_addresses()].concat()).unwrap_or_default()
         })
-        .with_own_listeners({
-            let (access, vnet) = (Arc::downgrade(&access), Arc::downgrade(&vnet));
-            move || {
-                let mut listeners = access.upgrade().map(|access| access.own_listeners()).unwrap_or_default();
-                listeners.extend(vnet.upgrade().and_then(|vnet| vnet.name_listener()));
-                listeners
-            }
-        });
+        .with_own_listeners(access.own_listeners());
     // 出口测试和替别人连用的是同一个拨号器：同一份出站策略。
     let (exit_test_answers_tx, exit_test_answers) = mpsc::channel(4);
     let exit_tests = Arc::new(ExitTests::new(outbound.clone(), exit_test_answers_tx));

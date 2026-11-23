@@ -146,15 +146,25 @@ impl Network {
     }
 }
 
-/// 各家云平台的实例元数据地址。
-const CLOUD_METADATA: [IpAddr; 4] = [
+/// 各家云平台的实例元数据地址，和同样发凭据的容器凭据地址。
+const CLOUD_METADATA: [IpAddr; 8] = [
+    // 大多数云平台（AWS、GCP、Azure、OpenStack……）的实例元数据。
     IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+    // 阿里云的实例元数据。
     IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
+    // Azure 的平台服务地址。
     IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16)),
+    // AWS 的实例元数据的 IPv6 地址。
     IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
+    // GCP 的实例元数据的 IPv6 地址（只有 IPv6 的虚拟机上）。
+    IpAddr::V6(Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254)),
+    // AWS 上容器的凭据：ECS 的任务，EKS Pod Identity（两种地址）。
+    IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2)),
+    IpAddr::V4(Ipv4Addr::new(169, 254, 170, 23)),
+    IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0023)),
 ];
 
-/// `ip` 是不是某个云平台的实例元数据地址。IPv4 映射的 IPv6 地址按里面的 IPv4 地址判断。
+/// `ip` 是不是某个云平台发凭据的地址（实例元数据、容器凭据）。IPv4 映射的 IPv6 地址按里面的 IPv4 地址判断。
 ///
 /// 能读到它就能拿到云主机的凭据，所以节点替别人连的地址里哪一种都不放行它：出口的互联网目标和局域网目标，
 /// 端口转发指向的地址。controller 也不收指向它的端口转发。
@@ -903,10 +913,22 @@ mod tests {
 
     #[test]
     fn cloud_metadata_addresses_are_recognised_in_every_form() {
-        for address in ["169.254.169.254", "100.100.100.200", "168.63.129.16", "fd00:ec2::254", "::ffff:169.254.169.254"] {
+        let listed = [
+            "169.254.169.254",
+            "100.100.100.200",
+            "168.63.129.16",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "fd00:ec2::23",
+            "::ffff:169.254.169.254",
+            "::ffff:169.254.170.2",
+        ];
+        for address in listed {
             assert!(is_cloud_metadata(address.parse().unwrap()), "{address}");
         }
-        for address in ["169.254.169.253", "192.168.1.1", "127.0.0.1", "fd00:ec2::255"] {
+        for address in ["169.254.169.253", "169.254.170.3", "192.168.1.1", "127.0.0.1", "fd00:ec2::255", "fd20:ce::255"] {
             assert!(!is_cloud_metadata(address.parse().unwrap()), "{address}");
         }
     }

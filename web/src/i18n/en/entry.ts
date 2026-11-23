@@ -67,6 +67,8 @@ export const forwards: Messages['forwards'] = {
     unknown: 'Unknown',
     accessDenied: 'Blocked by policies',
     accessDeniedDetail: (listen, target) => `${listen} is not allowed to reach ${target}`,
+    targetNotAllowed: 'Target not allowed',
+    targetNotAllowedDetail: "The target is a cloud metadata address or inside the network's range; not deployed",
     listenerOffline: 'Listen node offline',
     listenerOfflineDetail: (listen) => `Resumes when ${listen} is online`,
     targetOffline: 'Target offline',

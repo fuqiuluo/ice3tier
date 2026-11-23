@@ -148,6 +148,8 @@ struct Verdict {
 struct Destinations {
     /// 这些结论是按哪一版 netmap 得出的。
     netmap_version: u64,
+    /// 这些结论是按程序自己的监听的哪一版得出的（`i3t_access::OwnListeners::generation`）。
+    listeners_generation: u64,
     verdicts: HashMap<Target, Verdict>,
     /// 往它发过报文的地址，以及从它回来的报文报成什么来源。
     sources: HashMap<SocketAddr, Source>,
@@ -155,9 +157,11 @@ struct Destinations {
 
 impl Destinations {
     /// netmap 换了一版：出口的能力、端口、访问关系都可能变了，之前的结论全部作废。
-    fn follow(&mut self, netmap: &Netmap) {
-        if self.netmap_version != netmap.version {
-            self.netmap_version = netmap.version;
+    /// 程序自己的监听变了（`listeners` 是那张表的版本）也一样：原先可以发的地址上可能刚开了一个自己的监听，
+    /// 结论不重新得出的话，报文还会接着往那里发到结论过期为止。
+    fn follow(&mut self, netmap: &Netmap, listeners: u64) {
+        if self.netmap_version != netmap.version || self.listeners_generation != listeners {
+            (self.netmap_version, self.listeners_generation) = (netmap.version, listeners);
             self.verdicts.clear();
             self.sources.clear();
         }
@@ -321,7 +325,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
     /// 把发起节点发来的一个报文发往它的目标。返回有没有发出去。
     async fn send_to_target(&self, datagram: &Received, destinations: &mut Destinations, tally: &mut Tally, onward: Onward<'_, C>) -> bool {
         let netmap = Arc::clone(&self.netmap.borrow());
-        destinations.follow(&netmap);
+        destinations.follow(&netmap, self.outbound.own_listeners().generation());
         let now = Instant::now();
         let outcome = match destinations.verdict(&datagram.target, now) {
             Some(outcome) => outcome,
@@ -475,10 +479,10 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                 return Ok(Checked::Address(Destination { addr, source, exit_traffic: true, grant: Grant::Internet { port: *port } }));
             }
             Target::Lan { addr } => {
-                let addr = self.outbound.lan_target(netmap, *addr)?;
+                let addr = self.outbound.lan_target(netmap, *addr, ForwardProtocol::Udp)?;
                 return Ok(Checked::Address(Destination { addr, source: target.clone(), exit_traffic: true, grant: Grant::Lan }));
             }
-            Target::Node { port } => match forward_at_node_port(netmap, *port, ForwardProtocol::Udp, &self.outbound.own_listeners()) {
+            Target::Node { port } => match forward_at_node_port(netmap, *port, ForwardProtocol::Udp, self.outbound.own_listeners()) {
                 Some(forward) if forward.target != netmap.me.id => {
                     // 访问规则两段：发起节点能访问本节点（上面查过），本节点能访问目标节点。目标节点还会按编号再查一遍。
                     check_allow_list(initiator, forward)?;
@@ -602,14 +606,20 @@ mod tests {
         destinations.remember(target(53), allowed, now);
         destinations.sources.insert(real, source());
         let mut netmap = netmap();
-        destinations.follow(&netmap);
+        destinations.follow(&netmap, 0);
         assert!(destinations.verdicts.is_empty() && destinations.sources.is_empty());
         destinations.remember(target(53), allowed, now);
-        destinations.follow(&netmap);
+        destinations.follow(&netmap, 0);
         assert_eq!(destinations.verdicts.len(), 1, "同一版 netmap 不清");
         netmap.version += 1;
-        destinations.follow(&netmap);
+        destinations.follow(&netmap, 0);
         assert!(destinations.verdicts.is_empty());
+
+        // 程序自己的监听变了也一样：原先可以发的地址上可能刚开了一个自己的监听。
+        destinations.remember(target(53), allowed, now);
+        destinations.sources.insert(real, source());
+        destinations.follow(&netmap, 1);
+        assert!(destinations.verdicts.is_empty() && destinations.sources.is_empty());
     }
 
     /// 一份最小的 netmap，只用到它的版本号。

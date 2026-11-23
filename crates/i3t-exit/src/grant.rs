@@ -282,33 +282,41 @@ pub(crate) mod tests {
 
     #[test]
     fn a_node_port_is_taken_by_the_forward_on_the_virtual_ip_or_on_every_address() {
-        use i3t_access::OwnListener;
+        use i3t_access::{OwnListener, OwnListeners};
 
         use crate::handler::forward_at_node_port;
 
         let at = |text: &str| text.parse::<SocketAddr>().unwrap();
         let bound = |bind: &str| after(|netmap| netmap.me.forwards[0].bind = at(bind));
         let taken =
-            |netmap: &Netmap, port, listeners: &[OwnListener]| forward_at_node_port(netmap, port, TCP, listeners).map(|forward| forward.id);
+            |netmap: &Netmap, port, listeners: &OwnListeners| forward_at_node_port(netmap, port, TCP, listeners).map(|forward| forward.id);
+        let none = OwnListeners::default();
 
-        assert_eq!(taken(&netmap(), 9100, &[]), Some(7));
-        assert_eq!(taken(&netmap(), 9101, &[]), None);
-        assert_eq!(forward_at_node_port(&netmap(), 9100, ForwardProtocol::Udp, &[]).map(|forward| forward.id), None, "协议也要对得上");
-        for everywhere in ["0.0.0.0:9100", "[::]:9100", "[::ffff:10.66.0.2]:9100"] {
-            assert_eq!(taken(&bound(everywhere), 9100, &[]), Some(7), "{everywhere}");
+        assert_eq!(taken(&netmap(), 9100, &none), Some(7));
+        assert_eq!(taken(&netmap(), 9101, &none), None);
+        assert_eq!(forward_at_node_port(&netmap(), 9100, ForwardProtocol::Udp, &none).map(|forward| forward.id), None, "协议也要对得上");
+        // 全部地址和虚拟 IP，写成 IPv4 映射的 IPv6 地址的也认。
+        for everywhere in ["0.0.0.0:9100", "[::]:9100", "[::ffff:0.0.0.0]:9100", "[::ffff:10.66.0.2]:9100"] {
+            assert_eq!(taken(&bound(everywhere), 9100, &none), Some(7), "{everywhere}");
+            assert!(crate::handler::faces_the_mesh(&netmap(), at(everywhere)), "{everywhere}");
         }
         // 只监听在别的某一个地址上的不是给组网里的节点用的。
-        for elsewhere in ["192.168.1.5:9100", "127.0.0.1:9100", "[2001:db8::5]:9100", "10.66.0.3:9100"] {
-            assert_eq!(taken(&bound(elsewhere), 9100, &[]), None, "{elsewhere}");
+        for elsewhere in ["192.168.1.5:9100", "127.0.0.1:9100", "[2001:db8::5]:9100", "10.66.0.3:9100", "[::ffff:192.168.1.5]:9100"] {
+            assert_eq!(taken(&bound(elsewhere), 9100, &none), None, "{elsewhere}");
+            assert!(!crate::handler::faces_the_mesh(&netmap(), at(elsewhere)), "{elsewhere}");
         }
 
         // 端口写 0 的：入口挑定了哪个端口，就在哪个端口上接。
         let any_port = bound("0.0.0.0:0");
+        assert_eq!(taken(&any_port, 40123, &none), None, "还没有绑上");
+        let listeners = OwnListeners::default();
         let chosen = OwnListener { protocol: TCP, local: at("0.0.0.0:40123"), forward: Some(7) };
-        assert_eq!(taken(&any_port, 40123, &[chosen]), Some(7));
-        assert_eq!(taken(&any_port, 40124, &[chosen]), None);
-        assert_eq!(taken(&any_port, 40123, &[]), None, "还没有绑上");
-        assert_eq!(taken(&any_port, 40123, &[OwnListener { forward: Some(8), ..chosen }]), None, "那是别的转发挑的端口");
+        let other = listeners.claim(OwnListener { forward: Some(8), ..chosen });
+        assert_eq!(taken(&any_port, 40123, &listeners), None, "那是别的转发挑的端口");
+        let _claim = listeners.claim(chosen);
+        drop(other);
+        assert_eq!(taken(&any_port, 40123, &listeners), Some(7));
+        assert_eq!(taken(&any_port, 40124, &listeners), None);
 
         // 两种都有时用虚拟 IP 上的那一条。
         let both = after(|netmap| {
@@ -316,6 +324,6 @@ pub(crate) mod tests {
             (everywhere.id, everywhere.bind) = (17, at("0.0.0.0:9100"));
             netmap.me.forwards.insert(0, everywhere);
         });
-        assert_eq!(taken(&both, 9100, &[]), Some(7));
+        assert_eq!(taken(&both, 9100, &none), Some(7));
     }
 }

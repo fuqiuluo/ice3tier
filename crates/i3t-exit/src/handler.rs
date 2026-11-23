@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use i3t_access::{ForwardHealth, NoRoutes, OwnListener, RouteAtStart, SharedRoutes, TargetCause, proxy_header};
+use i3t_access::{ForwardHealth, NoRoutes, OwnListeners, RouteAtStart, SharedRoutes, TargetCause, proxy_header};
 use i3t_conn::contract::{DatagramSender, Datagrams};
 use i3t_conn::{Connector, Endpoint, RecvStream, SendStream};
 use i3t_flow::datagram::{self, Opener, OutboundSocket};
@@ -215,7 +215,7 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
                 let stream = self.outbound.lan(netmap, *addr).await?;
                 Ok((exit_traffic(stream), Grant::Lan))
             }
-            Target::Node { port } => match forward_at_node_port(netmap, *port, ForwardProtocol::Tcp, &self.outbound.own_listeners()) {
+            Target::Node { port } => match forward_at_node_port(netmap, *port, ForwardProtocol::Tcp, self.outbound.own_listeners()) {
                 Some(forward) if forward.target != netmap.me.id => {
                     let flow = self.onward(netmap, initiator, forward, open).await?;
                     let grant = Grant::VirtualForward { id: forward.id, bind: forward.bind, target: forward.target, addr: None };
@@ -505,24 +505,24 @@ pub(crate) fn forward_at_node_port<'n>(
     netmap: &'n Netmap,
     port: u16,
     protocol: ForwardProtocol,
-    listeners: &[OwnListener],
+    listeners: &OwnListeners,
 ) -> Option<&'n Forward> {
     let at_port = |forward: &Forward| match forward.bind.port() {
-        0 => listeners
-            .iter()
-            .any(|listener| listener.forward == Some(forward.id) && listener.protocol == protocol && listener.local.port() == port),
+        0 => listeners.forward_listens_on(forward.id, protocol, port),
         written => written == port,
     };
     let candidates = || netmap.me.forwards.iter().filter(|forward| forward.protocol == protocol && at_port(forward));
     let own = IpAddr::V4(netmap.me.virtual_ip);
     candidates()
         .find(|forward| forward.bind.ip().to_canonical() == own)
-        .or_else(|| candidates().find(|forward| forward.bind.ip().is_unspecified()))
+        .or_else(|| candidates().find(|forward| forward.bind.ip().to_canonical().is_unspecified()))
 }
 
 /// `bind` 上的监听是不是对组网里的节点开着的：本节点的虚拟 IP，或者全部地址（见 [`forward_at_node_port`]）。
+/// IPv4 映射的 IPv6 地址按里面的 IPv4 地址算。
 pub(crate) fn faces_the_mesh(netmap: &Netmap, bind: SocketAddr) -> bool {
-    bind.ip().is_unspecified() || bind.ip().to_canonical() == IpAddr::V4(netmap.me.virtual_ip)
+    let ip = bind.ip().to_canonical();
+    ip.is_unspecified() || ip == IpAddr::V4(netmap.me.virtual_ip)
 }
 
 /// 对组网里的节点开着的端口转发的来源白名单，按发起节点的虚拟 IP 查。
