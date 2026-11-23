@@ -148,6 +148,8 @@ struct Candidate {
     lan: bool,
     /// 最近一次本端往这个地址发探测。
     probed: Option<Instant>,
+    /// 最近一次因为收到对端从这个地址来的 PING 而反过来验证它（每个地址最多每 [`REVERSE_PROBE_INTERVAL`] 一次）。
+    reverse_probed: Option<Instant>,
     /// 最近一次对端从这个地址"不请自来"地探测本端：那时本端没有往这个地址发过东西，也没有在打洞的那一轮里。
     /// 这说明本端的地址本来就连得上，这条路不用打洞也建得起来（见 [`DirectPath::kind`]）。
     unsolicited: Option<Instant>,
@@ -242,6 +244,8 @@ pub(crate) struct DirectPath {
     last_request: Option<Instant>,
     /// 最近一次从对端收到打洞信令。
     signalled: Option<Instant>,
+    /// 最近一次本端发打洞请求。
+    requested: Option<Instant>,
     /// 两边的公网地址相同：对端的私有地址多半和本节点在同一个局域网里。
     same_nat: bool,
     /// 上一次因为信令立刻发一轮探测的时刻。
@@ -262,6 +266,7 @@ impl DirectPath {
             punch: Punch::Idle,
             last_request: None,
             signalled: None,
+            requested: None,
             same_nat: false,
             signal_volley: None,
             loopback: false,
@@ -465,24 +470,34 @@ impl DirectPath {
         self.learn(from, now);
         let quiet = |at: Option<Instant>| at.is_none_or(|at| now.saturating_duration_since(at) >= PENDING_TTL);
         let in_round = !quiet(self.signalled);
-        if let Some(candidate) = self.candidate_mut(from) {
-            candidate.pinged = Some(now);
-            if !in_round && quiet(candidate.probed) {
-                candidate.unsolicited = Some(now);
-            }
+        // 反向验证得到回答，靠的是对端刚从这个地址往本端发过探测。本端发过打洞请求的话，那个探测多半就是对端照着请求发的：
+        // 这样打通的路算打洞打通的，和收到过对端的信令一样（见 [`Pending::coordinated`]）。
+        let coordinated = in_round || !quiet(self.requested);
+        let in_use = self.active.as_ref().is_some_and(|active| active.addr == from);
+        let shunned = self.is_shunned(from, now);
+        // 没法发、不该发的地址，或者候选记满了挤不进来的地址，不反过来验证：本端只认候选地址来的连接包，
+        // 那里验证通过了也用不上。反向验证的时刻记在候选地址上，要记的东西也就有上限。
+        let candidate = self.candidate_mut(from)?;
+        candidate.pinged = Some(now);
+        if !in_round && quiet(candidate.probed) {
+            candidate.unsolicited = Some(now);
         }
-        if self.active.as_ref().is_some_and(|active| active.addr == from) {
+        if in_use {
             return None;
         }
         // 这个地址正因为丢包搁着不用：验证通过了也不会用，不白发。它发来的包照样认（上面记了 `pinged`）。
-        if self.is_shunned(from, now) {
+        if shunned {
             return None;
         }
-        let recently = |pending: &Pending| pending.addr == from && now.saturating_duration_since(pending.sent) < REVERSE_PROBE_INTERVAL;
-        if self.pending.iter().any(recently) {
+        // 按地址记上一次反向验证的时刻，不看在等回答的探测：回答一到那条记录就没了，两边之间通着两个地址时，
+        // 不在用的那个地址上会你一个我一个地一直互相验证下去。本端自己发起的探测也不算：它可能已经丢了
+        // （对端那时还不认识本端，或者被它的 NAT 挡掉），等它的下一轮要 300ms。这期间对端先验证通过、先拨号，
+        // 它的握手要等到本端也有路才得到应答，那条连接从一开头就把往返时间量成几百毫秒。
+        if candidate.reverse_probed.is_some_and(|at| now.saturating_duration_since(at) < REVERSE_PROBE_INTERVAL) {
             return None;
         }
-        Some(self.probe(from, now))
+        candidate.reverse_probed = Some(now);
+        Some(self.probe(from, coordinated, now))
     }
 
     /// 是不是向 `from` 发过带这个随机数的 PING、还在等回答。验 PONG 的签名之前先问这个，不花冤枉的计算。
@@ -597,7 +612,8 @@ impl DirectPath {
             let addr = active.addr;
             active.awaiting = Some(now);
             active.last_probe = now;
-            step.actions.push(self.probe(addr, now));
+            let coordinated = self.signalled_recently(now);
+            step.actions.push(self.probe(addr, coordinated, now));
         } else if let Some(nonce) = active.train.poll(now, policy.train, active.rtt.probe_timeout(), &mut active.estimate) {
             step.actions.push(Action::Ping { to: active.addr, nonce });
         }
@@ -620,6 +636,7 @@ impl DirectPath {
         let elapsed = now.saturating_duration_since(started);
         if PUNCH_VOLLEYS.get(volleys).is_some_and(|&at| elapsed >= at) {
             if volleys == 0 && policy.signal {
+                self.requested = Some(now);
                 step.actions.push(Action::Signal(Signal::PunchRequest { endpoints: policy.local.to_vec() }));
             }
             step.actions.extend(self.volley(now));
@@ -637,15 +654,20 @@ impl DirectPath {
     /// 向每个候选地址发一个 PING。
     fn volley(&mut self, now: Instant) -> Vec<Action> {
         let targets: Vec<SocketAddr> = self.candidates.iter().map(|candidate| candidate.addr).collect();
-        targets.into_iter().map(|addr| self.probe(addr, now)).collect()
+        let coordinated = self.signalled_recently(now);
+        targets.into_iter().map(|addr| self.probe(addr, coordinated, now)).collect()
     }
 
-    fn probe(&mut self, to: SocketAddr, now: Instant) -> Action {
+    /// 刚从对端收到过打洞信令：现在发的探测在打洞的那一轮里。
+    fn signalled_recently(&self, now: Instant) -> bool {
+        self.signalled.is_some_and(|signalled| now.saturating_duration_since(signalled) < PENDING_TTL)
+    }
+
+    fn probe(&mut self, to: SocketAddr, coordinated: bool, now: Instant) -> Action {
         let nonce: Nonce = i3t_underlay::random_bytes();
         if self.pending.len() == MAX_PENDING {
             self.pending.pop_front();
         }
-        let coordinated = self.signalled.is_some_and(|signalled| now.saturating_duration_since(signalled) < PENDING_TTL);
         if let Some(candidate) = self.candidate_mut(to) {
             candidate.probed = Some(now);
         }
@@ -691,6 +713,7 @@ impl DirectPath {
             pinged: None,
             lan: false,
             probed: None,
+            reverse_probed: None,
             unsolicited: None,
             budget,
         });
@@ -1109,6 +1132,110 @@ mod tests {
     }
 
     #[test]
+    fn a_ping_from_the_peer_is_probed_back_even_while_our_own_probe_to_it_is_unanswered() {
+        let start = Instant::now();
+        let peer = addr("203.0.113.7:20330");
+        let mut path = DirectPath::new();
+        path.set_reported(&[peer], start);
+        // 本端先探测了对端，这个探测没有回音：对端那时还不认识本端，丢掉了。
+        assert_eq!(pings(&path.poll(start, &policy(&[])).actions).len(), 1);
+
+        // 对端随后探测本端：不等本端的下一轮（300ms 之后），马上反过来验证，两边差不多同时改走直连。
+        let Some(Action::Ping { to, nonce }) = path.on_ping(peer, start + 5 * MS) else { panic!("应该反过来验证这个地址") };
+        assert_eq!(to, peer);
+        assert_eq!(path.on_pong(peer, &nonce, start + 6 * MS), Some(Change::Up { addr: peer }));
+
+        // 反向验证本身还是每秒最多一次：重放对端的 PING 不会让本端多发。
+        let mut path = DirectPath::new();
+        path.set_reported(&[peer], start);
+        path.poll(start, &policy(&[]));
+        assert!(path.on_ping(peer, start + 5 * MS).is_some());
+        assert_eq!(path.on_ping(peer, start + 500 * MS), None);
+    }
+
+    #[test]
+    fn an_answered_reverse_probe_still_counts_against_the_once_a_second_limit() {
+        // 两边之间通着两个地址，已经在用其中一个。对端从另一个地址探测本端，本端反过来验证、得到了回答：
+        // 对端紧接着从那里来的 PING（多半就是被本端的反向验证引出来的）不能再引出一个，不然两边一来一回停不下来。
+        let (primary, spare) = (addr("203.0.113.7:20330"), addr("198.51.100.4:20330"));
+        let (mut path, up) = established(primary);
+        let Some(Action::Ping { to, nonce }) = path.on_ping(spare, up) else { panic!("应该反过来验证这个地址") };
+        assert_eq!(to, spare);
+        assert_eq!(path.on_pong(spare, &nonce, up + MS), None, "已经有在用的地址，不换");
+        assert_eq!(path.on_ping(spare, up + 2 * MS), None, "一秒之内这个地址已经反向验证过了");
+        assert!(path.on_ping(spare, up + REVERSE_PROBE_INTERVAL).is_some());
+        assert_eq!(path.active().map(|(addr, _)| addr), Some(primary));
+    }
+
+    #[test]
+    fn a_ping_from_an_address_that_cannot_be_a_candidate_is_not_probed_back() {
+        // 没法发、不该发的地址（这里是链路本地地址）不记成候选，也就不反过来验证：那里的直连本来就用不了。
+        let start = Instant::now();
+        let mut path = DirectPath::new();
+        assert_eq!(path.on_ping(addr("169.254.1.2:20330"), start), None);
+
+        // 候选地址记满了、又都挤不掉（对端上报的）：新来的地址也不反过来验证，每个来源地址的频率限制就不用另外记。
+        let mut full = DirectPath::new();
+        let reported: Vec<SocketAddr> =
+            (0..MAX_CANDIDATES).map(|index| SocketAddr::from(([203, 0, 113, 1], 20330 + u16::try_from(index).unwrap()))).collect();
+        full.set_reported(&reported, start);
+        assert_eq!(full.candidates.len(), MAX_CANDIDATES);
+        assert_eq!(full.on_ping(addr("198.51.100.4:20330"), start), None);
+        assert!(full.on_ping(reported[0], start).is_some(), "记着的地址照常反过来验证");
+    }
+
+    #[test]
+    fn a_punch_both_sides_signalled_for_is_punched_whichever_answer_brings_it_up() {
+        // 两边都在 NAT 后面，A 发起：A 发打洞请求、向 B 发头一轮探测（被 B 的 NAT 挡掉）。B 收到请求后探测 A，
+        // 这个探测穿过 A 的 NAT（A 刚往 B 发过）。A 收到它时自己的探测还没有回音，就反过来验证。之后哪个回答先到都行：
+        // A 的反向验证的、A 收到回应信令之后那一轮的；B 那边也一样。两边都要说是打洞打通的。
+        let start = Instant::now();
+        let (pa, pb) = (addr("198.51.100.1:20330"), addr("203.0.113.7:20330"));
+        let begin = || {
+            let mut a = DirectPath::new();
+            a.set_reported(&[pb], start);
+            let first = a.poll(start, &policy(&[pa])).actions;
+            assert!(matches!(signals(&first)[..], [Signal::PunchRequest { .. }]), "{first:?}");
+            let mut b = DirectPath::new();
+            let answer = b.on_signal(&Signal::PunchRequest { endpoints: vec![pa] }, start + 40 * MS, &policy(&[pb]));
+            let (_, b_probe) = pings(&answer)[0];
+            let Some(Action::Ping { nonce: a_reverse, .. }) = a.on_ping(pb, start + 41 * MS) else { panic!("A 应该反过来验证 B") };
+            (a, b, b_probe, a_reverse)
+        };
+        let reply = Signal::PunchReply { endpoints: vec![pb] };
+
+        // A 的反向验证先得到回答，回应信令还没到。
+        let (mut a, _, _, a_reverse) = begin();
+        assert_eq!(a.on_pong(pb, &a_reverse, start + 42 * MS), Some(Change::Up { addr: pb }));
+        assert_eq!(a.kind(), Some(DirectKind::Punched), "反向验证先到");
+
+        // 回应信令先到，A 跟着发一轮；反向验证的回答先到，或者那一轮的回答先到。
+        for volley_first in [false, true] {
+            let (mut a, _, _, a_reverse) = begin();
+            let (_, a_volley) = pings(&a.on_signal(&reply, start + 45 * MS, &policy(&[pa])))[0];
+            let first = if volley_first { a_volley } else { a_reverse };
+            assert_eq!(a.on_pong(pb, &first, start + 46 * MS), Some(Change::Up { addr: pb }));
+            assert_eq!(a.kind(), Some(DirectKind::Punched), "回应信令之后，那一轮的回答先到：{volley_first}");
+        }
+
+        // B 这边：A 的反向验证的 PING 先到（B 自己的探测还没有回音），之后哪个回答先到都一样。
+        for own_first in [false, true] {
+            let (_, mut b, b_probe, _) = begin();
+            let Some(Action::Ping { nonce: b_reverse, .. }) = b.on_ping(pa, start + 42 * MS) else { panic!("B 应该反过来验证 A") };
+            let first = if own_first { b_probe } else { b_reverse };
+            assert_eq!(b.on_pong(pa, &first, start + 43 * MS), Some(Change::Up { addr: pa }));
+            assert_eq!(b.kind(), Some(DirectKind::Punched), "B 自己那一轮的回答先到：{own_first}");
+        }
+
+        // 对照：B 的地址本来就连得上，A 头一轮的探测直接得到了回答，B 还没来得及做什么：这是"本来就连得上"。
+        let mut reachable = DirectPath::new();
+        reachable.set_reported(&[pb], start);
+        let (_, first) = pings(&reachable.poll(start, &policy(&[pa])).actions)[0];
+        assert_eq!(reachable.on_pong(pb, &first, start + 5 * MS), Some(Change::Up { addr: pb }));
+        assert_eq!(reachable.kind(), Some(DirectKind::Reachable));
+    }
+
+    #[test]
     fn a_ping_alone_vouches_for_its_source_only_briefly_unless_the_reverse_probe_is_answered() {
         let start = Instant::now();
         // 别人截下对端的一个 PING，从 `spoofed` 重放过来：签名是对的，但对端并不在那里。
@@ -1386,7 +1513,7 @@ mod tests {
         met.set_reported(&[peer], start);
         let volley = met.on_signal(&Signal::PunchRequest { endpoints: vec![peer] }, start, &policy(&local));
         assert!(!pings(&volley).is_empty());
-        assert!(met.on_ping(peer, start + 10 * MS).is_none(), "刚往这个地址发过探测，不再反向验证");
+        assert!(met.on_ping(peer, start + 10 * MS).is_some(), "本端那一轮的探测可能被对面挡掉了，照样反向验证");
         let (to, nonce) = pings(&volley)[0];
         met.on_pong(to, &nonce, start + 30 * MS);
         assert_eq!(met.kind(), Some(DirectKind::Punched));
