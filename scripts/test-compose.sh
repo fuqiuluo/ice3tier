@@ -1,7 +1,8 @@
 #!/bin/sh
 # 照 deploy/docker/compose.yaml 把 controller 和它的 PostgreSQL 起来，把部署文档里写的几件事真的做一遍：
-# 第一次启动打出管理令牌，管理 API 和 i3tctl 能用，数据库重启之后 controller 自己连回去，重新生成管理令牌，
-# 备份（pg_dump 加密钥），在一套全新的卷上恢复。最后把容器和卷都删掉。
+# 第一次启动打出管理令牌，管理 API 和 i3tctl 能用，数据库不听网络，数据库重启之后 controller 自己连回去，
+# 重新生成管理令牌，备份（pg_dump 加密钥，两个文件都只有自己可读），在一套全新的卷上恢复；
+# 忘了把密钥放回来时 controller 不肯启动。最后把容器和卷都删掉。
 #
 # 用的是本机已经有的镜像 ghcr.io/fuqiuluo/ice3tier-controller:latest，先建出来：
 #   docker build -f deploy/docker/Dockerfile -t ghcr.io/fuqiuluo/ice3tier-controller:latest .
@@ -24,6 +25,28 @@ compose() {
     else
         docker compose -p "$project" -f "$repo/deploy/docker/compose.yaml" "$@"
     fi
+}
+
+# 一条本该马上失败的命令，万一没有失败（那就是在一直运行）也不让它卡住整个脚本：到点把它的容器停掉。
+compose_run_briefly() { # 输出写到哪里 run 的参数…
+    out=$1
+    shift
+    compose run --name "$project-brief" -T "$@" >"$out" 2>&1 &
+    pid=$!
+    i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -gt 60 ]; then
+            docker rm -f "$project-brief" >/dev/null 2>&1 || true
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 1
+    done
+    code=0
+    wait "$pid" || code=$?
+    docker rm -f "$project-brief" >/dev/null 2>&1 || true
+    return "$code"
 }
 
 step() {
@@ -72,6 +95,12 @@ first_token() {
     compose logs controller 2>/dev/null | sed -n 's/^.*|     \([A-Za-z0-9_-]\{43\}\)$/\1/p' | head -n 1
 }
 
+# 每一轮都重新去看日志：写成 `wait_for … test -n "$(first_token)"` 的话，那个 $(…) 在等之前就算完了，
+# 令牌晚一点打出来，等多少轮看的都是那一次的空结果。
+has_token() {
+    [ -n "$(first_token)" ]
+}
+
 step "the address is required"
 if I3T_PUBLIC_ADDR='' compose config --quiet 2>"$work/config.err"; then
     fail "compose accepted an empty I3T_PUBLIC_ADDR"
@@ -80,7 +109,7 @@ grep -q I3T_PUBLIC_ADDR "$work/config.err" || fail "the refusal does not name I3
 
 step "up: the database first, then the controller"
 compose up --detach
-wait_for "the controller printed no admin token" test -n "$(first_token)"
+wait_for "the controller printed no admin token" has_token
 token=$(first_token)
 wait_for "the admin API did not answer inside the container" ctl status
 
@@ -90,6 +119,12 @@ printf '%s' "$answer" | grep -q '"public_addr":"127.0.0.1:20331"' || fail "unexp
 curl -fsS --max-time 10 "http://$admin/" | grep -q '<div id="root">' || fail "the image has no WebUI in it"
 key=$(printf '%s' "$answer" | sed -n 's/.*"controller_key":"\([^"]*\)".*/\1/p')
 ctl network create home >/dev/null
+
+step "the database is not on the network: only on the socket the two containers share"
+compose exec -T postgres pg_isready --username i3t --dbname i3t >/dev/null || fail "the database does not answer on its socket"
+if compose exec -T postgres pg_isready --host 127.0.0.1 --username i3t --dbname i3t >/dev/null 2>&1; then
+    fail "the database listens on TCP"
+fi
 
 step "the database restarts under the controller"
 compose restart postgres
@@ -103,15 +138,33 @@ compose start controller
 wait_for "the new admin token does not work" ctl status
 
 step "back up: the database and the key"
-compose exec -T postgres pg_dump --username i3t --format custom i3t > "$work/controller.dump"
-compose exec -T controller cat /data/controller.key > "$work/controller.key"
-[ -s "$work/controller.dump" ] && [ -s "$work/controller.key" ] || fail "the backup is empty"
+mkdir "$work/backup"
+chmod 755 "$work/backup"
+# 文档里的写法：两个文件在 umask 077 下写出来。转储里有代理的密码，密钥就是 controller 的身份。
+(
+    cd "$work/backup"
+    umask 077
+    compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
+    compose exec -T controller cat /data/controller.key > controller.key
+)
+[ -s "$work/backup/controller.dump" ] && [ -s "$work/backup/controller.key" ] || fail "the backup is empty"
+for file in controller.dump controller.key; do
+    mode=$(stat -c '%a' "$work/backup/$file" 2>/dev/null || stat -f '%Lp' "$work/backup/$file")
+    [ "$mode" = 600 ] || fail "$file is readable by others (mode $mode)"
+done
 
 step "restore on new volumes"
 compose down --volumes --timeout 5
 compose up --detach --wait postgres
-compose exec -T postgres pg_restore --username i3t --dbname i3t --no-owner < "$work/controller.dump"
-compose run --rm -T --entrypoint sh controller -c 'umask 077; cat > /data/controller.key' < "$work/controller.key"
+compose exec -T postgres pg_restore --username i3t --dbname i3t --no-owner < "$work/backup/controller.dump"
+
+# 忘了把密钥放回来：controller 不生成新的（节点认的是原来那一把），说缺密钥，不启动。
+if compose_run_briefly "$work/no-key.out" controller; then
+    fail "the controller started on a restored database without its key"
+fi
+grep -q 'controller.key' "$work/no-key.out" || fail "the refusal does not name the key: $(cat "$work/no-key.out")"
+
+compose run --rm -T --entrypoint sh controller -c 'umask 077; cat > /data/controller.key' < "$work/backup/controller.key"
 compose up --detach
 wait_for "the restored controller does not answer with the token from the backup" ctl status
 [ -z "$(first_token)" ] || fail "the restored controller issued a new admin token: it started as a new controller"

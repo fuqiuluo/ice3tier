@@ -8,9 +8,11 @@
 #   docker compose logs controller
 #
 # Settings, from that .env file or the environment:
-#   I3T_PUBLIC_ADDR        required: HOST:PORT nodes use to reach the controller
-#   I3T_VERSION            controller version to run (default: latest)
-#   I3T_POSTGRES_PASSWORD  database password (default: i3t; the database is reachable only from the controller)
+#   I3T_PUBLIC_ADDR   required: HOST:PORT nodes use to reach the controller
+#   I3T_VERSION       controller version to run (default: latest)
+#
+# The database has no password to set. It does not listen on the network at all: it listens on a Unix socket in a
+# volume that only these two containers mount, so nothing else, on this machine or in another container, can reach it.
 
 name: i3t
 
@@ -18,12 +20,16 @@ services:
   postgres:
     image: postgres:18
     restart: unless-stopped
+    # No TCP: only the socket in /var/run/postgresql, which is the postgres-socket volume.
+    command: ["postgres", "-c", "listen_addresses="]
     environment:
       POSTGRES_USER: i3t
-      POSTGRES_PASSWORD: ${I3T_POSTGRES_PASSWORD:-i3t}
       POSTGRES_DB: i3t
+      # Whoever can open the socket is let in. That is the controller, and nobody else has the socket.
+      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - postgres:/var/lib/postgresql
+      - postgres-socket:/var/run/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready --username i3t --dbname i3t"]
       interval: 5s
@@ -38,7 +44,8 @@ services:
         condition: service_healthy
     environment:
       I3T_PUBLIC_ADDR: ${I3T_PUBLIC_ADDR:?set I3T_PUBLIC_ADDR to the HOST:PORT nodes use to reach the controller, e.g. 203.0.113.7:20331}
-      I3T_DATABASE_URL: postgres://i3t:${I3T_POSTGRES_PASSWORD:-i3t}@postgres/i3t
+      # The socket directory, written with %2F for each slash.
+      I3T_DATABASE_URL: postgres://i3t@%2Fvar%2Frun%2Fpostgresql/i3t
     ports:
       # Node protocol (TCP) and address queries (UDP).
       - "20331:20331/tcp"
@@ -48,7 +55,9 @@ services:
     volumes:
       # The controller's key and the cache of update packages.
       - controller:/data
+      - postgres-socket:/var/run/postgresql
 
 volumes:
   postgres:
+  postgres-socket:
   controller:
