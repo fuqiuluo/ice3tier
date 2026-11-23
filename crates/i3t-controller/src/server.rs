@@ -127,16 +127,17 @@ impl Server {
 /// 端口写 0 时最多挑几次端口：系统挑的一次，加上它用不了之后自己挑的。
 const NODE_PORT_TRIES: usize = 16;
 
-/// 自己挑端口时用的范围：留给临时用途的动态端口，Windows 和 macOS 的系统也在这里面挑。
+/// 自己挑端口时用的范围：留给临时用途的动态端口，Windows 的系统也在这里面挑。
 const DYNAMIC_PORTS: RangeInclusive<u16> = 49152..=65535;
 
 /// 绑节点协议的 TCP 和同一个端口号的 UDP（节点按"和节点协议同一个端口号"去找地址查询）。`bind_udp` 平时是
 /// `UdpSocket::bind`。
 ///
-/// 端口写 0 时先让系统给 TCP 挑一个。系统挑的时候不看 UDP，同号的 UDP 可能用不了：正被别的程序占着；Windows 上还见过
-/// 一连几十个挨着的端口号都被拒绝，报的是"没有权限"。那里系统是顺着往后一个个挑的，再让它挑多少次都还在这一段里，
-/// 所以系统挑的用不了时不再让它挑，自己在动态端口的范围里随便挑：每次挑的互不相干，不会卡在同一段上。
-/// 端口写明了的不换，照实报错。
+/// 端口写 0 时先让系统给 TCP 挑一个。系统挑的时候不看 UDP，同号的 UDP 可能用不了：正被别的程序占着；或者落在 Windows
+/// 给 UDP 保留、不让绑的一段里（`netsh int ipv4 show excludedportrange protocol=udp`，绑它报"没有权限"）。这样的段
+/// Windows 会在运行中新划出来，见过挨着的两段、各 100 个，划在系统正要挑给 TCP 的那些端口号上；而系统是顺着往后一个个
+/// 挑的，之后挑给 TCP 的 200 个端口号全在段里，再让它挑多少次都一样。所以系统挑的用不了时不再让它挑，自己在动态端口的
+/// 范围里随便挑：每次挑的互不相干，不会卡在同一段上。端口写明了的不换，照实报错。
 async fn bind_node<F, Fut>(listen: SocketAddr, mut bind_udp: F) -> Result<(TcpListener, UdpSocket), Error>
 where
     F: FnMut(SocketAddr) -> Fut,
@@ -161,8 +162,8 @@ where
     }
 }
 
-/// 绑不上是不是因为这个端口号用不了（换一个端口号就可能绑得上）。别的程序占着时一般报"地址已被占用"；Windows 上有的
-/// 端口号报的是"没有权限"（10013），比如被别的程序独占着的、系统保留的。
+/// 绑不上是不是因为这个端口号用不了（换一个端口号就可能绑得上）。别的程序占着时报"地址已被占用"；Windows 上端口在
+/// 系统保留的一段里时，报的是"没有权限"（10013）。
 fn port_unusable(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied)
 }
@@ -301,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_port_left_to_the_system_moves_on_when_udp_refuses_the_number_the_way_windows_does() {
-        // Windows 上同号的 UDP 被拒绝时报的是"没有权限"，而且不止一个端口号这样：这里头三个都拒绝。
+        // Windows 上端口在给 UDP 保留的一段里时报的是"没有权限"，而且一段里挨着的端口号都这样：这里头三个都拒绝。
         let mut refused = Vec::new();
         let bound = bind_node("127.0.0.1:0".parse().unwrap(), |addr| {
             let refuse = refused.len() < 3;

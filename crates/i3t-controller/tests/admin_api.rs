@@ -1233,7 +1233,8 @@ async fn the_static_directory_is_served_at_the_root_when_configured() {
 /// 一个假的节点 UDP 端口：回答地址查询；和同一个端口号上的 TCP 监听。
 ///
 /// 系统给一种协议挑端口的时候不看另一种：同一个端口号在另一种协议上可能用不了（同一台机器上并行跑的测试一直在开连接；
-/// Windows 上还见过一连几十个挨着的端口号 UDP 都被拒绝）。两种挑法轮着来，哪种先挑到两种协议都用得了的端口就用它。
+/// Windows 还会在运行中给 UDP 保留成段的端口，正好划在系统要挑给 TCP 的端口号上）。两种挑法轮着来，哪种先挑到两种协议
+/// 都用得了的端口就用它。
 async fn answering_relay() -> std::net::SocketAddr {
     use i3t_proto::addr::{Query, Reply};
     use tokio::net::{TcpListener, UdpSocket};

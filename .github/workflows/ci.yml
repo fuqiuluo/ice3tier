@@ -43,62 +43,9 @@ jobs:
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # 临时：测试期间每隔几秒看一眼系统接下来要挑给 TCP 的那些端口号 UDP 上绑不绑得上，绑不上时记下是谁占着。合并前删掉。
-      - name: Watch ports during the tests (temporary)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          $watch = @'
-          param([string]$Log)
-          $lo = [System.Net.IPAddress]::Loopback
-          function Code($e) { $x = $e.Exception; while ($x.InnerException) { $x = $x.InnerException }; if ($x -is [System.Net.Sockets.SocketException]) { "$($x.SocketErrorCode)" } else { $x.GetType().Name } }
-          function Say($text) { Add-Content -Path $Log -Value "$(Get-Date -Format 'HH:mm:ss.fff') $text" }
-          function UdpAt($port) { try { $u = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new($lo, $port)); $u.Close(); 'ok' } catch { Code $_ } }
-          function Owners { (Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -ge 49152 } | Group-Object OwningProcess | Sort-Object Count -Descending | Select-Object -First 6 | ForEach-Object { $m = $_.Group | Measure-Object LocalPort -Minimum -Maximum; "$((Get-Process -Id $_.Name -ErrorAction SilentlyContinue).ProcessName)[$($_.Name)] x$($_.Count) $($m.Minimum)-$($m.Maximum)" }) -join '; ' }
-          Say 'watching'
-          $n = 0
-          while ($true) {
-            try {
-              $l = [System.Net.Sockets.TcpListener]::new($lo, 0); $l.Start(); $tcp = $l.LocalEndpoint.Port; $l.Stop()
-              $u = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new($lo, 0)); $udp = $u.Client.LocalEndPoint.Port; $u.Close()
-              $bad = @(); $denied = @()
-              if ($tcp -lt 65400) { foreach ($p in ($tcp + 1)..($tcp + 64)) { $r = UdpAt $p; if ($r -ne 'ok') { $bad += "$p=$r" }; if ($r -eq 'AccessDenied') { $denied += $p } } }
-              if ($denied.Count -gt 0) {
-                Say "tcp cursor $tcp, udp cursor $udp; udp refused just ahead of the tcp cursor: $($bad -join ' ')"
-                $held = Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Where-Object { $denied -contains $_.LocalPort }
-                Say "  held by: $(($held | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) $((Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName)[$($_.OwningProcess)]" }) -join '; ')"
-                Say "  udp endpoints by process: $(Owners)"
-                Say "  udp exclusions: $((netsh int ipv4 show excludedportrange protocol=udp | Where-Object { $_ -match '^\s*\d+\s+\d+' } | ForEach-Object { ($_.Trim() -replace '\s+', '-') }) -join ' ')"
-                $wide = @(foreach ($p in ([Math]::Max($tcp - 300, 49152))..([Math]::Min($tcp + 300, 65535))) { if ((UdpAt $p) -eq 'AccessDenied') { $p } })
-                Say "  refused with AccessDenied within 300 of the tcp cursor: $($wide.Count) ports, $(($wide | Measure-Object -Minimum).Minimum)-$(($wide | Measure-Object -Maximum).Maximum)"
-              } elseif ($n % 10 -eq 0) {
-                Say "tcp cursor $tcp, udp cursor $udp; nothing refused ahead, in use ahead: $($bad.Count); udp endpoints by process: $(Owners)"
-              }
-            } catch { Say "watch error: $_" }
-            $n += 1
-            Start-Sleep -Seconds 3
-          }
-          '@
-          Set-Content -Path "$env:RUNNER_TEMP\watch-ports.ps1" -Value $watch
-          Start-Process pwsh -ArgumentList '-NoProfile', '-File', "$env:RUNNER_TEMP\watch-ports.ps1", "$env:RUNNER_TEMP\ports.log" -WindowStyle Hidden
       # 一个测试程序失败了也把剩下的跑完：一次运行就看得到这个平台上全部的失败。
       - name: Test
         run: cargo test --workspace --no-fail-fast
-      - name: What the port watch saw (temporary)
-        if: always() && matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Get-Content "$env:RUNNER_TEMP\ports.log" -ErrorAction SilentlyContinue
-          $lo = [System.Net.IPAddress]::Loopback
-          $codes = @{}; $denied = @()
-          foreach ($p in 49152..65535) {
-            try { $u = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new($lo, $p)); $u.Close() }
-            catch { $x = $_.Exception; while ($x.InnerException) { $x = $x.InnerException }; $c = "$($x.SocketErrorCode)"; $codes[$c] = 1 + [int]$codes[$c]; if ($c -eq 'AccessDenied') { $denied += $p } }
-          }
-          "after the tests, udp on 127.0.0.1 over the whole dynamic range, refused: $(($codes.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')"
-          "refused with AccessDenied: $($denied -join ' ')"
-          Get-NetUDPEndpoint | Where-Object { $_.LocalPort -ge 49152 } | Group-Object OwningProcess | Sort-Object Count -Descending | Select-Object -First 8 | ForEach-Object { $m = $_.Group | Measure-Object LocalPort -Minimum -Maximum; "$((Get-Process -Id $_.Name -ErrorAction SilentlyContinue).ProcessName)[$($_.Name)] x$($_.Count) $($m.Minimum)-$($m.Maximum)" }
-          netsh int ipv4 show excludedportrange protocol=udp
 
   # 真的建一块虚拟网卡、配上地址和路由、再拆掉（`i3t-vnet` 的 `a_real_device_…` 测试）：这台开发机上只能在 Linux 上做，
   # Windows 和 macOS 的 CI 机器以管理员 / 可以 sudo 的用户运行，在这里做。Windows 上 wintun.dll 要放在测试程序旁边
