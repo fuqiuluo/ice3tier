@@ -302,11 +302,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_port_left_to_the_system_moves_on_when_udp_refuses_the_number_the_way_windows_does() {
-        // Windows 上端口在给 UDP 保留的一段里时报的是"没有权限"，而且一段里挨着的端口号都这样：这里头三个都拒绝。
+        // Windows 上端口在给 UDP 保留的一段里时报的是"没有权限"，而且一段里挨着的端口号都这样：这里头三个不同的端口号
+        // 都拒绝，之后再挑到它们也一样拒绝。
         let mut refused = Vec::new();
         let bound = bind_node("127.0.0.1:0".parse().unwrap(), |addr| {
-            let refuse = refused.len() < 3;
-            if refuse {
+            let seen = refused.contains(&addr);
+            let refuse = seen || refused.len() < 3;
+            if refuse && !seen {
                 refused.push(addr);
             }
             async move { if refuse { Err(io::ErrorKind::PermissionDenied.into()) } else { UdpSocket::bind(addr).await } }
@@ -315,7 +317,7 @@ mod tests {
         let (tcp, udp) = bound.unwrap();
         let (tcp, udp) = (tcp.local_addr().unwrap(), udp.local_addr().unwrap());
         assert_eq!(tcp, udp, "TCP 和 UDP 在同一个端口号上");
-        assert_eq!(refused.len(), 3, "拒绝了几个就另挑了几次");
+        assert_eq!(refused.len(), 3, "三个端口号都被拒绝之后才挑到的");
         assert!(!refused.contains(&udp), "用的不是被拒绝的端口：{refused:?}");
         assert!(refused[1..].iter().all(|addr| DYNAMIC_PORTS.contains(&addr.port())), "自己挑的在动态端口的范围里：{refused:?}");
     }
