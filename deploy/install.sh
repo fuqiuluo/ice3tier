@@ -1707,7 +1707,13 @@ main() {
     fi
 
     WORK=$(mktemp -d)
-    trap on_exit EXIT HUP INT TERM
+    # A signal ends the script. Left to run the handler alone, the shell would carry on afterwards with the step that
+    # follows the interrupted one: the handler would have started the controller again and removed the work
+    # directory, and the install would go on regardless. The EXIT trap runs on the way out in either case.
+    trap on_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     if [ "$MODE" = "controller" ]; then
         install_controller

@@ -465,6 +465,35 @@ if [ "$os" = "Linux" ]; then
         sleep 1
     done
 
+    step "a signal in the middle of an upgrade ends it there, and the controller is started again"
+    # The stand-in writes down every call, and holds daemon-reload for a while after saying which shell called it:
+    # the signal goes to that shell while the upgrade is in the middle. A shell that only ran its handler would carry
+    # on with the steps after daemon-reload, and restart the service itself as if nothing had happened.
+    # shellcheck disable=SC2016
+    printf '#!/bin/sh\necho "$*" >> %s\nif [ "${1:-}" = daemon-reload ]; then echo "$PPID" > %s; sleep 5; fi\nexec %s "$@"\n' \
+        "$work/systemctl.calls" "$work/systemctl.reached" "$real_systemctl" > "$work/fakebin/systemctl"
+    sudo env "PATH=$work/fakebin:$PATH" sh "$repo/deploy/install.sh" --from "$dir" --controller >/dev/null 2>&1 &
+    install_pid=$!
+    i=0
+    until [ -s "$work/systemctl.reached" ]; do
+        i=$((i + 1))
+        [ "$i" -lt 60 ] || fail "the install never got to daemon-reload"
+        sleep 1
+    done
+    sudo kill -TERM "$(cat "$work/systemctl.reached")"
+    install_status=0
+    wait "$install_pid" || install_status=$?
+    [ "$install_status" -eq 143 ] || fail "the install did not end on the signal (exit status $install_status)"
+    if grep -q -x 'restart i3t-controller' "$work/systemctl.calls"; then
+        fail "the install carried on after the signal: $(tr '\n' ';' < "$work/systemctl.calls")"
+    fi
+    i=0
+    until systemctl is-active -q i3t-controller; do
+        i=$((i + 1))
+        [ "$i" -lt 15 ] || fail "an interrupted upgrade left the controller stopped"
+        sleep 1
+    done
+
     step "/etc/i3t/controller.env stays root's and private when the address is set again"
     # What an admin puts there by hand may be a secret; an older install left the file readable by everyone.
     [ "$(sudo stat -c '%a %U' /etc/i3t/controller.env)" = "600 root" ] || fail "controller.env is not root's and private after install"
