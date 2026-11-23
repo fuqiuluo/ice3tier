@@ -227,15 +227,17 @@ impl Inner {
         let group = view.groups.iter().find(|group| group.id == id).ok_or(Error::NoSuchGroup(id))?;
         Ok(group_view(&view, group))
     }
+}
 
-    /// 在这些分组里的节点：一条规则变了，要重算的就是它两头的节点。有 `All` 时是全网。
-    pub(super) fn members_of(&self, network: NetworkId, groups: &[GroupId]) -> Result<Seeds, Error> {
-        if self.store.builtin_group(network)?.is_some_and(|all| groups.contains(&all)) {
-            return Ok(Seeds::All);
-        }
-        let members = self.store.nodes(network)?.into_iter().filter(|node| groups.iter().any(|group| node.groups.contains(group)));
-        Ok(Seeds::of(members.map(|node| node.id)))
+/// 在这些分组里的节点：一条规则变了，要重算的就是它两头的节点。有 `All` 时是全网。
+///
+/// 在改规则的事务里读：提交之后再读，读不出来时规则已经改了，却没人去重算。
+pub(super) fn members_of(store: &Store, network: NetworkId, groups: &[GroupId]) -> Result<Seeds, Error> {
+    if store.builtin_group(network)?.is_some_and(|all| groups.contains(&all)) {
+        return Ok(Seeds::All);
     }
+    let members = store.nodes(network)?.into_iter().filter(|node| groups.iter().any(|group| node.groups.contains(group)));
+    Ok(Seeds::of(members.map(|node| node.id)))
 }
 
 /// 管理 API 里的一个分组：成员（`All` 是全部节点）和用到它的规则。

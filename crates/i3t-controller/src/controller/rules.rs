@@ -3,7 +3,7 @@
 use i3t_model::admin::{CreateRule, Direction, GroupId, GroupRef, LogRef, NetworkId, RefKind, Rule, UpdateRule, action};
 use serde_json::json;
 
-use super::groups::require_group;
+use super::groups::{members_of, require_group};
 use super::{Controller, naming};
 use crate::error::{Entity, Error, InField};
 use crate::store::Store;
@@ -28,7 +28,7 @@ impl Controller {
         let mut inner = self.lock();
         inner.require_network(network)?;
         let now = inner.clock.now();
-        let rule = inner.store.atomically(|store| {
+        let (rule, seeds) = inner.store.atomically(|store| {
             let mut rule = Rule {
                 id: 0,
                 name,
@@ -46,9 +46,9 @@ impl Controller {
                 &[LogRef::new(RefKind::Rule, rule.id)],
                 params(&rule),
             )?;
-            Ok::<_, Error>(rule)
+            let seeds = members_of(store, network, &[rule.src.id, rule.dst.id])?;
+            Ok::<_, Error>((rule, seeds))
         })?;
-        let seeds = inner.members_of(network, &[rule.src.id, rule.dst.id])?;
         inner.refresh(network, seeds, None)?;
         self.wake_if_needed(&inner);
         Ok(rule)
@@ -62,7 +62,7 @@ impl Controller {
     pub fn update_rule(&self, network: NetworkId, id: u32, request: &UpdateRule) -> Result<Rule, Error> {
         let mut inner = self.lock();
         let now = inner.clock.now();
-        let (before, after) = inner.store.atomically(|store| {
+        let (after, seeds) = inner.store.atomically(|store| {
             let before = store.rule(network, id)?.ok_or(Error::NotFound(Entity::Rule))?;
             let mut rule = before.clone();
             if let Some(name) = &request.name {
@@ -78,9 +78,9 @@ impl Controller {
             rule.enabled = request.enabled.unwrap_or(rule.enabled);
             store.update_rule(&rule)?;
             store.log_refs(now, Some(network), action::RULE_UPDATE, &describe(&rule), &[LogRef::new(RefKind::Rule, id)], params(&rule))?;
-            Ok::<_, Error>((before, rule))
+            let seeds = members_of(store, network, &[before.src.id, before.dst.id, rule.src.id, rule.dst.id])?;
+            Ok::<_, Error>((rule, seeds))
         })?;
-        let seeds = inner.members_of(network, &[before.src.id, before.dst.id, after.src.id, after.dst.id])?;
         inner.refresh(network, seeds, None)?;
         self.wake_if_needed(&inner);
         Ok(after)
@@ -92,13 +92,12 @@ impl Controller {
     pub fn delete_rule(&self, network: NetworkId, id: u32) -> Result<(), Error> {
         let mut inner = self.lock();
         let now = inner.clock.now();
-        let rule = inner.store.atomically(|store| {
+        let seeds = inner.store.atomically(|store| {
             let rule = store.rule(network, id)?.ok_or(Error::NotFound(Entity::Rule))?;
             store.delete_rule(id)?;
             store.log_refs(now, Some(network), action::RULE_DELETE, &describe(&rule), &[LogRef::new(RefKind::Rule, id)], params(&rule))?;
-            Ok::<_, Error>(rule)
+            members_of(store, network, &[rule.src.id, rule.dst.id])
         })?;
-        let seeds = inner.members_of(network, &[rule.src.id, rule.dst.id])?;
         inner.refresh(network, seeds, None)?;
         self.wake_if_needed(&inner);
         Ok(())

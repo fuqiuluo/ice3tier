@@ -168,8 +168,9 @@ pub(crate) struct Inner {
     /// 叫醒后台任务，和 [`Controller::wake_if_needed`] 用的是同一个。重算没做成、排了重试时在这里叫：
     /// 那时调用方多半带着错误提前返回了，轮不到它来叫。
     pub(crate) wake: Arc<Notify>,
-    /// 重算时整个数据库读写不了（连不上、只读了、盘满了）：这个时刻之前后台不再去重算。不然到期时间错开的节点、
-    /// 被叫醒的后台任务会让它一次接一次地去碰数据库。只是某一行、某张表被别的连接占着不算，那由存储限着等多久。
+    /// 后台工作时整个数据库读写不了（连不上、只读了、盘满了）：这个时刻之前后台不再去重算，也不做别的要写存储的
+    /// 不急的事（见 `Inner::tick_work`）。不然到期时间错开的节点、被叫醒的后台任务会让它一次接一次地去碰数据库。
+    /// 只是某一行、某张表被别的连接占着不算，那由存储限着等多久。
     pub(crate) flush_after: Option<Instant>,
     /// 有一次提交当时不知道结果、后来查出来是算了数的：提交之后该做的事（重算 netmap、断开被删的节点）那时没有做，
     /// 内存里的状态和数据库对不上，要照数据库补齐（见 [`Inner::settle_commits`]）。
@@ -478,7 +479,10 @@ impl Controller {
     pub fn tick(&self) -> Result<Option<Instant>, Error> {
         let mut inner = self.lock();
         let wall = inner.clock.now();
-        inner.tick(Instant::now(), wall)
+        let next = inner.tick(Instant::now(), wall);
+        // 到点的 `roll_out` 可能要了新的包，叫醒取包的任务。`wake` 不用叫：调用这里的就是后台任务，它拿着返回的时刻接着去等。
+        self.wake_fetcher_if_needed(&inner);
+        next
     }
 
     /// 等到有新的延后工作。
@@ -506,6 +510,11 @@ impl Controller {
         {
             self.wake.notify_one();
         }
+        self.wake_fetcher_if_needed(inner);
+    }
+
+    /// 有包要取时叫醒管发布的后台任务。
+    fn wake_fetcher_if_needed(&self, inner: &Inner) {
         if inner.updates.packages.values().any(|package| *package == update::Package::Wanted) {
             self.release_wake.notify_one();
         }
@@ -622,24 +631,82 @@ impl Inner {
     }
 
     /// 时间序列以外的后台工作。返回下一次要做的时刻。
+    ///
+    /// 一样工作出错不耽误后面的：每一样出错时都自己留着下次再做（排着的重算、要重新看谁用不了 UDP 的网络、`next_rollout`），
+    /// 这里把第一个错误报出去（后面的打日志），调用方过一会儿再来。
+    ///
+    /// 只有整个数据库都读写不了时（连不上、只读了、盘满了）例外：后面不急的清理、存测试结果、开始矩阵里排着的测试这一轮不做，
+    /// 退避期间（见 [`Inner::flush_after`]）的每一轮也都不做。它们每写一次存储都要拿着 controller 的锁等满一次超时，
+    /// 所有连接和管理请求都被拖住；退避期间不做，是因为排上重试的重算刚叫醒了后台任务，它马上就会再来一轮。
     fn tick_work(&mut self, now: Instant, wall: Timestamp) -> Result<Option<Instant>, Error> {
+        let mut failures = Failures::default();
         self.give_up_on_slow_acks(now);
-        let unsettled = self.settle_commits(now)?;
-        let no_udp = self.no_udp_tick(now)?;
-        let next = self.flush_due(now)?;
+        let unsettled = failures.keep(self.settle_commits(now));
+        let no_udp = failures.keep(self.no_udp_tick(now));
+        let next = failures.keep(self.flush_due(now));
+        // 下发、撤回更新指令只读存储，照样做：该撤回的（比如管理员刚关掉了自动更新）不该等数据库。
         if self.updates.next_rollout.is_some_and(|at| at <= now) {
-            self.roll_out()?;
+            failures.keep(self.roll_out());
         }
-        if self.last_purge.is_none_or(|last| now.duration_since(last) >= PURGE_INTERVAL) {
+        let backing_off = failures.database_wide || self.flush_after.is_some_and(|after| now < after);
+        if !backing_off && self.last_purge.is_none_or(|last| now.duration_since(last) >= PURGE_INTERVAL) {
             self.last_purge = Some(now);
-            self.store.purge_expired_tokens(wall)?;
-            self.store.purge_cooldowns(wall)?;
+            // 两张表各清各的：一张出错不耽误另一张。
+            failures.keep(self.store.purge_expired_tokens(wall).map(drop).map_err(Error::from));
+            if !failures.database_wide {
+                failures.keep(self.store.purge_cooldowns(wall).map(drop).map_err(Error::from));
+            }
+        }
+        // 不管是哪一样遇到的，都退避一会儿：重算也先不碰数据库。
+        if failures.database_wide {
+            self.back_off();
         }
         // 还有节点欠着确认时，隔一会儿要回来看它们是不是等得太久了。
         let waiting = self.sync.values().any(NodeSync::is_waiting).then(|| now + self.timing.ack_timeout.min(SWEEP_INTERVAL));
-        let tests = self.tests_tick(now);
+        let tests = if backing_off || failures.database_wide {
+            // 测试结果这一轮不存，到点了的测试的结果照样先定下来：不然迟到的上报会把超时的测试记成做完了。
+            self.time_out_tests(now);
+            None
+        } else {
+            self.tests_tick(now)
+        };
+        failures.into_result()?;
         Ok([next, no_udp, waiting, self.updates.next_rollout, tests, unsettled].into_iter().flatten().min())
     }
+}
+
+/// 一连做了好几样工作、每一样都可能出错时，记下出了什么错。
+#[derive(Default)]
+struct Failures {
+    first: Option<Error>,
+    /// 出过整个数据库都读写不了的错（连不上、只读了、盘满了）：后面要写存储的不急的事就不去试了。
+    database_wide: bool,
+}
+
+impl Failures {
+    /// 记下一样工作的结果，出错时交回默认值。第一个错误留给调用方，后面的打日志：调用方只拿得到一个，不然就看不到了。
+    fn keep<T: Default>(&mut self, outcome: Result<T, Error>) -> T {
+        outcome.unwrap_or_else(|err| {
+            self.database_wide |= err.is_database_wide();
+            match &self.first {
+                None => self.first = Some(err),
+                Some(_) => tracing::error!("同时还出了一个错，稍后再试：{}", error_chain(&err)),
+            }
+            T::default()
+        })
+    }
+
+    fn into_result(self) -> Result<(), Error> {
+        self.first.map_or(Ok(()), Err)
+    }
+}
+
+/// 前后两样都做了的工作：交回第一个错误，两样都出错时后一个打日志。
+pub(crate) fn first_failure(first: Result<(), Error>, then: Result<(), Error>) -> Result<(), Error> {
+    let mut failures = Failures::default();
+    failures.keep(first);
+    failures.keep(then);
+    failures.into_result()
 }
 
 /// 过期的令牌和冷却记录多久清一次。它们过期之后本来就不起作用，清理只是不让表一直长。

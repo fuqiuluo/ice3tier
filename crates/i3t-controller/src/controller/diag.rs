@@ -566,12 +566,10 @@ impl Inner {
     /// 存储出错不算这里出错：记下日志，存不下来的测试、开始不了的矩阵各自隔 [`STORE_RETRY`] 再试，
     /// 一个出错不耽误别的，也不让后台任务丢掉别的工作要它回来的时刻。
     pub(super) fn tests_tick(&mut self, now: Instant) -> Option<Instant> {
-        let due: Vec<u64> = self.diag.running.iter().filter(|(_, running)| now >= running.due_at()).map(|(id, _)| *id).collect();
-        for id in due {
+        for id in self.time_out_tests(now) {
             // 前面结束的测试给节点发结束时，节点可能掉线，连带结束了这一个。
-            let Some(running) = self.diag.running.get(&id) else { continue };
-            if running.outcome.is_none() {
-                tracing::info!(test = id, "主动测试到时间了，按手上的结果结束");
+            if !self.diag.running.contains_key(&id) {
+                continue;
             }
             if let Err(error) = self.finish_test(id, false) {
                 tracing::warn!(test = id, "存主动测试的结果时出错，{} 秒后再试：{error}", STORE_RETRY.as_secs());
@@ -581,6 +579,25 @@ impl Inner {
         let next = self.diag.running.values().map(Running::due_at).min();
         let cooling = self.matrix_wake(now);
         [next, cooling].into_iter().flatten().min()
+    }
+
+    /// 到点了的测试里还没结束的，按手上的结果定下来，返回到点了的测试。只改内存、不碰存储：
+    /// 整个数据库都读写不了、后台任务这一轮不存测试结果时也要做，定下之后来的上报就不算数了（见 [`Inner::test_reported`]），
+    /// 不然一个已经超时、本该算失败的测试，会被迟到的上报记成做完了。结果等能存了再存。
+    pub(super) fn time_out_tests(&mut self, now: Instant) -> Vec<u64> {
+        let due: Vec<u64> = self.diag.running.iter().filter(|(_, running)| now >= running.due_at()).map(|(id, _)| *id).collect();
+        for &id in &due {
+            if self.diag.running.get(&id).is_some_and(|running| running.outcome.is_none()) {
+                tracing::info!(test = id, "主动测试到时间了，按手上的结果结束");
+                self.fix_outcome(id, false);
+                // 定下之后它只看 `deadline`（见 `Running::due_at`）。因为接受方过了宽限期才结束的，原来的时间窗可能还早：
+                // 收到现在，能存了马上就存，不用等到时间窗结束才放开这一对节点。
+                if let Some(running) = self.diag.running.get_mut(&id) {
+                    running.deadline = running.deadline.min(now);
+                }
+            }
+        }
+        due
     }
 
     /// 节点掉线了：它参与的测试不会再有它的结果，按手上有的结束。
@@ -1265,6 +1282,56 @@ mod tests {
         assert_eq!(lab.controller.lock().store.test(network, view.id).unwrap().unwrap().state, TestState::Failed);
         b.receive();
         assert_eq!(b.test_ends, [view.id]);
+    }
+
+    #[test]
+    fn a_test_that_times_out_while_the_whole_store_is_unusable_takes_no_late_reports() {
+        let (lab, network, a, b) = two_nodes();
+        let view = lab.controller.start_test(network, &request(&a, &b)).unwrap();
+        // 时间窗过了，什么都没报。这时整个数据库都写不进去（清理过期的记录时发现的），后台任务这一轮不存测试结果。
+        {
+            let mut inner = lab.controller.lock();
+            inner.diag.running.get_mut(&view.id).unwrap().deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+            inner.store.set_read_only(true);
+            inner.last_purge = None;
+            let wall = inner.clock.now();
+            assert!(inner.tick_work(Instant::now(), wall).unwrap_err().is_database_wide());
+            inner.store.set_read_only(false);
+        }
+        assert_eq!(lab.controller.test(network, view.id).unwrap().state, TestState::Failed, "结果照样定下了");
+
+        // 两端的最后一份在这之后才到：不算数，不然超时的测试被记成做完了。
+        try_send(&lab, &a, initiator_report(view.id)).unwrap();
+        try_send(&lab, &b, responder_report(view.id, true)).unwrap();
+        lab.controller.lock().tests_tick(later(1));
+        let stored = lab.controller.lock().store.test(network, view.id).unwrap().unwrap();
+        assert_eq!((stored.state, stored.error.map(|problem| problem.code)), (TestState::Failed, Some(TestCode::NoReport)));
+    }
+
+    #[test]
+    fn a_test_whose_responder_ran_late_while_the_whole_store_was_unusable_is_stored_as_soon_as_it_can_be() {
+        let (lab, network, a, b) = two_nodes();
+        let view = lab.controller.start_test(network, &request(&a, &b)).unwrap();
+        // 发起方报完了，controller 叫接受方结束；接受方过了宽限期还没报最后一份，离时间窗结束还早。
+        try_send(&lab, &a, initiator_report(view.id)).unwrap();
+        let late = Instant::now() + RESPONDER_GRACE + Duration::from_secs(1);
+        assert!(late < lab.controller.lock().diag.running[&view.id].deadline);
+        // 这时整个数据库都写不进去：结果先定下来，不存。
+        {
+            let mut inner = lab.controller.lock();
+            inner.store.set_read_only(true);
+            inner.last_purge = None;
+            let wall = inner.clock.now();
+            assert!(inner.tick_work(late, wall).unwrap_err().is_database_wide());
+            inner.store.set_read_only(false);
+        }
+        let fixed = lab.controller.test(network, view.id).unwrap();
+        assert!(fixed.finished_at.is_some(), "结果定下了");
+
+        // 能写了：马上存下来，放开这一对节点，不用等到原来的时间窗结束。
+        lab.controller.lock().tests_tick(late);
+        assert!(!lab.controller.lock().diag.running.contains_key(&view.id));
+        assert_eq!(lab.controller.lock().store.test(network, view.id).unwrap().unwrap(), fixed);
     }
 
     #[test]

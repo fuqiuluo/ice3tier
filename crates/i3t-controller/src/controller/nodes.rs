@@ -10,7 +10,7 @@ use i3t_proto::NodeId;
 use serde_json::{Map, Value, json};
 
 use super::groups::resolve_groups;
-use super::{COOLDOWN_SECS, Controller, Inner, Seeds, address, listed, naming, switch};
+use super::{COOLDOWN_SECS, Controller, Inner, Seeds, address, first_failure, listed, naming, switch};
 use crate::error::{Capability, Entity, Error, InField};
 use crate::relay_reach::{self, ReachIndex};
 use crate::store::{CooldownKind, GroupRecord, NetworkRecord, NodeRecord, Store, is_pending};
@@ -71,7 +71,7 @@ impl Controller {
         let mut inner = self.lock();
         let network = inner.require_network(network)?;
         let now = inner.clock.now();
-        let (before, after, groups) = inner.store.atomically(|store| {
+        let (before, after, groups, listeners) = inner.store.atomically(|store| {
             let before = require_node(store, network.id, id)?;
             let mut node = before.clone();
             if let Some(name) = &request.name {
@@ -95,15 +95,7 @@ impl Controller {
             node.reach = request.reach.unwrap_or(node.reach);
             node.profile = request.profile.unwrap_or(node.profile);
             node.forward_target = request.forward_target.unwrap_or(node.forward_target);
-            if node.forward_target != before.forward_target {
-                let state = if node.forward_target { "打开" } else { "关闭" };
-                tracing::info!(node = %id, name = %node.name, "管理员{state}了它作为端口转发目标的开关");
-            }
             node.auto_update = request.auto_update.unwrap_or(node.auto_update);
-            if node.auto_update != before.auto_update {
-                let state = if node.auto_update { "打开" } else { "关闭" };
-                tracing::info!(node = %id, name = %node.name, "管理员{state}了这个节点的自动更新");
-            }
             store.update_node(&node)?;
             if node.groups != before.groups {
                 store.set_node_groups(id, &node.groups)?;
@@ -112,27 +104,43 @@ impl Controller {
             let params = update_params(&before, &node, &groups);
             let detail = describe_update(&before, &node, &groups);
             store.log_refs(now, Some(network.id), action::NODE_UPDATE, &detail, &[LogRef::node(id)], params)?;
-            Ok::<_, Error>((before, node, groups))
+            // 要重算哪些节点也在这里读：提交之后再读的话，读不出来时改动已经生效，却没人去重算。
+            // relay 的名字写在全网每个节点的 netmap 里（这时是 `None`：全网都要重算，不用读）；别的改动只影响 netmap 里有它的节点。
+            // 端口转发目标的开关只管指向它的转发：两端的节点（监听节点不一定在它的 netmap 里，比如访问规则不允许时）。
+            let listeners = if node.relay.is_some() && before.name != node.name {
+                None
+            } else if node.forward_target != before.forward_target {
+                let forwards = store.forwards(network.id)?.into_iter();
+                Some(forwards.filter(|forward| forward.config.target_node == id).map(|forward| forward.config.listen_node).collect())
+            } else {
+                Some(Vec::new())
+            };
+            Ok::<_, Error>((before, node, groups, listeners))
         })?;
-        // relay 的名字写在全网每个节点的 netmap 里；别的改动只影响 netmap 里有它的节点。
-        // 开关只管指向它的转发：两端的节点（监听节点不一定在它的 netmap 里，比如访问规则不允许时）。
-        let seeds = if after.relay.is_some() && before.name != after.name {
-            Seeds::All
-        } else if after.forward_target != before.forward_target {
-            let listeners = inner.store.forwards(network.id)?.into_iter().filter(|forward| forward.config.target_node == id);
-            let mut seeds = inner.holders_of(id);
-            seeds.insert(id);
-            seeds.extend(listeners.map(|forward| forward.config.listen_node));
-            Seeds::Nodes(seeds)
-        } else {
-            inner.holders_and(id)
-        };
-        inner.refresh(network.id, seeds, None)?;
-        // 开关关掉时撤回还没换上去的自动更新，打开时轮到它；和全局的开关一样。
-        if after.auto_update != before.auto_update {
-            inner.roll_out()?;
+        // 日志在提交之后再打：没提交的话什么都没有改。
+        if after.forward_target != before.forward_target {
+            let state = if after.forward_target { "打开" } else { "关闭" };
+            tracing::info!(node = %id, name = %after.name, "管理员{state}了它作为端口转发目标的开关");
         }
+        if after.auto_update != before.auto_update {
+            let state = if after.auto_update { "打开" } else { "关闭" };
+            tracing::info!(node = %id, name = %after.name, "管理员{state}了这个节点的自动更新");
+        }
+        let seeds = match listeners {
+            None => Seeds::All,
+            Some(listeners) if after.forward_target != before.forward_target => {
+                let mut seeds = inner.holders_of(id);
+                seeds.insert(id);
+                seeds.extend(listeners);
+                Seeds::Nodes(seeds)
+            }
+            Some(_) => inner.holders_and(id),
+        };
+        let refreshed = inner.refresh(network.id, seeds, None);
+        // 开关关掉时撤回还没换上去的自动更新，打开时轮到它；和全局的开关一样。重算没成也要做：开关已经改了。
+        let rolled = if after.auto_update == before.auto_update { Ok(()) } else { inner.roll_out() };
         self.wake_if_needed(&inner);
+        first_failure(refreshed, rolled)?;
         Ok(inner.node_view(&network, &groups, &after, now, &inner.reach_index(network.id)?))
     }
 
@@ -218,10 +226,11 @@ impl Controller {
             Affects::WholeNetwork => Seeds::All,
             Affects::Holders => inner.holders_and(id),
         };
-        inner.refresh(network.id, seeds, None)?;
-        // relay 的更新要排队，是不是 relay 变了，该轮到谁也跟着变。
-        inner.roll_out()?;
+        let refreshed = inner.refresh(network.id, seeds, None);
+        // relay 的更新要排队，是不是 relay 变了，该轮到谁也跟着变。重算没成也要做：能力已经改了。
+        let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
+        first_failure(refreshed, rolled)?;
         Ok(inner.node_view(&network, &inner.store.groups(network.id)?, &node, now, &inner.reach_index(network.id)?))
     }
 
@@ -255,10 +264,11 @@ impl Controller {
         // 先告诉它自己，再从别人那里去掉它。它的连接随着发送队列的关闭而结束。
         inner.send(id, ToNode::Revoked);
         inner.forget_node(id);
-        inner.refresh(network, Seeds::All, None)?;
-        inner.roll_out()?;
+        let refreshed = inner.refresh(network, Seeds::All, None);
+        // 它占着 relay 的更新轮次的话，轮到下一个。重算没成也要做：它已经删掉了。
+        let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
-        Ok(())
+        first_failure(refreshed, rolled)
     }
 
     /// 把 `id` 指定为已下线节点 `predecessor` 的继任：继承它的虚拟 IP、名字、所在的分组（和自己的合并），
@@ -304,10 +314,11 @@ impl Controller {
         })?;
         tracing::info!(node = %id, %predecessor, name = %node.name, "节点继任");
         inner.forget_node(predecessor);
-        inner.refresh(network.id, Seeds::All, None)?;
-        // 继任者可能接过了关掉的自动更新：撤回已经给它的自动更新。
-        inner.roll_out()?;
+        let refreshed = inner.refresh(network.id, Seeds::All, None);
+        // 继任者可能接过了关掉的自动更新：撤回已经给它的自动更新。重算没成也要做：继任已经生效了。
+        let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
+        first_failure(refreshed, rolled)?;
         Ok(inner.node_view(&network, &inner.store.groups(network.id)?, &node, now, &inner.reach_index(network.id)?))
     }
 }

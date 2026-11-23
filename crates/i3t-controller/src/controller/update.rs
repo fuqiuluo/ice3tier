@@ -293,6 +293,7 @@ impl Controller {
         let mut inner = self.lock();
         let before = inner.updates.settings.clone();
         let mut after = before.clone();
+        let mut rolled = Ok(());
         after.auto_update = request.auto_update.unwrap_or(before.auto_update);
         after.source = source.unwrap_or_else(|| before.source.clone());
         if after != before {
@@ -310,9 +311,11 @@ impl Controller {
                 inner.updates.check_error = None;
                 self.check_wake.notify_one();
             }
-            inner.roll_out()?;
+            rolled = inner.roll_out();
         }
+        // 下发没做完也要叫醒后台任务：它排了重试，要后台任务到点来做（下面几个入口一样）。
         self.wake_if_needed(&inner);
+        rolled?;
         inner.update_overview()
     }
 
@@ -332,12 +335,14 @@ impl Controller {
         };
         let checked = check(&source_text, &keys);
         let mut inner = self.lock();
-        if inner.updates.source_text() == source_text {
-            inner.check_finished(&source_text, checked)?;
+        let finished = if inner.updates.source_text() == source_text {
+            inner.check_finished(&source_text, checked)
         } else {
             tracing::info!(source = %source_text, "查的时候发布源被改了，这次的结果不要");
-        }
+            Ok(())
+        };
         self.wake_if_needed(&inner);
+        finished?;
         inner.update_overview()
     }
 
@@ -362,8 +367,10 @@ impl Controller {
             let Some(job) = self.lock().next_fetch() else { return Ok(()) };
             let outcome = job.run();
             let mut inner = self.lock();
-            inner.fetch_finished(&job, outcome)?;
+            let finished = inner.fetch_finished(&job, outcome);
+            // 出错时也要叫醒：还有别的平台的包排着的话，取包的任务等的就是这一声。
             self.wake_if_needed(&inner);
+            finished?;
         }
     }
 
@@ -387,8 +394,9 @@ impl Controller {
         write_meta(&inner.store, PAUSED_META, &inner.updates.paused)?;
         inner.store.log(now, None, action::UPDATE_RESUME, &format!("继续版本 {version} 的自动更新"), json!({ "version": version }))?;
         tracing::info!(%version, "管理员继续了这个版本的自动更新");
-        inner.roll_out()?;
+        let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
+        rolled?;
         inner.update_overview()
     }
 
@@ -427,8 +435,9 @@ impl Controller {
             json!({ "node": node.id, "node_name": node.name, "timing": timing }),
         )?;
         tracing::info!(node = %id, name = %node.name, ?timing, "管理员让这个节点立即更新");
-        inner.roll_out()?;
+        let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
+        rolled?;
         Ok(inner.node_update(&node))
     }
 
@@ -466,12 +475,13 @@ impl Controller {
         let params = json!({ "timing": timing, "nodes": accepted.len(), "skipped": outcome.skipped.len() });
         inner.store.log(now, None, action::UPDATE_FORCE_ALL, &detail, params)?;
         tracing::info!(?timing, nodes = accepted.len(), skipped = outcome.skipped.len(), "管理员让全部节点立即更新");
-        inner.roll_out()?;
+        let rolled = inner.roll_out();
+        self.wake_if_needed(&inner);
+        rolled?;
         for node in &accepted {
             let ordered = inner.live.get(&node.id).and_then(|live| live.order.as_ref()).is_some_and(|order| order.timing == timing);
             if ordered { outcome.ordered.push(node.to_ref()) } else { outcome.queued.push(node.to_ref()) }
         }
-        self.wake_if_needed(&inner);
         Ok(outcome)
     }
 }

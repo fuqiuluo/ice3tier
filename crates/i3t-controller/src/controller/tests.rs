@@ -10,6 +10,7 @@ mod ordering;
 mod proxies;
 mod routes;
 mod stats;
+mod store_failures;
 mod unsettled;
 mod update;
 

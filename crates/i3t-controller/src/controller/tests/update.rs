@@ -4,11 +4,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::time::Duration;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use i3t_crypto::NodeKey;
 use i3t_model::admin::{ErrorCode, NetworkId, PackageState, RelaySettings, UpdateNode, UpdateSettings, UpdateWait};
-use i3t_model::control::{Declared, Hello, MAX_PACKAGE_CHUNK, SelfUpdate, ToController};
+use i3t_model::control::{Declared, Hello, MAX_PACKAGE_CHUNK, Report, SelfUpdate, ToController};
 use i3t_model::update::{
     Artifact, FailureKind, LATEST_DIR, MANIFEST_FILE, Manifest, NODE_PROGRAM, Platform, SIGNATURE_FILE, SelfUpdateBlocker, Sha256,
     UpdateCause, UpdateStatus, UpdateTiming, Version,
@@ -16,8 +18,9 @@ use i3t_model::update::{
 use i3t_update::{TrustedKeys, sign_manifest};
 use ring::digest;
 
-use super::super::testing::{CAN_DO_ALL, Lab, Member, hello, modern_hello};
+use super::super::testing::{CAN_DO_ALL, Lab, Member, REMOTE, hello, modern_hello};
 use super::super::{Controller, Timing};
+use super::is_woken;
 use crate::store::Store;
 
 const LINUX: &str = "linux-x86_64";
@@ -578,6 +581,159 @@ fn switch_auto_update(fleet: &Fleet, member: &Member, on: bool) {
     let request = UpdateNode { auto_update: Some(on), ..UpdateNode::default() };
     let node = fleet.controller().update_node(fleet.network, member.id, &request).unwrap();
     assert_eq!(node.auto_update, on);
+}
+
+#[test]
+fn switching_auto_update_off_withdraws_the_order_even_if_recomputing_netmaps_fails() {
+    let mut fleet = Fleet::new();
+    let mut pending = fleet.node(OLD);
+    fleet.release();
+    assert!(fleet.last_order(&mut pending).is_some());
+
+    // 开关改完之后重算 netmap 时读不出这个网络。开关已经改了，撤回照样要发：不然节点会装上管理员刚关掉的更新。
+    fleet.controller().lock().store.execute_batch("ALTER TABLE pair_settings RENAME TO pair_settings_away;");
+    let request = UpdateNode { auto_update: Some(false), ..UpdateNode::default() };
+    assert!(fleet.controller().update_node(fleet.network, pending.id, &request).is_err());
+    fleet.controller().lock().store.execute_batch("ALTER TABLE pair_settings_away RENAME TO pair_settings;");
+    pending.receive();
+    assert_eq!(pending.cancels, 1);
+}
+
+/// 让存储里这个节点的那一行读不出来（"本机的网卡地址"那一列里不是一张地址表），别的节点照常；`readable` 改回来。
+fn unreadable(fleet: &Fleet, member: &Member) {
+    let sql = format!("UPDATE nodes SET local_addresses = '\"unreadable\"' WHERE id = {};", member.id.get());
+    fleet.controller().lock().store.execute_batch(&sql);
+}
+
+fn readable(fleet: &Fleet, member: &Member) {
+    let sql = format!("UPDATE nodes SET local_addresses = NULL WHERE id = {};", member.id.get());
+    fleet.controller().lock().store.execute_batch(&sql);
+}
+
+/// 后台任务把到点的 `roll_out` 重做一遍。
+fn retry_rollout(fleet: &Fleet) {
+    fleet.controller().lock().updates.next_rollout = Some(Instant::now());
+    fleet.controller().tick().unwrap();
+}
+
+#[test]
+fn a_relay_turn_is_handed_on_after_the_order_that_held_it_is_withdrawn_even_if_another_node_cannot_be_read() {
+    let mut fleet = Fleet::new();
+    let mut relays = [fleet.relay(OLD), fleet.relay(OLD), fleet.relay(OLD)];
+    relays.sort_by_key(|relay| relay.id);
+    // 下发时按节点编号的顺序看：下一个 relay 最先看到，读不出来的节点在中间，轮到的 relay 最后。
+    let [mut next, broken, mut holder] = relays;
+    switch_auto_update(&fleet, &next, false);
+    switch_auto_update(&fleet, &broken, false);
+    fleet.release();
+    assert!(fleet.last_order(&mut holder).is_some());
+    switch_auto_update(&fleet, &next, true);
+    assert_eq!(fleet.last_order(&mut next), None, "这一轮是它前面那个的");
+
+    // 管理员关掉了轮到的 relay 的自动更新，这一轮让出来。这时候另一个节点读不出来：跳过它，别的照常。
+    // 撤回要先发出去，下一个才开始：先看到下一个就给它下发的话，读不出的节点会挡住后面的撤回，两个 relay 同时在更新。
+    unreadable(&fleet, &broken);
+    let off = UpdateNode { auto_update: Some(false), ..UpdateNode::default() };
+    assert!(fleet.controller().update_node(fleet.network, holder.id, &off).is_err());
+    holder.receive();
+    assert_eq!(holder.cancels, 1);
+    assert!(fleet.last_order(&mut next).is_some(), "撤回了，轮到下一个");
+    readable(&fleet, &broken);
+}
+
+#[test]
+fn a_forced_update_goes_out_while_another_node_cannot_be_read() {
+    let mut fleet = Fleet::new();
+    let mut nodes = [fleet.node(OLD), fleet.node(OLD)];
+    nodes.sort_by_key(|node| node.id);
+    // 读不出来的节点排在前面。
+    let [broken, mut kept] = nodes;
+    switch_auto_update(&fleet, &kept, false);
+    fleet.release();
+    assert_eq!(fleet.last_order(&mut kept), None);
+
+    // 存储里有一个节点一直读不出来，管理员强制更新另一个：照样下发，不能每次都卡在读不出的那个上。错误照旧交回去。
+    unreadable(&fleet, &broken);
+    assert!(fleet.controller().force_update(fleet.network, kept.id, UpdateTiming::Now).is_err());
+    assert_eq!(fleet.last_order(&mut kept), Some((version(NEW), UpdateTiming::Now)));
+    readable(&fleet, &broken);
+}
+
+#[test]
+fn queued_relays_wait_while_a_node_that_may_still_hold_the_turn_cannot_be_read() {
+    let mut fleet = Fleet::new();
+    let mut relays = [fleet.relay(OLD), fleet.relay(OLD)];
+    relays.sort_by_key(|relay| relay.id);
+    let [mut next, mut holder] = relays;
+    switch_auto_update(&fleet, &next, false);
+    fleet.release();
+    assert!(fleet.last_order(&mut holder).is_some());
+    switch_auto_update(&fleet, &next, true);
+
+    // 上一轮让出了它的轮次，撤回却没发出去（那时整个数据库都读不了）。现在它读不出来，不知道它是不是还在更新：
+    // 排队的 relay 先不开始，不然可能两个 relay 同时在更新。
+    {
+        let inner = &mut *fleet.controller().lock();
+        inner.store.execute_batch(&format!("UPDATE nodes SET auto_update = FALSE WHERE id = {};", holder.id.get()));
+        inner.updates.relay_turns.clear();
+        inner.updates.next_rollout = Some(Instant::now());
+    }
+    unreadable(&fleet, &holder);
+    assert!(fleet.controller().tick().is_err());
+    assert_eq!(fleet.last_order(&mut next), None);
+
+    readable(&fleet, &holder);
+    retry_rollout(&fleet);
+    holder.receive();
+    assert_eq!(holder.cancels, 1);
+    assert!(fleet.last_order(&mut next).is_some(), "撤回了，轮到下一个");
+}
+
+#[test]
+fn turning_auto_update_off_while_the_store_cannot_be_read_wakes_the_background_task_to_withdraw_orders() {
+    let mut fleet = Fleet::new();
+    let mut pending = fleet.node(OLD);
+    fleet.release();
+    assert!(fleet.last_order(&mut pending).is_some());
+    is_woken(&fleet.lab);
+
+    // 开关记下了，撤回却没发成：排上的重试要叫醒后台任务，不然要等到下一条节点消息才会去做。
+    fleet.controller().lock().store.execute_batch("ALTER TABLE nodes RENAME TO nodes_away;");
+    let off = UpdateSettings { auto_update: Some(false), ..UpdateSettings::default() };
+    assert!(fleet.controller().set_update_settings(&off).is_err());
+    assert!(is_woken(&fleet.lab));
+    fleet.controller().lock().store.execute_batch("ALTER TABLE nodes_away RENAME TO nodes;");
+
+    retry_rollout(&fleet);
+    pending.receive();
+    assert_eq!(pending.cancels, 1);
+}
+
+/// 取包的后台任务现在是不是被叫醒了。问一次就算它醒过一次。
+fn fetcher_woken(fleet: &Fleet) -> bool {
+    let mut wanted = pin!(fleet.controller().wait_for_wanted_packages());
+    matches!(wanted.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(()))
+}
+
+#[test]
+fn a_package_wanted_when_the_background_task_retries_a_rollout_is_fetched_without_waiting() {
+    let mut fleet = Fleet::new();
+    fleet.release();
+    let other = fleet.node(NEW);
+    let mut node = fleet.lab.join_as(fleet.network, &modern_hello(OLD));
+
+    // 它第一次上报时下发没做完（读不出另一个节点），排了重试。
+    unreadable(&fleet, &other);
+    let report = ToController::Report(Box::new(Report { update: Some(UpdateStatus::Idle), ..Report::default() }));
+    assert!(fleet.controller().handle(node.session, REMOTE, report).is_err());
+    readable(&fleet, &other);
+    fetcher_woken(&fleet);
+
+    // 前面叫的那一声已经用掉了。后台任务重做下发时这个平台的包还要：要再叫醒取包的任务，后台任务做的下发没有别人替它叫。
+    retry_rollout(&fleet);
+    assert!(fetcher_woken(&fleet));
+    fleet.controller().fetch_packages().unwrap();
+    assert_eq!(fleet.last_order(&mut node), Some((version(NEW), UpdateTiming::Idle)));
 }
 
 #[test]

@@ -152,7 +152,7 @@ impl Inner {
 
     /// 整个数据库刚读写不了：后台的重算过一会儿再碰它，见 [`Inner::flush_after`]。
     /// 只是某一行、某张表被占着（等锁到了期限）不算：那由存储自己限着，见 [`Self::refresh_reporting`]。
-    fn back_off(&mut self) {
+    pub(crate) fn back_off(&mut self) {
         self.flush_after = Some(Instant::now() + RETRY_DELAY);
     }
 

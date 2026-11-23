@@ -21,8 +21,8 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::usage::UsageReport;
-use super::{Controller, Inner, Live, Seeds};
-use crate::error::{Error, Rejection, error_chain};
+use super::{Controller, Inner, Live, Seeds, first_failure};
+use crate::error::{Entity, Error, Rejection, error_chain};
 use crate::netmap::{MAX_ENDPOINTS, VnetFacts};
 use crate::store::{NewSwitch, NodeRecord};
 use crate::{node_addresses, relay_reach};
@@ -186,6 +186,14 @@ impl Controller {
     }
 }
 
+/// controller 看到的节点地址：这条连接的来源 IP 加上节点自报的 UDP 端口，节点没报端口时是 `None`。
+/// 来源是回环地址时换成 controller 对外地址里的主机 `public_host`（见 [`Inner::observed_endpoint`]）。
+fn observed_endpoint(public_host: Option<IpAddr>, remote: IpAddr, port: u16) -> Option<SocketAddr> {
+    let remote = remote.to_canonical();
+    let ip = if remote.is_loopback() { public_host.unwrap_or(remote) } else { remote };
+    (port != 0).then(|| SocketAddr::new(ip, port))
+}
+
 /// 节点要的那一段：从哪里起，最多多少字节。
 #[derive(Debug, Clone, Copy)]
 struct PackageRange {
@@ -261,9 +269,7 @@ impl Inner {
             tracing::info!(node = %node.id, "同一个节点的新连接顶替了旧连接");
         }
         tracing::info!(node = %node.id, name = %node.name, %remote, version = %node.version, platform = %node.platform, enrolling, "节点上线");
-        // 注册时那一条连接不算"最近在线"：节点真的跑起来、带着 Hello 连上来才算。
-        let outcome = if enrolling { Ok(()) } else { self.store.set_node_last_seen(node.id, self.clock.now()).map_err(Error::from) };
-        let outcome = outcome.and_then(|()| match self.refresh_reporting(node.network, seeds, Some(node.id)) {
+        let outcome = match self.refresh_reporting(node.network, seeds, Some(node.id)) {
             // 它自己的 netmap 发出去了，没做成的是同一批里别的节点。那些已经排上了重试，不该因此不让它上线：
             // 不然只要有一个节点一直记不下来，谁都连不上来。"做成了"不等于发到了：发送队列的另一头已经关了、
             // 或者满了时，连接在下发的那一刻就被断开了，所以还要看它是不是还连着。
@@ -272,12 +278,18 @@ impl Inner {
                 Ok(())
             }
             outcome => outcome.map_err(|unfinished| unfinished.error),
-        });
+        };
         if let Err(err) = outcome {
             // 它没能上线，就不在线：不再等它确认。不然它欠着的确认没人放，`give_up_on_slow_acks` 只看在线的节点。
             self.live.remove(&node.id);
             self.stop_waiting_for(node.network, node.id);
             return Err(err);
+        }
+        // 注册时那一条连接不算"最近在线"：节点真的跑起来、带着 Hello 连上来才算。上线了才记，没上线的不该被记成刚刚在线过；
+        // 整个数据库被别的进程锁着时，也就只在重算那里拿着 controller 的锁等一次超时，不是两次。
+        // 记不下来只影响界面上的"最近在线"（和 `drop_session` 一样），不因此拒绝它：它的自我介绍记下了，netmap 也发了。
+        if !enrolling && let Err(err) = self.store.set_node_last_seen(node.id, self.clock.now()) {
+            tracing::warn!(node = %node.id, "记录节点最近在线的时间失败：{}", error_chain(&err));
         }
         // 更新的指令不在这里发：要等它的第一次上报，才知道它是带着什么回来的（见 `rollout`）。
         self.relay_is_back(&node);
@@ -293,8 +305,10 @@ impl Inner {
             live.remote = remote;
             live.port = hello.port;
         }
-        self.refresh(node.network, seeds, None)?;
-        self.roll_out()
+        let refreshed = self.refresh(node.network, seeds, None);
+        // 它会不会自己更新可能变了。重算没成也要做：自我介绍已经记下了。
+        let rolled = self.roll_out();
+        first_failure(refreshed, rolled)
     }
 
     /// 记下节点的自我介绍。节点撤回了某项声明时，已经启用的那项能力随之关闭。返回因此要重算的节点。
@@ -319,33 +333,47 @@ impl Inner {
 
         let mut whole_network = false;
         let mut affected = BTreeSet::from([node.id]);
+        let mut withdrawn = Vec::new();
         if node.relay.is_some() && !node.declared.relay {
             node.relay = None;
             whole_network = true;
-            tracing::warn!(node = %node.id, name = %node.name, "节点撤回了可以作为 relay 的声明，关闭它的 relay");
-            let detail = format!("节点 {} 撤回了声明，中继已关闭", node.name);
-            let params = json!({ "node": node.id, "node_name": node.name });
-            self.store.log_refs(now, Some(node.network), action::NODE_RELAY_WITHDRAWN, &detail, &[LogRef::node(node.id)], params)?;
+            withdrawn.push((action::NODE_RELAY_WITHDRAWN, "中继"));
         }
         if node.exit.is_some() && !node.declared.exit {
             node.exit = None;
             affected.extend(self.holders_of(node.id));
-            tracing::warn!(node = %node.id, name = %node.name, "节点撤回了可以作为出口的声明，关闭它的出口");
-            let detail = format!("节点 {} 撤回了声明，出口已关闭", node.name);
-            let params = json!({ "node": node.id, "node_name": node.name });
-            self.store.log_refs(now, Some(node.network), action::NODE_EXIT_WITHDRAWN, &detail, &[LogRef::node(node.id)], params)?;
+            withdrawn.push((action::NODE_EXIT_WITHDRAWN, "出口"));
         }
-        if *node != before {
-            self.store.update_node(node)?;
+        // 撤回了声明的话节点也变了，所以有撤回时这个一定是真的。
+        let declared_changed = *node != before;
+        node.observed = self.observed_endpoint(remote, hello.port);
+        let observed_changed = node.observed != before.observed;
+        // 一起写进存储，要么都写进去、要么都没写：写了一半就返回的话，比如能力已经关了，因此要重算的节点却没报给调用方，
+        // 就没人去重算了。什么都没变时（多数重连都是这样）不用开事务。
+        if declared_changed || observed_changed {
+            self.store.atomically(|store| {
+                for (action, what) in &withdrawn {
+                    let detail = format!("节点 {} 撤回了声明，{what}已关闭", node.name);
+                    let params = json!({ "node": node.id, "node_name": node.name });
+                    store.log_refs(now, Some(node.network), action, &detail, &[LogRef::node(node.id)], params)?;
+                }
+                if declared_changed {
+                    store.update_node(node)?;
+                }
+                if observed_changed {
+                    store.set_node_observed(node.id, node.observed)?;
+                }
+                Ok::<_, Error>(())
+            })?;
+        }
+        if before.relay.is_some() && node.relay.is_none() {
+            tracing::warn!(node = %node.id, name = %node.name, "节点撤回了可以作为 relay 的声明，关闭它的 relay");
         }
         if before.exit.is_some() && node.exit.is_none() {
+            tracing::warn!(node = %node.id, name = %node.name, "节点撤回了可以作为出口的声明，关闭它的出口");
             self.usage.exit_disabled(node.id);
         }
-
-        let observed = self.observed_endpoint(remote, hello.port);
-        if observed != node.observed {
-            node.observed = observed;
-            self.store.set_node_observed(node.id, observed)?;
+        if observed_changed {
             let holders = self.holders_of(node.id);
             self.defer(node.network, holders, self.timing.report_coalesce);
         }
@@ -362,36 +390,44 @@ impl Inner {
     /// 节点和 controller 在同一台机器上、走回环连过来时，回环地址对别的机器没有用，换成 controller 对外地址里的主机；
     /// 那个主机是域名、还没解析出来时照旧用回环地址：同一台机器上的节点还用得上它。
     fn observed_endpoint(&self, remote: IpAddr, port: u16) -> Option<SocketAddr> {
-        let remote = remote.to_canonical();
-        let ip = if remote.is_loopback() { self.public_host.unwrap_or(remote) } else { remote };
-        (port != 0).then(|| SocketAddr::new(ip, port))
+        observed_endpoint(self.public_host, remote, port)
     }
 
     /// controller 对外地址里的主机解析出来了（或者变了）：走回环连着的节点，controller 看到的地址跟着变。
+    ///
+    /// 走回环连着的节点在一个事务里一起改，提交了才记下新的主机：中途读写不了存储时一个都没改，主机也还是旧的，
+    /// 下次解析出来不管是新的还是旧的 IP，存储里的地址都和记着的主机对得上。一个一个地改的话，改了一半时
+    /// 下次解析出的 IP 和记着的一样就不做了，已经改过的（或者还没改的）节点一直用着不对的地址。
     pub(super) fn set_public_host(&mut self, host: Option<IpAddr>) -> Result<(), Error> {
         if self.public_host == host {
             return Ok(());
         }
-        tracing::info!(?host, "controller 对外地址里的主机是这个 IP");
-        self.public_host = host;
-        let looped: Vec<(NodeId, IpAddr, u16)> = self
+        let looped: Vec<(NodeId, IpAddr, u16, BTreeSet<NodeId>)> = self
             .live
             .iter()
             .filter(|(_, live)| live.remote.to_canonical().is_loopback())
-            .map(|(id, live)| (*id, live.remote, live.port))
+            .map(|(id, live)| (*id, live.remote, live.port, self.holders_of(*id)))
             .collect();
-        for (id, remote, port) in looped {
-            let Some(mut node) = self.store.node(id)? else { continue };
-            let cidr = self.require_network(node.network)?.cidr;
-            let before = node_addresses::relay_addresses(&node, cidr);
-            node.observed = self.observed_endpoint(remote, port);
-            self.store.set_node_observed(id, node.observed)?;
-            let mut affected = self.holders_of(id);
-            if node.relay.is_some() && node_addresses::relay_addresses(&node, cidr) != before {
-                affected.extend(self.store.nodes(node.network)?.into_iter().map(|record| record.id));
+        let changed = self.store.atomically(|store| {
+            let mut changed = Vec::new();
+            for (id, remote, port, mut affected) in looped {
+                let Some(mut node) = store.node(id)? else { continue };
+                let cidr = store.network(node.network)?.ok_or(Error::NotFound(Entity::Network))?.cidr;
+                let before = node_addresses::relay_addresses(&node, cidr);
+                node.observed = observed_endpoint(host, remote, port);
+                if node.relay.is_some() && node_addresses::relay_addresses(&node, cidr) != before {
+                    affected.extend(store.nodes(node.network)?.into_iter().map(|record| record.id));
+                }
+                store.set_node_observed(id, node.observed)?;
+                changed.push((node.network, affected));
             }
-            self.defer(node.network, affected, self.timing.report_coalesce);
+            Ok::<_, Error>(changed)
+        })?;
+        for (network, affected) in changed {
+            self.defer(network, affected, self.timing.report_coalesce);
         }
+        tracing::info!(?host, "controller 对外地址里的主机是这个 IP");
+        self.public_host = host;
         Ok(())
     }
 

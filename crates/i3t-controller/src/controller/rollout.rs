@@ -22,7 +22,8 @@
 //!
 //! 离线的节点什么都不用记：它重新连上来的时候和别的节点一样过一遍这些规矩。
 
-use std::time::Instant;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use i3t_model::admin::UpdateWait;
 use i3t_model::control::ToNode;
@@ -30,9 +31,12 @@ use i3t_model::update::{FailureKind, Platform, UpdateTiming, Version};
 use i3t_proto::NodeId;
 
 use super::update::Package;
-use super::{Inner, Live};
+use super::{Failures, Inner, Live};
 use crate::error::Error;
 use crate::store::NodeRecord;
+
+/// 下发更新指令没做完（读不出存储）时，过多久再做一遍。
+const ROLLOUT_RETRY: Duration = Duration::from_secs(1);
 
 /// 这次连接上发给一个节点的更新指令。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +119,7 @@ impl Inner {
             if !matches!(self.updates.packages.get(&node.platform), Some(Package::Cached(_))) {
                 return Some(UpdateWait::Package);
             }
-            let queues = node.relay.is_some() && !forced.is_some_and(|forced| forced.skips_relay_queue);
+            let queues = self.queues_for_turn(node);
             let taken = self.updates.relay_turns.get(&node.network).is_some_and(|turn| turn.holder != node.id);
             (queues && taken).then_some(UpdateWait::RelayTurn)
         });
@@ -124,27 +128,59 @@ impl Inner {
 
     /// 按现在的情况给该更新的节点下发指令，撤回不该再做的。任何可能改变结论的事情之后都要调用一次：
     /// 节点上线、节点报了失败、查到了新的发布、包取回来了、设置变了、管理员点了按钮、轮到的 relay 站稳了。
+    ///
+    /// 读不出存储、没做完时过 [`ROLLOUT_RETRY`] 再做一遍：不然要等下一件可能改变结论的事，这期间该下发的指令发不出去，
+    /// 该撤回的（比如管理员刚关掉了自动更新）也撤不回来。
     pub(crate) fn roll_out(&mut self) -> Result<(), Error> {
-        let now = Instant::now();
         self.updates.next_rollout = None;
-        self.settle_relay_turns(now)?;
+        let outcome = self.roll_out_at(Instant::now());
+        if outcome.is_err() {
+            // 从出错的时候算：读存储可能等了很久（数据库被别的进程锁着时要等满超时），从开始算的话这时已经到点了。
+            let retry = Instant::now() + ROLLOUT_RETRY;
+            self.updates.next_rollout = Some(self.updates.next_rollout.map_or(retry, |at| at.min(retry)));
+        }
+        outcome
+    }
+
+    /// 它要排 relay 的队：是 relay，并且不是管理员单独点的"立即更新"。
+    fn queues_for_turn(&self, node: &NodeRecord) -> bool {
+        node.relay.is_some() && !self.updates.forced.get(&node.id).is_some_and(|forced| forced.skips_relay_queue)
+    }
+
+    /// 先撤回、再下发：撤回的都发出去了，才给任何节点下发新的指令。
+    ///
+    /// relay 的轮次在 [`Inner::settle_relay_turns`] 里就让出来了，比如轮到的 relay 刚被关掉了自动更新；
+    /// 边看边发的话，排在它前面的下一个 relay 先拿到指令，看到它之前读存储出了错，它的撤回这一轮就发不出去，
+    /// 两个 relay 同时在更新。
+    ///
+    /// 只是某一个节点读不出来时跳过它，别的照常：不然它一直读不出的话，每次重做都卡在它这里，谁都拿不到指令，
+    /// 管理员强制更新别的节点也不行。它手上还有没撤回的指令时，不知道该不该撤回，它可能正在更新、占着这个网络的轮次：
+    /// 这个网络里排队的 relay 这一轮不开始。整个数据库都读不了时不往下试，别的节点也读不出来。
+    fn roll_out_at(&mut self, now: Instant) -> Result<(), Error> {
+        let mut failures = Failures::default();
+        self.settle_relay_turns(now, &mut failures)?;
 
         let online: Vec<NodeId> = self.live.keys().copied().collect();
+        let mut wanted = Vec::new();
+        let mut unsure = BTreeSet::new();
         for id in online {
-            let Some(node) = self.store.node(id)? else { continue };
+            let node = match self.store.node(id) {
+                Ok(Some(node)) => node,
+                Ok(None) => continue,
+                Err(err) if err.is_database_wide() => return Err(err.into()),
+                Err(err) => {
+                    let ordered = self.live.get(&id).filter(|live| live.order.as_ref().is_some_and(|order| !order.failed));
+                    if let Some(live) = ordered {
+                        unsure.insert(live.network);
+                    }
+                    failures.keep(Err::<(), _>(err.into()));
+                    continue;
+                }
+            };
             let plan = self.plan(&node);
             let current = self.live.get(&id).and_then(|live| live.order.clone());
             match (plan.wanted, plan.available) {
-                (Some(timing), Some(version)) => {
-                    if current.is_some_and(|order| order.version == version && order.timing == timing) {
-                        continue;
-                    }
-                    match plan.waiting {
-                        None => self.order(&node, version, timing),
-                        Some(UpdateWait::Package) => self.want_package(&node.platform),
-                        Some(UpdateWait::RelayTurn | UpdateWait::Unknown) => {}
-                    }
-                }
+                (Some(_), Some(_)) => wanted.push(node),
                 // 失败了的指令不用撤回：节点那边已经结束了，撤回只会把它报上来的失败原因盖掉。
                 _ => {
                     if current.is_some_and(|order| !order.failed) {
@@ -153,7 +189,25 @@ impl Inner {
                 }
             }
         }
-        Ok(())
+        // 结论要重新看：前面的 relay 拿到指令时占了这一轮，同一个网络里后面的 relay 就要等。
+        for node in wanted {
+            let plan = self.plan(&node);
+            let (Some(timing), Some(version)) = (plan.wanted, plan.available) else { continue };
+            let current = self.live.get(&node.id).and_then(|live| live.order.as_ref());
+            if current.is_some_and(|order| order.version == version && order.timing == timing) {
+                continue;
+            }
+            // 空着的轮次不给排队的 relay：读不出来的节点可能还在更新（见上）。它自己占着这一轮时照常，多不出一个 relay。
+            let blocked =
+                unsure.contains(&node.network) && self.queues_for_turn(&node) && !self.updates.relay_turns.contains_key(&node.network);
+            match plan.waiting {
+                None if blocked => {}
+                None => self.order(&node, version, timing),
+                Some(UpdateWait::Package) => self.want_package(&node.platform),
+                Some(UpdateWait::RelayTurn | UpdateWait::Unknown) => {}
+            }
+        }
+        failures.into_result()
     }
 
     fn order(&mut self, node: &NodeRecord, version: Version, timing: UpdateTiming) {
@@ -197,13 +251,21 @@ impl Inner {
     }
 
     /// 看每个网络里轮到的那个 relay 是不是已经结束了它的这一轮，结束了就把这一轮让出来。
-    fn settle_relay_turns(&mut self, now: Instant) -> Result<(), Error> {
+    ///
+    /// 只是它读不出来时这一轮还留给它（不知道它是不是还在更新），错误记进 `failures`，别的网络照常；
+    /// 整个数据库都读不了时不往下试。
+    fn settle_relay_turns(&mut self, now: Instant, failures: &mut Failures) -> Result<(), Error> {
         let turns: Vec<_> = self.updates.relay_turns.iter().map(|(network, turn)| (*network, *turn)).collect();
         for (network, turn) in turns {
-            let over = match self.store.node(turn.holder)? {
-                Some(node) if node.relay.is_some() => self.turn_is_over(&node, turn, now),
+            let over = match self.store.node(turn.holder) {
+                Ok(Some(node)) if node.relay.is_some() => self.turn_is_over(&node, turn, now),
                 // 节点被删掉了，或者不再是 relay。
-                Some(_) | None => true,
+                Ok(Some(_) | None) => true,
+                Err(err) if err.is_database_wide() => return Err(err.into()),
+                Err(err) => {
+                    failures.keep(Err::<(), _>(err.into()));
+                    false
+                }
             };
             if over {
                 tracing::info!(%network, relay = %turn.holder, "这个 relay 的更新告一段落，轮到下一个");
