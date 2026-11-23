@@ -96,7 +96,12 @@ impl Inner {
     }
 
     /// 这些节点的重算没做成：过一会儿再试，并且叫醒后台任务，让它到点来做。
+    /// 一个节点都没有时（要重算整个网络，网络读不出来，又没有谁在线）没有排上谁，就不叫。
     fn retry_later(&mut self, network: NetworkId, nodes: impl IntoIterator<Item = NodeId>) {
+        let mut nodes = nodes.into_iter().peekable();
+        if nodes.peek().is_none() {
+            return;
+        }
         self.defer(network, nodes, RETRY_DELAY);
         self.wake.notify_one();
     }

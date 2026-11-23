@@ -486,6 +486,29 @@ fn a_push_whose_network_could_not_be_read_is_tried_again() {
 }
 
 #[test]
+fn a_failed_push_that_leaves_nobody_to_retry_does_not_wake_the_background_task() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let doomed = lab.join(network.id, &[]);
+    let other = lab.join(network.id, &[]);
+    lab.controller.disconnect(doomed.session);
+    lab.controller.disconnect(other.session);
+    lab.settle(&mut []);
+    is_woken(&lab);
+    assert!(!is_woken(&lab), "现在没有要后台任务做的事");
+
+    // 要重算整个网络，网络读不出来，又没有谁在线：没有排上谁，也就没有要后台任务到点去做的事。
+    sql(&lab, BLOCK_READING);
+    assert!(lab.controller.delete_node(network.id, doomed.id).is_err());
+    assert!(lab.controller.lock().dirty.is_empty());
+    assert!(!is_woken(&lab), "没有排上重试就不叫醒后台任务");
+
+    sql(&lab, UNBLOCK_READING);
+    let other = lab.connect(other.key, Declared::default()).unwrap();
+    assert!(other.netmap().peers.is_empty(), "不在线的节点回来时拿到的是那时的内容");
+}
+
+#[test]
 fn a_store_that_fails_for_longer_than_the_timeout_does_not_let_the_initiator_go_first() {
     let timeout = Duration::from_millis(50);
     let mut lab = Lab::with_timing(impatient(timeout));
