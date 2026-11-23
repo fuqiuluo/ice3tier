@@ -1,0 +1,12 @@
+# 构建镜像用不到的东西不送进构建上下文。工作区的每个成员（crates、bins、bench）都要在：cargo 要读它们的清单。
+.git
+.github
+.claude
+.idea
+target
+**/node_modules
+web/dist
+site
+docs
+tests
+fuzz
