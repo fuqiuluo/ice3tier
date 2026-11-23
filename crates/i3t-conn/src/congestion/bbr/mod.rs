@@ -45,6 +45,8 @@
 //!   流的接收窗口挡住发送时也算没有数据可发，所以单条流被接收窗口限速时，样本都带着应用受限的标记，只能抬高带宽估计。
 //! - 一次丢包检测里判丢的包一起报告，只带其中最晚的那个的发送时刻，丢包就按这个时刻记账（见 [`loss`]）。
 //! - 换路发生在库的下面，库和控制器都得不到通知，只能从往返时间和送达速率的变化自己发现（上一节）。
+//! - 断路之后库的平滑往返时间被旧包的确认抬高，那一阵它的发送节奏比窗口允许的慢得多，这时的送达速率不拿来拉低带宽估计
+//!   （见 [`PACER_LAG`]）。
 //!
 //! # 没有做的
 //!
@@ -120,6 +122,14 @@ const MIN_RTT_FLOOR: Duration = Duration::from_millis(2);
 /// 在途有数据、却至少这么久（并且至少四个往返时间下限）没有收到任何确认，算路断过一次。
 /// 正常的尾部丢包靠探测超时恢复，安静的时间是两三个往返时间；拥塞时确认照样一直在来，只是来得晚。
 const OUTAGE: Duration = Duration::from_secs(1);
+
+/// 库的平滑往返时间比这一批量到的往返时间高出这么多倍时，这一批的送达速率只能用来抬高带宽估计。
+///
+/// 库按"窗口 ÷ 它的平滑往返时间 × 1.25"定发送节奏。断路之后第一批确认里有断路之前发的包（路径层补发的、对端补发的
+/// 旧确认），库从它们得到几秒的往返时间样本，平滑值一下子到几百毫秒，而实际的往返时间只有几毫秒。这时送达速率量的是
+/// 库的发送节奏，不是路径，和应用没有数据可发时一样；拿它拉低带宽估计的话，窗口跟着落到最小，节奏更慢，平滑值要好几秒
+/// 才降得下来。平时一个样本比平滑值低一些是常事，所以要高出几倍才算。
+const PACER_LAG: u32 = 4;
 
 /// 日志里每隔多久记一次估计值。
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
@@ -242,6 +252,10 @@ pub(crate) struct Bbr {
     in_flight: u64,
     /// 上一批确认之后第一次发送的时刻。从那时起发出去的数据还没有任何回音。
     unanswered_since: Option<Instant>,
+    /// 最近一次断路结束的时刻：断了之后第一批确认到达的时候。
+    outage_ended: Option<Instant>,
+    /// 库自己的平滑往返时间，它的发送节奏按这个算（见 [`PACER_LAG`]）。
+    pacing_rtt: Option<Duration>,
     next_report: Instant,
     rng: XorShift,
 }
@@ -278,6 +292,8 @@ impl Bbr {
             last_inflation_probe: None,
             in_flight: 0,
             unanswered_since: None,
+            outage_ended: None,
+            pacing_rtt: None,
             next_report: now + REPORT_INTERVAL,
             rng: XorShift::new(seed),
         }
@@ -318,6 +334,7 @@ impl Bbr {
             tracing::debug!(?silence, "在途的数据很久没有回音，算路断过一次，那之前发出的包的丢失不当作拥塞");
             self.ledger.restart(now, self.epoch_kind(), self.window);
             self.epoch_stale = false;
+            self.outage_ended = Some(now);
         }
         while let Some(verdict) = self.ledger.settle(self.mtu) {
             self.apply_verdict(verdict);
@@ -325,7 +342,11 @@ impl Bbr {
 
         // 往返时间探测期间是自己故意少发，量出来的速率和应用没数据可发时一样，不能用来拉低带宽估计。
         let self_limited = app_limited || matches!(self.state, State::ProbeRtt(_));
-        if let Some(sample) = self.sampler.finish(now, in_flight, self_limited, self.min_rtt.get()) {
+        if let Some(mut sample) = self.sampler.finish(now, in_flight, self_limited, self.min_rtt.get()) {
+            // 库的发送节奏还按断路时抬高的往返时间走，见 [`PACER_LAG`]。
+            if self.pacing_rtt.is_some_and(|srtt| srtt > sample.rtt.max(MIN_RTT_FLOOR) * PACER_LAG) {
+                sample.app_limited = true;
+            }
             let floor = self.min_rtt.update(now, sample.rtt);
             if let Some(rate) = sample.rate {
                 self.round_bw = self.round_bw.max(Some(rate));
@@ -359,6 +380,12 @@ impl Bbr {
 
     fn lost(&mut self, now: Instant, sent: Instant, is_persistent: bool, lost_bytes: u64) {
         if lost_bytes == 0 {
+            return;
+        }
+        // 库判"持续拥塞"的依据是一长段时间里发出的包全丢了。这些包是断路的时候发出的话，那一段已经按断路处理过
+        // （见 `end_acks`，库总是先报这一批确认、再报丢包），和发多少无关，不从头开始。从头开始的话窗口落到最小，
+        // 库的发送节奏又还按断路时抬高的往返时间走（见 [`PACER_LAG`]）：恢复之后一两秒都发不快。
+        if is_persistent && self.outage_ended.is_some_and(|ended| sent < ended) {
             return;
         }
         if is_persistent {
@@ -738,8 +765,9 @@ impl Controller for Bbr {
         self.sent(now, bytes);
     }
 
-    // 库给的往返时间估计用不上：这里要的是每个样本本身，由发送时刻自己算。
-    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, _app_limited: bool, _rtt: &RttEstimator) {
+    // 往返时间的样本由发送时刻自己算。库的估计只用来看它的发送节奏是不是还按断路时的值走。
+    fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, _app_limited: bool, rtt: &RttEstimator) {
+        self.pacing_rtt = Some(rtt.get());
         self.acked(now, sent, bytes);
     }
 

@@ -417,6 +417,53 @@ fn persistent_congestion_starts_over_from_the_minimum_window() {
 }
 
 #[test]
+fn the_persistent_loss_of_what_was_sent_while_the_path_was_down_does_not_start_over() {
+    let start = Instant::now();
+    let mut bbr = new_bbr(start);
+    let now = feed(&mut bbr, start, ms(50), 500);
+    let (bw, floor) = (bbr.bw.get(), bbr.min_rtt.get());
+    // 路断了两秒，这期间发出去的包没有回音。路恢复之后先到一批确认，库接着报告那期间发的包全丢了（持续拥塞）。
+    bbr.sent(now, MTU);
+    bbr.sent(now + secs(1), MTU);
+    let back = now + secs(2);
+    bbr.acked(back, now, MTU);
+    bbr.end_acks(back, MTU, false);
+    bbr.lost(back, now + secs(1), true, MTU);
+    assert_eq!((bbr.bw.get(), bbr.min_rtt.get()), (bw, floor), "断路之前的估计留着");
+    assert!(bbr.window() > 10 * MTU, "{}", bbr.window());
+    // 路恢复之后发的包又持续丢失，照常从头开始。
+    bbr.sent(back + ms(10), MTU);
+    bbr.lost(back + secs(1), back + ms(10), true, MTU);
+    assert_eq!(bbr.window(), MIN_WINDOW_PACKETS * MTU);
+}
+
+#[test]
+fn slow_deliveries_paced_by_a_stale_library_rtt_do_not_lower_the_bandwidth_estimate() {
+    let start = Instant::now();
+    let mut bbr = new_bbr(start);
+    let mut now = feed(&mut bbr, start, ms(50), 500);
+    let bw = bbr.bw.get().unwrap();
+    // 断路之后库的平滑往返时间是 600ms，确认却 50ms 就到：库按 600ms 定的节奏每 100ms 才发一个包。比带宽滤波器的十轮多得多。
+    bbr.pacing_rtt = Some(ms(600));
+    for _ in 0..40 {
+        bbr.sent(now, MTU);
+        bbr.acked(now + ms(50), now, MTU);
+        bbr.end_acks(now + ms(50), 0, false);
+        now += ms(100);
+    }
+    assert_eq!(bbr.bw.get(), Some(bw), "量到的是库的发送节奏，不是路径");
+    // 库的往返时间回到实际的值之后，同样慢的送达就是路径真的慢了。
+    bbr.pacing_rtt = Some(ms(50));
+    for _ in 0..40 {
+        bbr.sent(now, MTU);
+        bbr.acked(now + ms(50), now, MTU);
+        bbr.end_acks(now + ms(50), 0, false);
+        now += ms(100);
+    }
+    assert!(bbr.bw.get().unwrap() < bw / 10, "{:?}", bbr.bw.get());
+}
+
+#[test]
 fn congestion_marks_without_lost_bytes_are_ignored() {
     let start = Instant::now();
     let mut bbr = new_bbr(start);
