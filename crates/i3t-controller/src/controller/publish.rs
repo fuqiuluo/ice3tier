@@ -70,8 +70,13 @@ impl Inner {
             self.sync.entry(*node).or_default();
         }
         let batch = self.reconcile(&view, &access, &seeds);
-        for node in batch {
-            self.publish(&view, &access, node, force == Some(node))?;
+        for &node in &batch {
+            if let Err(err) = self.publish(&view, &access, node, force == Some(node)) {
+                // 这一个和排在它后面的都还没算完，过一会儿再试。`reconcile` 已经替它们登记了等待，
+                // 不重试的话它们要到下一次碰巧有别的变化才会拿到新的 netmap。
+                self.defer(network, batch.range(node..).copied(), RETRY_DELAY);
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -155,15 +160,15 @@ impl Inner {
 
         let sync = self.sync.entry(id).or_default();
         let changed = sync.state.digest != Some(digest);
+        let version = sync.state.version + u64::from(changed);
         if changed {
-            sync.state.version += 1;
+            // 新的版本号先记进存储，记下了才算数。记不下来时这里什么都没动，调用方过一会儿重试，算出来的还是"内容变了"。
+            // 反过来先改这里的话，重试时摘要已经对得上，这一版就既记不下来也发不出去。
+            self.store.set_node_netmap(id, version, &digest)?;
+            sync.state.version = version;
             sync.state.digest = Some(digest);
         }
-        let version = sync.state.version;
         let released = sync.settle(relations);
-        if changed {
-            self.store.set_node_netmap(id, version, &digest)?;
-        }
         self.defer(view.network.id, released, Duration::ZERO);
 
         if (changed || force) && self.is_online(id) {
@@ -171,6 +176,7 @@ impl Inner {
             tracing::debug!(node = %id, version, peers = netmap.peers.len(), relays = netmap.relays.len(), "下发 netmap");
             if self.send(id, ToNode::Snapshot(Box::new(netmap))) {
                 self.counters.snapshots_sent += 1;
+                // 发出去了就是发出去了，先记在这里：节点的确认要拿它来对。存储里的记不下来只是旧一些，下一次发的时候补上。
                 let sync = self.sync.entry(id).or_default();
                 sync.state.sent = version;
                 self.store.set_node_sent(id, version)?;

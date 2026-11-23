@@ -531,10 +531,11 @@ impl Inner {
         }
         sync.state.acked = version;
         let released = sync.confirm(version);
-        self.store.set_node_acked(id, version)?;
+        // 等它确认的对端先排上重算，再去记：节点不会把同一版再确认一遍，记不下来时不能让它们跟着没人管。
         if let Some(network) = self.live.get(&id).map(|live| live.network) {
             self.defer(network, released, self.timing.ack_coalesce);
         }
+        self.store.set_node_acked(id, version)?;
         Ok(())
     }
 

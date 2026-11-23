@@ -3,14 +3,16 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use i3t_model::admin::{Direction, ErrorCode};
+use i3t_model::admin::{CreateRule, Direction, ErrorCode};
 use i3t_model::control::{Declared, Report, Route, RouteEntry, Signal, ToController, ToNode};
+use i3t_proto::NodeId;
 use tokio::sync::mpsc;
 
 use super::super::Timing;
 use super::super::testing::{Lab, Member, REMOTE, hello};
 use super::{add_rule, drop_default_rule, peer_ids, relations};
-use crate::error::Rejection;
+use crate::error::{Error, Rejection};
+use crate::store::NetmapState;
 
 /// 两个在线的节点，一个带标签 `src`，一个带标签 `dst`，之间没有任何规则，都已经确认了当前的 netmap。
 fn two_unconnected(lab: &mut Lab) -> (i3t_model::admin::NetworkId, Member, Member) {
@@ -214,6 +216,134 @@ fn a_netmap_that_keeps_changing_does_not_keep_a_revocation_pending() {
     assert!(source.snapshots.len() >= before + 4, "这期间发起端不断收到新的 netmap");
     lab.settle(&mut [&mut destination, &mut pal]);
     assert!(destination.netmap().peers.is_empty(), "等满一个超时就不再认发起端，重发推迟不了");
+}
+
+/// 比"失败之后多久再试"长：把后台工作的时间往后拨这么多，排着重试的就都到期了，测试不用真的等。
+const PAST_RETRY: Duration = Duration::from_secs(2);
+
+/// 做一遍后台工作，时间算作 `after` 之后。
+fn tick_after(lab: &Lab, after: Duration) -> Result<Option<Instant>, Error> {
+    let mut inner = lab.controller.lock();
+    let wall = inner.clock.now();
+    inner.tick(Instant::now() + after, wall)
+}
+
+/// 存储里记着的这个节点的 netmap 下发到了哪一步。
+fn stored(lab: &Lab, node: NodeId) -> NetmapState {
+    lab.controller.lock().store.node(node).unwrap().expect("节点应该存在").netmap
+}
+
+#[test]
+fn a_netmap_the_store_could_not_record_goes_out_once_it_can() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let mut reporter = lab.join(network.id, &[]);
+    let mut peer = lab.join(network.id, &[]);
+    lab.settle(&mut [&mut reporter, &mut peer]);
+    let version = peer.netmap().version;
+    let before = stored(&lab, peer.id);
+    assert_eq!((before.version, before.sent, before.acked), (version, version, version));
+
+    // 另一头报了新的端点，对端的 netmap 要变；可是轮到重算的时候存储写不进去。
+    report_endpoints(&lab, &reporter, "203.0.113.9:1");
+    lab.controller.lock().store.set_read_only(true);
+    assert!(tick_after(&lab, PAST_RETRY).is_err());
+    assert!(tick_after(&lab, PAST_RETRY).is_err(), "隔一会儿再试，还是写不进去");
+    assert_eq!(peer.receive(), 0, "版本号记不下来，这一版就不发");
+    assert_eq!(stored(&lab, peer.id), before);
+    assert_eq!(lab.controller.node(network.id, peer.id).unwrap().node.netmap_version, version, "没记下来的版本号不算数");
+
+    lab.controller.lock().store.set_read_only(false);
+    tick_after(&lab, PAST_RETRY).unwrap();
+    assert_eq!(peer.receive(), 1, "能写了之后补发");
+    assert_eq!(peer.netmap().version, version + 1);
+    assert_eq!(peer.netmap().peer(reporter.id).unwrap().endpoints[0], "203.0.113.9:1".parse::<SocketAddr>().unwrap());
+    let after = stored(&lab, peer.id);
+    assert_eq!((after.version, after.sent), (version + 1, version + 1));
+    assert!(after.digest.is_some() && after.digest != before.digest);
+
+    lab.settle(&mut [&mut reporter, &mut peer]);
+    assert_eq!(peer.snapshots.last().unwrap().version, version + 1, "只补发一次");
+    assert_eq!(stored(&lab, peer.id).acked, version + 1);
+}
+
+#[test]
+fn a_two_step_change_goes_on_once_the_store_can_record_the_second_step() {
+    let mut lab = Lab::new();
+    let (network, mut source, mut destination) = two_unconnected(&mut lab);
+
+    // 授权：目的端认了、也确认了，轮到发起端时存储写不进去。
+    let rule = add_rule(&lab, network, "src", "dst", Direction::OneWay);
+    destination.receive_and_ack(&lab.controller);
+    lab.controller.lock().store.set_read_only(true);
+    assert!(tick_after(&lab, PAST_RETRY).is_err());
+    assert_eq!(source.receive(), 0);
+    lab.controller.lock().store.set_read_only(false);
+    tick_after(&lab, PAST_RETRY).unwrap();
+    source.receive();
+    assert_eq!(relations(source.netmap()), vec![(destination.id, false, true)], "能写了之后发起端接着拿到许可");
+    lab.settle(&mut [&mut source, &mut destination]);
+
+    // 撤销：发起端停了、也确认了，轮到目的端时存储写不进去。
+    lab.controller.delete_rule(network, rule).unwrap();
+    source.receive_and_ack(&lab.controller);
+    assert!(source.netmap().peers.is_empty());
+    lab.controller.lock().store.set_read_only(true);
+    assert!(tick_after(&lab, PAST_RETRY).is_err());
+    assert_eq!(destination.receive(), 0);
+    lab.controller.lock().store.set_read_only(false);
+    tick_after(&lab, PAST_RETRY).unwrap();
+    destination.receive();
+    assert!(destination.netmap().peers.is_empty(), "能写了之后目的端接着不认发起端");
+}
+
+#[test]
+fn an_acknowledgement_the_store_could_not_record_still_lets_the_peer_go_on() {
+    let mut lab = Lab::new();
+    let (network, mut source, mut destination) = two_unconnected(&mut lab);
+    add_rule(&lab, network, "src", "dst", Direction::OneWay);
+    destination.receive();
+    let version = destination.netmap().version;
+
+    lab.controller.lock().store.set_read_only(true);
+    assert!(lab.controller.handle(destination.session, REMOTE, ToController::Ack { version }).is_err());
+    lab.controller.lock().store.set_read_only(false);
+
+    // 节点不会把同一版再确认一遍：它确认过了就是确认过了，等它的发起端不能就此没人管。
+    tick_after(&lab, PAST_RETRY).unwrap();
+    source.receive();
+    assert_eq!(relations(source.netmap()), vec![(destination.id, false, true)]);
+    assert!(lab.controller.access_graph(network).unwrap().unacknowledged.iter().all(|node| node.id != destination.id));
+}
+
+#[test]
+fn nodes_behind_a_failed_one_in_the_same_push_are_not_forgotten() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    drop_default_rule(&lab, network.id);
+    let mut source = lab.join(network.id, &["src"]);
+    let mut first = lab.join(network.id, &["dst"]);
+    let mut second = lab.join(network.id, &["dst"]);
+    lab.settle(&mut [&mut source, &mut first, &mut second]);
+
+    // 规则存下来了，可是给第一个目的端记新版本号时写不进去：这一次下发到它为止，第二个目的端还没轮到。
+    lab.controller
+        .lock()
+        .store
+        .execute_batch("CREATE TRIGGER no_netmap BEFORE UPDATE OF netmap_version ON nodes BEGIN SELECT RAISE(ABORT, 'no netmap'); END;");
+    let (src, dst) = (lab.group(network.id, "src"), lab.group(network.id, "dst"));
+    let request = CreateRule { name: String::new(), src, dst, direction: Direction::OneWay, enabled: true };
+    assert!(lab.controller.create_rule(network.id, &request).is_err());
+    assert_eq!(first.receive() + second.receive(), 0);
+    lab.controller.lock().store.execute_batch("DROP TRIGGER no_netmap;");
+
+    tick_after(&lab, PAST_RETRY).unwrap();
+    first.receive();
+    second.receive();
+    assert_eq!(relations(first.netmap()), vec![(source.id, true, false)], "失败的那个过一会儿重试");
+    assert_eq!(relations(second.netmap()), vec![(source.id, true, false)], "排在它后面的也没有落下");
+    lab.settle(&mut [&mut source, &mut first, &mut second]);
+    assert_eq!(peer_ids(source.netmap()), vec![first.id, second.id], "两个目的端都确认之后，发起端可以访问它们");
 }
 
 #[test]
