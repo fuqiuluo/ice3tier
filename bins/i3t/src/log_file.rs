@@ -33,7 +33,7 @@ fn parse_size(text: &str) -> Option<u64> {
     number.parse::<u64>().ok()?.checked_mul(1 << shift).filter(|&size| size > 0)
 }
 
-/// 日志文件打不开、过大的归档处理不了的时候，过这么久再试。
+/// 日志文件打不开或者写不进去、过大的归档处理不了的时候，过这么久再试。
 const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// 裁短文件时一次读写这么多。
@@ -55,7 +55,7 @@ pub struct LogFile {
 
 struct State {
     open: Option<Open>,
-    /// 日志文件打不开、轮转不了之后，到这个时刻之前不再试：免得每条日志都把文件系统碰一遍。
+    /// 日志文件打不开、轮转不了、写不进去之后，到这个时刻之前不再试：免得每条日志都把文件系统碰一遍。
     closed_until: Option<Instant>,
     /// 什么时候去看归档有没有超过上限。看过没有问题就不再看：之后只有这里往归档里放东西。
     check_archive_at: Option<Instant>,
@@ -103,16 +103,18 @@ impl LogFile {
         if state.open.is_none() && !insist && state.closed_until.is_some_and(|until| Instant::now() < until) {
             return;
         }
-        match self.ready(state.open.take(), size) {
-            Ok(mut current) => {
-                current.len = match current.file.write_all(head).and_then(|()| current.file.write_all(newline)) {
-                    Ok(()) => current.len.saturating_add(size),
-                    // 没写进去（盘满了），或者只写进去一半：有多少以文件为准。文件留着开，下一条接着试。
-                    Err(_) => current.file.metadata().map_or(current.len.saturating_add(size), |file| file.len()),
-                };
+        let written = self.ready(state.open.take(), size).and_then(|mut current| {
+            current.file.write_all(head)?;
+            current.file.write_all(newline)?;
+            current.len = current.len.saturating_add(size);
+            Ok(current)
+        });
+        match written {
+            Ok(current) => {
                 state.open = Some(current);
                 state.closed_until = None;
             }
+            // 打不开、轮转不了、写不进去（盘满了）都一样：文件关上，过一会儿重新打开再试，里面有多少字节到时候重新看。
             Err(_) => state.closed_until = Some(Instant::now() + RETRY_AFTER),
         }
     }
@@ -166,14 +168,17 @@ impl LogFile {
         Ok(())
     }
 
-    /// 旧版本留下的归档可能比上限大：裁短，裁不了就删掉。都不成（正被别的程序开着）就是错误，过一会儿再试。
+    /// 旧版本留下的归档可能比上限大：裁短，裁不了就删掉。都不成（正被别的程序开着），或者连看都看不了，就是错误，过一会儿再试。
     fn fit_archive(&self) -> io::Result<()> {
         match fs::symlink_metadata(&self.archive) {
             Ok(archive) if archive.is_file() && archive.len() > self.limit => {
                 shrink(&self.archive, self.limit).or_else(|_| fs::remove_file(&self.archive))
             }
-            // 没有归档、没有超过上限，或者那里根本不是文件。
-            _ => Ok(()),
+            // 没有超过上限，或者那里根本不是文件。
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            // 一时看不了不等于没有问题：过一会儿再看。
+            Err(err) => Err(err),
         }
     }
 }
@@ -530,6 +535,26 @@ mod tests {
         assert_eq!(read(&path), "i3t: 配置文件读不了\nand on\n");
     }
 
+    /// `/dev/full` 打得开，往里写总是"盘满了"。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_disk_pauses_writing_instead_of_failing_on_every_record() {
+        let log = LogFile::open(PathBuf::from("/dev/full"), LIMIT);
+        assert!(log.state.lock().unwrap().open.is_some(), "文件打得开");
+
+        write(&log, "no space left\n");
+        let paused_until = {
+            let state = log.state.lock().unwrap();
+            assert!(state.open.is_none(), "写不进去：关上，到时候重新打开（句柄本身坏了的话也就换掉了）");
+            state.closed_until.expect("记着过一会儿再试")
+        };
+        assert!(paused_until > Instant::now());
+
+        write(&log, "too soon\n");
+        let state = log.state.lock().unwrap();
+        assert!(state.open.is_none() && state.closed_until == Some(paused_until), "还没到时候，这一条没有再去写");
+    }
+
     /// 这些测试靠文件权限造出"改不了、打不开"，特权用户不受权限管，测不了。
     #[cfg(unix)]
     mod without_permission {
@@ -621,6 +646,29 @@ mod tests {
             log.append_line("i3t: 再写一行");
             assert_eq!(read(&archive), "older\n".repeat(170), "归档裁到了上限以内");
             assert!(log.state.lock().unwrap().check_archive_at.is_none(), "不用再看了");
+        }
+
+        #[test]
+        fn an_archive_that_cannot_even_be_looked_at_is_looked_at_again_later() {
+            let outside = tempfile::tempdir().unwrap();
+            if privileged(outside.path()) {
+                return;
+            }
+            let dir = outside.path().join("state");
+            fs::create_dir(&dir).unwrap();
+            let archive = dir.join("i3t.log.old");
+            fs::write(&archive, "older\n".repeat(1000)).unwrap();
+            // 目录进不去：归档有多大都看不了，这不等于它没有问题。
+            allow(&dir, 0o000);
+
+            let log = LogFile::open(dir.join("i3t.log"), LIMIT);
+            assert!(log.state.lock().unwrap().check_archive_at.is_some_and(|at| at > Instant::now()), "记着过一会儿再看");
+
+            allow(&dir, 0o755);
+            log.state.lock().unwrap().check_archive_at = Some(Instant::now());
+            log.append_line("i3t: 再写一行");
+            assert_eq!(read(&archive), "older\n".repeat(170), "看得了之后归档裁到了上限以内");
+            assert_eq!(read(&dir.join("i3t.log")), "i3t: 再写一行\n");
         }
     }
 

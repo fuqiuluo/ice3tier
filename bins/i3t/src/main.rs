@@ -365,25 +365,35 @@ fn runs_as_service(state: &StateDir) -> bool {
 /// 服务控制管理器启动的节点：日志写进状态目录里的文件（服务没有终端），停止的通知来自 SCM。
 #[cfg(windows)]
 fn run_as_service(state: StateDir, version: Version, r#static: Option<PathBuf>) -> anyhow::Result<ExitCode> {
-    // 一个日志文件的上限有默认值，可以用环境变量改。给的值读不懂就用默认的，在日志里说一声。
-    let setting = std::env::var_os(log_file::LIMIT_ENV).map(|value| value.to_string_lossy().into_owned());
-    let limit = log_file::limit(setting.as_deref());
-    let log = std::sync::Arc::new(log_file::LogFile::open(state.path().join(SERVICE_LOG), limit.unwrap_or(log_file::DEFAULT_LIMIT)));
-    if let (None, Some(setting)) = (limit, &setting) {
-        log.append_line(&format!("i3t: {}", (texts().ui.bad_log_size_env)(setting, log_file::DEFAULT_LIMIT >> 20)));
-    }
-    let job = move |stop: service::Stop| match run_node(&state, &version, r#static, &LogTo::File(std::sync::Arc::clone(&log)), stop) {
-        Ok(Outcome::Stopped) => 0,
-        Ok(Outcome::Restart) => u32::from(RESTART_EXIT_CODE),
-        Err(error) => {
-            // 出错可能早于日志初始化（配置文件读不了），所以直接写进日志文件。
-            log.append_line(&format!("i3t: {}", i3t_lang::current().chain(error.chain())));
-            // 重启也救不了的以 0 停止，服务控制管理器不再拉；别的它过一会儿重新启动。
-            if is_unrecoverable(&error) { 0 } else { 1 }
+    let job = move |stop: service::Stop| {
+        // 到这里才碰日志文件：这时确实是服务控制管理器启动的（在终端里执行 `i3t run --service` 走不到这里，
+        // 动不了正在运行的服务的日志），也已经向它报了"运行中"，旧版本留下的大文件裁多久都不耽误启动。
+        let log = service_log(&state);
+        match run_node(&state, &version, r#static, &LogTo::File(std::sync::Arc::clone(&log)), stop) {
+            Ok(Outcome::Stopped) => 0,
+            Ok(Outcome::Restart) => u32::from(RESTART_EXIT_CODE),
+            Err(error) => {
+                // 出错可能早于日志初始化（配置文件读不了），所以直接写进日志文件。
+                log.append_line(&format!("i3t: {}", i3t_lang::current().chain(error.chain())));
+                // 重启也救不了的以 0 停止，服务控制管理器不再拉；别的它过一会儿重新启动。
+                if is_unrecoverable(&error) { 0 } else { 1 }
+            }
         }
     };
     service::dispatch(job).context(texts().service.not_started_by_system)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// 打开服务的日志文件。一个文件的上限有默认值，可以用环境变量改；给的值读不懂就用默认的，在日志里说一声。
+#[cfg(windows)]
+fn service_log(state: &StateDir) -> std::sync::Arc<log_file::LogFile> {
+    let setting = std::env::var_os(log_file::LIMIT_ENV).map(|value| value.to_string_lossy().into_owned());
+    let limit = log_file::limit(setting.as_deref());
+    let log = log_file::LogFile::open(state.path().join(SERVICE_LOG), limit.unwrap_or(log_file::DEFAULT_LIMIT));
+    if let (None, Some(setting)) = (limit, &setting) {
+        log.append_line(&format!("i3t: {}", (texts().ui.bad_log_size_env)(setting, log_file::DEFAULT_LIMIT >> 20)));
+    }
+    std::sync::Arc::new(log)
 }
 
 /// `i3t service install`、`i3t service uninstall`。
