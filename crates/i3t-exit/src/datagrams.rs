@@ -132,6 +132,8 @@ impl Outcome {
 /// 往它发过报文的一个地址：从它回来的报文报成什么来源，那是不是出口流量，以及当初凭什么放行的。
 #[derive(Debug, Clone)]
 struct Source {
+    /// 检查通过的那个地址（经过 [`System::udp_route`] 之前的）。
+    addr: SocketAddr,
     target: Target,
     exit_traffic: bool,
     grant: Grant,
@@ -148,7 +150,7 @@ struct Verdict {
 struct Destinations {
     /// 这些结论是按哪一版 netmap 得出的。
     netmap_version: u64,
-    /// 这些结论是按程序自己的监听的哪一版得出的（`i3t_access::OwnListeners::generation`）。
+    /// 这些结论是按程序自己的 UDP 监听的哪一版得出的（`i3t_access::OwnListeners::generation`）。
     listeners_generation: u64,
     verdicts: HashMap<Target, Verdict>,
     /// 往它发过报文的地址，以及从它回来的报文报成什么来源。
@@ -157,13 +159,19 @@ struct Destinations {
 
 impl Destinations {
     /// netmap 换了一版：出口的能力、端口、访问关系都可能变了，之前的结论全部作废。
-    /// 程序自己的监听变了（`listeners` 是那张表的版本）也一样：原先可以发的地址上可能刚开了一个自己的监听，
-    /// 结论不重新得出的话，报文还会接着往那里发到结论过期为止。
-    fn follow(&mut self, netmap: &Netmap, listeners: u64) {
-        if self.netmap_version != netmap.version || self.listeners_generation != listeners {
+    ///
+    /// 程序自己的 UDP 监听变了（`listeners` 是那张表的版本）：和它有关的只有"本节点的端口"和局域网目标，
+    /// 这两种的结论下次重新得出；记着的来源只去掉现在成了程序自己的监听的那些（`held`）。别的都不动：
+    /// 一个上下文往好几个目标发报文，全清掉的话，别的目标在路上的回包就送不回去了。
+    fn follow(&mut self, netmap: &Netmap, listeners: u64, held: impl Fn(SocketAddr) -> bool) {
+        if self.netmap_version != netmap.version {
             (self.netmap_version, self.listeners_generation) = (netmap.version, listeners);
             self.verdicts.clear();
             self.sources.clear();
+        } else if self.listeners_generation != listeners {
+            self.listeners_generation = listeners;
+            self.verdicts.retain(|target, _| !matches!(target, Target::Node { .. } | Target::Lan { .. }));
+            self.sources.retain(|_, source| !(matches!(source.grant, Grant::NodeService | Grant::Lan) && held(source.addr)));
         }
     }
 
@@ -325,7 +333,8 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
     /// 把发起节点发来的一个报文发往它的目标。返回有没有发出去。
     async fn send_to_target(&self, datagram: &Received, destinations: &mut Destinations, tally: &mut Tally, onward: Onward<'_, C>) -> bool {
         let netmap = Arc::clone(&self.netmap.borrow());
-        destinations.follow(&netmap, self.outbound.own_listeners().generation());
+        let listeners = self.outbound.own_listeners().generation(ForwardProtocol::Udp);
+        destinations.follow(&netmap, listeners, |addr| self.outbound.own_listener_holds(ForwardProtocol::Udp, addr));
         let now = Instant::now();
         let outcome = match destinations.verdict(&datagram.target, now) {
             Some(outcome) => outcome,
@@ -333,7 +342,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                 let outcome = match self.check(&netmap, &datagram.target).await {
                     Ok(Checked::Address(Destination { addr, source, exit_traffic, grant })) => {
                         let real = self.outbound.udp_route(addr);
-                        destinations.sources.insert(real, Source { target: source, exit_traffic, grant });
+                        destinations.sources.insert(real, Source { addr, target: source, exit_traffic, grant });
                         Outcome::Allowed { real, exit_traffic, grant }
                     }
                     Ok(Checked::Onward { forward, node, grant }) => Outcome::Onward { forward, node, grant },
@@ -586,7 +595,7 @@ mod tests {
         let now = Instant::now();
 
         let allowed = Outcome::Allowed { real, exit_traffic: false, grant: Grant::NodeService };
-        let source = || Source { target: target(53), exit_traffic: false, grant: Grant::NodeService };
+        let source = || Source { addr: real, target: target(53), exit_traffic: false, grant: Grant::NodeService };
         destinations.remember(target(53), allowed, now);
         destinations.remember(target(54), Outcome::Refused, now);
         destinations.sources.insert(real, source());
@@ -606,20 +615,58 @@ mod tests {
         destinations.remember(target(53), allowed, now);
         destinations.sources.insert(real, source());
         let mut netmap = netmap();
-        destinations.follow(&netmap, 0);
+        let nothing_held = |_: SocketAddr| false;
+        destinations.follow(&netmap, 0, nothing_held);
         assert!(destinations.verdicts.is_empty() && destinations.sources.is_empty());
         destinations.remember(target(53), allowed, now);
-        destinations.follow(&netmap, 0);
+        destinations.follow(&netmap, 0, nothing_held);
         assert_eq!(destinations.verdicts.len(), 1, "同一版 netmap 不清");
         netmap.version += 1;
-        destinations.follow(&netmap, 0);
+        destinations.follow(&netmap, 0, nothing_held);
         assert!(destinations.verdicts.is_empty());
+    }
 
-        // 程序自己的监听变了也一样：原先可以发的地址上可能刚开了一个自己的监听。
-        destinations.remember(target(53), allowed, now);
-        destinations.sources.insert(real, source());
-        destinations.follow(&netmap, 1);
-        assert!(destinations.verdicts.is_empty() && destinations.sources.is_empty());
+    #[test]
+    fn a_change_in_the_programs_own_listeners_redoes_node_and_lan_verdicts_only_and_keeps_replies_on_their_way() {
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let internet = Target::Internet { host: Host::Ip(at("93.184.216.34:443").ip()), port: 443 };
+        let (node, lan, forward) = (Target::Node { port: 53 }, Target::Lan { addr: at("192.168.77.20:161") }, Target::Forward { id: 7 });
+        let grants = [
+            (internet.clone(), at("93.184.216.34:443"), Grant::Internet { port: 443 }),
+            (node.clone(), at("192.168.77.5:53"), Grant::NodeService),
+            (lan.clone(), at("192.168.77.20:161"), Grant::Lan),
+            (forward.clone(), at("127.0.0.1:5353"), Grant::Forward { id: 7, addr: at("127.0.0.1:5353") }),
+        ];
+        let netmap = netmap();
+        let now = Instant::now();
+        let filled = || {
+            let mut destinations = Destinations::default();
+            destinations.follow(&netmap, 0, |_| false);
+            for (target, addr, grant) in grants.clone() {
+                destinations.remember(target.clone(), Outcome::Allowed { real: addr, exit_traffic: false, grant }, now);
+                destinations.sources.insert(addr, Source { addr, target, exit_traffic: false, grant });
+            }
+            destinations
+        };
+
+        // 别的监听变了，记着的地址上没有：两种和监听有关的结论重新得出，回包的来源一个不少。
+        let mut destinations = filled();
+        destinations.follow(&netmap, 1, |_| false);
+        assert!(destinations.verdict(&internet, now).is_some() && destinations.verdict(&forward, now).is_some());
+        assert!(destinations.verdict(&node, now).is_none() && destinations.verdict(&lan, now).is_none());
+        assert_eq!(destinations.sources.len(), 4);
+
+        // 本节点的那个端口上现在是程序自己的监听：只有它的来源去掉。
+        let mut destinations = filled();
+        destinations.follow(&netmap, 1, |addr| addr == at("192.168.77.5:53"));
+        let kept: Vec<bool> = grants.iter().map(|(_, addr, _)| destinations.sources.contains_key(addr)).collect();
+        assert_eq!(kept, [true, false, true, true]);
+
+        // 互联网目标和端口转发的地址即使被说成"是"，也和程序自己的监听无关，不动。
+        let mut destinations = filled();
+        destinations.follow(&netmap, 1, |_| true);
+        let kept: Vec<bool> = grants.iter().map(|(_, addr, _)| destinations.sources.contains_key(addr)).collect();
+        assert_eq!(kept, [true, false, false, true]);
     }
 
     /// 一份最小的 netmap，只用到它的版本号。

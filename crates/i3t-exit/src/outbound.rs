@@ -189,6 +189,12 @@ impl<S: System> Outbound<S> {
         &self.inner.own_listeners
     }
 
+    /// `addr` 是不是本机的地址、上面又正好是程序自己的监听（`protocol` 那一种）。读不到本机网卡的地址时按"是本机的"算。
+    pub(crate) fn own_listener_holds(&self, protocol: ForwardProtocol, addr: SocketAddr) -> bool {
+        let own = self.interfaces().map_or(true, |interfaces| is_own_address(&interfaces, addr.ip().to_canonical()));
+        own && self.inner.own_listeners.receives(protocol, addr)
+    }
+
     /// 互联网目标：本节点必须是出口，端口要在允许的范围里，解析出来的每一个地址都要过出站策略。
     pub(crate) async fn internet(&self, netmap: &Netmap, host: &Host, port: u16, asker: Asker) -> Result<TcpStream, Reply> {
         let (role, targets) = self.internet_targets(netmap, host, port, asker).await?;
@@ -266,15 +272,17 @@ impl<S: System> Outbound<S> {
             Some(ExitRole { lan: true, .. }) => {}
         }
         let ip = addr.ip().to_canonical();
-        let attached = self.interfaces()?.iter().any(|net| !net.addr().is_loopback() && subnet_contains(net, ip));
+        let interfaces = self.interfaces()?;
+        let attached = interfaces.iter().any(|net| !net.addr().is_loopback() && subnet_contains(net, ip));
         let refused = if ip.is_loopback() || policy::is_link_local(ip) || netmap::is_cloud_metadata(ip) {
             Some("回环、链路本地和云平台的元数据地址不算局域网")
         } else if netmap.network.is_overlay_address(ip) {
             Some("覆盖网的地址不算局域网")
         } else if !attached {
             Some("目标不在本机网卡直连的网段里")
-        } else if self.inner.own_listeners.receives(protocol, SocketAddr::new(ip, addr.port())) {
+        } else if is_own_address(&interfaces, ip) && self.inner.own_listeners.receives(protocol, SocketAddr::new(ip, addr.port())) {
             // 本机在那个网段里的地址也算局域网里的地址。程序自己的监听在上面的话，和访问本节点的端口时一样不去连。
+            // 只看本机的地址：同一个网段里别的机器的同一个端口和程序自己的监听没有关系。
             Some("目标是这个节点自己的代理或者端口转发的监听，出口不从本机去连它")
         } else {
             None
@@ -687,6 +695,11 @@ fn forbidden_as_internet(network: &Network, interfaces: &[IpNet], nodes: &[IpAdd
 }
 
 /// `ip` 是不是在这块网卡的网段里。前缀长度是 0 的网卡地址（没有网段信息）只算它自己。
+/// `ip`（规范形式）是不是本机某块网卡上的地址。
+fn is_own_address(interfaces: &[IpNet], ip: IpAddr) -> bool {
+    interfaces.iter().any(|net| net.addr().to_canonical() == ip)
+}
+
 fn subnet_contains(interface: &IpNet, ip: IpAddr) -> bool {
     if interface.prefix_len() == 0 { interface.addr() == ip } else { interface.contains(&ip) }
 }

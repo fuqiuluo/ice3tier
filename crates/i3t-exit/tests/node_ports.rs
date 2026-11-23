@@ -11,10 +11,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::{
-    GW, LAPTOP, NAS, PATIENCE, Target, UdpTarget, World, assert_echo, assert_reset, drain, echo_server, node, non_loopback_address,
-    peer_mut, proxy, socks5, udp_associate, udp_echo_server,
+    GW, LAPTOP, NAS, PATIENCE, PUBLIC_IP, Target, UdpTarget, World, assert_echo, assert_reset, drain, echo_server, node,
+    non_loopback_address, peer_mut, proxy, socks5, udp_associate, udp_echo_server,
 };
-use i3t_access::{OwnListener, TargetCause};
+use i3t_access::{ListenState, OwnListener, TargetCause};
 use i3t_model::netmap::{ExitRole, Forward, ForwardProtocol, ForwardTarget, ListenerProtocol, PeerExit, ProxyProtocol};
 use ipnet::IpNet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -208,12 +208,19 @@ async fn the_exits_own_address_on_its_lan_does_not_lead_to_what_the_program_itse
     world.gw.system.redirect("192.168.77.5:5353", udp_trap.addr());
     world.gw.system.redirect("192.168.77.5:9090", echo_server().await);
     world.gw.system.redirect("192.168.77.5:5354", udp_echo_server().await);
-    // 这个程序自己的监听：那个地址上的一个代理，全部地址上的一条转发，那个地址上的一条 UDP 转发。
+    world.gw.system.redirect("192.168.77.5:5355", udp_trap.addr());
+    // 同一个网段里的另一台机器，上面的服务正好用着和下面那些监听一样的端口。
+    for port in [8080, 8081] {
+        world.gw.system.redirect(&format!("192.168.77.20:{port}"), echo_server().await);
+    }
+    world.gw.system.redirect("192.168.77.20:5355", udp_echo_server().await);
+    // 这个程序自己的监听：那个地址上的一个代理，全部地址上的一条转发，那个地址上的和全部地址上的各一条 UDP 转发。
     let listener = |protocol, local: &str| OwnListener { protocol, local: local.parse().unwrap(), forward: None };
     let _held = [
         world.gw.own_listeners.claim(listener(TCP, "192.168.77.5:8080")),
         world.gw.own_listeners.claim(listener(TCP, "0.0.0.0:8081")),
         world.gw.own_listeners.claim(listener(UDP, "192.168.77.5:5353")),
+        world.gw.own_listeners.claim(listener(UDP, "[::]:5355")),
     ];
 
     // 别的节点把它们当成局域网目标来访问：出口不去连。连了的话，来源是 gw 自己在这个网段里的地址。
@@ -221,7 +228,9 @@ async fn the_exits_own_address_on_its_lan_does_not_lead_to_what_the_program_itse
         assert_eq!(socks5(world.socks().await, None, "192.168.77.5", port).await.failed(), 2, "{port}");
     }
     let client = udp_associate(world.socks().await, None).await;
-    client.send("192.168.77.5", 5353, b"query").await;
+    for port in [5353, 5355] {
+        client.send("192.168.77.5", port, b"query").await;
+    }
     client.assert_silent(QUIET).await;
     trap.assert_untouched(QUIET).await;
     udp_trap.assert_untouched(QUIET).await;
@@ -232,6 +241,54 @@ async fn the_exits_own_address_on_its_lan_does_not_lead_to_what_the_program_itse
     assert_echo(&mut stream).await;
     client.send("192.168.77.5", 5354, b"other service").await;
     assert_eq!(client.recv().await.1, b"other service");
+
+    // 同一个网段里别的机器也照常可达，哪怕端口和程序自己的监听一样：监听在全部地址上的，管的也只是本机的地址。
+    for port in [8080, 8081] {
+        let mut stream = socks5(world.socks().await, None, "192.168.77.20", port).await.connected();
+        assert_echo(&mut stream).await;
+    }
+    client.send("192.168.77.20", 5355, b"another host").await;
+    assert_eq!(client.recv().await, ("192.168.77.20:5355".to_owned(), b"another host".to_vec()));
+}
+
+#[tokio::test]
+async fn replies_on_their_way_from_other_targets_still_come_back_when_a_listener_of_the_program_appears() {
+    let world = World::new().await;
+    let far = UdpTarget::bind("127.0.0.1").await;
+    world.gw.system.redirect(&format!("{PUBLIC_IP}:443"), far.addr());
+    world.gw.system.redirect("93.184.216.35:443", udp_echo_server().await);
+    let client = udp_associate(world.socks().await, None).await;
+    client.send(PUBLIC_IP, 443, b"request").await;
+    let (_, exit_port) = far.recv().await;
+
+    // 这时程序自己开了一个 UDP 监听，客户端接着往别的目标发报文。
+    let _held = world.gw.own_listeners.claim(OwnListener { protocol: UDP, local: "192.168.77.5:5353".parse().unwrap(), forward: None });
+    client.send("93.184.216.35", 443, b"elsewhere").await;
+    assert_eq!(client.recv().await.1, b"elsewhere");
+
+    // 第一个目标迟到的回包照样送回去：它和程序自己的监听没有关系。
+    far.send(b"late reply", exit_port).await;
+    assert_eq!(client.recv().await, (format!("{PUBLIC_IP}:443"), b"late reply".to_vec()));
+}
+
+#[tokio::test]
+async fn a_listener_that_cannot_be_bound_is_not_registered_however_often_it_is_retried() {
+    let world = World::new().await;
+    // 这个端口在别的程序手里。
+    let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken = squatter.local_addr().unwrap();
+    let status = world.nas.update(|netmap| netmap.me.forwards.push(forward(7, TCP, &taken.to_string(), LAPTOP))).await;
+    assert!(matches!(status.forwards[0].state, ListenState::PortInUse { .. }), "{:?}", status.forwards[0].state);
+
+    let generations = || (world.nas.own_listeners.generation(TCP), world.nas.own_listeners.generation(UDP));
+    let before = generations();
+    // netmap 每变一次，绑不上的监听就重试一遍。
+    for round in 0..3 {
+        world.nas.update(|netmap| peer_mut(netmap, GW).keep_alive = round % 2 == 0).await;
+    }
+    assert_eq!(generations(), before, "重试没有登记、撤销任何东西");
+    assert!(!world.nas.own_listeners.receives(TCP, taken), "别的程序的端口没有被当成自己的");
+    drop(squatter);
 }
 
 #[tokio::test]

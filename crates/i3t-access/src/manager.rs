@@ -348,22 +348,24 @@ impl<C: Connector + Datagrams> Access<C> {
             Key::Proxy { .. } | Key::Local { .. } => (ForwardProtocol::Tcp, None),
         };
         let claim = |local| self.shared.own_listeners.claim(OwnListener { protocol, local, forward });
-        // 端口定了的先登记再绑，绑不上就撤销；等系统挑端口的，绑上之后、开始收连接之前登记（[`OwnListeners::claim`]）。
-        let early = (bind.port() != 0).then(|| claim(bind));
+        // 只登记绑上了的（[`OwnListeners::claim`]）：绑不上的隔一阵重试一次，那个端口多半在别的程序手里。
         let started = match key {
             Key::Forward { id, protocol: ForwardProtocol::Udp, .. } => udp_socket(bind, free).map(|socket| {
                 let local = socket.local_addr().unwrap_or(bind);
-                let claim = early.unwrap_or_else(|| claim(local));
+                // UDP 的端口一绑上就在收，绑上马上登记。
+                let claim = claim(local);
                 let span = tracing::info_span!("access", listen = %key);
                 let sessions = udp::forward::serve(Arc::clone(&self.shared), *id, configured, socket, counters.clone());
                 (local, Serving { task: tokio::spawn(sessions.instrument(span)), _claim: claim })
             }),
             Key::Forward { protocol: ForwardProtocol::Tcp, .. } | Key::Proxy { .. } | Key::Local { .. } => {
-                tcp_listener(bind, free).map(|listener| {
-                    let local = listener.local_addr().unwrap_or(bind);
-                    let claim = early.unwrap_or_else(|| claim(local));
+                tcp_bound(bind, free).and_then(|socket| {
+                    let local = socket.local_addr().unwrap_or(bind);
+                    // 绑上了、还没有开始监听，这时连不进来：先登记，再开始监听。
+                    let claim = claim(local);
+                    let listener = socket.listen(TCP_BACKLOG)?;
                     let task = tokio::spawn(accept_loop(Arc::clone(&self.shared), key.clone(), listener, counters.clone()));
-                    (local, Serving { task, _claim: claim })
+                    Ok((local, Serving { task, _claim: claim }))
                 })
             }
         };
@@ -637,18 +639,21 @@ impl Drop for Bound {
     }
 }
 
-/// TCP 的监听。`free` 时（地址是本节点的虚拟 IP）地址还不在网卡上也绑得上（[`free_bind`]）。
-fn tcp_listener(bind: SocketAddr, free: bool) -> io::Result<TcpListener> {
-    if !free {
-        return i3t_underlay::tcp_mss::listen(bind);
-    }
+/// TCP 的监听上排队的连接最多这么多条，和 `i3t_underlay::tcp_mss::listen` 一样。
+const TCP_BACKLOG: u32 = 1024;
+
+/// 绑好了、还没有开始监听的 TCP socket，开始监听留给调用方：这中间连不进来，调用方趁这时把它登记成程序自己的监听。
+/// 别的和 `i3t_underlay::tcp_mss::listen` 做的一样。`free` 时（地址是本节点的虚拟 IP）地址还不在网卡上也绑得上（[`free_bind`]）。
+fn tcp_bound(bind: SocketAddr, free: bool) -> io::Result<TcpSocket> {
     let socket = if bind.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
     #[cfg(unix)]
     socket.set_reuseaddr(true)?;
-    free_bind(&socket2::SockRef::from(&socket))?;
+    if free {
+        free_bind(&socket2::SockRef::from(&socket))?;
+    }
     i3t_underlay::tcp_mss::clamp(&socket);
     socket.bind(bind)?;
-    socket.listen(1024)
+    Ok(socket)
 }
 
 /// UDP 的监听，`free` 同上。

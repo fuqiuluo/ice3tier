@@ -24,10 +24,11 @@ pub struct OwnListener {
 }
 
 impl OwnListener {
-    /// 发往 `addr` 的连接（`protocol` 是 UDP 时是报文）是不是落在这个监听上。IPv4 映射的 IPv6 地址按里面的 IPv4 地址算。
+    /// 发往本机的地址 `addr` 的连接（`protocol` 是 UDP 时是报文）是不是落在这个监听上。
+    /// IPv4 映射的 IPv6 地址按里面的 IPv4 地址算。
     ///
-    /// 监听在全部地址上的，哪个地址上的这个端口都算它的：`[::]` 在有的系统上不收 IPv4 的，这里也按收算，
-    /// 宁可少连一个地址，不把来源洗成本机。
+    /// `addr` 要是本机的地址，这由调用方保证：监听在全部地址上的，哪个地址上的这个端口都算它的，拿别的机器的地址来问也会说"是"。
+    /// `[::]` 在有的系统上不收 IPv4 的，这里也按收算，宁可少连一个地址，不把来源洗成本机。
     #[must_use]
     pub fn receives(&self, protocol: ForwardProtocol, addr: SocketAddr) -> bool {
         let wanted = addr.ip().to_canonical();
@@ -48,10 +49,21 @@ pub struct OwnListeners {
 
 #[derive(Debug, Default)]
 struct Shared {
-    /// 每次登记、撤销之后加一：凭它知道以前查的结论还作不作数。
-    generation: AtomicU64,
+    /// TCP 的监听每次登记、撤销之后加一：凭它知道以前查的结论还作不作数。
+    tcp_generation: AtomicU64,
+    /// 同上，UDP 的。
+    udp_generation: AtomicU64,
     next_claim: AtomicU64,
     held: Mutex<Vec<Held>>,
+}
+
+impl Shared {
+    const fn generation(&self, protocol: ForwardProtocol) -> &AtomicU64 {
+        match protocol {
+            ForwardProtocol::Tcp => &self.tcp_generation,
+            ForwardProtocol::Udp => &self.udp_generation,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -63,24 +75,28 @@ struct Held {
 impl OwnListeners {
     /// 登记一个监听，返回的凭据丢掉时撤销。
     ///
-    /// 地址定了的要在绑定之前登记：从登记的那一刻起出口就不去连这个地址，而绑上之前本来也没有人在那里听，
-    /// 这样不留"已经在听、出口还不知道"的空当。端口等系统挑的，绑上之后马上登记。撤销要等监听真的关掉之后。
+    /// 要在这个监听收得到东西之前登记，这样不留"已经在听、出口还不知道"的空当：TCP 的在绑上之后、开始监听之前
+    /// （这中间连不进来）；UDP 的端口一绑上就在收，绑上马上登记。绑不上会隔一阵重试的监听只在绑上之后登记：
+    /// 每次重试都登记再撤销的话，别的程序占着的端口会被当成自己的，版本号也跟着白白地变。只开一次、不重试的，
+    /// 可以在绑之前就登记，绑不上就把凭据丢掉。撤销要等监听真的关掉之后。
     #[must_use = "凭据一丢掉，登记就撤销了"]
     pub fn claim(&self, listener: OwnListener) -> Claim {
         let claim = self.shared.next_claim.fetch_add(1, Ordering::Relaxed);
         self.held().push(Held { claim, listener });
         // 先改表再改版本号：读到新版本号的一定读得到新的表。
-        self.shared.generation.fetch_add(1, Ordering::SeqCst);
-        Claim { listeners: self.clone(), claim }
+        self.shared.generation(listener.protocol).fetch_add(1, Ordering::SeqCst);
+        Claim { listeners: self.clone(), claim, protocol: listener.protocol }
     }
 
-    /// 每次登记、撤销之后都不一样。记着"某个地址可以连"这类结论的地方，看到它变了就重新查。
+    /// `protocol` 这一种监听每次登记、撤销之后都不一样。记着"某个地址可以连"这类结论的地方，看到它变了就重新查。
+    /// 两种协议各算各的：TCP 的监听变了，和 UDP 的报文发到哪里没有关系。
     #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.shared.generation.load(Ordering::SeqCst)
+    pub fn generation(&self, protocol: ForwardProtocol) -> u64 {
+        self.shared.generation(protocol).load(Ordering::SeqCst)
     }
 
-    /// 发往 `addr` 的连接（`protocol` 是 UDP 时是报文）是不是落在程序自己的某个监听上。
+    /// 发往本机的地址 `addr` 的连接（`protocol` 是 UDP 时是报文）是不是落在程序自己的某个监听上。
+    /// `addr` 要是本机的地址（[`OwnListener::receives`]）。
     #[must_use]
     pub fn receives(&self, protocol: ForwardProtocol, addr: SocketAddr) -> bool {
         self.held().iter().any(|held| held.listener.receives(protocol, addr))
@@ -105,12 +121,13 @@ impl OwnListeners {
 pub struct Claim {
     listeners: OwnListeners,
     claim: u64,
+    protocol: ForwardProtocol,
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
         self.listeners.held().retain(|held| held.claim != self.claim);
-        self.listeners.shared.generation.fetch_add(1, Ordering::SeqCst);
+        self.listeners.shared.generation(self.protocol).fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -151,25 +168,30 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_holds_until_it_is_dropped_and_every_change_moves_the_generation() {
+    fn a_claim_holds_until_it_is_dropped_and_moves_the_generation_of_its_own_protocol() {
         let listeners = OwnListeners::default();
-        let start = listeners.generation();
+        let start = (listeners.generation(TCP), listeners.generation(UDP));
         assert!(!listeners.receives(TCP, at("192.168.1.5:8080")));
 
         let proxy = listeners.claim(listener("192.168.1.5:8080"));
+        assert_ne!(listeners.generation(TCP), start.0);
+        assert_eq!(listeners.generation(UDP), start.1, "TCP 的监听变了，UDP 的版本不动");
+
         let forward = listeners.clone().claim(OwnListener { protocol: UDP, local: at("0.0.0.0:40123"), forward: Some(7) });
         assert!(listeners.receives(TCP, at("192.168.1.5:8080")) && listeners.receives(UDP, at("10.66.0.1:40123")));
         assert!(listeners.forward_listens_on(7, UDP, 40123));
         assert!(!listeners.forward_listens_on(7, TCP, 40123) && !listeners.forward_listens_on(8, UDP, 40123));
         assert!(!listeners.forward_listens_on(7, UDP, 40124));
-        let claimed = listeners.generation();
-        assert_ne!(claimed, start);
+        let claimed = (listeners.generation(TCP), listeners.generation(UDP));
+        assert_ne!(claimed.1, start.1);
 
         drop(proxy);
         assert!(!listeners.receives(TCP, at("192.168.1.5:8080")), "撤销的只是丢掉的那一个");
         assert!(listeners.receives(UDP, at("10.66.0.1:40123")));
-        assert_ne!(listeners.generation(), claimed);
+        assert_ne!(listeners.generation(TCP), claimed.0);
+        assert_eq!(listeners.generation(UDP), claimed.1);
         drop(forward);
         assert!(!listeners.forward_listens_on(7, UDP, 40123));
+        assert_ne!(listeners.generation(UDP), claimed.1);
     }
 }

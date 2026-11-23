@@ -463,6 +463,7 @@ fn device_cause(error: DeviceError) -> VnetCause {
 async fn start_names(parts: &Parts, own: Ipv4Addr, device: &str, domain: &str) -> (NameService, Option<NameResponder>) {
     let address = SocketAddr::from((own, i3t_vnet::DNS_PORT));
     // 先登记再绑：绑上的那一刻起它就在答查询，出口得在那之前就知道这个地址不能从本机去连。绑不上时登记随凭据撤销。
+    // 名字服务每装一次网卡只开这一次，绑不上不重试，所以不会反复登记。
     let claim = parts.own_listeners.claim(OwnListener { protocol: ForwardProtocol::Udp, local: address, forward: None });
     let socket = match UdpSocket::bind(address).await {
         Ok(socket) => socket,
