@@ -124,6 +124,9 @@ jobs:
           cp "$OUT_DIR/i3t.exe" wintun/i3t.exe
           "$(command -v python3 || command -v python)" -I -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED); [z.write(f'wintun/{name}', name) for name in ('i3t.exe', 'wintun.dll', 'wintun-LICENSE.txt')]; z.close()" "dist/i3t-$PLATFORM.zip"
           ls -l dist
+      # 冒烟时要把 controller 启动起来，它要一个 PostgreSQL。
+      - uses: ./.github/actions/test-postgres
+        if: matrix.platform == 'linux-x86_64' || matrix.platform == 'windows-x86_64' || matrix.platform == 'macos-aarch64'
       # 上传发布之前先对产物做冒烟：核对三个程序的版本号、确认 controller 确实嵌进了 WebUI（不是空占位页）、
       # Linux 核对 GLIBC 符号版本不超过 2.28、Windows 核对 zip 归档内容完整。
       - name: Smoke-test the built programs
@@ -283,3 +286,46 @@ jobs:
             flags+=(--latest)
           fi
           gh release create "$TAG" dist/* "${flags[@]}"
+
+  # controller 的镜像：把上面编好的 Linux 程序装进基础镜像，推到 ghcr.io。不在这里编译，两个架构都只是拷文件。
+  # 只在这次发布是公开的（清单签了名）时推；预发布版不动 latest。
+  image:
+    name: push the controller image
+    needs: [check, build, sign, publish]
+    if: needs.sign.outputs.signed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Build and push
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+        run: |
+          mkdir -p image-context/amd64 image-context/arm64
+          for pair in "x86_64 amd64" "aarch64 arm64"; do
+            set -- $pair
+            install -m 0755 "dist/i3t-controller-linux-$1" "image-context/$2/i3t-controller"
+            install -m 0755 "dist/i3tctl-linux-$1" "image-context/$2/i3tctl"
+          done
+          # 镜像的名字要全是小写。
+          image=$(printf 'ghcr.io/%s-controller' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          tags=(--tag "$image:$VERSION")
+          if [ "$PRERELEASE" != true ]; then
+            tags+=(--tag "$image:latest")
+          fi
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --use
+          docker buildx build --file deploy/docker/Dockerfile --build-context binaries=image-context \
+            --platform linux/amd64,linux/arm64 \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            "${tags[@]}" --push .

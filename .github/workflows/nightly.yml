@@ -65,6 +65,7 @@ jobs:
         run: |
           scripts/build-linux.sh x86_64
           scripts/build-linux.sh aarch64
+      - uses: ./.github/actions/test-postgres
       - name: Smoke-test binaries, embedded WebUI and glibc ceiling
         run: |
           version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "i3t") | .version')
@@ -77,6 +78,18 @@ jobs:
             --bin-dir target/dist/aarch64-unknown-linux-gnu/dist \
             --no-run \
             --check-glibc 2.28
+      # 发布时的镜像不重新编译，用的就是上面这两份程序：两个架构都装一遍，再把这台机器的那个照 compose 文件起来。
+      - name: Dry-run the controller image and start it with compose
+        run: |
+          mkdir -p image-context/amd64 image-context/arm64
+          cp target/dist/x86_64-unknown-linux-gnu/dist/i3t-controller target/dist/x86_64-unknown-linux-gnu/dist/i3tctl image-context/amd64/
+          cp target/dist/aarch64-unknown-linux-gnu/dist/i3t-controller target/dist/aarch64-unknown-linux-gnu/dist/i3tctl image-context/arm64/
+          docker buildx create --use
+          docker buildx build --file deploy/docker/Dockerfile --build-context binaries=image-context \
+            --platform linux/amd64,linux/arm64 .
+          docker buildx build --file deploy/docker/Dockerfile --build-context binaries=image-context \
+            --platform linux/amd64 --tag ghcr.io/fuqiuluo/ice3tier-controller:latest --load .
+          scripts/test-compose.sh
       - name: Dry-run manifest signing and verification with a throwaway key
         run: |
           version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "i3t") | .version')

@@ -1,0 +1,16 @@
+# controller 的测试都要一个真的 PostgreSQL：起一个用完就扔的，连接串放进后面步骤的环境变量
+# （I3T_TEST_DATABASE_URL、I3T_TEST_DATABASE_TCP_URL，见 scripts/test-postgres.sh）。
+# Linux 和 Windows 的 runner 上本来就装着 PostgreSQL；macOS 上先用 Homebrew 装一个。
+name: Test PostgreSQL
+description: Start a throwaway PostgreSQL for the controller's tests and export its connection strings
+runs:
+  using: composite
+  steps:
+    - name: Start a throwaway PostgreSQL
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        if [ "$RUNNER_OS" = macOS ]; then
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install --quiet postgresql@17
+        fi
+        scripts/test-postgres.sh start >> "$GITHUB_ENV"

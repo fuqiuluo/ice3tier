@@ -43,6 +43,8 @@ jobs:
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # controller 的测试要一个 PostgreSQL。
+      - uses: ./.github/actions/test-postgres
       # 一个测试程序失败了也把剩下的跑完：一次运行就看得到这个平台上全部的失败。
       - name: Test
         run: cargo test --workspace --no-fail-fast
@@ -105,7 +107,8 @@ jobs:
       - name: Lint, and the copies inside match deploy/
         if: runner.os == 'Linux'
         run: |
-          shellcheck -s sh -S warning deploy/install.sh scripts/test-install.sh scripts/setup-e2e-env.sh
+          shellcheck -s sh -S warning deploy/install.sh scripts/test-install.sh scripts/setup-e2e-env.sh \
+            scripts/test-postgres.sh scripts/test-compose.sh
           for pair in "write_node_service deploy/systemd/i3t.service" \
                       "write_controller_service deploy/systemd/i3t-controller.service" \
                       "write_polkit_rule deploy/polkit/50-i3t-resolved.rules"; do
@@ -114,6 +117,7 @@ jobs:
           done
       - name: Build
         run: cargo build -p i3t -p i3t-controller-bin -p i3tctl -p i3t-release
+      - uses: ./.github/actions/test-postgres
       - name: Install, join, reinstall, uninstall
         run: scripts/test-install.sh target/debug
 
@@ -132,6 +136,7 @@ jobs:
       - name: Wintun next to the program
         shell: bash
         run: scripts/fetch-wintun.sh amd64 target/debug
+      - uses: ./.github/actions/test-postgres
       - name: Install, join, crash, reinstall, uninstall
         shell: powershell
         run: scripts\test-install.ps1 target\debug
@@ -183,6 +188,7 @@ jobs:
           path: web/dist
       - name: Build release binaries (with embedded WebUI)
         run: cargo build --release --locked -p i3t -p i3t-controller-bin -p i3tctl -p i3t-release
+      - uses: ./.github/actions/test-postgres
       - name: Smoke-test embedded WebUI and versions
         run: python3 scripts/smoke-release.py --bin-dir target/release --check-webui
       - name: Stage normal release binaries
@@ -206,6 +212,7 @@ jobs:
 
   # 用网络命名空间跑完整多节点端到端场景（tests/e2e/）：NAT 打洞、中继/TCP 回退、虚拟网卡与防火墙、
   # 代理与端口转发、UDP、配额限流、ice3proxy、断网恢复、主动探测、备份恢复、签名自动更新与回滚。
+  # controller 的数据库是这台机器上起的一个 PostgreSQL，经 Unix 套接字连：命名空间里的主机连不到本机的端口。
   e2e:
     name: e2e (${{ matrix.shard }})
     needs: [e2e-build]
@@ -247,6 +254,7 @@ jobs:
           fi
       - name: Prepare Linux network namespace lab
         run: scripts/setup-e2e-env.sh
+      - uses: ./.github/actions/test-postgres
       - name: Run e2e suites
         env:
           SUITES: ${{ matrix.suites }}
@@ -299,6 +307,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Install Chromium for Playwright
         run: pnpm exec playwright install --with-deps chromium
+      - uses: ./.github/actions/test-postgres
       - name: Run Playwright e2e flows
         run: pnpm exec playwright test --project=flows
       - uses: actions/upload-artifact@v4
@@ -334,6 +343,19 @@ jobs:
           path: resolved-out
           retention-days: 7
           if-no-files-found: ignore
+
+  # controller 的镜像从源码建一遍，再照 compose 文件把它和 PostgreSQL 一起起来，把部署文档里写的事做一遍：
+  # 第一次启动的管理令牌、管理 API 和 WebUI、数据库重启之后自己连回去、重新生成令牌、备份、在新的卷上恢复。
+  docker:
+    name: docker image + compose
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the controller image from source
+        run: docker build -f deploy/docker/Dockerfile -t ghcr.io/fuqiuluo/ice3tier-controller:latest .
+      - name: Start with compose, back up and restore
+        run: scripts/test-compose.sh
 
   site:
     name: site (check, build)
