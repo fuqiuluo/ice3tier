@@ -85,10 +85,10 @@ token=$(first_token)
 wait_for "the admin API did not answer inside the container" ctl status
 
 step "the admin API is published on this machine's loopback, and serves the WebUI"
-status=$(curl -fsS --max-time 10 -H "Authorization: Bearer $token" "http://$admin/api/v1/status") || fail "no answer on $admin"
-printf '%s' "$status" | grep -q '"public_addr":"127.0.0.1:20331"' || fail "unexpected status: $status"
+answer=$(curl -fsS --max-time 10 -H "Authorization: Bearer $token" "http://$admin/api/v1/status") || fail "no answer on $admin"
+printf '%s' "$answer" | grep -q '"public_addr":"127.0.0.1:20331"' || fail "unexpected status: $answer"
 curl -fsS --max-time 10 "http://$admin/" | grep -q '<div id="root">' || fail "the image has no WebUI in it"
-key=$(printf '%s' "$status" | sed -n 's/.*"controller_key":"\([^"]*\)".*/\1/p')
+key=$(printf '%s' "$answer" | sed -n 's/.*"controller_key":"\([^"]*\)".*/\1/p')
 ctl network create home >/dev/null
 
 step "the database restarts under the controller"
