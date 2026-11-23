@@ -2,9 +2,11 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 
@@ -122,58 +124,55 @@ impl Server {
     }
 }
 
-/// 端口写 0 时最多挑几次端口，两种挑法（见 [`bind_node`]）各占一半。几次之内总能挑到 TCP 和 UDP 都用得了的。
+/// 端口写 0 时最多挑几次端口：系统挑的一次，加上它用不了之后自己挑的。
 const NODE_PORT_TRIES: usize = 16;
+
+/// 自己挑端口时用的范围：留给临时用途的动态端口，Windows 和 macOS 的系统也在这里面挑。
+const DYNAMIC_PORTS: RangeInclusive<u16> = 49152..=65535;
 
 /// 绑节点协议的 TCP 和同一个端口号的 UDP（节点按"和节点协议同一个端口号"去找地址查询）。`bind_udp` 平时是
 /// `UdpSocket::bind`。
 ///
-/// 端口写 0 时由系统挑。系统给一种协议挑端口的时候不看另一种：挑给 TCP 的端口号，UDP 上可能正被别的程序占着；
-/// Windows 上还可能落在系统给 UDP 保留、不让绑的一段里（`netsh int ipv4 show excludedportrange protocol=udp`），
-/// 而且接着挑给 TCP 的端口号是挨着的，会一连几十个都落在这一段里。所以两种挑法轮着来：系统给 TCP 挑、去绑同号的
-/// UDP；系统给 UDP 挑、去听同号的 TCP。系统给哪种协议挑，就躲开了那种协议用不了的端口，轮着来不会一直卡在同一段上。
-/// 挑过而没用上的先拿着，免得系统又挑回它。端口写明了的不换，照实报错。
+/// 端口写 0 时先让系统给 TCP 挑一个。系统挑的时候不看 UDP，同号的 UDP 可能用不了：正被别的程序占着；Windows 上还见过
+/// 一连几十个挨着的端口号都被拒绝，报的是"没有权限"。那里系统是顺着往后一个个挑的，再让它挑多少次都还在这一段里，
+/// 所以系统挑的用不了时不再让它挑，自己在动态端口的范围里随便挑：每次挑的互不相干，不会卡在同一段上。
+/// 端口写明了的不换，照实报错。
 async fn bind_node<F, Fut>(listen: SocketAddr, mut bind_udp: F) -> Result<(TcpListener, UdpSocket), Error>
 where
     F: FnMut(SocketAddr) -> Fut,
     Fut: Future<Output = io::Result<UdpSocket>>,
 {
-    let failed = |source| Error::Bind { address: listen, source };
-    let (mut spare_tcp, mut spare_udp) = (Vec::new(), Vec::new());
+    let mut wanted = listen;
+    let mut tries = 0;
     loop {
-        let tries = spare_tcp.len() + spare_udp.len();
-        let (addr, source) = if tries % 2 == 0 {
-            let tcp = i3t_underlay::tcp_mss::listen(listen).map_err(failed)?;
-            let addr = tcp.local_addr().map_err(failed)?;
-            match bind_udp(addr).await {
+        tries += 1;
+        let (addr, source) = match i3t_underlay::tcp_mss::listen(wanted).and_then(|tcp| Ok((tcp.local_addr()?, tcp))) {
+            Ok((addr, tcp)) => match bind_udp(addr).await {
                 Ok(udp) => return Ok((tcp, udp)),
-                Err(source) => {
-                    spare_tcp.push(tcp);
-                    (addr, source)
-                }
-            }
-        } else {
-            let udp = bind_udp(listen).await.map_err(failed)?;
-            let addr = udp.local_addr().map_err(failed)?;
-            match i3t_underlay::tcp_mss::listen(addr) {
-                Ok(tcp) => return Ok((tcp, udp)),
-                Err(source) => {
-                    spare_udp.push(udp);
-                    (addr, source)
-                }
-            }
+                Err(source) => (addr, source),
+            },
+            Err(source) => (wanted, source),
         };
-        if listen.port() != 0 || !port_unusable(&source) || tries + 1 >= NODE_PORT_TRIES {
+        if listen.port() != 0 || !port_unusable(&source) || tries >= NODE_PORT_TRIES {
             return Err(Error::Bind { address: addr, source });
         }
-        tracing::debug!(%addr, error = %source, "系统给一种协议挑的端口号，另一种协议上用不了，另挑一个");
+        tracing::debug!(%addr, error = %source, "这个端口号 TCP 和 UDP 不是都用得了，另挑一个");
+        wanted = SocketAddr::new(listen.ip(), any_dynamic_port()?);
     }
 }
 
-/// 绑不上是不是因为这个端口号用不了（换一个端口号就可能绑得上）。别的程序占着时一般报"地址已被占用"；Windows 上端口在
-/// 系统保留的一段里、或者被别的账户的程序独占着时，报的是"没有权限"（10013）。
+/// 绑不上是不是因为这个端口号用不了（换一个端口号就可能绑得上）。别的程序占着时一般报"地址已被占用"；Windows 上有的
+/// 端口号报的是"没有权限"（10013），比如被别的程序独占着的、系统保留的。
 fn port_unusable(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied)
+}
+
+/// 动态端口的范围里随便一个端口号。
+fn any_dynamic_port() -> Result<u16, Error> {
+    let mut random = [0; 2];
+    SystemRandom::new().fill(&mut random).map_err(|_| Error::Random)?;
+    let count = DYNAMIC_PORTS.end() - DYNAMIC_PORTS.start() + 1;
+    Ok(DYNAMIC_PORTS.start() + u16::from_ne_bytes(random) % count)
 }
 
 /// 后台任务：到点做延后的下发，不再等迟迟不确认的节点，清理过期的东西。
@@ -301,50 +300,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_node_port_left_to_the_system_is_found_when_every_number_picked_for_tcp_is_refused_on_udp() {
-        // Windows 上系统接连挑给 TCP 的端口号可以全落在给 UDP 保留的一段里，同号的 UDP 一个都绑不上，报的是"没有权限"。
+    async fn a_node_port_left_to_the_system_moves_on_when_udp_refuses_the_number_the_way_windows_does() {
+        // Windows 上同号的 UDP 被拒绝时报的是"没有权限"，而且不止一个端口号这样：这里头三个都拒绝。
         let mut refused = Vec::new();
         let bound = bind_node("127.0.0.1:0".parse().unwrap(), |addr| {
-            let reserved = addr.port() != 0;
-            if reserved {
+            let refuse = refused.len() < 3;
+            if refuse {
                 refused.push(addr);
             }
-            async move { if reserved { Err(io::ErrorKind::PermissionDenied.into()) } else { UdpSocket::bind(addr).await } }
+            async move { if refuse { Err(io::ErrorKind::PermissionDenied.into()) } else { UdpSocket::bind(addr).await } }
         })
         .await;
         let (tcp, udp) = bound.unwrap();
         let (tcp, udp) = (tcp.local_addr().unwrap(), udp.local_addr().unwrap());
         assert_eq!(tcp, udp, "TCP 和 UDP 在同一个端口号上");
-        assert!(!refused.is_empty() && !refused.contains(&udp), "用的是系统给 UDP 挑的端口，不是被拒绝的 {refused:?}");
+        assert_eq!(refused.len(), 3, "拒绝了几个就另挑了几次");
+        assert!(!refused.contains(&udp), "用的不是被拒绝的端口：{refused:?}");
+        assert!(refused[1..].iter().all(|addr| DYNAMIC_PORTS.contains(&addr.port())), "自己挑的在动态端口的范围里：{refused:?}");
     }
 
     #[tokio::test]
     async fn picking_a_node_port_stops_after_a_fixed_number_of_tries() {
-        // 两种挑法都不成：给 TCP 挑的端口号 UDP 上一律被拒绝；给 UDP 挑的端口号，同号的 TCP 都被这里先占上。
-        let mut squatters = Vec::new();
         let mut calls = 0;
-        let bound = bind_node("127.0.0.1:0".parse().unwrap(), |addr| {
+        let bound = bind_node("127.0.0.1:0".parse().unwrap(), |_| {
             calls += 1;
-            let udp = if addr.port() == 0 {
-                let (udp, tcp) = (0..100).find_map(|_| udp_port_with_its_tcp_taken()).expect("占得上一个 UDP 和 TCP 都空着的端口");
-                squatters.push(tcp);
-                UdpSocket::from_std(udp)
-            } else {
-                Err(io::ErrorKind::PermissionDenied.into())
-            };
-            std::future::ready(udp)
+            std::future::ready(Err(io::ErrorKind::PermissionDenied.into()))
         })
         .await;
         assert!(matches!(&bound, Err(Error::Bind { address, .. }) if address.port() != 0), "{:?}", bound.err());
-        assert_eq!(calls, NODE_PORT_TRIES, "挑够次数就照实报错，不会一直挑下去");
+        // 自己挑的端口号 TCP 上正好被占着的那几次走不到 UDP，所以可以少于上限，不会多。
+        assert!((2..=NODE_PORT_TRIES).contains(&calls), "挑够次数就照实报错，不会一直挑下去：挑了 {calls} 次");
     }
 
-    /// 系统挑的一个 UDP 端口，同号的 TCP 也占上；TCP 占不上时是 `None`。
-    fn udp_port_with_its_tcp_taken() -> Option<(std::net::UdpSocket, std::net::TcpListener)> {
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        udp.set_nonblocking(true).unwrap();
-        let tcp = std::net::TcpListener::bind(udp.local_addr().unwrap()).ok()?;
-        Some((udp, tcp))
+    #[tokio::test]
+    async fn a_node_port_written_out_is_tried_once_whatever_the_refusal() {
+        for refusal in [io::ErrorKind::AddrInUse, io::ErrorKind::PermissionDenied] {
+            // 占着这个端口号的 UDP，别的测试就不会挑到它；它的 TCP 一般空着。
+            let squatter = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let written = squatter.local_addr().unwrap();
+            let mut calls = 0;
+            let bound = bind_node(written, |_| {
+                calls += 1;
+                std::future::ready(Err(refusal.into()))
+            })
+            .await;
+            assert!(matches!(&bound, Err(Error::Bind { address, .. }) if *address == written), "{:?}", bound.err());
+            assert!(calls <= 1, "写明的端口不换，{refusal:?} 也只试一次：试了 {calls} 次");
+        }
+    }
+
+    #[test]
+    fn ports_picked_here_stay_in_the_dynamic_range() {
+        let picked: Vec<u16> = (0..1000).map(|_| any_dynamic_port().unwrap()).collect();
+        assert!(picked.iter().all(|port| DYNAMIC_PORTS.contains(port)), "{picked:?}");
+        assert!(picked.iter().any(|port| *port != picked[0]), "不是每次都挑同一个");
     }
 
     #[tokio::test]

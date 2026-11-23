@@ -1232,24 +1232,28 @@ async fn the_static_directory_is_served_at_the_root_when_configured() {
 
 /// 一个假的节点 UDP 端口：回答地址查询；和同一个端口号上的 TCP 监听。
 ///
-/// 系统给一种协议挑端口的时候不看另一种：同一个端口号在另一种协议上可能正被别的程序用着（同一台机器上并行跑的测试
-/// 一直在开连接），Windows 上还可能落在系统给那种协议保留、不让绑的一段里。两种挑法轮着来，哪种先挑到两种协议都用得了的
-/// 端口就用它。
+/// 系统给一种协议挑端口的时候不看另一种：同一个端口号在另一种协议上可能用不了（同一台机器上并行跑的测试一直在开连接；
+/// Windows 上还见过一连几十个挨着的端口号 UDP 都被拒绝）。两种挑法轮着来，哪种先挑到两种协议都用得了的端口就用它。
 async fn answering_relay() -> std::net::SocketAddr {
     use i3t_proto::addr::{Query, Reply};
     use tokio::net::{TcpListener, UdpSocket};
     let mut attempts = 0..100;
+    let mut last_error = String::new();
     let (udp, tcp) = loop {
-        let attempt = attempts.next().expect("找不到 TCP 和 UDP 都空闲的端口");
+        let Some(attempt) = attempts.next() else { panic!("找不到 TCP 和 UDP 都空闲的端口，最后一次失败：{last_error}") };
         if attempt % 2 == 0 {
             let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            if let Ok(tcp) = TcpListener::bind(udp.local_addr().unwrap()).await {
-                break (udp, tcp);
+            let addr = udp.local_addr().unwrap();
+            match TcpListener::bind(addr).await {
+                Ok(tcp) => break (udp, tcp),
+                Err(error) => last_error = format!("TCP {addr}：{error}"),
             }
         } else {
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
-                break (udp, tcp);
+            let addr = tcp.local_addr().unwrap();
+            match UdpSocket::bind(addr).await {
+                Ok(udp) => break (udp, tcp),
+                Err(error) => last_error = format!("UDP {addr}：{error}"),
             }
         }
     };
