@@ -447,6 +447,24 @@ if [ "$os" = "Linux" ]; then
         sleep 1
     done
 
+    step "an upgrade that fails halfway does not leave the controller stopped"
+    # The script stops the service before it changes what the service starts from. Here a later step fails
+    # (systemctl daemon-reload, through a stand-in that refuses just that): the controller was up before, so it is
+    # up afterwards.
+    mkdir "$work/fakebin"
+    real_systemctl=$(command -v systemctl)
+    printf '#!/bin/sh\n[ "${1:-}" != daemon-reload ] || exit 1\nexec %s "$@"\n' "$real_systemctl" > "$work/fakebin/systemctl"
+    chmod 755 "$work/fakebin/systemctl"
+    if sudo env "PATH=$work/fakebin:$PATH" sh "$repo/deploy/install.sh" --from "$dir" --controller >/dev/null 2>&1; then
+        fail "the install went through although a step of it failed"
+    fi
+    i=0
+    until systemctl is-active -q i3t-controller; do
+        i=$((i + 1))
+        [ "$i" -lt 15 ] || fail "a failed upgrade left the controller stopped"
+        sleep 1
+    done
+
     step "/etc/i3t/controller.env stays root's and private when the address is set again"
     # What an admin puts there by hand may be a secret; an older install left the file readable by everyone.
     [ "$(sudo stat -c '%a %U' /etc/i3t/controller.env)" = "600 root" ] || fail "controller.env is not root's and private after install"

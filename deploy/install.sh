@@ -119,6 +119,17 @@ cleanup_work() {
     fi
 }
 
+# 1 while this script has stopped a controller service that was up, and has not started it again yet.
+CONTROLLER_STOPPED=0
+
+on_exit() {
+    if [ "$CONTROLLER_STOPPED" -eq 1 ]; then
+        CONTROLLER_STOPPED=0
+        ${SUDO:-} systemctl start i3t-controller 2>/dev/null || true
+    fi
+    cleanup_work
+}
+
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -1381,10 +1392,10 @@ report_controller_up() {
 }
 
 # Whether the controller's log level was set by hand in /etc/i3t/controller.env. With I3T_LOG=warn, say, the line
-# that says it is up is not logged.
+# that says it is up is not logged. Nor is it with an empty value: that is a filter that lets nothing through.
 controller_log_level_is_set() {
     $SUDO test -f /etc/i3t/controller.env \
-        && $SUDO grep -q '^[[:space:]]*I3T_LOG=[^[:space:]]' /etc/i3t/controller.env
+        && $SUDO grep -q '^[[:space:]]*I3T_LOG=' /etc/i3t/controller.env
 }
 
 # Whether the service is still running the start with invocation ID `$1` (systemd starts it again when it exits).
@@ -1400,6 +1411,8 @@ controller_still_in_start() {
 # install that kept its data in a file and now gets its database, or a retry after the database could not be
 # reached the first time.
 restart_controller() {
+    # From here on this function looks after the service: nothing to make up for on the way out.
+    CONTROLLER_STOPPED=0
     since=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
     # A service that kept failing (no database to reach) may have run into systemd's start limit: start counting anew.
     $SUDO systemctl reset-failed i3t-controller 2>/dev/null || true
@@ -1435,7 +1448,13 @@ restart_controller() {
         i=$((i + 1))
     done
     if [ "$failed" -eq 0 ] && [ "$quiet" -eq 1 ] && controller_still_in_start "$invocation"; then
-        report_controller_up "$(controller_log "$invocation" "$since")"
+        out=$(controller_log "$invocation" "$since")
+        if printf '%s\n' "$out" | grep -q '^    [^ ]'; then
+            report_controller_up "$out"
+        else
+            # Not "is running": with this log level the script cannot see it come up, only that it has not given up.
+            log "i3t-controller has been running for ${patience} seconds (its log level, I3T_LOG, hides the line that says it is up)"
+        fi
         return
     fi
     printf '%s\n' "$out"
@@ -1528,9 +1547,18 @@ install_controller() {
     # starts from is changed: systemd starts a failing service again every two seconds, and one that comes up on its
     # own in the middle prints the one-time admin token in a start this script is not watching.
     start_at_end=0
-    if has_systemd && { [ -n "$PUBLIC_ADDR" ] || controller_meant_to_run; }; then
-        start_at_end=1
-        $SUDO systemctl stop i3t-controller 2>/dev/null || true
+    if has_systemd; then
+        if controller_meant_to_run; then
+            start_at_end=1
+            # Should a later step fail, the service is started again on the way out (see on_exit): a failed upgrade
+            # must not leave a controller down that was up before.
+            CONTROLLER_STOPPED=1
+        elif [ -n "$PUBLIC_ADDR" ]; then
+            start_at_end=1
+        fi
+        if [ "$start_at_end" -eq 1 ]; then
+            $SUDO systemctl stop i3t-controller 2>/dev/null || true
+        fi
     fi
 
     $SUDO install -d -m 0755 /usr/local/bin
@@ -1679,7 +1707,7 @@ main() {
     fi
 
     WORK=$(mktemp -d)
-    trap cleanup_work EXIT HUP INT TERM
+    trap on_exit EXIT HUP INT TERM
 
     if [ "$MODE" = "controller" ]; then
         install_controller
