@@ -134,6 +134,17 @@ impl Store {
         self.conn.pragma_update(None, "query_only", read_only).unwrap();
     }
 
+    /// 测试用：别的连接占着写锁时不等，这一次写直接算失败，并且叫一下 `seen`。
+    /// 模拟"数据库正忙"而不用真的等满超时，也数得出等了几次。
+    #[cfg(test)]
+    pub(crate) fn fail_when_busy(&mut self, mut seen: impl FnMut() + Send + 'static) {
+        let give_up = move |_| {
+            seen();
+            false
+        };
+        self.conn.busy_handler(Some(give_up)).unwrap();
+    }
+
     /// 测试用：直接执行几条 SQL，比如装一个让某张表写不进去的触发器，模拟一串写里只有前面的写进去了。
     #[cfg(test)]
     pub(crate) fn execute_batch(&self, sql: &str) {
@@ -187,12 +198,43 @@ pub enum StoreError {
     NewerSchema { found: u32, supported: u32 },
 }
 
+impl StoreError {
+    /// 这次失败是不是整个数据库的事：别的进程占着写锁、数据库只读、盘满、读写文件出错。
+    /// 这时换一行写、马上再写一次都是一样的结果，而且"占着写锁"的每一次都要先等满超时才失败。
+    ///
+    /// 别的失败（约束、触发器之类）只和那一条语句有关，别的行照样写得进去。
+    #[must_use]
+    pub fn is_database_wide(&self) -> bool {
+        use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked, DiskFull, ReadOnly, SystemIoFailure};
+        match self {
+            Self::Sqlite(err) => {
+                matches!(err.sqlite_error_code(), Some(DatabaseBusy | DatabaseLocked | DiskFull | ReadOnly | SystemIoFailure))
+            }
+            Self::NewerSchema { .. } => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const FIRST: &str = "CREATE TABLE a (x INTEGER NOT NULL);";
     const SECOND: &str = "CREATE TABLE b (y TEXT NOT NULL); ALTER TABLE a ADD COLUMN z INTEGER NOT NULL DEFAULT 7;";
+
+    #[test]
+    fn only_failures_of_the_whole_database_count_as_database_wide() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_meta("k", b"v").unwrap();
+
+        store.set_read_only(true);
+        assert!(store.set_meta("k", b"w").unwrap_err().is_database_wide(), "只读");
+        store.set_read_only(false);
+
+        store.execute_batch("CREATE TRIGGER no_meta BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'no'); END;");
+        assert!(!store.set_meta("k", b"w").unwrap_err().is_database_wide(), "只是这一条语句被拦下了");
+        assert!(!StoreError::NewerSchema { found: 2, supported: 1 }.is_database_wide());
+    }
 
     #[test]
     fn an_empty_file_is_migrated_to_the_current_schema() {

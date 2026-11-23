@@ -263,7 +263,15 @@ impl Inner {
         tracing::info!(node = %node.id, name = %node.name, %remote, version = %node.version, platform = %node.platform, enrolling, "节点上线");
         // 注册时那一条连接不算"最近在线"：节点真的跑起来、带着 Hello 连上来才算。
         let outcome = if enrolling { Ok(()) } else { self.store.set_node_last_seen(node.id, self.clock.now()).map_err(Error::from) };
-        let outcome = outcome.and_then(|()| self.refresh(node.network, seeds, Some(node.id)));
+        let outcome = outcome.and_then(|()| match self.refresh_reporting(node.network, seeds, Some(node.id)) {
+            // 它自己的 netmap 发出去了，没做成的是同一批里别的节点。那些已经排上了重试，不该因此不让它上线：
+            // 不然只要有一个节点一直记不下来，谁都连不上来。
+            Err(unfinished) if unfinished.done.contains(&node.id) => {
+                tracing::error!(node = %node.id, "节点上线时，同一批里别的节点的 netmap 没发成，稍后再试：{}", error_chain(&unfinished.error));
+                Ok(())
+            }
+            outcome => outcome.map_err(|unfinished| unfinished.error),
+        });
         if let Err(err) = outcome {
             // 它没能上线，就不在线：不再等它确认。不然它欠着的确认没人放，`give_up_on_slow_acks` 只看在线的节点。
             self.live.remove(&node.id);

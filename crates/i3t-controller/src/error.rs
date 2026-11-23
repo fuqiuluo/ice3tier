@@ -123,6 +123,11 @@ pub enum Error {
 }
 
 impl Error {
+    /// 是不是整个数据库都读写不了（见 [`StoreError::is_database_wide`]）。这时别的节点、别的网络也是一样的结果，不用往下试。
+    pub(crate) fn is_database_wide(&self) -> bool {
+        matches!(self, Self::Store(err) if err.is_database_wide())
+    }
+
     /// 给程序看的分类，管理 API 的应答里用它。
     #[must_use]
     pub const fn code(&self) -> ErrorCode {

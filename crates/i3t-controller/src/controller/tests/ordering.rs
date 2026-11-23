@@ -2,6 +2,8 @@
 
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -10,8 +12,8 @@ use i3t_model::control::{Declared, Report, Route, RouteEntry, Signal, ToControll
 use i3t_proto::NodeId;
 use tokio::sync::mpsc;
 
-use super::super::Timing;
 use super::super::testing::{Lab, Member, REMOTE, hello};
+use super::super::{Controller, DATABASE_FILE, Timing};
 use super::{add_rule, drop_default_rule, peer_ids, relations};
 use crate::error::{Error, Rejection};
 use crate::store::NetmapState;
@@ -579,6 +581,74 @@ fn a_revocation_takes_effect_in_time_even_if_the_initiators_netmap_can_never_be_
     tick_after(&lab, PAST_RETRY).unwrap();
     source.receive();
     assert!(source.netmap().peers.is_empty());
+}
+
+#[test]
+fn a_busy_database_is_waited_for_once_however_many_nodes_and_networks_are_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let mut lab = Lab::around(Controller::open(&data, "ctl.example.com:20331".to_owned()).unwrap().controller);
+    let waits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&waits);
+    lab.controller.lock().store.fail_when_busy(move || {
+        seen.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // 两个网络，各有一个节点报了新的端点：每个网络里另外两个节点的 netmap 要变，报的那个自己的不变。
+    let mut members = Vec::new();
+    for name in ["home", "office"] {
+        let network = lab.network(name);
+        members.extend([lab.join(network.id, &[]), lab.join(network.id, &[]), lab.join(network.id, &[])]);
+    }
+    lab.settle(&mut members.iter_mut().collect::<Vec<_>>());
+    report_endpoints(&lab, &members[0], "203.0.113.9:1");
+    report_endpoints(&lab, &members[3], "203.0.113.9:2");
+    let queued = |lab: &Lab| lab.controller.lock().dirty.len();
+    assert_eq!(queued(&lab), 6);
+
+    // 别的进程占着写锁。等它放开的那几秒是拿着 controller 的锁等的：只能等一次，不能每个节点、每个网络各等一次。
+    let other = rusqlite::Connection::open(data.join(DATABASE_FILE)).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let flush = |lab: &Lab| lab.controller.lock().flush_due(Instant::now() + PAST_RETRY);
+    assert!(flush(&lab).is_err());
+    assert_eq!(waits.load(Ordering::Relaxed), 1, "整个数据库都写不进去时，试一次就交回去");
+    assert_eq!(queued(&lab), 5, "只有头一个节点（它的内容没变，不用写）算做完了，其余的原样排着");
+    assert_eq!(members.iter_mut().map(Member::receive).sum::<usize>(), 0);
+
+    other.execute_batch("ROLLBACK").unwrap();
+    flush(&lab).unwrap();
+    assert_eq!(members.iter_mut().map(Member::receive).collect::<Vec<_>>(), vec![0, 1, 1, 0, 1, 1], "放开之后都补发");
+}
+
+#[test]
+fn a_node_that_got_its_netmap_comes_online_even_if_another_node_in_the_same_push_failed() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let mut old = lab.join(network.id, &[]);
+    lab.settle(&mut [&mut old]);
+
+    // 老节点的新版本号记不下来。新节点加入时两个在同一批里：新节点自己的那一份发出去了，就该让它上线。
+    block_column_of(&lab, "netmap_version", old.id);
+    let secret = lab.secret(network.id, &Default::default());
+    let key = lab.fresh_key();
+    let mut new = lab.enroll(key, &secret, Declared::default()).expect("别的节点没做成，不该连累它");
+    assert!(lab.controller.node(network.id, new.id).unwrap().node.online);
+    assert_eq!(old.receive(), 0);
+    assert!(lab.controller.lock().dirty.contains_key(&old.id), "没做成的老节点排着重试");
+    assert!(new.netmap().peer(old.id).is_some_and(|peer| !peer.outbound), "老节点还没认它，它还不能去访问");
+
+    unblock(&lab, "netmap_version");
+    tick_after(&lab, PAST_RETRY).unwrap();
+    lab.settle(&mut [&mut old, &mut new]);
+    assert_eq!(relations(old.netmap()), vec![(new.id, true, true)]);
+    assert_eq!(relations(new.netmap()), vec![(old.id, true, true)]);
+
+    // 它自己那一份没发成（这里是"发到了哪一版"记不下来），照旧不让它上线。
+    block_column_of(&lab, "sent_version", new.id);
+    assert_eq!(lab.connect(new.key, Declared::default()).err(), Some(Rejection::Internal));
+    assert!(!lab.controller.node(network.id, new.id).unwrap().node.online);
+    unblock(&lab, "sent_version");
+    lab.connect(new.key, Declared::default()).expect("能记了就能上线");
 }
 
 #[test]

@@ -37,6 +37,14 @@ impl Seeds {
     }
 }
 
+/// 一次重算没有全做成。没做成的节点已经排上了重试。
+pub(crate) struct Unfinished {
+    /// 头一个错误；整个数据库都写不进去时是那一个。
+    pub(crate) error: Error,
+    /// 做成了的节点：netmap 算好了、记下了，该发的也发了。
+    pub(crate) done: BTreeSet<NodeId>,
+}
+
 impl Inner {
     /// 启动时建立下发状态。假定每个节点手上的 netmap 和规则一致，没有谁欠着确认：
     /// 上次运行期间没走完的顺序已经无从得知，节点重新连上来时会拿到当前的内容。
@@ -60,9 +68,14 @@ impl Inner {
     /// 重算 `seeds` 和被它们牵连的节点的 netmap，内容变了的下发。
     /// `force` 指定的节点即使内容没变也发一份：它刚连上来，不知道它手上是哪一版。
     ///
-    /// 一个节点没做成不耽误别的。返回的是头一个错误；没做成的节点已经排上了重试，后台任务也叫醒了，
+    /// 一个节点没做成不耽误别的。没做成的节点已经排上了重试，后台任务也叫醒了，
     /// 调用方把错误交回去就行，不用自己再排。
     pub(crate) fn refresh(&mut self, network: NetworkId, seeds: Seeds, force: Option<NodeId>) -> Result<(), Error> {
+        self.refresh_reporting(network, seeds, force).map_err(|unfinished| unfinished.error)
+    }
+
+    /// 和 [`Self::refresh`] 一样，没有全做成时把哪些节点做成了也交回去。
+    pub(crate) fn refresh_reporting(&mut self, network: NetworkId, seeds: Seeds, force: Option<NodeId>) -> Result<(), Unfinished> {
         let view = match NetworkView::load(&self.store, network) {
             Ok(Some(view)) => view,
             Ok(None) => return Ok(()),
@@ -73,7 +86,7 @@ impl Inner {
                     Seeds::All => self.live.iter().filter(|(_, live)| live.network == network).map(|(node, _)| *node).collect(),
                 };
                 self.retry_later(network, nodes);
-                return Err(err.into());
+                return Err(Unfinished { error: err.into(), done: BTreeSet::new() });
             }
         };
         let access = view.access();
@@ -85,19 +98,32 @@ impl Inner {
             self.sync.entry(*node).or_default();
         }
         let batch = self.reconcile(&view, &access, &seeds);
-        // 一个节点没做成不耽误同一批里别的：各算各的，看到的是同一套"谁在等谁确认"。
-        // 不然一个一直记不下来的节点会把排在它后面的都挡住，比如等它停下来才能不认它的目的端。
+        let mut done = BTreeSet::new();
         let mut failed = BTreeSet::new();
-        let mut first_error = None;
+        let mut error = None;
         for &node in &batch {
-            if let Err(err) = self.publish(&view, &access, node, force == Some(node)) {
-                failed.insert(node);
-                first_error.get_or_insert(err);
+            match self.publish(&view, &access, node, force == Some(node)) {
+                Ok(()) => {
+                    done.insert(node);
+                }
+                // 整个数据库都写不进去：别的节点也是一样的结果，不往下试。别的进程占着写锁时，每试一次都是
+                // 拿着 controller 的锁等满超时，一个节点等一次，所有连接和管理请求就都被拖住了。
+                Err(err) if err.is_database_wide() => {
+                    failed.extend(batch.range(node..).copied());
+                    error = Some(err);
+                    break;
+                }
+                // 只是这一个节点没做成，不耽误同一批里别的：各算各的，看到的是同一套"谁在等谁确认"。
+                // 不然一个一直记不下来的节点会把排在它后面的都挡住，比如等它停下来才能不认它的目的端。
+                Err(err) => {
+                    failed.insert(node);
+                    error.get_or_insert(err);
+                }
             }
         }
         // `reconcile` 已经替没做成的登记了等待，不重试的话它们要到下一次碰巧有别的变化才会拿到新的 netmap。
         self.retry_later(network, failed);
-        first_error.map_or(Ok(()), Err)
+        error.map_or(Ok(()), |error| Err(Unfinished { error, done }))
     }
 
     /// 这些节点的重算没做成：过一会儿再试，并且叫醒后台任务，让它到点来做。
@@ -296,11 +322,20 @@ impl Inner {
             !is_due
         });
         let mut first_error = None;
-        for (network, nodes) in due {
-            // 一个网络失败不耽误别的网络；没算完的 `refresh` 自己放回了队列，过一会儿再试。
+        let mut due = due.into_iter();
+        for (network, nodes) in due.by_ref() {
+            // 一个网络失败不耽误别的网络；没做成的 `refresh` 自己放回了队列，过一会儿再试。
             if let Err(err) = self.refresh(network, Seeds::Nodes(nodes), None) {
+                let database_wide = err.is_database_wide();
                 first_error.get_or_insert(err);
+                if database_wide {
+                    break;
+                }
             }
+        }
+        // 整个数据库都读写不了时，剩下的网络不去试（见 `refresh_reporting`），原样放回队列。
+        for (network, nodes) in due {
+            self.retry_later(network, nodes);
         }
         match first_error {
             Some(err) => Err(err),
