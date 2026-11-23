@@ -124,8 +124,12 @@ impl NodeSync {
     }
 
     /// 开始等了 `timeout` 还没确认的不再等。后来才开始等的照旧等满它自己的时间。返回可以继续下一步的对端。
+    ///
+    /// 等的那一版还没定下来的（版本号记不进存储，还在重试）不算：节点没有可确认的东西，这时放开对端，
+    /// 对端就会先于它走完下一步，顺序正好反过来。
     pub(crate) fn give_up_waiting(&mut self, now: Instant, timeout: Duration) -> BTreeSet<NodeId> {
-        self.release(|pending| now.saturating_duration_since(pending.since) >= timeout)
+        let issued = self.state.version;
+        self.release(|pending| pending.version <= issued && now.saturating_duration_since(pending.since) >= timeout)
     }
 
     /// 不再等这个节点确认（它下线了）。返回可以继续下一步的对端。
@@ -255,6 +259,21 @@ mod tests {
         assert!(sync.give_up_waiting(at(15), timeout).is_empty());
         assert_eq!(sync.give_up_waiting(at(16), timeout), [id(3)].into());
         assert!(!sync.is_waiting());
+    }
+
+    #[test]
+    fn a_wait_for_a_version_that_has_not_gone_out_does_not_time_out() {
+        let timeout = Duration::from_secs(10);
+        let mut sync = NodeSync::default();
+        sync.begin_accepting(id(2), true, at(0));
+        sync.begin_undialing(id(3), true, at(0));
+        // 新的一版还没定下来：等多久都谈不上它迟迟不确认。
+        assert!(sync.give_up_waiting(at(60), timeout).is_empty());
+        assert!(!sync.has_confirmed_accepting(id(2)) && sync.may_still_dial(id(3)));
+
+        sync.state.version = 1;
+        assert!(sync.settle([(id(2), inbound())].into()).is_empty());
+        assert_eq!(sync.give_up_waiting(at(60), timeout), [id(2), id(3)].into(), "定下来之后照旧从开始等的那一刻算");
     }
 
     #[test]

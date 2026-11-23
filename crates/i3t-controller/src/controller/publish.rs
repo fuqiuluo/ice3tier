@@ -59,8 +59,22 @@ impl Inner {
 
     /// 重算 `seeds` 和被它们牵连的节点的 netmap，内容变了的下发。
     /// `force` 指定的节点即使内容没变也发一份：它刚连上来，不知道它手上是哪一版。
+    ///
+    /// 出错时没算完的节点已经排上了重试，后台任务也叫醒了：调用方把错误交回去就行，不用自己再排。
     pub(crate) fn refresh(&mut self, network: NetworkId, seeds: Seeds, force: Option<NodeId>) -> Result<(), Error> {
-        let Some(view) = NetworkView::load(&self.store, network)? else { return Ok(()) };
+        let view = match NetworkView::load(&self.store, network) {
+            Ok(Some(view)) => view,
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                let nodes = match seeds {
+                    Seeds::Nodes(nodes) => nodes,
+                    // 网络读不出来，说不出"全部"是哪些：排上在线的。不在线的回来时拿到的本来就是那时的内容。
+                    Seeds::All => self.live.iter().filter(|(_, live)| live.network == network).map(|(node, _)| *node).collect(),
+                };
+                self.retry_later(network, nodes);
+                return Err(err.into());
+            }
+        };
         let access = view.access();
         let seeds: BTreeSet<NodeId> = match seeds {
             Seeds::All => view.nodes.keys().copied().collect(),
@@ -72,13 +86,19 @@ impl Inner {
         let batch = self.reconcile(&view, &access, &seeds);
         for &node in &batch {
             if let Err(err) = self.publish(&view, &access, node, force == Some(node)) {
-                // 这一个和排在它后面的都还没算完，过一会儿再试。`reconcile` 已经替它们登记了等待，
+                // 这一个和排在它后面的都还没算完。`reconcile` 已经替它们登记了等待，
                 // 不重试的话它们要到下一次碰巧有别的变化才会拿到新的 netmap。
-                self.defer(network, batch.range(node..).copied(), RETRY_DELAY);
+                self.retry_later(network, batch.range(node..).copied());
                 return Err(err);
             }
         }
         Ok(())
+    }
+
+    /// 这些节点的重算没做成：过一会儿再试，并且叫醒后台任务，让它到点来做。
+    fn retry_later(&mut self, network: NetworkId, nodes: impl IntoIterator<Item = NodeId>) {
+        self.defer(network, nodes, RETRY_DELAY);
+        self.wake.notify_one();
     }
 
     /// 先把访问关系变更的第一步登记到所有相关节点上，再去算任何一份 netmap。
@@ -267,9 +287,8 @@ impl Inner {
         });
         let mut first_error = None;
         for (network, nodes) in due {
-            // 一个网络失败不耽误别的网络；失败的放回队列，过一会儿再试。
-            if let Err(err) = self.refresh(network, Seeds::Nodes(nodes.clone()), None) {
-                self.defer(network, nodes, RETRY_DELAY);
+            // 一个网络失败不耽误别的网络；没算完的 `refresh` 自己放回了队列，过一会儿再试。
+            if let Err(err) = self.refresh(network, Seeds::Nodes(nodes), None) {
                 first_error.get_or_insert(err);
             }
         }

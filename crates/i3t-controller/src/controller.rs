@@ -128,8 +128,8 @@ pub struct Controller {
     /// 管理令牌的哈希。每个管理请求都要查它，所以不放在大锁里。
     admin_token: Mutex<Option<[u8; DIGEST_LEN]>>,
     inner: Mutex<Inner>,
-    /// 有延后的下发时叫醒后台任务。
-    wake: Notify,
+    /// 有延后的下发时叫醒后台任务。`Inner` 手上也有一份。
+    wake: Arc<Notify>,
     /// 有包要取时叫醒取包的后台任务。
     release_wake: Notify,
     /// 设置变了、要尽快重新查发布源时叫醒查发布源的后台任务。
@@ -164,6 +164,9 @@ pub(crate) struct Inner {
     pub(crate) no_vnet: BTreeSet<NodeId>,
     /// 等着延后重算的节点。
     pub(crate) dirty: BTreeMap<NodeId, Deferred>,
+    /// 叫醒后台任务，和 [`Controller::wake_if_needed`] 用的是同一个。重算没做成、排了重试时在这里叫：
+    /// 那时调用方多半带着错误提前返回了，轮不到它来叫。
+    pub(crate) wake: Arc<Notify>,
     /// 各个节点最近上报的路由表。节点离线之后留着，界面上显示成过期的；controller 重启就没有了。
     pub(crate) routes: BTreeMap<NodeId, routes::Reported>,
     /// 出口和用出口的节点报的计数，算健康和交叉核对用。节点离线之后留着；controller 重启就没有了。
@@ -260,6 +263,7 @@ impl Controller {
         let admin_token = store.meta(ADMIN_TOKEN_META)?.and_then(|hash| <[u8; DIGEST_LEN]>::try_from(hash).ok());
         let version: Version = env!("CARGO_PKG_VERSION").parse().expect("Cargo 保证包的版本号是合法的语义化版本");
         let updates = update::Updates::load(&store, version)?;
+        let wake = Arc::new(Notify::new());
         let mut inner = Inner {
             store,
             timing,
@@ -270,6 +274,7 @@ impl Controller {
             no_udp_dirty: BTreeSet::new(),
             no_vnet: BTreeSet::new(),
             dirty: BTreeMap::new(),
+            wake: Arc::clone(&wake),
             routes: BTreeMap::new(),
             usage: usage::Usage::default(),
             route_queries: BTreeMap::new(),
@@ -290,7 +295,7 @@ impl Controller {
             timing,
             admin_token: Mutex::new(admin_token),
             inner: Mutex::new(inner),
-            wake: Notify::new(),
+            wake,
             release_wake: Notify::new(),
             check_wake: Notify::new(),
             refusal_log: Throttle::new(REFUSAL_LOG_EVERY),
