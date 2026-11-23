@@ -24,9 +24,9 @@ use crate::store::NodeRecord;
 
 /// 健康看最近这么久。
 const HEALTH_WINDOW: Duration = Duration::from_secs(5 * 60);
-/// 归因于出口自己的失败至少这么多次、并且占请求的这么大比例，才算不健康。偶尔一次解析器超时不算。
+/// 归因于出口自己的失败至少这么多次、并且每这么多个请求里至少有一次（一成），才算不健康。偶尔一次解析器超时不算。
 const DEGRADED_MIN_FAILURES: u64 = 3;
-const DEGRADED_RATIO_PERCENT: u64 = 10;
+const DEGRADED_ONE_IN: u64 = 10;
 /// 一个节点最多报这么多个监听。乱报的节点占不了太多内存。
 const MAX_LISTENS: usize = 256;
 /// 一次上报里最多看这么多项出口的观测。观测是一次次报上来累积的，跨多次上报也替一个节点最多留这么多个出口的。
@@ -170,10 +170,12 @@ impl Usage {
 }
 
 /// 一个出口最近 5 分钟的健康。
+///
+/// 计数是节点报的，多大都有可能。门槛（请求数的一成，向上取整）用除法算，不拿计数去乘：报什么数都不会溢出。
 fn health(online: bool, (requests, failures): (u64, u64)) -> ExitHealth {
     if !online || requests == 0 {
         ExitHealth::Unknown
-    } else if failures >= DEGRADED_MIN_FAILURES && failures * 100 >= requests * DEGRADED_RATIO_PERCENT {
+    } else if failures >= DEGRADED_MIN_FAILURES.max(requests.div_ceil(DEGRADED_ONE_IN)) {
         ExitHealth::Degraded
     } else {
         ExitHealth::Ok
@@ -389,6 +391,44 @@ mod tests {
         // 出口重启：累计的数从头开始，不和重启之前的相减。
         usage.exit_reported(exit, 2, report(5, 0), start + HEALTH_WINDOW + Duration::from_secs(40));
         assert_eq!(usage.exits[&exit].recent(), (0, 0));
+    }
+
+    #[test]
+    fn an_exit_is_degraded_from_three_failures_and_one_request_in_ten_on() {
+        assert_eq!(health(true, (30, 3)), ExitHealth::Degraded, "3 次，正好一成");
+        assert_eq!(health(true, (31, 3)), ExitHealth::Ok, "31 个请求里 3 次不到一成");
+        assert_eq!(health(true, (10, 3)), ExitHealth::Degraded);
+        assert_eq!(health(true, (20, 2)), ExitHealth::Ok, "正好一成，但只有 2 次");
+        assert_eq!(health(true, (2, 2)), ExitHealth::Ok, "全是失败，但只有 2 次");
+        assert_eq!(health(true, (1000, 99)), ExitHealth::Ok);
+        assert_eq!(health(true, (1000, 100)), ExitHealth::Degraded);
+    }
+
+    #[test]
+    fn health_is_judged_exactly_however_large_the_reported_counts_are() {
+        // 能被 10 整除的最大的请求数：门槛正好是它的十分之一。
+        let requests = u64::MAX - 5;
+        let tenth = requests / 10;
+        assert_eq!(health(true, (requests, tenth - 1)), ExitHealth::Ok, "差一次不到一成");
+        assert_eq!(health(true, (requests, tenth)), ExitHealth::Degraded, "正好一成");
+        assert_eq!(health(true, (requests, tenth + 1)), ExitHealth::Degraded);
+        // 不能整除的：一成带小数，要再多一次才够。
+        assert_eq!(health(true, (u64::MAX, u64::MAX / 10)), ExitHealth::Ok);
+        assert_eq!(health(true, (u64::MAX, u64::MAX / 10 + 1)), ExitHealth::Degraded);
+        assert_eq!(health(true, (u64::MAX, 3)), ExitHealth::Ok);
+        // 拿计数去乘的话，这两组在 64 位里绕回去，正好判反。
+        assert_eq!(health(true, (u64::MAX / 10 + 1, 3)), ExitHealth::Ok, "请求数的 10 倍放不进 64 位");
+        assert_eq!(health(true, (u64::MAX / 100 + 1, u64::MAX / 100 + 1)), ExitHealth::Degraded, "失败数的 100 倍放不进 64 位");
+
+        // 从上报一路算下来也一样：同一次运行里，累计的数从 0 跳到最大。
+        let mut usage = Usage::default();
+        let exit = id(2);
+        let start = Instant::now();
+        usage.exit_reported(exit, 1, report(0, 0), start);
+        usage.exit_reported(exit, 1, report(u64::MAX, u64::MAX), start + Duration::from_secs(10));
+        let seen = &usage.exits[&exit];
+        assert_eq!(seen.recent(), (u64::MAX, u64::MAX));
+        assert_eq!(health(true, seen.recent()), ExitHealth::Degraded, "全是出口自己的失败");
     }
 
     #[test]

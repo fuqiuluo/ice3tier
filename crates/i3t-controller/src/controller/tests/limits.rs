@@ -92,6 +92,29 @@ fn an_exit_keeps_its_own_counts_and_the_initiators_view_for_cross_checking_and_h
 }
 
 #[test]
+fn an_exit_that_reports_absurdly_large_counts_still_gets_the_right_health() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let exit = lab.join_with(network.id, &[], CAN_DO_ALL);
+    lab.controller.enable_exit(network.id, exit.id, ExitRole::default()).unwrap();
+    // 每次运行报两份：累计的数从 0 跳到这么多，窗口里的增量就是它。
+    let jump_to = |run, total, failed_by_exit| {
+        for counts in [ExitReport::default(), ExitReport { total, failed_by_exit, ..ExitReport::default() }] {
+            exit.send(&lab.controller, ToController::Report(Box::new(Report { exit: Some(Box::new(counts)), ..report(run) })));
+        }
+    };
+
+    jump_to(1, u64::MAX, u64::MAX);
+    let view = lab.controller.exit(network.id, exit.id).unwrap();
+    assert_eq!((view.recent_requests, view.recent_failures, view.health), (u64::MAX, u64::MAX, ExitHealth::Degraded));
+    assert_eq!(lab.controller.exits(network.id).unwrap()[0].health, ExitHealth::Degraded, "出口的列表也读得出来");
+
+    // 请求数的 10 倍放不进 64 位，失败只有 3 次：远不到一成。
+    jump_to(2, u64::MAX / 10 + 1, 3);
+    assert_eq!(lab.controller.exit(network.id, exit.id).unwrap().health, ExitHealth::Ok);
+}
+
+#[test]
 fn only_observations_of_enabled_exits_in_the_reporters_own_network_are_kept_until_the_exit_is_switched_off() {
     let mut lab = Lab::new();
     let network = lab.network("home");
