@@ -27,6 +27,55 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      # 临时：读出这台 Windows 上端口是怎么挑的，合并前删掉。
+      - name: Port facts (temporary)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          netsh int ipv4 show dynamicport tcp
+          netsh int ipv4 show dynamicport udp
+          netsh int ipv4 show excludedportrange protocol=tcp
+          netsh int ipv4 show excludedportrange protocol=udp
+          $lo = [System.Net.IPAddress]::Loopback
+          function Code($e) { $x = $e.Exception; while ($x.InnerException) { $x = $x.InnerException }; if ($x -is [System.Net.Sockets.SocketException]) { "$($x.SocketErrorCode)($($x.ErrorCode))" } else { $x.GetType().Name } }
+
+          $tcp = @(); foreach ($i in 1..48) { $l = [System.Net.Sockets.TcpListener]::new($lo, 0); $l.Start(); $tcp += $l }
+          $tcpPorts = $tcp | ForEach-Object { $_.LocalEndpoint.Port }
+          "tcp bind(0), all held: $($tcpPorts -join ' ')"
+          $r = foreach ($p in $tcpPorts) { try { $u = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new($lo, $p)); $u.Close(); 'ok' } catch { Code $_ } }
+          "udp on those numbers: $(($r | Group-Object | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ')"
+          $tcp | ForEach-Object { $_.Stop() }
+
+          $udp = @(); foreach ($i in 1..48) { $udp += [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new($lo, 0)) }
+          $udpPorts = $udp | ForEach-Object { $_.Client.LocalEndPoint.Port }
+          "udp bind(0), all held: $($udpPorts -join ' ')"
+          $r = foreach ($p in $udpPorts) { try { $l = [System.Net.Sockets.TcpListener]::new($lo, $p); $l.Start(); $l.Stop(); 'ok' } catch { Code $_ } }
+          "tcp on those numbers: $(($r | Group-Object | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ')"
+          $udp | ForEach-Object { $_.Close() }
+
+          $ports = foreach ($i in 1..24) { $l = [System.Net.Sockets.TcpListener]::new($lo, 0); $l.Start(); $l.LocalEndpoint.Port; $l.Stop() }
+          "tcp bind(0), each closed at once: $($ports -join ' ')"
+          $ports = foreach ($i in 1..24) { $u = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new($lo, 0)); $u.Client.LocalEndPoint.Port; $u.Close() }
+          "udp bind(0), each closed at once: $($ports -join ' ')"
+
+          # 一条刚关掉的连接（拨出去的一头先关）用过的本机端口，马上能不能在上面监听。
+          $srv = [System.Net.Sockets.TcpListener]::new($lo, 0); $srv.Start()
+          $cli = [System.Net.Sockets.TcpClient]::new(); $cli.Connect($lo, $srv.LocalEndpoint.Port)
+          $p = $cli.Client.LocalEndPoint.Port
+          $acc = $srv.AcceptTcpClient()
+          $cli.Close(); Start-Sleep -Milliseconds 200; $acc.Close(); $srv.Stop()
+          try { $l = [System.Net.Sockets.TcpListener]::new($lo, $p); $l.Start(); $l.Stop(); "listen on the local port of a connection just closed ($p): ok" } catch { "listen on the local port of a connection just closed ($p): $(Code $_)" }
+
+          # 落在保留段里的端口号，两种协议各报什么。
+          foreach ($proto in 'tcp', 'udp') {
+            $line = netsh int ipv4 show excludedportrange protocol=$proto | Where-Object { $_ -match '^\s*(\d+)\s+(\d+)' } | Select-Object -First 1
+            if ($line -match '^\s*(\d+)\s+(\d+)') {
+              $p = [int]$Matches[1]
+              $t = try { $l = [System.Net.Sockets.TcpListener]::new($lo, $p); $l.Start(); $l.Stop(); 'ok' } catch { Code $_ }
+              $u = try { $c = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new($lo, $p)); $c.Close(); 'ok' } catch { Code $_ }
+              "port $p (first of the $proto reserved ranges): tcp $t, udp $u"
+            }
+          }
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
