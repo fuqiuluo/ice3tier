@@ -265,8 +265,9 @@ impl Inner {
         let outcome = if enrolling { Ok(()) } else { self.store.set_node_last_seen(node.id, self.clock.now()).map_err(Error::from) };
         let outcome = outcome.and_then(|()| match self.refresh_reporting(node.network, seeds, Some(node.id)) {
             // 它自己的 netmap 发出去了，没做成的是同一批里别的节点。那些已经排上了重试，不该因此不让它上线：
-            // 不然只要有一个节点一直记不下来，谁都连不上来。
-            Err(unfinished) if unfinished.done.contains(&node.id) => {
+            // 不然只要有一个节点一直记不下来，谁都连不上来。"做成了"不等于发到了：发送队列的另一头已经关了、
+            // 或者满了时，连接在下发的那一刻就被断开了，所以还要看它是不是还连着。
+            Err(unfinished) if unfinished.done.contains(&node.id) && self.live.get(&node.id).is_some_and(|live| live.conn == conn) => {
                 tracing::error!(node = %node.id, "节点上线时，同一批里别的节点的 netmap 没发成，稍后再试：{}", error_chain(&unfinished.error));
                 Ok(())
             }

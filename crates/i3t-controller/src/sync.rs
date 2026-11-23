@@ -32,6 +32,8 @@ pub(crate) struct NodeSync {
     awaiting_undial: BTreeMap<NodeId, Pending>,
     /// 最近一次因为别的节点的上报（端点、挂靠、连得上哪些 relay）给它排的重算的时刻，见 `Inner::defer_report`。
     pub report_due: Option<Instant>,
+    /// 它的重算没做成，还排着重试：它手上的 netmap 可能已经跟不上规则了，哪怕它确认过的就是当前这个版本号。
+    pub retrying: bool,
 }
 
 /// 一项还欠着的确认。
@@ -111,6 +113,18 @@ impl NodeSync {
         }
         if online {
             start_waiting(&mut self.awaiting_undial, peer, self.state.version + 1, now);
+        }
+    }
+
+    /// 现在这个版本号刚定下来（每个版本号只有这一次）。等它确认的授权从这一刻起算等了多久。
+    ///
+    /// 登记和定下来通常是同一刻。版本号一时记不进存储时会差出很久，那段时间节点没有可确认的东西：
+    /// 还从登记算起的话，这一版刚发出去就已经"超时"，对端马上被放开，节点连收下的工夫都没有。
+    /// 撤销不动：它的期限从登记起算，不取决于这一版什么时候定下来。
+    pub(crate) fn version_issued(&mut self, now: Instant) {
+        let version = self.state.version;
+        for pending in self.awaiting_accept.values_mut().filter(|pending| pending.version == version) {
+            pending.since = now;
         }
     }
 
@@ -296,6 +310,29 @@ mod tests {
         sync.state.version = 1;
         assert!(sync.settle([(id(2), inbound())].into()).is_empty());
         assert_eq!(sync.give_up_waiting(at(60), timeout), [id(2)].into(), "定下来之后照旧从开始等的那一刻算");
+    }
+
+    #[test]
+    fn a_grant_counts_its_wait_from_when_its_version_went_out() {
+        let timeout = Duration::from_secs(10);
+        let mut sync = NodeSync::with_state(NetmapState::default(), [(id(3), Relation { inbound: false, outbound: true })].into());
+        sync.begin_accepting(id(2), true, at(0));
+        sync.begin_undialing(id(3), true, at(0));
+        // 版本号过了很久才定下来。
+        sync.state.version = 1;
+        sync.version_issued(at(60));
+        assert!(sync.settle([(id(2), inbound())].into()).is_empty());
+        assert_eq!(sync.give_up_waiting(at(65), timeout), [id(3)].into(), "撤销照旧从登记算起；授权刚发出去五秒，还没到");
+        assert_eq!(sync.give_up_waiting(at(70), timeout), [id(2)].into());
+
+        // 之后的版本不再动它：只有它等的那一版定下来的那一次。
+        let mut sync = NodeSync::default();
+        sync.begin_accepting(id(2), true, at(0));
+        sync.state.version = 1;
+        sync.version_issued(at(0));
+        sync.state.version = 2;
+        sync.version_issued(at(8));
+        assert_eq!(sync.give_up_waiting(at(10), timeout), [id(2)].into());
     }
 
     #[test]

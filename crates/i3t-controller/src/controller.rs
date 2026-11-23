@@ -167,6 +167,9 @@ pub(crate) struct Inner {
     /// 叫醒后台任务，和 [`Controller::wake_if_needed`] 用的是同一个。重算没做成、排了重试时在这里叫：
     /// 那时调用方多半带着错误提前返回了，轮不到它来叫。
     pub(crate) wake: Arc<Notify>,
+    /// 重算时整个数据库读写不了：这个时刻之前后台不再去重算。不然到期时间错开的节点、被叫醒的后台任务会让它
+    /// 一次接一次地去碰数据库，别的进程占着写锁时每一次都是拿着 controller 的锁等满超时。
+    pub(crate) flush_after: Option<Instant>,
     /// 各个节点最近上报的路由表。节点离线之后留着，界面上显示成过期的；controller 重启就没有了。
     pub(crate) routes: BTreeMap<NodeId, routes::Reported>,
     /// 出口和用出口的节点报的计数，算健康和交叉核对用。节点离线之后留着；controller 重启就没有了。
@@ -275,6 +278,7 @@ impl Controller {
             no_vnet: BTreeSet::new(),
             dirty: BTreeMap::new(),
             wake: Arc::clone(&wake),
+            flush_after: None,
             routes: BTreeMap::new(),
             usage: usage::Usage::default(),
             route_queries: BTreeMap::new(),

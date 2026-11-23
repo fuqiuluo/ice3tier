@@ -85,6 +85,9 @@ impl Inner {
                     // 网络读不出来，说不出"全部"是哪些：排上在线的。不在线的回来时拿到的本来就是那时的内容。
                     Seeds::All => self.live.iter().filter(|(_, live)| live.network == network).map(|(node, _)| *node).collect(),
                 };
+                if err.is_database_wide() {
+                    self.back_off();
+                }
                 self.retry_later(network, nodes);
                 return Err(Unfinished { error: err.into(), done: BTreeSet::new() });
             }
@@ -111,6 +114,7 @@ impl Inner {
                 Err(err) if err.is_database_wide() => {
                     failed.extend(batch.range(node..).copied());
                     error = Some(err);
+                    self.back_off();
                     break;
                 }
                 // 只是这一个节点没做成，不耽误同一批里别的：各算各的，看到的是同一套"谁在等谁确认"。
@@ -126,15 +130,25 @@ impl Inner {
         error.map_or(Ok(()), |error| Err(Unfinished { error, done }))
     }
 
-    /// 这些节点的重算没做成：过一会儿再试，并且叫醒后台任务，让它到点来做。
+    /// 这些节点的重算没做成：过一会儿再试，并且叫醒后台任务，让它到点来做。做成之前它们算"还在重试"。
     /// 一个节点都没有时（都做成了；或者要重算整个网络，网络读不出来，又没有谁在线）没有排上谁，就不叫。
     fn retry_later(&mut self, network: NetworkId, nodes: impl IntoIterator<Item = NodeId>) {
-        let mut nodes = nodes.into_iter().peekable();
-        if nodes.peek().is_none() {
+        let nodes: BTreeSet<NodeId> = nodes.into_iter().collect();
+        if nodes.is_empty() {
             return;
+        }
+        for node in &nodes {
+            if let Some(sync) = self.sync.get_mut(node) {
+                sync.retrying = true;
+            }
         }
         self.defer(network, nodes, RETRY_DELAY);
         self.wake.notify_one();
+    }
+
+    /// 整个数据库刚读写不了：后台的重算过一会儿再碰它，见 [`Inner::flush_after`]。
+    fn back_off(&mut self) {
+        self.flush_after = Some(Instant::now() + RETRY_DELAY);
     }
 
     /// 先把访问关系变更的第一步登记到所有相关节点上，再去算任何一份 netmap。
@@ -223,6 +237,7 @@ impl Inner {
             self.store.set_node_netmap(id, version, &digest)?;
             sync.state.version = version;
             sync.state.digest = Some(digest);
+            sync.version_issued(Instant::now());
         }
         let released = sync.settle(relations);
         self.defer(view.network.id, released, Duration::ZERO);
@@ -238,6 +253,7 @@ impl Inner {
                 self.store.set_node_sent(id, version)?;
             }
         }
+        self.sync.entry(id).or_default().retrying = false;
         Ok(())
     }
 
@@ -313,6 +329,10 @@ impl Inner {
 
     /// 重算到期的节点。返回剩下的里面最早的到期时间。
     pub(crate) fn flush_due(&mut self, now: Instant) -> Result<Option<Instant>, Error> {
+        // 整个数据库刚读写不了，还没到再试的时候：到期的先放着，不碰数据库。
+        if let Some(after) = self.flush_after.filter(|after| now < *after) {
+            return Ok(Some(after));
+        }
         let mut due: BTreeMap<NetworkId, BTreeSet<NodeId>> = BTreeMap::new();
         self.dirty.retain(|node, deferred| {
             let is_due = deferred.due <= now;
@@ -333,7 +353,7 @@ impl Inner {
                 }
             }
         }
-        // 整个数据库都读写不了时，剩下的网络不去试（见 `refresh_reporting`），原样放回队列。
+        // 整个数据库都读写不了时，剩下的网络不去试（见 `refresh_reporting`），放回队列等下一次。
         for (network, nodes) in due {
             self.retry_later(network, nodes);
         }

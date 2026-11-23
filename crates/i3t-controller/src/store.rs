@@ -199,17 +199,16 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// 这次失败是不是整个数据库的事：别的进程占着写锁、数据库只读、盘满、读写文件出错。
+    /// 这次失败是不是整个数据库的事：别的进程占着写锁、数据库只读、读写文件出错。
     /// 这时换一行写、马上再写一次都是一样的结果，而且"占着写锁"的每一次都要先等满超时才失败。
     ///
-    /// 别的失败（约束、触发器之类）只和那一条语句有关，别的行照样写得进去。
+    /// 别的失败只和那一条语句有关，别的行照样写得进去：约束、触发器之类；盘满也算在这里，
+    /// 这一条要新的页所以装不下，不用新页的写照旧写得进去，它也不用等就失败。
     #[must_use]
     pub fn is_database_wide(&self) -> bool {
-        use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked, DiskFull, ReadOnly, SystemIoFailure};
+        use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked, ReadOnly, SystemIoFailure};
         match self {
-            Self::Sqlite(err) => {
-                matches!(err.sqlite_error_code(), Some(DatabaseBusy | DatabaseLocked | DiskFull | ReadOnly | SystemIoFailure))
-            }
+            Self::Sqlite(err) => matches!(err.sqlite_error_code(), Some(DatabaseBusy | DatabaseLocked | ReadOnly | SystemIoFailure)),
             Self::NewerSchema { .. } => false,
         }
     }
@@ -234,6 +233,14 @@ mod tests {
         store.execute_batch("CREATE TRIGGER no_meta BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'no'); END;");
         assert!(!store.set_meta("k", b"w").unwrap_err().is_database_wide(), "只是这一条语句被拦下了");
         assert!(!StoreError::NewerSchema { found: 2, supported: 1 }.is_database_wide());
+        store.execute_batch("DROP TRIGGER no_meta;");
+
+        // 满了：这一条要新的页，装不下；不用新页的写照样写得进去，所以不算整个数据库的事。
+        store.execute_batch("PRAGMA max_page_count = 1;");
+        let full = store.set_meta("big", &vec![0; 1 << 20]).unwrap_err();
+        assert!(matches!(&full, StoreError::Sqlite(err) if err.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)), "{full:?}");
+        assert!(!full.is_database_wide());
+        store.set_meta("k", b"x").unwrap();
     }
 
     #[test]

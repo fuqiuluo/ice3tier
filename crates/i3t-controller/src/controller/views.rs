@@ -116,9 +116,10 @@ impl Inner {
         NetworkView::load(&self.store, network)?.ok_or(Error::NotFound(Entity::Network))
     }
 
-    /// 节点是不是已经确认了它当前版本的 netmap。
+    /// 节点是不是已经确认了它该有的 netmap：确认到了当前的版本号，没有欠着的确认，也没有做不成、还在重试的重算。
+    /// 后两样在新的版本号一时记不进存储时才会和第一样不一致：版本号没加，它确认过的"当前版本"其实是旧的内容。
     fn has_acknowledged(&self, id: NodeId) -> bool {
-        self.sync.get(&id).is_none_or(|sync| sync.state.acked >= sync.state.version)
+        self.sync.get(&id).is_none_or(|sync| sync.state.acked >= sync.state.version && !sync.is_waiting() && !sync.retrying)
     }
 
     /// 两端都在线、但至少一端上报"没有可用的路"的节点对。
