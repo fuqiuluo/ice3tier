@@ -10,7 +10,11 @@ mod ordering;
 mod proxies;
 mod routes;
 mod stats;
+mod unsettled;
 mod update;
+
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use i3t_model::Netmap;
 use i3t_model::admin::{CreateRule, Direction, NetworkId, UpdateNode};
@@ -25,6 +29,12 @@ fn relations(netmap: &Netmap) -> Vec<(NodeId, bool, bool)> {
 
 fn peer_ids(netmap: &Netmap) -> Vec<NodeId> {
     netmap.peers.iter().map(|peer| peer.id).collect()
+}
+
+/// 后台任务现在是不是被叫醒了。问一次就算它醒过一次。
+fn is_woken(lab: &Lab) -> bool {
+    let mut work = pin!(lab.controller.wait_for_work());
+    matches!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(()))
 }
 
 /// 去掉网络自带的 `All <-> All`，之后谁能访问谁全看测试自己加的规则。

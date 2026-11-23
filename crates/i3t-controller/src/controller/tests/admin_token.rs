@@ -124,6 +124,32 @@ fn a_data_dir_and_a_database_of_different_controllers_are_not_put_together() {
 }
 
 #[test]
+fn two_controllers_that_reach_an_empty_database_at_the_same_moment_do_not_both_get_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    // 另一个数据目录的 controller 抢先了一步：这一个读的时候库里还没有记公钥，等它去记时那一个的已经在了。
+    // 用一个触发器把"那一个的"在这一刻塞进去。
+    let theirs = [7u8; 32];
+    Store::open(&database).unwrap().execute_batch(&format!(
+        "CREATE FUNCTION come_first() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+             INSERT INTO meta (key, value) VALUES ('controller_key', '\\x{}');
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER come_first BEFORE INSERT ON meta FOR EACH ROW
+             WHEN (NEW.key = 'controller_key' AND pg_trigger_depth() = 0) EXECUTE FUNCTION come_first();",
+        "07".repeat(theirs.len())
+    ));
+
+    let data = dir.path().join("late");
+    let refused = Controller::open(&data, &database, ADDR.to_owned()).err().expect("库已经是另一个 controller 的了");
+    assert!(matches!(&refused, Error::KeyMismatch { path } if *path == data.join(KEY_FILE)), "{refused:?}");
+    let store = Store::open(&database).unwrap();
+    assert_eq!(store.meta("controller_key").unwrap().as_deref(), Some(theirs.as_slice()), "先记上的那一把没有被盖掉");
+    assert_eq!(store.meta("admin_token_hash").unwrap(), None, "没开成的这一个也没有在别人的库里生成管理令牌");
+}
+
+#[test]
 fn a_database_that_already_has_a_controller_is_not_given_a_new_key() {
     let dir = tempfile::tempdir().unwrap();
     let scratch = Scratch::new();

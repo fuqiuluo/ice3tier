@@ -1,8 +1,6 @@
 //! 下发的顺序和节奏：授权先到目的端，撤销先到发起端；上报引起的变化合并下发；删除立即生效。
 
 use std::net::SocketAddr;
-use std::pin::pin;
-use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use i3t_model::admin::{CreateRule, Direction, ErrorCode, UpdateNode};
@@ -10,9 +8,10 @@ use i3t_model::control::{Declared, Report, Route, RouteEntry, Signal, ToControll
 use i3t_proto::NodeId;
 use tokio::sync::mpsc;
 
+use super::super::publish::Seeds;
 use super::super::testing::{Lab, Member, REMOTE, hello};
 use super::super::{Controller, Timing};
-use super::{add_rule, drop_default_rule, peer_ids, relations};
+use super::{add_rule, drop_default_rule, is_woken, peer_ids, relations};
 use crate::error::{Error, Rejection};
 use crate::store::{NetmapState, Scratch, Store};
 
@@ -256,12 +255,6 @@ fn block_column_of(lab: &Lab, column: &str, node: NodeId) {
 
 fn unblock(lab: &Lab, column: &str) {
     lab.controller.lock().store.unblock(&format!("no_{column}"), "nodes");
-}
-
-/// 后台任务现在是不是被叫醒了。问一次就算它醒过一次。
-fn is_woken(lab: &Lab) -> bool {
-    let mut work = pin!(lab.controller.wait_for_work());
-    matches!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(()))
 }
 
 fn one_way(lab: &Lab, network: i3t_model::admin::NetworkId) -> CreateRule {
@@ -621,12 +614,13 @@ fn a_locked_table_is_waited_for_once_however_many_nodes_and_networks_are_due() {
     assert_eq!(queued(&lab), 4, "每个网络里头一个节点内容没变、不用写，算做完了；其余的排回队列");
     assert_eq!(members.iter_mut().map(Member::receive).sum::<usize>(), 0);
 
-    // 刚等过一次。这时又有节点到期、后台任务又被叫醒（重试排上时叫的，节点的上报也会叫），也不马上再去写。
+    // 刚等过一次。这时又有节点到期、后台任务又被叫醒（重试排上时叫的，节点的上报也会叫）：去写了，马上失败，不再等。
     assert!(is_woken(&lab));
     lab.controller.lock().defer(networks[0], [members[1].id], Duration::ZERO);
-    let again = lab.controller.lock().flush_due(Instant::now()).expect("没有去写，也就没有出错");
-    assert!(again.is_some_and(|at| at > Instant::now()), "告诉后台任务过一会儿再来");
-    assert_eq!(waits(&lab), 1, "退避的这一会儿里不碰数据库");
+    let started = Instant::now();
+    assert!(lab.controller.lock().flush_due(Instant::now()).is_err());
+    assert!(started.elapsed() < LOCK_PATIENCE, "{:?}", started.elapsed());
+    assert_eq!(waits(&lab), 1, "存储刚等满过一次，这一会儿里不再等");
     assert_eq!(queued(&lab), 4);
 
     // 过了这一会儿（存储也重新肯等了）再试一次，还是只等一次。
@@ -669,6 +663,33 @@ fn a_locked_row_holds_up_only_its_own_node() {
     other.execute_batch("ROLLBACK");
     flush(&lab).unwrap();
     assert_eq!(members[1].receive(), 1, "放开之后补发");
+}
+
+#[test]
+fn a_locked_node_that_is_hit_again_and_again_does_not_hold_back_what_is_due_in_another_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let (lab, networks, mut members) = two_networks_with_changes_due(&database, dir.path());
+
+    // 第一个网络里一个节点的那一行被别的连接占着。头一轮过后只剩它没做成。
+    let other = Store::open(&database).unwrap();
+    other.execute_batch(&format!("BEGIN; UPDATE nodes SET hostname = hostname WHERE id = {}", members[1].id.get()));
+    assert!(lab.controller.lock().flush_due(Instant::now() + PAST_RETRY).is_err());
+    assert_eq!(members.iter_mut().map(Member::receive).collect::<Vec<_>>(), vec![0, 0, 1, 0, 1, 1]);
+
+    // 第二个网络里又有了变化，到期了。同时前台的请求（管理操作、节点的上报）一次接一次地碰上被占着的那个节点。
+    report_endpoints(&lab, &members[3], "203.0.113.9:3");
+    for _ in 0..3 {
+        let hit = lab.controller.lock().refresh(networks[0], Seeds::of([members[1].id]), None);
+        assert!(matches!(hit, Err(Error::Store(error)) if error.is_lock_timeout()));
+        // 前台每碰一次都让后台"过一会儿再来"的话，这里到期的就一直轮不到：现在就做，不等。
+        lab.controller.lock().defer(networks[1], [members[4].id, members[5].id], Duration::ZERO);
+        // 被占着的那个节点要是也到了再试的时候，这一轮会带着它的错误回来：不管，只看第二个网络的发没发。
+        let _ = lab.controller.lock().flush_due(Instant::now());
+    }
+    assert_eq!(members.iter_mut().map(Member::receive).collect::<Vec<_>>(), vec![0, 0, 0, 0, 1, 1], "第二个网络的照常发了");
+    other.execute_batch("ROLLBACK");
 }
 
 #[test]

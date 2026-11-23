@@ -131,11 +131,6 @@ impl Error {
         matches!(self, Self::Store(err) if err.is_database_wide())
     }
 
-    /// 是不是等别的连接放开锁等到了期限（见 [`StoreError::is_lock_timeout`]）。被占着的可能只是一行，别的照样写得进去。
-    pub(crate) fn is_lock_timeout(&self) -> bool {
-        matches!(self, Self::Store(err) if err.is_lock_timeout())
-    }
-
     /// 给程序看的分类，管理 API 的应答里用它。
     #[must_use]
     pub const fn code(&self) -> ErrorCode {

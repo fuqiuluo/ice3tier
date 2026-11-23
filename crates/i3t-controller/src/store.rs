@@ -23,6 +23,7 @@
 //! 连接断了（数据库重启、网络闪断）时，下一次读写会换一条新的连接再做。断的那一刻正在做的读写报错。
 //! 它要是在事务里，事务不算数，数据库那边已经撤销了，只有一种情况说不准：断在"提交"发出去之后、回答回来之前。
 //! 那时数据库可能已经提交了，也可能没有，这里报 [`StoreError::CommitUnknown`]，调用方不能当成"没有做"。
+//! 后来到底算没算数是问得出来的：提交之前记下了事务的编号，连接恢复之后拿它去问（[`Store::settle_commits`]）。
 
 mod codec;
 mod cooldown;
@@ -49,8 +50,10 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Notify;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Config, Row};
@@ -112,8 +115,8 @@ impl FromStr for Database {
     fn from_str(text: &str) -> Result<Self, StoreError> {
         // 解析的错误里会带着连接串的片段（拼错了 `postgres://` 时是整个连接串，连密码在内），所以不留它的原话。
         let mut config: Config = text.trim().parse().map_err(|_| StoreError::BadConnectionString)?;
-        // 空的连接串解析得过去，要到连的时候才说没有主机。
-        if config.get_hosts().is_empty() {
+        // 空的连接串解析得过去，要到连的时候才说没有主机。主机可以只写地址（`hostaddr=…`）。
+        if config.get_hosts().is_empty() && config.get_hostaddrs().is_empty() {
             return Err(StoreError::BadConnectionString);
         }
         if config.get_ssl_mode() == SslMode::Require {
@@ -146,11 +149,23 @@ impl fmt::Debug for Database {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Database")
             .field("hosts", &self.0.get_hosts())
+            .field("hostaddrs", &self.0.get_hostaddrs())
             .field("ports", &self.0.get_ports())
             .field("user", &self.0.get_user())
             .field("dbname", &self.0.get_dbname())
             .finish_non_exhaustive()
     }
+}
+
+/// 结果不明的提交（[`StoreError::CommitUnknown`]）后来怎么样了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unsettled {
+    /// 没有这样的提交。
+    Nothing,
+    /// 数据库那边还没做完：过一会儿再问。
+    Pending,
+    /// 都有了结果。`committed` 是里面有没有算了数的：有的话，数据库里已经是改过的样子。
+    Settled { committed: bool },
 }
 
 /// 事务进行到哪了。
@@ -176,6 +191,10 @@ pub struct Store {
     impatient: Cell<bool>,
     /// 刚试过没连上：到这个时刻之前不再去连。
     reconnect_after: Cell<Option<Instant>>,
+    /// 提交发出去了、回答没有回来的事务的编号（[`StoreError::CommitUnknown`]）：还不知道它们后来算没算数。
+    unsettled: RefCell<Vec<String>>,
+    /// 出了上面这样的事务时叫醒谁，见 [`Store::wake_on_unsettled_commit`]。
+    unsettled_wake: Option<Arc<Notify>>,
     /// 测试用：有几条语句是把等锁的期限等满了才失败的。
     #[cfg(test)]
     lock_waits: Cell<usize>,
@@ -229,6 +248,8 @@ impl Store {
             impatient_until: Cell::new(None),
             impatient: Cell::new(false),
             reconnect_after: Cell::new(None),
+            unsettled: RefCell::default(),
+            unsettled_wake: None,
             #[cfg(test)]
             lock_waits: Cell::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -266,6 +287,49 @@ impl Store {
         Ok(value)
     }
 
+    /// 有事务的提交结果不明时叫醒 `wake`：得有人回头来问它后来算没算数（[`Store::settle_commits`]），
+    /// 而那一刻的调用方多半只是带着错误返回了。
+    pub(crate) fn wake_on_unsettled_commit(&mut self, wake: Arc<Notify>) {
+        self.unsettled_wake = Some(wake);
+    }
+
+    /// 去问数据库，结果不明的那些提交后来怎么样了。都有了结果就不再记着它们。
+    ///
+    /// # Errors
+    ///
+    /// 读数据库失败：过后再问。
+    pub(crate) fn settle_commits(&self) -> Result<Unsettled, StoreError> {
+        let transactions = self.unsettled.borrow().clone();
+        if transactions.is_empty() {
+            return Ok(Unsettled::Nothing);
+        }
+        let mut committed = false;
+        for transaction in &transactions {
+            let asked = self.query_one("SELECT pg_xact_status($1::text::xid8)", &[transaction], |row| row.try_get::<_, Option<String>>(0));
+            let status = match asked {
+                Ok(status) => status,
+                // 数据库答了话，说这个编号它答不上来（库换成了另一份的话，这个编号在它那里还没有用到）。
+                Err(StoreError::Postgres(error)) if error.code().is_some() => None,
+                Err(error) => return Err(error),
+            };
+            match status.as_deref() {
+                Some("in progress") => return Ok(Unsettled::Pending),
+                Some("aborted") => {}
+                // 答不上来的（还有太久以前的事务）：当它算了数，多核对一次没有坏处。
+                Some(_) | None => committed = true,
+            }
+        }
+        // 只去掉问过的这几个：问的时候不在事务里，不会有新的加进来，可是不靠这个。
+        self.unsettled.borrow_mut().retain(|transaction| !transactions.contains(transaction));
+        Ok(Unsettled::Settled { committed })
+    }
+
+    /// 测试用：有没有提交的结果还不知道。
+    #[cfg(test)]
+    pub(crate) fn has_unsettled_commits(&self) -> bool {
+        !self.unsettled.borrow().is_empty()
+    }
+
     /// 测试用：让数据库只能读，或者恢复成能写，模拟数据库暂时写不进去。
     #[cfg(test)]
     pub(crate) fn set_read_only(&self, read_only: bool) {
@@ -293,6 +357,12 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn set_response_timeout(&self, timeout: Duration) {
         self.session.borrow().as_ref().expect("连接还在").set_response_timeout(timeout);
+    }
+
+    /// 测试用：数据库那边照看现在这条连接的进程。
+    #[cfg(test)]
+    pub(crate) fn backend(&self) -> i32 {
+        self.query_one("SELECT pg_backend_pid()", &[], |row| row.try_get(0)).unwrap()
     }
 
     /// 测试用：直接执行几条 SQL。
@@ -336,6 +406,18 @@ impl Store {
             &[&key, &value],
         )?;
         Ok(())
+    }
+
+    /// 记下一项只定一次的全局设置：已经有了就不动它。返回现在记着的值，是自己刚写的，或者别人先写的那个。
+    /// 几个进程同时来也只有一个写得上。
+    ///
+    /// # Errors
+    ///
+    /// 读写数据库失败。
+    pub fn set_meta_once(&self, key: &str, value: &[u8]) -> Result<Vec<u8>, StoreError> {
+        self.execute("INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING", &[&key, &value])?;
+        // 分成两句：别人先写的那一行可能是在上一句开始之后才提交的，同一句里看不见它。
+        self.query_one("SELECT value FROM meta WHERE key = $1", &[&key], |row| row.try_get(0))
     }
 
     /// 在连接上做一件事。事务外面先看连接还在不在、等锁的期限对不对；事务里面不动这两样：
@@ -460,6 +542,9 @@ impl OpenTransaction<'_> {
         if self.0.transaction.get() == Transaction::Failed {
             return Err(StoreError::Aborted);
         }
+        // 先记下这个事务的编号：提交的回答要是回不来，过后凭它问得出事务算了数没有。什么都没改过的事务没有编号。
+        let transaction: Option<String> =
+            self.0.run(|session| Ok(session.query_one("SELECT pg_current_xact_id_if_assigned()::text", &[])?.try_get(0)?))?;
         match self.0.on_session(|session| session.batch("COMMIT")) {
             Ok(()) => {
                 self.0.transaction.set(Transaction::None);
@@ -470,6 +555,13 @@ impl OpenTransaction<'_> {
             // 发出去了，回答没有回来：数据库那边可能已经提交了。
             Err(error) => {
                 self.0.transaction.set(Transaction::None);
+                // 什么都没改过的事务算不算数都一样，没有要过后去问的。
+                if let Some(transaction) = transaction {
+                    self.0.unsettled.borrow_mut().push(transaction);
+                    if let Some(wake) = &self.0.unsettled_wake {
+                        wake.notify_one();
+                    }
+                }
                 Err(StoreError::CommitUnknown(Box::new(error)))
             }
         }
@@ -573,7 +665,7 @@ pub enum StoreError {
     Unresponsive(Duration),
     #[error("事务里有一步失败了，整个事务没有提交")]
     Aborted,
-    /// 提交发出去了，回答没有回来：数据库那边可能已经提交了，也可能没有。
+    /// 提交发出去了，回答没有回来：数据库那边可能已经提交了，也可能没有。过后问得出来，见 [`Store::settle_commits`]。
     #[error("提交之后没有等到数据库的回答，不知道这次改动算不算数")]
     CommitUnknown(#[source] Box<StoreError>),
     #[error("search_path 里没有一个存在的 schema，表没有地方建")]
@@ -854,18 +946,61 @@ mod tests {
                  FOR EACH ROW EXECUTE FUNCTION stall();",
         );
         store.set_response_timeout(Duration::from_millis(200));
+        let wake = Arc::new(Notify::new());
+        store.wake_on_unsettled_commit(Arc::clone(&wake));
         let started = Instant::now();
         let outcome: Result<(), StoreError> = store.atomically(|store| store.set_meta("k", b"v"));
         let error = outcome.unwrap_err();
         assert!(matches!(error, StoreError::CommitUnknown(_)) && error.is_database_wide(), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        // 得有人回头来问它后来怎么样了：记着它，并且叫醒了要来问的人。
+        assert!(store.has_unsettled_commits());
+        let mut woken = std::pin::pin!(wake.notified());
+        assert!(woken.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())).is_ready());
 
         // 数据库那边其实还在做，做完就提交了：这次改动是算数的。调用方要是把这个错当成"没有做"，就错了。
+        // 问得出来：数据库那边做完之前是"还没做完"，然后是"算了数"。
         let deadline = Instant::now() + Duration::from_secs(20);
-        while store.meta("k").unwrap().is_none() {
+        let answer = loop {
+            match store.settle_commits().unwrap() {
+                Unsettled::Pending => {}
+                answer => break answer,
+            }
             assert!(Instant::now() < deadline, "数据库那边应该提交了");
             std::thread::sleep(Duration::from_millis(50));
-        }
+        };
+        assert_eq!(answer, Unsettled::Settled { committed: true });
+        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()));
+        assert!(!store.has_unsettled_commits(), "问出了结果就不再记着");
+    }
+
+    #[test]
+    fn what_became_of_a_transaction_is_asked_by_its_number() {
+        let scratch = Scratch::new();
+        let (store, other) = (Store::open(&scratch.database()).unwrap(), Store::open(&scratch.database()).unwrap());
+        assert_eq!(store.settle_commits().unwrap(), Unsettled::Nothing);
+        let number = |store: &Store| store.query_one("SELECT pg_current_xact_id()::text", &[], |row| row.try_get::<_, String>(0)).unwrap();
+
+        // 撤销了的。
+        other.execute_batch("BEGIN");
+        store.unsettled.borrow_mut().push(number(&other));
+        other.execute_batch("ROLLBACK");
+        assert_eq!(store.settle_commits().unwrap(), Unsettled::Settled { committed: false });
+        assert!(!store.has_unsettled_commits());
+
+        // 还没做完的过后再问，这期间一直记着；做完了、算了数的。
+        other.execute_batch("BEGIN");
+        store.unsettled.borrow_mut().push(number(&other));
+        assert_eq!(store.settle_commits().unwrap(), Unsettled::Pending);
+        assert!(store.has_unsettled_commits());
+        other.execute_batch("COMMIT");
+        assert_eq!(store.settle_commits().unwrap(), Unsettled::Settled { committed: true });
+        assert_eq!(store.settle_commits().unwrap(), Unsettled::Nothing);
+
+        // 数据库答不上来的编号（库换成了另一份的话，它在那里还没有用到）：当它算了数，多核对一次没有坏处。
+        store.unsettled.borrow_mut().push(u64::MAX.to_string());
+        assert_eq!(store.settle_commits().unwrap(), Unsettled::Settled { committed: true });
+        assert!(!store.has_unsettled_commits());
     }
 
     #[test]
@@ -1109,6 +1244,38 @@ mod tests {
             assert!(matches!(empty.parse::<Database>(), Err(StoreError::BadConnectionString)), "{empty:?}");
         }
         assert!("  postgres://i3t@db.example/controller\n".parse::<Database>().is_ok(), "前后的空白和换行不碍事");
+    }
+
+    #[test]
+    fn a_setting_that_is_set_once_keeps_the_first_value() {
+        let scratch = Scratch::new();
+        let (first, second) = (Store::open(&scratch.database()).unwrap(), Store::open(&scratch.database()).unwrap());
+        assert_eq!(first.set_meta_once("owner", b"first").unwrap(), b"first");
+        assert_eq!(second.set_meta_once("owner", b"second").unwrap(), b"first", "后来的写不上，读到的是先写的");
+        assert_eq!(first.meta("owner").unwrap().as_deref(), Some(b"first".as_slice()));
+
+        // 先来的还没提交时后来的等着它；它提交了，后来的读到的是它写的，不是空的。
+        first.execute_batch("BEGIN; INSERT INTO meta (key, value) VALUES ('race', 'early')");
+        let late = std::thread::spawn(move || second.set_meta_once("race", b"late").unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        first.execute_batch("COMMIT");
+        assert_eq!(late.join().unwrap(), b"early");
+    }
+
+    #[test]
+    fn a_host_written_only_as_an_address_is_a_host() {
+        // 只写 `hostaddr`、不写 `host`：不是"没有主机"，照样去连。
+        let database: Database = "hostaddr=127.0.0.1 port=1 user=i3t password=s3cret dbname=controller".parse().expect("只写了地址");
+        let printed = format!("{database:?}");
+        assert!(printed.contains("127.0.0.1") && !printed.contains("s3cret"), "{printed}");
+        let error = Store::open(&database).err().expect("这个端口上没有数据库");
+        assert!(matches!(error, StoreError::Connect(_)), "去连了，而不是说连接串读不懂：{error:?}");
+
+        // 建连的期限按主机的个数给：写名字、写地址都算。
+        let limit = |text: &str| session::connect_limit(&text.parse::<Database>().unwrap().0);
+        assert_eq!(limit("hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), Duration::from_secs(6));
+        assert_eq!(limit("host=a.example,b.example,c.example user=i3t connect_timeout=3"), Duration::from_secs(9));
+        assert_eq!(limit("host=a.example,b.example hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), Duration::from_secs(6));
     }
 
     #[test]

@@ -55,7 +55,7 @@ use crate::gate::Throttle;
 use crate::netmap::NetworkView;
 use crate::node_server::{PENDING, VerificationQuota};
 use crate::relay_reach::{self, ReachIndex};
-use crate::store::{DIGEST_LEN, Database, GroupRecord, LogFilter, NetworkRecord, NodeRecord, Store};
+use crate::store::{DIGEST_LEN, Database, GroupRecord, LogFilter, NetworkRecord, NodeRecord, Store, StoreError};
 use crate::sync::NodeSync;
 use crate::{node_addresses, secret};
 
@@ -126,8 +126,8 @@ pub struct Controller {
     /// 从数据目录打开时是那个目录。
     data_dir: Option<PathBuf>,
     timing: Timing,
-    /// 管理令牌的哈希。每个管理请求都要查它，所以不放在大锁里。
-    admin_token: Mutex<Option<[u8; DIGEST_LEN]>>,
+    /// 管理令牌的哈希。每个管理请求都要查它，所以不放在大锁里。`Inner` 手上也有一份。
+    admin_token: Arc<Mutex<Option<[u8; DIGEST_LEN]>>>,
     inner: Mutex<Inner>,
     /// 有延后的下发时叫醒后台任务。`Inner` 手上也有一份。
     wake: Arc<Notify>,
@@ -168,9 +168,14 @@ pub(crate) struct Inner {
     /// 叫醒后台任务，和 [`Controller::wake_if_needed`] 用的是同一个。重算没做成、排了重试时在这里叫：
     /// 那时调用方多半带着错误提前返回了，轮不到它来叫。
     pub(crate) wake: Arc<Notify>,
-    /// 重算时整个数据库读写不了：这个时刻之前后台不再去重算。不然到期时间错开的节点、被叫醒的后台任务会让它
-    /// 一次接一次地去碰数据库，别的进程占着写锁时每一次都是拿着 controller 的锁等满超时。
+    /// 重算时整个数据库读写不了（连不上、只读了、盘满了）：这个时刻之前后台不再去重算。不然到期时间错开的节点、
+    /// 被叫醒的后台任务会让它一次接一次地去碰数据库。只是某一行、某张表被别的连接占着不算，那由存储限着等多久。
     pub(crate) flush_after: Option<Instant>,
+    /// 有一次提交当时不知道结果、后来查出来是算了数的：提交之后该做的事（重算 netmap、断开被删的节点）那时没有做，
+    /// 内存里的状态和数据库对不上，要照数据库补齐（见 [`Inner::settle_commits`]）。
+    pub(crate) out_of_step: bool,
+    /// 管理令牌的哈希，和 [`Controller::is_admin_token`] 查的是同一个。照数据库补齐时按库里记的改它。
+    pub(crate) admin_token: Arc<Mutex<Option<[u8; DIGEST_LEN]>>>,
     /// 各个节点最近上报的路由表。节点离线之后留着，界面上显示成过期的；controller 重启就没有了。
     pub(crate) routes: BTreeMap<NodeId, routes::Reported>,
     /// 出口和用出口的节点报的计数，算健康和交叉核对用。节点离线之后留着；controller 重启就没有了。
@@ -272,11 +277,12 @@ impl Controller {
     /// # Errors
     ///
     /// 读存储失败。
-    pub fn new(store: Store, key: NodeKey, public_addr: String, timing: Timing) -> Result<Self, Error> {
-        let admin_token = store.meta(ADMIN_TOKEN_META)?.and_then(|hash| <[u8; DIGEST_LEN]>::try_from(hash).ok());
+    pub fn new(mut store: Store, key: NodeKey, public_addr: String, timing: Timing) -> Result<Self, Error> {
+        let admin_token = Arc::new(Mutex::new(admin_token_hash(&store)?));
         let version: Version = env!("CARGO_PKG_VERSION").parse().expect("Cargo 保证包的版本号是合法的语义化版本");
         let updates = update::Updates::load(&store, version)?;
         let wake = Arc::new(Notify::new());
+        store.wake_on_unsettled_commit(Arc::clone(&wake));
         let mut inner = Inner {
             store,
             timing,
@@ -289,6 +295,8 @@ impl Controller {
             dirty: BTreeMap::new(),
             wake: Arc::clone(&wake),
             flush_after: None,
+            out_of_step: false,
+            admin_token: Arc::clone(&admin_token),
             routes: BTreeMap::new(),
             usage: usage::Usage::default(),
             route_queries: BTreeMap::new(),
@@ -307,7 +315,7 @@ impl Controller {
             public_addr,
             data_dir: None,
             timing,
-            admin_token: Mutex::new(admin_token),
+            admin_token,
             inner: Mutex::new(inner),
             wake,
             release_wake: Notify::new(),
@@ -362,7 +370,8 @@ impl Controller {
     pub fn issue_admin_token(&self) -> Result<String, Error> {
         let mut inner = self.lock();
         let now = inner.clock.now();
-        let (token, hash) = store_admin_token(&mut inner.store, now)?;
+        let (token, hash) = new_admin_token()?;
+        inner.store.atomically(|store| record_admin_token(store, &hash, now))?;
         *self.admin_token.lock().expect("admin token mutex poisoned") = Some(hash);
         Ok(token)
     }
@@ -388,11 +397,17 @@ impl Controller {
         let pem = fs::read_to_string(&key).map_err(|source| Error::Io { path: key.clone(), source })?;
         let node_key = NodeKey::from_pem(&pem).map_err(|source| Error::Key { path: key.clone(), source })?;
         let mut store = Store::open_existing(database)?;
-        // controller 在一个库上启动过，库里就记着它的公钥。没有记的库没有哪个 controller 用过，也算对不上。
-        if store.meta(CONTROLLER_KEY_META)?.as_deref() != Some(node_key.public().as_bytes().as_slice()) {
-            return Err(Error::KeyMismatch { path: key });
-        }
-        let (token, _) = store_admin_token(&mut store, Clock::default().now())?;
+        let public = node_key.public();
+        let (token, hash) = new_admin_token()?;
+        let now = Clock::default().now();
+        store.atomically(|store| {
+            // controller 在一个库上启动过，库里就记着它的公钥。没有记的库没有哪个 controller 用过，也算对不上。
+            // 和换令牌在同一个事务里核对。
+            if store.meta(CONTROLLER_KEY_META)?.as_deref() != Some(public.as_bytes().as_slice()) {
+                return Err(Error::KeyMismatch { path: key.clone() });
+            }
+            Ok(record_admin_token(store, &hash, now)?)
+        })?;
         Ok(token)
     }
 
@@ -609,6 +624,7 @@ impl Inner {
     /// 时间序列以外的后台工作。返回下一次要做的时刻。
     fn tick_work(&mut self, now: Instant, wall: Timestamp) -> Result<Option<Instant>, Error> {
         self.give_up_on_slow_acks(now);
+        let unsettled = self.settle_commits(now)?;
         let no_udp = self.no_udp_tick(now)?;
         let next = self.flush_due(now)?;
         if self.updates.next_rollout.is_some_and(|at| at <= now) {
@@ -622,7 +638,7 @@ impl Inner {
         // 还有节点欠着确认时，隔一会儿要回来看它们是不是等得太久了。
         let waiting = self.sync.values().any(NodeSync::is_waiting).then(|| now + self.timing.ack_timeout.min(SWEEP_INTERVAL));
         let tests = self.tests_tick(now);
-        Ok([next, no_udp, waiting, self.updates.next_rollout, tests].into_iter().flatten().min())
+        Ok([next, no_udp, waiting, self.updates.next_rollout, tests, unsettled].into_iter().flatten().min())
     }
 }
 
@@ -677,17 +693,23 @@ impl Clock {
     }
 }
 
-/// 生成一个新的管理令牌，把它的哈希写进存储，记一条操作。返回明文和哈希。
-/// 换上一个新的管理令牌，并记一条操作。两样在一个事务里：记不下来的话原来的令牌照旧有效，
-/// 不会出现"原来的已经作废、新的却没有交到调用方手上"。
-fn store_admin_token(store: &mut Store, now: Timestamp) -> Result<(String, [u8; DIGEST_LEN]), Error> {
+/// 数据库里记着的管理令牌的哈希。
+pub(crate) fn admin_token_hash(store: &Store) -> Result<Option<[u8; DIGEST_LEN]>, StoreError> {
+    Ok(store.meta(ADMIN_TOKEN_META)?.and_then(|hash| <[u8; DIGEST_LEN]>::try_from(hash).ok()))
+}
+
+/// 一个新的管理令牌：明文，和存进数据库的哈希。
+fn new_admin_token() -> Result<(String, [u8; DIGEST_LEN]), Error> {
     let token = secret::generate()?;
     let hash = secret::sha256(token.as_bytes());
-    store.atomically(|store| {
-        store.set_meta(ADMIN_TOKEN_META, &hash)?;
-        store.log(now, None, action::ADMIN_TOKEN, "生成了新的管理令牌", serde_json::json!({}))
-    })?;
     Ok((token, hash))
+}
+
+/// 换上哈希是 `hash` 的管理令牌，并记一条操作。要放在一个事务里（[`Store::atomically`]）：记不下来的话原来的令牌
+/// 照旧有效，不会出现"原来的已经作废、新的却没有交到调用方手上"。
+fn record_admin_token(store: &Store, hash: &[u8; DIGEST_LEN], now: Timestamp) -> Result<(), StoreError> {
+    store.set_meta(ADMIN_TOKEN_META, hash)?;
+    store.log(now, None, action::ADMIN_TOKEN, "生成了新的管理令牌", serde_json::json!({}))
 }
 
 /// 数据目录里一定要有的文件。不在时说这不是一个数据目录。
@@ -718,10 +740,13 @@ fn bound_key(store: &Store, path: &Path) -> Result<NodeKey, Error> {
         (None, None) => create_key(path)?,
     };
     let public = key.public();
-    match recorded {
-        Some(recorded) if recorded == public.as_bytes() => {}
-        Some(_) => return Err(Error::KeyMismatch { path: path.to_owned() }),
-        None => store.set_meta(CONTROLLER_KEY_META, public.as_bytes())?,
+    let recorded = match recorded {
+        Some(recorded) => recorded,
+        // 两个数据目录同时头一次连上同一个空库的话，只有一个记得上：另一个在这里读到的是别人的那一把。
+        None => store.set_meta_once(CONTROLLER_KEY_META, public.as_bytes())?,
+    };
+    if recorded != public.as_bytes() {
+        return Err(Error::KeyMismatch { path: path.to_owned() });
     }
     Ok(key)
 }

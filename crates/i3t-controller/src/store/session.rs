@@ -49,11 +49,12 @@ const HANDOVER_MARGIN: Duration = Duration::from_secs(5);
 const GOODBYE: Duration = Duration::from_secs(1);
 
 /// 整个建连最多花多久：找地址、连上、认证，都算在里面。`tokio-postgres` 自己的 `connect_timeout` 只管连上端口
-/// 那一步，对面接了连接却不答话时它一直等。连接串里写了几个主机就给几份。
+/// 那一步，对面接了连接却不答话时它一直等。连接串里写了几个主机就给几份；主机可以写名字（`host`）、
+/// 写地址（`hostaddr`）或者两样都写，个数是多的那一样。
 pub(super) fn connect_limit(config: &Config) -> Duration {
     let each = config.get_connect_timeout().copied().unwrap_or(CONNECT_TIMEOUT);
-    let hosts = u32::try_from(config.get_hosts().len()).unwrap_or(u32::MAX).max(1);
-    each.saturating_mul(hosts)
+    let hosts = config.get_hosts().len().max(config.get_hostaddrs().len());
+    each.saturating_mul(u32::try_from(hosts).unwrap_or(u32::MAX).max(1))
 }
 
 pub(super) struct Session {

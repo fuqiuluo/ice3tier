@@ -12,11 +12,12 @@ use i3t_model::control::ToNode;
 use i3t_proto::NodeId;
 use tokio::sync::mpsc::error::TrySendError;
 
-use super::{Deferred, Inner};
+use super::{Deferred, Inner, admin_token_hash};
 use crate::access::AccessMap;
 use crate::error::Error;
 use crate::netmap::{NetworkView, Relation};
 use crate::secret;
+use crate::store::Unsettled;
 use crate::sync::NodeSync;
 
 /// 延后的重算失败之后多久再试。
@@ -85,7 +86,7 @@ impl Inner {
                     // 网络读不出来，说不出"全部"是哪些：排上在线的。不在线的回来时拿到的本来就是那时的内容。
                     Seeds::All => self.live.iter().filter(|(_, live)| live.network == network).map(|(node, _)| *node).collect(),
                 };
-                if err.is_database_wide() || err.is_lock_timeout() {
+                if err.is_database_wide() {
                     self.back_off();
                 }
                 self.retry_later(network, nodes);
@@ -118,13 +119,12 @@ impl Inner {
                 }
                 // 只是这一个节点没做成，不耽误同一批里别的：各算各的，看到的是同一套"谁在等谁确认"。
                 // 不然一个一直记不下来的节点会把排在它后面的都挡住，比如等它停下来才能不认它的目的端。
+                //
+                // 它那一行（或者整张表）被别的连接占着、等到了期限时也是这样。等的那一阵 controller 的锁是拿着的，
+                // 可是等多久由存储管着：等满一次之后的一小段时间里它不再等（见 `Store` 的"等多久"），被占着的马上失败、
+                // 排回队列，没被占着的照常写。所以这里不让整个后台的重算退避：那样的话，前台只要一秒里不止一次碰上
+                // 被占着的那个节点，别的网络到了期的重算就一直轮不到。
                 Err(err) => {
-                    // 它那一行（或者整张表）被别的连接占着，等到了期限。等的时候 controller 的锁是拿着的，
-                    // 所以后台的重算过一会儿再来；存储在这之后的一小段时间里不再等（见 `Store` 的"等多久"），
-                    // 同一批里别的节点、别的网络照常往下做：没被占着的写得进去，被占着的马上失败、排回队列。
-                    if err.is_lock_timeout() {
-                        self.back_off();
-                    }
                     failed.insert(node);
                     error.get_or_insert(err);
                 }
@@ -151,9 +151,66 @@ impl Inner {
         self.wake.notify_one();
     }
 
-    /// 整个数据库刚读写不了，或者刚为一把锁等满了期限：后台的重算过一会儿再碰它，见 [`Inner::flush_after`]。
+    /// 整个数据库刚读写不了：后台的重算过一会儿再碰它，见 [`Inner::flush_after`]。
+    /// 只是某一行、某张表被占着（等锁到了期限）不算：那由存储自己限着，见 [`Self::refresh_reporting`]。
     fn back_off(&mut self) {
         self.flush_after = Some(Instant::now() + RETRY_DELAY);
+    }
+
+    /// 提交的回答没有回来的那些事务（[`StoreError::CommitUnknown`](crate::store::StoreError::CommitUnknown)）：
+    /// 问数据库它们后来算了数没有。算了数的话，数据库里已经是改过的样子，而提交之后才做的那些事当时没有做
+    /// （调用方带着错误返回了）：照数据库现在的样子补上。不补的话，一条删掉了的规则、一个删掉了的节点会一直留在
+    /// 别的节点的 netmap 里，管理员再删一次只会得到"没有这个东西"。
+    ///
+    /// 返回过多久再来问：数据库那边还没做完的时候。
+    pub(crate) fn settle_commits(&mut self, now: Instant) -> Result<Option<Instant>, Error> {
+        // 整个数据库刚读写不了，还没到再试的时候：`flush_due` 会说什么时候再来。
+        if self.flush_after.is_some_and(|after| now < after) {
+            return Ok(None);
+        }
+        let settled = self.settle_commits_now(now);
+        if settled.as_ref().is_err_and(Error::is_database_wide) {
+            self.back_off();
+        }
+        settled
+    }
+
+    fn settle_commits_now(&mut self, now: Instant) -> Result<Option<Instant>, Error> {
+        match self.store.settle_commits()? {
+            Unsettled::Nothing => {}
+            Unsettled::Pending => return Ok(Some(now + RETRY_DELAY)),
+            Unsettled::Settled { committed } => self.out_of_step |= committed,
+        }
+        if self.out_of_step {
+            tracing::warn!("有一次提交当时不知道结果，现在查到它算了数：照数据库现在的样子重算各个网络");
+            self.catch_up_with_store()?;
+            self.out_of_step = false;
+        }
+        Ok(None)
+    }
+
+    /// 照数据库现在的样子把内存里跟着它的状态补齐：数据库里已经没有的节点断开、忘掉，管理令牌按库里记的来，
+    /// 每个网络的 netmap 重算一遍（内容没变的不会下发）。做到一半出错的话下次从头再做，重做没有坏处。
+    fn catch_up_with_store(&mut self) -> Result<(), Error> {
+        let networks = self.store.networks()?;
+        let mut known = BTreeSet::new();
+        for network in &networks {
+            known.extend(self.store.nodes(network.id)?.into_iter().map(|node| node.id));
+        }
+        let gone: BTreeSet<NodeId> = self.sync.keys().chain(self.live.keys()).filter(|node| !known.contains(node)).copied().collect();
+        for node in gone {
+            tracing::info!(%node, "节点已经不在数据库里了：吊销它");
+            self.send(node, ToNode::Revoked);
+            self.forget_node(node);
+        }
+        *self.admin_token.lock().expect("admin token mutex poisoned") = admin_token_hash(&self.store)?;
+        for network in networks {
+            // 没做成的节点 `refresh` 自己排了重试，不用为它们从头再来。
+            if let Err(error) = self.refresh(network.id, Seeds::All, None) {
+                tracing::warn!(network = %network.id, %error, "照数据库重算网络没有全做成，没做成的节点稍后再试");
+            }
+        }
+        self.roll_out()
     }
 
     /// 先把访问关系变更的第一步登记到所有相关节点上，再去算任何一份 netmap。
