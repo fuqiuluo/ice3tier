@@ -36,7 +36,7 @@ const REMOTE: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
 
 impl Fixture {
     async fn start() -> Self {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let controller =
             Controller::new(store, NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), Timing::default()).unwrap();
         Self::serve(controller).await
@@ -427,18 +427,14 @@ fn publish(root: &std::path::Path, key: &NodeKey, version: &str, security_floor:
 async fn updates_routes_and_paths_can_be_driven_from_the_command_line() {
     let (source, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let release_key = NodeKey::generate().unwrap();
-    let controller = Controller::new(
-        Store::open_in_memory().unwrap(),
-        NodeKey::generate().unwrap(),
-        "ctl.example.com:20331".to_owned(),
-        Timing::default(),
-    )
-    .unwrap()
-    .with_release_keys(TrustedKeys::from(release_key.public()))
-    .unwrap()
-    .with_release_cache(cache.path().to_owned())
-    // 下面发布的版本号是写死的，controller 的版本也固定下来，不随这个包的版本号变。
-    .with_version("0.1.0".parse().unwrap());
+    let controller =
+        Controller::new(Store::temporary(), NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), Timing::default())
+            .unwrap()
+            .with_release_keys(TrustedKeys::from(release_key.public()))
+            .unwrap()
+            .with_release_cache(cache.path().to_owned())
+            // 下面发布的版本号是写死的，controller 的版本也固定下来，不随这个包的版本号变。
+            .with_version("0.1.0".parse().unwrap());
     let fixture = Fixture::serve(controller).await;
     fixture.ok(&["network", "create", "home"]).await;
 

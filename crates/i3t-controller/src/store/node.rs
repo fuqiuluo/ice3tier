@@ -7,19 +7,16 @@ use i3t_model::admin::{GroupId, NetworkId, NodeRef, RelaySettings, Timestamp, Up
 use i3t_model::control::{Declared, SelfUpdate, TryOutcome};
 use i3t_model::netmap::{Attachment, ExitRole, Profile, Reach, RoutingMode};
 use i3t_proto::{NodeId, PublicKey};
-use rusqlite::{OptionalExtension, Row, named_params, params};
 use serde::{Deserialize, Serialize};
+use tokio_postgres::Row;
 
-use super::codec::{Json, SqlIp, SqlKey, SqlNetwork, SqlNode, Text, Unsigned};
+use super::codec::{Blob, Int, Json, Read, SqlIp, SqlKey, SqlNetwork, SqlNode, Text, Unsigned};
+use super::session::Params;
 use super::{DIGEST_LEN, Store, StoreError};
 
 /// 读节点时顺带取出它所在的分组（成员表里的分组编号，JSON 数组）。
-const SELECT: &str = "SELECT nodes.*, (SELECT json_group_array(group_id) FROM group_members WHERE node_id = nodes.id) AS groups FROM nodes";
-
-/// [`Store::exits_among`]：`?1` 是编号的 JSON 数组。从数组出发按主键找，问几个查几行。
-/// `CROSS JOIN` 让 SQLite 照写的顺序连：库里没有统计信息时，它会以为先按网络的索引读整个网络更省。
-const EXITS_AMONG: &str = "SELECT nodes.id FROM json_each(?1) AS asked CROSS JOIN nodes ON nodes.id = asked.value \
-                           WHERE nodes.network_id = ?2 AND nodes.exit IS NOT NULL";
+const SELECT: &str =
+    "SELECT nodes.*, (SELECT COALESCE(jsonb_agg(group_id), '[]'::jsonb) FROM group_members WHERE node_id = nodes.id) AS groups FROM nodes";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRecord {
@@ -103,43 +100,43 @@ impl NodeRecord {
         NodeRef { id: self.id, name: self.name.clone(), virtual_ip: self.virtual_ip }
     }
 
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(row: &Row) -> Read<Self> {
         Ok(Self {
-            id: row.get::<_, SqlNode>("id")?.0,
-            network: row.get::<_, SqlNetwork>("network_id")?.0,
-            key: row.get::<_, SqlKey>("public_key")?.0,
-            name: row.get("name")?,
-            virtual_ip: row.get::<_, SqlIp>("virtual_ip")?.0,
-            groups: row.get::<_, Json<BTreeSet<GroupId>>>("groups")?.0,
-            declared: row.get::<_, Json<Declared>>("declared")?.0,
-            forward_target: row.get("forward_target")?,
-            relay: row.get::<_, Option<Json<RelaySettings>>>("relay")?.map(|json| json.0),
-            exit: row.get::<_, Option<Json<ExitRole>>>("exit")?.map(|json| json.0),
-            dial_out_only: row.get("dial_out_only")?,
-            routing: row.get::<_, Option<Json<RoutingMode>>>("routing")?.map(|json| json.0),
-            reach: row.get::<_, Option<Json<Reach>>>("reach")?.map(|json| json.0),
-            pinned_relays: row.get::<_, Json<Vec<NodeId>>>("pinned_relays")?.0,
-            profile: row.get::<_, Option<Json<Profile>>>("profile")?.map(|json| json.0),
-            auto_update: row.get("auto_update")?,
-            endpoints: row.get::<_, Json<Vec<SocketAddr>>>("endpoints")?.0,
-            local_addresses: row.get::<_, Option<Json<Vec<IpAddr>>>>("local_addresses")?.map(|json| json.0),
-            observed: row.get::<_, Option<Text<SocketAddr>>>("observed")?.map(|text| text.0),
-            attached: row.get::<_, Json<Vec<Attachment>>>("attached")?.0,
-            relay_reach: row.get::<_, Json<Vec<ReachRecord>>>("relay_reach")?.0,
-            platform: row.get("platform")?,
-            version: row.get("version")?,
-            hostname: row.get("hostname")?,
-            self_update: row.get::<_, Option<Json<SelfUpdate>>>("self_update")?.map(|json| json.0),
-            update_failure: row.get::<_, Option<Json<UpdateFailure>>>("update_failure")?.map(|json| json.0),
-            created_at: row.get::<_, Unsigned>("created_at")?.0,
-            last_seen_at: row.get::<_, Option<Unsigned>>("last_seen_at")?.map(|at| at.0),
+            id: row.try_get::<_, SqlNode>("id")?.0,
+            network: row.try_get::<_, SqlNetwork>("network_id")?.0,
+            key: row.try_get::<_, SqlKey>("public_key")?.0,
+            name: row.try_get("name")?,
+            virtual_ip: row.try_get::<_, SqlIp>("virtual_ip")?.0,
+            groups: row.try_get::<_, Json<BTreeSet<GroupId>>>("groups")?.0,
+            declared: row.try_get::<_, Json<Declared>>("declared")?.0,
+            forward_target: row.try_get("forward_target")?,
+            relay: row.try_get::<_, Option<Json<RelaySettings>>>("relay")?.map(|json| json.0),
+            exit: row.try_get::<_, Option<Json<ExitRole>>>("exit")?.map(|json| json.0),
+            dial_out_only: row.try_get("dial_out_only")?,
+            routing: row.try_get::<_, Option<Json<RoutingMode>>>("routing")?.map(|json| json.0),
+            reach: row.try_get::<_, Option<Json<Reach>>>("reach")?.map(|json| json.0),
+            pinned_relays: row.try_get::<_, Json<Vec<NodeId>>>("pinned_relays")?.0,
+            profile: row.try_get::<_, Option<Json<Profile>>>("profile")?.map(|json| json.0),
+            auto_update: row.try_get("auto_update")?,
+            endpoints: row.try_get::<_, Json<Vec<SocketAddr>>>("endpoints")?.0,
+            local_addresses: row.try_get::<_, Option<Json<Vec<IpAddr>>>>("local_addresses")?.map(|json| json.0),
+            observed: row.try_get::<_, Option<Text<SocketAddr>>>("observed")?.map(|text| text.0),
+            attached: row.try_get::<_, Json<Vec<Attachment>>>("attached")?.0,
+            relay_reach: row.try_get::<_, Json<Vec<ReachRecord>>>("relay_reach")?.0,
+            platform: row.try_get("platform")?,
+            version: row.try_get("version")?,
+            hostname: row.try_get("hostname")?,
+            self_update: row.try_get::<_, Option<Json<SelfUpdate>>>("self_update")?.map(|json| json.0),
+            update_failure: row.try_get::<_, Option<Json<UpdateFailure>>>("update_failure")?.map(|json| json.0),
+            created_at: row.try_get::<_, Unsigned>("created_at")?.0,
+            last_seen_at: row.try_get::<_, Option<Unsigned>>("last_seen_at")?.map(|at| at.0),
             netmap: NetmapState {
-                version: row.get::<_, Unsigned>("netmap_version")?.0,
-                digest: row.get("netmap_digest")?,
-                sent: row.get::<_, Unsigned>("sent_version")?.0,
-                acked: row.get::<_, Unsigned>("acked_version")?.0,
+                version: row.try_get::<_, Unsigned>("netmap_version")?.0,
+                digest: row.try_get::<_, Option<Blob<DIGEST_LEN>>>("netmap_digest")?.map(|digest| digest.0),
+                sent: row.try_get::<_, Unsigned>("sent_version")?.0,
+                acked: row.try_get::<_, Unsigned>("acked_version")?.0,
             },
-            enrolled_with: row.get("enrolled_with")?,
+            enrolled_with: row.try_get::<_, Option<Blob<DIGEST_LEN>>>("enrolled_with")?.map(|hash| hash.0),
         })
     }
 }
@@ -169,26 +166,27 @@ impl Store {
         // 名字有唯一约束，编号又要插入之后才知道，所以先占个位，再改成默认名字。
         // 占位的名字带冒号，合法的名字里没有冒号，所以不会和任何节点撞。
         let placeholder = format!("new:{}", new.key);
-        self.conn.execute(
-            "INSERT INTO nodes (network_id, public_key, name, virtual_ip, declared, dial_out_only, pinned_relays, endpoints,
-                                attached, platform, version, created_at, netmap_version, sent_version, acked_version, enrolled_with)
-             VALUES (:network, :key, :name, :ip, :declared, 0, '[]', '[]', '[]', :platform, :version, :created_at, 0, 0, 0, :enrolled_with)",
-            named_params! {
-                ":network": SqlNetwork(new.network),
-                ":key": SqlKey(new.key),
-                ":name": new.name.as_deref().unwrap_or(&placeholder),
-                ":ip": SqlIp(new.virtual_ip),
-                ":declared": Json(new.declared),
-                ":platform": new.platform,
-                ":version": new.version,
-                ":created_at": Unsigned(new.created_at),
-                ":enrolled_with": new.enrolled_with,
-            },
+        let id = self.query_one(
+            "INSERT INTO nodes (network_id, public_key, name, virtual_ip, hostname, platform, version, declared, forward_target,
+                                dial_out_only, pinned_relays, auto_update, endpoints, attached, relay_reach, created_at,
+                                netmap_version, sent_version, acked_version, enrolled_with)
+             VALUES ($1, $2, $3, $4, '', $5, $6, $7, FALSE, FALSE, '[]', TRUE, '[]', '[]', '[]', $8, 0, 0, 0, $9)
+             RETURNING id",
+            &[
+                &SqlNetwork(new.network),
+                &SqlKey(new.key),
+                &new.name.as_deref().unwrap_or(&placeholder),
+                &SqlIp(new.virtual_ip),
+                &new.platform,
+                &new.version,
+                &Json(new.declared),
+                &Unsigned(new.created_at),
+                &new.enrolled_with.map(Blob),
+            ],
+            |row| Ok(row.try_get::<_, SqlNode>(0)?.0),
         )?;
-        let raw = self.conn.last_insert_rowid();
-        let id = u32::try_from(raw).ok().and_then(NodeId::new).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, raw))?;
         if new.name.is_none() {
-            self.conn.execute("UPDATE nodes SET name = ?2 WHERE id = ?1", params![SqlNode(id), format!("node-{id}")])?;
+            self.execute("UPDATE nodes SET name = $2 WHERE id = $1", &[&SqlNode(id), &format!("node-{id}")])?;
         }
         self.set_node_groups(id, &new.groups)?;
         Ok(id)
@@ -198,7 +196,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn node(&self, id: NodeId) -> Result<Option<NodeRecord>, StoreError> {
-        Ok(self.conn.query_row(&format!("{SELECT} WHERE id = ?1"), params![SqlNode(id)], NodeRecord::from_row).optional()?)
+        self.query_opt(&format!("{SELECT} WHERE id = $1"), &[&SqlNode(id)], NodeRecord::from_row)
     }
 
     /// 按公钥找节点，不分网络：一把公钥在整个 controller 里只对应一个节点。
@@ -207,8 +205,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn node_by_key(&self, key: &PublicKey) -> Result<Option<NodeRecord>, StoreError> {
-        let sql = format!("{SELECT} WHERE public_key = ?1");
-        Ok(self.conn.query_row(&sql, params![SqlKey(*key)], NodeRecord::from_row).optional()?)
+        self.query_opt(&format!("{SELECT} WHERE public_key = $1"), &[&SqlKey(*key)], NodeRecord::from_row)
     }
 
     /// 一个网络里的全部节点，按编号排。
@@ -217,9 +214,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn nodes(&self, network: NetworkId) -> Result<Vec<NodeRecord>, StoreError> {
-        let mut statement = self.conn.prepare(&format!("{SELECT} WHERE network_id = ?1 ORDER BY id"))?;
-        let rows = statement.query_map(params![SqlNetwork(network)], NodeRecord::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.query(&format!("{SELECT} WHERE network_id = $1 ORDER BY id"), &[&SqlNetwork(network)], NodeRecord::from_row)
     }
 
     /// 一个网络里启用了 relay 的节点。
@@ -228,9 +223,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn relays_in(&self, network: NetworkId) -> Result<BTreeSet<NodeId>, StoreError> {
-        let mut statement = self.conn.prepare("SELECT id FROM nodes WHERE network_id = ?1 AND relay IS NOT NULL")?;
-        let rows = statement.query_map(params![SqlNetwork(network)], |row| Ok(row.get::<_, SqlNode>(0)?.0))?;
-        Ok(rows.collect::<rusqlite::Result<BTreeSet<_>>>()?)
+        let sql = "SELECT id FROM nodes WHERE network_id = $1 AND relay IS NOT NULL";
+        self.query_into(sql, &[&SqlNetwork(network)], |row| Ok(row.try_get::<_, SqlNode>(0)?.0))
     }
 
     /// 全部启用了 relay 的节点：所在的网络和节点编号。
@@ -239,9 +233,9 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn relay_nodes(&self) -> Result<Vec<(NetworkId, NodeId)>, StoreError> {
-        let mut statement = self.conn.prepare("SELECT network_id, id FROM nodes WHERE relay IS NOT NULL ORDER BY id")?;
-        let rows = statement.query_map([], |row| Ok((row.get::<_, SqlNetwork>(0)?.0, row.get::<_, SqlNode>(1)?.0)))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.query("SELECT network_id, id FROM nodes WHERE relay IS NOT NULL ORDER BY id", &[], |row| {
+            Ok((row.try_get::<_, SqlNetwork>(0)?.0, row.try_get::<_, SqlNode>(1)?.0))
+        })
     }
 
     /// `ids` 里哪些是 `network` 里启用了出口的节点。一条语句按编号查，不读整个网络。
@@ -250,21 +244,20 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn exits_among(&self, network: NetworkId, ids: impl IntoIterator<Item = NodeId>) -> Result<BTreeSet<NodeId>, StoreError> {
-        let ids: Vec<u32> = ids.into_iter().map(NodeId::get).collect();
+        let ids: Vec<i64> = ids.into_iter().map(|id| i64::from(id.get())).collect();
         if ids.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let mut statement = self.conn.prepare_cached(EXITS_AMONG)?;
-        let rows = statement.query_map(params![Json(&ids), SqlNetwork(network)], |row| Ok(row.get::<_, SqlNode>(0)?.0))?;
-        Ok(rows.collect::<rusqlite::Result<BTreeSet<_>>>()?)
+        let sql = "SELECT id FROM nodes WHERE id = ANY($1) AND network_id = $2 AND exit IS NOT NULL";
+        self.query_into(sql, &[&ids, &SqlNetwork(network)], |row| Ok(row.try_get::<_, SqlNode>(0)?.0))
     }
 
     /// # Errors
     ///
     /// 读数据库失败。
     pub fn node_count(&self, network: Option<NetworkId>) -> Result<u32, StoreError> {
-        let network = network.map(SqlNetwork);
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM nodes WHERE ?1 IS NULL OR network_id = ?1", params![network], |row| row.get(0))?)
+        let sql = "SELECT COUNT(*) FROM nodes WHERE $1::bigint IS NULL OR network_id = $1";
+        self.query_one(sql, &[&network.map(SqlNetwork)], |row| Ok(row.try_get::<_, Int<u32>>(0)?.0))
     }
 
     /// 写回一个节点的身份和设置：名字、虚拟 IP、声明、启用的能力（含端口转发的目标）、各个开关，以及它自我介绍里的
@@ -275,31 +268,31 @@ impl Store {
     ///
     /// 写数据库失败，包括名字或虚拟 IP 和别的节点重复。
     pub fn update_node(&self, node: &NodeRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE nodes SET name = :name, virtual_ip = :ip, declared = :declared, forward_target = :forward_target, relay = :relay, exit = :exit,
-                              dial_out_only = :dial_out_only, routing = :routing, reach = :reach, pinned_relays = :pinned,
-                              profile = :profile, auto_update = :auto_update, platform = :platform, version = :version,
-                              hostname = :hostname, self_update = :self_update
-             WHERE id = :id",
-            named_params! {
-                ":id": SqlNode(node.id),
-                ":name": node.name,
-                ":ip": SqlIp(node.virtual_ip),
-                ":declared": Json(node.declared),
-                ":forward_target": node.forward_target,
-                ":relay": node.relay.as_ref().map(Json),
-                ":exit": node.exit.as_ref().map(Json),
-                ":dial_out_only": node.dial_out_only,
-                ":routing": node.routing.map(Json),
-                ":reach": node.reach.map(Json),
-                ":pinned": Json(&node.pinned_relays),
-                ":profile": node.profile.map(Json),
-                ":auto_update": node.auto_update,
-                ":platform": node.platform,
-                ":version": node.version,
-                ":hostname": node.hostname,
-                ":self_update": node.self_update.map(Json),
-            },
+        self.execute(
+            "UPDATE nodes SET name = $2, virtual_ip = $3, declared = $4, forward_target = $5, relay = $6, exit = $7,
+                              dial_out_only = $8, routing = $9, reach = $10, pinned_relays = $11,
+                              profile = $12, auto_update = $13, platform = $14, version = $15,
+                              hostname = $16, self_update = $17
+             WHERE id = $1",
+            &[
+                &SqlNode(node.id),
+                &node.name,
+                &SqlIp(node.virtual_ip),
+                &Json(node.declared),
+                &node.forward_target,
+                &node.relay.as_ref().map(Json),
+                &node.exit.as_ref().map(Json),
+                &node.dial_out_only,
+                &node.routing.map(Json),
+                &node.reach.map(Json),
+                &Json(&node.pinned_relays),
+                &node.profile.map(Json),
+                &node.auto_update,
+                &node.platform,
+                &node.version,
+                &node.hostname,
+                &node.self_update.map(Json),
+            ],
         )?;
         Ok(())
     }
@@ -310,7 +303,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_forward_target(&self, id: NodeId, on: bool) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET forward_target = ?2 WHERE id = ?1", params![SqlNode(id), on])?;
+        self.execute("UPDATE nodes SET forward_target = $2 WHERE id = $1", &[&SqlNode(id), &on])?;
         Ok(())
     }
 
@@ -320,7 +313,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_auto_update(&self, id: NodeId, on: bool) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET auto_update = ?2 WHERE id = ?1", params![SqlNode(id), on])?;
+        self.execute("UPDATE nodes SET auto_update = $2 WHERE id = $1", &[&SqlNode(id), &on])?;
         Ok(())
     }
 
@@ -330,7 +323,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_update_failure(&self, id: NodeId, failure: Option<&UpdateFailure>) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET update_failure = ?2 WHERE id = ?1", params![SqlNode(id), failure.map(Json)])?;
+        self.execute("UPDATE nodes SET update_failure = $2 WHERE id = $1", &[&SqlNode(id), &failure.map(Json)])?;
         Ok(())
     }
 
@@ -340,10 +333,8 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_report(&self, id: NodeId, endpoints: &[SocketAddr], attached: &[Attachment]) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE nodes SET endpoints = ?2, attached = ?3 WHERE id = ?1",
-            params![SqlNode(id), Json(endpoints), Json(attached)],
-        )?;
+        let sql = "UPDATE nodes SET endpoints = $2, attached = $3 WHERE id = $1";
+        self.execute(sql, &[&SqlNode(id), &Json(endpoints), &Json(attached)])?;
         Ok(())
     }
 
@@ -353,7 +344,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_relay_reach(&self, id: NodeId, reach: &[ReachRecord]) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET relay_reach = ?2 WHERE id = ?1", params![SqlNode(id), Json(reach)])?;
+        self.execute("UPDATE nodes SET relay_reach = $2 WHERE id = $1", &[&SqlNode(id), &Json(reach)])?;
         Ok(())
     }
 
@@ -363,7 +354,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_local_addresses(&self, id: NodeId, addresses: &[IpAddr]) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET local_addresses = ?2 WHERE id = ?1", params![SqlNode(id), Json(addresses)])?;
+        self.execute("UPDATE nodes SET local_addresses = $2 WHERE id = $1", &[&SqlNode(id), &Json(addresses)])?;
         Ok(())
     }
 
@@ -371,7 +362,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_observed(&self, id: NodeId, observed: Option<SocketAddr>) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET observed = ?2 WHERE id = ?1", params![SqlNode(id), observed.map(Text)])?;
+        self.execute("UPDATE nodes SET observed = $2 WHERE id = $1", &[&SqlNode(id), &observed.map(Text)])?;
         Ok(())
     }
 
@@ -379,7 +370,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_last_seen(&self, id: NodeId, at: Timestamp) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET last_seen_at = ?2 WHERE id = ?1", params![SqlNode(id), Unsigned(at)])?;
+        self.execute("UPDATE nodes SET last_seen_at = $2 WHERE id = $1", &[&SqlNode(id), &Unsigned(at)])?;
         Ok(())
     }
 
@@ -389,10 +380,8 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_netmap(&self, id: NodeId, version: u64, digest: &[u8; DIGEST_LEN]) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE nodes SET netmap_version = ?2, netmap_digest = ?3 WHERE id = ?1",
-            params![SqlNode(id), Unsigned(version), digest],
-        )?;
+        let sql = "UPDATE nodes SET netmap_version = $2, netmap_digest = $3 WHERE id = $1";
+        self.execute(sql, &[&SqlNode(id), &Unsigned(version), &Blob(*digest)])?;
         Ok(())
     }
 
@@ -400,7 +389,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_sent(&self, id: NodeId, version: u64) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET sent_version = ?2 WHERE id = ?1", params![SqlNode(id), Unsigned(version)])?;
+        self.execute("UPDATE nodes SET sent_version = $2 WHERE id = $1", &[&SqlNode(id), &Unsigned(version)])?;
         Ok(())
     }
 
@@ -408,7 +397,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_acked(&self, id: NodeId, version: u64) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE nodes SET acked_version = ?2 WHERE id = ?1", params![SqlNode(id), Unsigned(version)])?;
+        self.execute("UPDATE nodes SET acked_version = $2 WHERE id = $1", &[&SqlNode(id), &Unsigned(version)])?;
         Ok(())
     }
 
@@ -419,8 +408,8 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn delete_node(&self, id: NodeId) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE proxies SET exit_id = NULL, enabled = 0 WHERE exit_id = ?1", params![SqlNode(id)])?;
-        self.conn.execute("DELETE FROM nodes WHERE id = ?1", params![SqlNode(id)])?;
+        self.execute("UPDATE proxies SET exit_id = NULL, enabled = FALSE WHERE exit_id = $1", &[&SqlNode(id)])?;
+        self.execute("DELETE FROM nodes WHERE id = $1", &[&SqlNode(id)])?;
         Ok(())
     }
 
@@ -431,7 +420,7 @@ impl Store {
     /// 写数据库失败。
     pub fn park_node(&self, id: NodeId) -> Result<(), StoreError> {
         // 两列都有唯一约束，所以换成不会和任何正常值相撞的东西：带冒号的名字，负数的地址。
-        self.conn.execute("UPDATE nodes SET name = 'parked:' || id, virtual_ip = -id WHERE id = ?1", params![SqlNode(id)])?;
+        self.execute("UPDATE nodes SET name = 'parked:' || id, virtual_ip = -id WHERE id = $1", &[&SqlNode(id)])?;
         Ok(())
     }
 
@@ -442,25 +431,30 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn repoint_node(&self, old: NodeId, new: NodeId) -> Result<(), StoreError> {
-        let ids = params![SqlNode(old), SqlNode(new)];
+        let ids: Params<'_> = &[&SqlNode(old), &SqlNode(new)];
         // 新节点自己已经有同名的代理、或者和同一个对端已经有设置时，保留新节点的，旧的随旧节点一起删掉。
-        self.conn.execute("UPDATE OR IGNORE proxies SET node_id = ?2 WHERE node_id = ?1", ids)?;
-        self.conn.execute("UPDATE proxies SET exit_id = ?2 WHERE exit_id = ?1", ids)?;
-        // 出口成了监听的节点自己：不支持，当作没有出口。
-        self.conn.execute("UPDATE proxies SET exit_id = NULL, enabled = 0 WHERE exit_id = node_id", [])?;
-        self.conn.execute("UPDATE forwards SET listen_node = ?2 WHERE listen_node = ?1", ids)?;
-        self.conn.execute("UPDATE forwards SET target_node = ?2 WHERE target_node = ?1", ids)?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO pair_settings (node_a, node_b, keep_alive, congestion)
-             SELECT MIN(peer, ?2), MAX(peer, ?2), keep_alive, congestion
-             FROM (SELECT CASE WHEN node_a = ?1 THEN node_b ELSE node_a END AS peer, keep_alive, congestion
-                   FROM pair_settings WHERE node_a = ?1 OR node_b = ?1)
-             WHERE peer <> ?2",
+        self.execute(
+            "UPDATE proxies SET node_id = $2 WHERE node_id = $1 AND name NOT IN (SELECT name FROM proxies WHERE node_id = $2)",
             ids,
         )?;
-        self.conn.execute("DELETE FROM pair_settings WHERE node_a = ?1 OR node_b = ?1", params![SqlNode(old)])?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO group_members (group_id, node_id) SELECT group_id, ?2 FROM group_members WHERE node_id = ?1",
+        self.execute("UPDATE proxies SET exit_id = $2 WHERE exit_id = $1", ids)?;
+        // 出口成了监听的节点自己：不支持，当作没有出口。
+        self.execute("UPDATE proxies SET exit_id = NULL, enabled = FALSE WHERE exit_id = node_id", &[])?;
+        self.execute("UPDATE forwards SET listen_node = $2 WHERE listen_node = $1", ids)?;
+        self.execute("UPDATE forwards SET target_node = $2 WHERE target_node = $1", ids)?;
+        self.execute(
+            "INSERT INTO pair_settings (node_a, node_b, keep_alive, congestion)
+             SELECT LEAST(peer, $2), GREATEST(peer, $2), keep_alive, congestion
+             FROM (SELECT CASE WHEN node_a = $1 THEN node_b ELSE node_a END AS peer, keep_alive, congestion
+                   FROM pair_settings WHERE node_a = $1 OR node_b = $1) AS moved
+             WHERE peer <> $2
+             ON CONFLICT DO NOTHING",
+            ids,
+        )?;
+        self.execute("DELETE FROM pair_settings WHERE node_a = $1 OR node_b = $1", &[&SqlNode(old)])?;
+        self.execute(
+            "INSERT INTO group_members (group_id, node_id) SELECT group_id, $2::bigint FROM group_members WHERE node_id = $1
+             ON CONFLICT DO NOTHING",
             ids,
         )?;
         Ok(())
@@ -477,7 +471,7 @@ mod tests {
 
     #[test]
     fn a_node_round_trips_with_everything_set() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         let id = store.insert_node(&new_node(network, 1)).unwrap();
         let mut node = store.node(id).unwrap().unwrap();
@@ -551,7 +545,7 @@ mod tests {
 
     #[test]
     fn a_new_node_has_no_hostname_and_has_not_said_whether_it_can_update_itself() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         let node = store.node(store.insert_node(&new_node(network, 1)).unwrap()).unwrap().unwrap();
         assert_eq!((node.hostname.as_str(), node.self_update, node.update_failure), ("", None, None));
@@ -561,7 +555,7 @@ mod tests {
 
     #[test]
     fn the_relays_of_a_network_are_its_nodes_with_relay_enabled() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let first = store.insert_network(&home()).unwrap();
         let second = store.insert_network(&NewNetwork { name: "work".to_owned(), ..home() }).unwrap();
         let enable = |id| {
@@ -579,7 +573,7 @@ mod tests {
 
     #[test]
     fn exits_among_are_the_given_nodes_of_one_network_with_the_exit_switched_on() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let ours = store.insert_network(&home()).unwrap();
         let theirs = store.insert_network(&NewNetwork { name: "office".to_owned(), ..home() }).unwrap();
         let switch_on = |id| {
@@ -602,29 +596,8 @@ mod tests {
     }
 
     #[test]
-    fn exits_among_looks_up_the_asked_ids_by_key_and_never_reads_the_whole_network() {
-        let store = Store::open_in_memory().unwrap();
-        let network = store.insert_network(&home()).unwrap();
-        for seed in 1..=200 {
-            store.insert_node(&new_node(network, seed)).unwrap();
-        }
-        let plan = || -> Vec<String> {
-            let mut statement = store.conn.prepare(&format!("EXPLAIN QUERY PLAN {EXITS_AMONG}")).unwrap();
-            let rows = statement.query_map(params![Json(&[1u32, 2]), SqlNetwork(network)], |row| row.get::<_, String>(3)).unwrap();
-            rows.map(Result::unwrap).collect()
-        };
-        let by_key = |plan: &[String]| matches!(plan, [outer, inner] if outer.starts_with("SCAN asked") && inner.starts_with("SEARCH nodes USING INTEGER PRIMARY KEY"));
-        // controller 不跑 ANALYZE，库里没有统计信息：这时 SQLite 会以为按网络的索引更省，要靠写法把顺序定住。
-        let plan_without_stats = plan();
-        assert!(by_key(&plan_without_stats), "{plan_without_stats:?}");
-        store.conn.execute_batch("ANALYZE").unwrap();
-        let plan_with_stats = plan();
-        assert!(by_key(&plan_with_stats), "有了统计信息也一样：{plan_with_stats:?}");
-    }
-
-    #[test]
     fn node_ids_are_never_reused() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         let first = store.insert_node(&new_node(network, 1)).unwrap();
         let second = store.insert_node(&new_node(network, 2)).unwrap();
@@ -635,7 +608,7 @@ mod tests {
 
     #[test]
     fn key_address_and_name_are_unique() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         store.insert_node(&NewNode { name: Some("a".to_owned()), ..new_node(network, 1) }).unwrap();
         assert!(store.insert_node(&NewNode { virtual_ip: "10.66.0.99".parse().unwrap(), ..new_node(network, 1) }).is_err(), "同一把公钥");
@@ -645,7 +618,7 @@ mod tests {
 
     #[test]
     fn a_parked_node_gives_up_its_name_and_address_to_a_successor() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         let old = store.insert_node(&NewNode { name: Some("nas-01".to_owned()), ..new_node(network, 1) }).unwrap();
         let taken = NewNode { name: Some("nas-01".to_owned()), virtual_ip: "10.66.0.1".parse().unwrap(), ..new_node(network, 2) };
@@ -664,7 +637,7 @@ mod tests {
 
     #[test]
     fn nodes_are_listed_per_network_only() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let home_id = store.insert_network(&home()).unwrap();
         let lab_id = store.insert_network(&NewNetwork { name: "lab".to_owned(), cidr: "10.67.0.0/16".parse().unwrap(), ..home() }).unwrap();
         let in_home = store.insert_node(&new_node(home_id, 1)).unwrap();

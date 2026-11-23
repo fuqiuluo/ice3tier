@@ -2,7 +2,7 @@
 //!
 //! | 模块 | 内容 |
 //! |---|---|
-//! | [`store`] | 存储：一个 SQLite 文件 |
+//! | [`store`] | 存储：一个 PostgreSQL 数据库 |
 //! | [`access`] | 访问规则的编译：谁能访问谁 |
 //! | [`netmap`] | 给一个节点算它的 netmap |
 //! | [`Controller`] | 存储之上的全部规则，和 netmap 的下发。节点协议和管理 API 都只是它的入口 |
@@ -19,7 +19,8 @@
 //! use i3t_controller::webui::WebUi;
 //! use i3t_controller::{Controller, ServeOptions, Server};
 //!
-//! let opened = Controller::open("/var/lib/i3t-controller".as_ref(), "ctl.example.com:20331".to_owned())?;
+//! let database = "postgres://i3t:secret@127.0.0.1/i3t".parse()?;
+//! let opened = Controller::open("/var/lib/i3t-controller".as_ref(), &database, "ctl.example.com:20331".to_owned())?;
 //! if let Some(token) = opened.admin_token {
 //!     println!("管理令牌（只显示这一次）：{token}");
 //! }
@@ -55,6 +56,6 @@ pub mod store;
 mod sync;
 pub mod webui;
 
-pub use controller::{ALPN, Admitted, Backup, BackupFile, Controller, Opened, RouteAnswers, Timing};
+pub use controller::{ALPN, Admitted, Controller, Opened, RouteAnswers, Timing};
 pub use error::{Capability, Entity, Error, Rejection};
 pub use server::{ServeOptions, Server};

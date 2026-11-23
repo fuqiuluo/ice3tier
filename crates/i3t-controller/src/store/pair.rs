@@ -5,17 +5,17 @@
 use i3t_model::admin::{NetworkId, PairSetting};
 use i3t_model::netmap::Congestion;
 use i3t_proto::NodeId;
-use rusqlite::{OptionalExtension, Row, params};
+use tokio_postgres::Row;
 
-use super::codec::{SqlNetwork, SqlNode};
+use super::codec::{Read, SqlNetwork, SqlNode};
 use super::{Store, StoreError};
 
-fn from_row(row: &Row<'_>) -> rusqlite::Result<PairSetting> {
-    let congestion: Option<String> = row.get("congestion")?;
+fn from_row(row: &Row) -> Read<PairSetting> {
+    let congestion: Option<String> = row.try_get("congestion")?;
     Ok(PairSetting {
-        a: row.get::<_, SqlNode>("node_a")?.0,
-        b: row.get::<_, SqlNode>("node_b")?.0,
-        keep_alive: row.get("keep_alive")?,
+        a: row.try_get::<_, SqlNode>("node_a")?.0,
+        b: row.try_get::<_, SqlNode>("node_b")?.0,
+        keep_alive: row.try_get("keep_alive")?,
         // 只有本程序写这一列；读到不认识的值（比本程序新的版本写的）按没有设置（节点的默认）。
         congestion: congestion.and_then(|text| text.parse().ok()),
     })
@@ -41,10 +41,10 @@ impl Store {
     pub fn set_pair(&self, a: NodeId, b: NodeId, setting: PairOptions) -> Result<(), StoreError> {
         let (low, high) = ordered(a, b);
         let PairOptions { keep_alive, congestion } = setting;
-        self.conn.execute(
-            "INSERT INTO pair_settings (node_a, node_b, keep_alive, congestion) VALUES (?1, ?2, ?3, ?4)
+        self.execute(
+            "INSERT INTO pair_settings (node_a, node_b, keep_alive, congestion) VALUES ($1, $2, $3, $4)
              ON CONFLICT (node_a, node_b) DO UPDATE SET keep_alive = excluded.keep_alive, congestion = excluded.congestion",
-            params![low, high, keep_alive, congestion.map(Congestion::as_str)],
+            &[&low, &high, &keep_alive, &congestion.map(Congestion::as_str)],
         )?;
         Ok(())
     }
@@ -56,7 +56,7 @@ impl Store {
     /// 读数据库失败。
     pub fn pair(&self, a: NodeId, b: NodeId) -> Result<Option<PairSetting>, StoreError> {
         let (low, high) = ordered(a, b);
-        Ok(self.conn.query_row("SELECT * FROM pair_settings WHERE node_a = ?1 AND node_b = ?2", params![low, high], from_row).optional()?)
+        self.query_opt("SELECT * FROM pair_settings WHERE node_a = $1 AND node_b = $2", &[&low, &high], from_row)
     }
 
     /// 一个网络里全部的节点对设置。
@@ -65,12 +65,9 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn pairs(&self, network: NetworkId) -> Result<Vec<PairSetting>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT pair_settings.* FROM pair_settings JOIN nodes ON nodes.id = pair_settings.node_a
-             WHERE nodes.network_id = ?1 ORDER BY node_a, node_b",
-        )?;
-        let rows = statement.query_map(params![SqlNetwork(network)], from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let sql = "SELECT pair_settings.* FROM pair_settings JOIN nodes ON nodes.id = pair_settings.node_a
+                   WHERE nodes.network_id = $1 ORDER BY node_a, node_b";
+        self.query(sql, &[&SqlNetwork(network)], from_row)
     }
 
     /// 返回这一对之前有没有设置。
@@ -80,7 +77,7 @@ impl Store {
     /// 写数据库失败。
     pub fn delete_pair(&self, a: NodeId, b: NodeId) -> Result<bool, StoreError> {
         let (low, high) = ordered(a, b);
-        Ok(self.conn.execute("DELETE FROM pair_settings WHERE node_a = ?1 AND node_b = ?2", params![low, high])? > 0)
+        Ok(self.execute("DELETE FROM pair_settings WHERE node_a = $1 AND node_b = $2", &[&low, &high])? > 0)
     }
 }
 

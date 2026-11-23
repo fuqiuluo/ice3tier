@@ -2,8 +2,6 @@
 
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -13,10 +11,10 @@ use i3t_proto::NodeId;
 use tokio::sync::mpsc;
 
 use super::super::testing::{Lab, Member, REMOTE, hello};
-use super::super::{Controller, DATABASE_FILE, Timing};
+use super::super::{Controller, Timing};
 use super::{add_rule, drop_default_rule, peer_ids, relations};
 use crate::error::{Error, Rejection};
-use crate::store::NetmapState;
+use crate::store::{NetmapState, Scratch, Store};
 
 /// 两个在线的节点，一个带标签 `src`，一个带标签 `dst`，之间没有任何规则，都已经确认了当前的 netmap。
 fn two_unconnected(lab: &mut Lab) -> (i3t_model::admin::NetworkId, Member, Member) {
@@ -239,11 +237,12 @@ fn stored(lab: &Lab, node: NodeId) -> NetmapState {
 
 /// 新的版本号记不进存储，别的照常能写：一次操作里前面的写进去了，轮到下发时写不进去。
 const BLOCK_VERSIONS: &str =
-    "CREATE TRIGGER no_netmap BEFORE UPDATE OF netmap_version ON nodes BEGIN SELECT RAISE(ABORT, 'no netmap'); END;";
-const UNBLOCK_VERSIONS: &str = "DROP TRIGGER no_netmap;";
-/// 规则读不出来（临时表挡在真的表前面，列对不上），写不受影响：重算一开头读网络就失败。
-const BLOCK_READING: &str = "CREATE TEMP TABLE rules (shadow INTEGER);";
-const UNBLOCK_READING: &str = "DROP TABLE temp.rules;";
+    "CREATE OR REPLACE FUNCTION no_netmap() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'no netmap'; END $$;
+     CREATE TRIGGER no_netmap BEFORE UPDATE OF netmap_version ON nodes FOR EACH ROW EXECUTE FUNCTION no_netmap();";
+const UNBLOCK_VERSIONS: &str = "DROP TRIGGER no_netmap ON nodes;";
+/// 规则读不出来（有一列换了名字，读的那一头对不上），写不受影响：重算一开头读网络就失败。
+const BLOCK_READING: &str = "ALTER TABLE rules RENAME COLUMN direction TO hidden;";
+const UNBLOCK_READING: &str = "ALTER TABLE rules RENAME COLUMN hidden TO direction;";
 
 fn sql(lab: &Lab, sql: &str) {
     lab.controller.lock().store.execute_batch(sql);
@@ -251,17 +250,12 @@ fn sql(lab: &Lab, sql: &str) {
 
 /// 只有这一个节点的那一列写不进存储，别的节点照常。用 `unblock` 恢复。
 fn block_column_of(lab: &Lab, column: &str, node: NodeId) {
-    let id = node.get();
-    sql(
-        lab,
-        &format!(
-            "CREATE TRIGGER no_{column} BEFORE UPDATE OF {column} ON nodes WHEN NEW.id = {id} BEGIN SELECT RAISE(ABORT, 'blocked'); END;"
-        ),
-    );
+    let only = format!("NEW.id = {}", node.get());
+    lab.controller.lock().store.block(&format!("no_{column}"), &format!("UPDATE OF {column} ON nodes"), Some(&only));
 }
 
 fn unblock(lab: &Lab, column: &str) {
-    sql(lab, &format!("DROP TRIGGER no_{column};"));
+    lab.controller.lock().store.unblock(&format!("no_{column}"), "nodes");
 }
 
 /// 后台任务现在是不是被叫醒了。问一次就算它醒过一次。
@@ -586,13 +580,12 @@ fn a_revocation_takes_effect_in_time_even_if_the_initiators_netmap_can_never_be_
 #[test]
 fn a_busy_database_is_waited_for_once_however_many_nodes_and_networks_are_due() {
     let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    let mut lab = Lab::around(Controller::open(&data, "ctl.example.com:20331".to_owned()).unwrap().controller);
-    let waits = Arc::new(AtomicUsize::new(0));
-    let seen = Arc::clone(&waits);
-    lab.controller.lock().store.fail_when_busy(move || {
-        seen.fetch_add(1, Ordering::Relaxed);
-    });
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let mut lab = Lab::around(Controller::open(dir.path(), &database, "ctl.example.com:20331".to_owned()).unwrap().controller);
+    // 等锁只等一小会儿，不用真的等满平时的期限；等了几次由存储数着。
+    lab.controller.lock().store.set_lock_timeout(Duration::from_millis(50));
+    let waits = |lab: &Lab| lab.controller.lock().store.lock_waits();
 
     // 两个网络，各有一个节点报了新的端点：每个网络里另外两个节点的 netmap 要变，报的那个自己的不变。
     let mut members = Vec::new();
@@ -608,12 +601,13 @@ fn a_busy_database_is_waited_for_once_however_many_nodes_and_networks_are_due() 
     let queued = |lab: &Lab| lab.controller.lock().dirty.len();
     assert_eq!(queued(&lab), 6);
 
-    // 别的进程占着写锁。等它放开的那几秒是拿着 controller 的锁等的：只能等一次，不能每个节点、每个网络各等一次。
-    let other = rusqlite::Connection::open(data.join(DATABASE_FILE)).unwrap();
-    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // 别的连接锁着节点那张表（读照常，写要等）。等它放开的那几秒是拿着 controller 的锁等的：只能等一次，
+    // 不能每个节点、每个网络各等一次。
+    let other = Store::open(&database).unwrap();
+    other.execute_batch("BEGIN; LOCK TABLE nodes IN EXCLUSIVE MODE");
     let flush = |lab: &Lab| lab.controller.lock().flush_due(Instant::now() + PAST_RETRY);
     assert!(flush(&lab).is_err());
-    assert_eq!(waits.load(Ordering::Relaxed), 1, "整个数据库都写不进去时，试一次就交回去");
+    assert_eq!(waits(&lab), 1, "整个数据库都写不进去时，试一次就交回去");
     assert_eq!(queued(&lab), 5, "只有头一个节点（它的内容没变，不用写）算做完了，其余的原样排着");
     assert_eq!(members.iter_mut().map(Member::receive).sum::<usize>(), 0);
 
@@ -623,14 +617,14 @@ fn a_busy_database_is_waited_for_once_however_many_nodes_and_networks_are_due() 
     lab.controller.lock().defer(networks[0], [members[1].id], Duration::ZERO);
     let again = lab.controller.lock().flush_due(Instant::now()).expect("没有去写，也就没有出错");
     assert!(again.is_some_and(|at| at > Instant::now()), "告诉后台任务过一会儿再来");
-    assert_eq!(waits.load(Ordering::Relaxed), 1, "退避的这一会儿里不碰数据库");
+    assert_eq!(waits(&lab), 1, "退避的这一会儿里不碰数据库");
     assert_eq!(queued(&lab), 5);
 
     // 过了这一会儿再试一次，还是只等一次。
     assert!(flush(&lab).is_err());
-    assert_eq!(waits.load(Ordering::Relaxed), 2);
+    assert_eq!(waits(&lab), 2);
 
-    other.execute_batch("ROLLBACK").unwrap();
+    other.execute_batch("ROLLBACK");
     flush(&lab).unwrap();
     assert_eq!(members.iter_mut().map(Member::receive).collect::<Vec<_>>(), vec![0, 1, 1, 0, 1, 1], "放开之后都补发");
 }

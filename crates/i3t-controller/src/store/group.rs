@@ -1,15 +1,15 @@
 //! 分组和它的成员。
 //!
-//! 内置分组 `All` 是一行 `builtin = 1` 的分组，每个网络一个，建网时一起建（[`Store::insert_network`]）。
+//! 内置分组 `All` 是一行 `builtin` 为真的分组，每个网络一个，建网时一起建（[`Store::insert_network`]）。
 //! 它的成员是全部节点，不写在成员表里。名字在一个网络里不分大小写唯一，靠的是存着的小写写法上的唯一约束。
 
 use std::collections::BTreeSet;
 
 use i3t_model::admin::{GroupId, GroupRef, NetworkId};
 use i3t_proto::NodeId;
-use rusqlite::{OptionalExtension, Row, params};
+use tokio_postgres::Row;
 
-use super::codec::{SqlGroup, SqlNetwork, SqlNode, row_id};
+use super::codec::{Int, Read, SqlGroup, SqlNetwork, SqlNode};
 use super::{Store, StoreError};
 
 /// 内置分组的名字。
@@ -32,12 +32,12 @@ impl GroupRecord {
         GroupRef { id: self.id, name: self.name.clone(), builtin: self.builtin }
     }
 
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(row: &Row) -> Read<Self> {
         Ok(Self {
-            id: row.get::<_, SqlGroup>("id")?.0,
-            network: row.get::<_, SqlNetwork>("network_id")?.0,
-            name: row.get("name")?,
-            builtin: row.get("builtin")?,
+            id: row.try_get::<_, SqlGroup>("id")?.0,
+            network: row.try_get::<_, SqlNetwork>("network_id")?.0,
+            name: row.try_get("name")?,
+            builtin: row.try_get("builtin")?,
         })
     }
 }
@@ -64,11 +64,8 @@ impl Store {
     }
 
     fn insert_group_row(&self, network: NetworkId, name: &str, builtin: bool) -> Result<GroupId, StoreError> {
-        self.conn.execute(
-            "INSERT INTO groups (network_id, name, folded, builtin) VALUES (?1, ?2, ?3, ?4)",
-            params![SqlNetwork(network), name, folded(name), builtin],
-        )?;
-        Ok(GroupId(row_id(self.conn.last_insert_rowid())?))
+        let sql = "INSERT INTO groups (network_id, name, folded, builtin) VALUES ($1, $2, $3, $4) RETURNING id";
+        Ok(GroupId(self.insert(sql, &[&SqlNetwork(network), &name, &folded(name), &builtin])?))
     }
 
     /// 一个网络的全部分组：内置的在最前面，其余按名字排（不分大小写）。
@@ -77,9 +74,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn groups(&self, network: NetworkId) -> Result<Vec<GroupRecord>, StoreError> {
-        let mut statement = self.conn.prepare("SELECT * FROM groups WHERE network_id = ?1 ORDER BY builtin DESC, folded, id")?;
-        let rows = statement.query_map(params![SqlNetwork(network)], GroupRecord::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let sql = "SELECT * FROM groups WHERE network_id = $1 ORDER BY builtin DESC, folded, id";
+        self.query(sql, &[&SqlNetwork(network)], GroupRecord::from_row)
     }
 
     /// 只在这个网络里找：别的网络的分组编号在这里等于不存在。
@@ -88,8 +84,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn group(&self, network: NetworkId, id: GroupId) -> Result<Option<GroupRecord>, StoreError> {
-        let sql = "SELECT * FROM groups WHERE network_id = ?1 AND id = ?2";
-        Ok(self.conn.query_row(sql, params![SqlNetwork(network), SqlGroup(id)], GroupRecord::from_row).optional()?)
+        let sql = "SELECT * FROM groups WHERE network_id = $1 AND id = $2";
+        self.query_opt(sql, &[&SqlNetwork(network), &SqlGroup(id)], GroupRecord::from_row)
     }
 
     /// 这个网络里不分大小写叫 `name` 的分组。
@@ -98,8 +94,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn group_named(&self, network: NetworkId, name: &str) -> Result<Option<GroupRecord>, StoreError> {
-        let sql = "SELECT * FROM groups WHERE network_id = ?1 AND folded = ?2";
-        Ok(self.conn.query_row(sql, params![SqlNetwork(network), folded(name)], GroupRecord::from_row).optional()?)
+        let sql = "SELECT * FROM groups WHERE network_id = $1 AND folded = $2";
+        self.query_opt(sql, &[&SqlNetwork(network), &folded(name)], GroupRecord::from_row)
     }
 
     /// 网络的内置分组 `All`。网络不存在时是 `None`。
@@ -108,15 +104,15 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn builtin_group(&self, network: NetworkId) -> Result<Option<GroupId>, StoreError> {
-        let sql = "SELECT id FROM groups WHERE network_id = ?1 AND builtin = 1";
-        Ok(self.conn.query_row(sql, params![SqlNetwork(network)], |row| row.get::<_, SqlGroup>(0)).optional()?.map(|id| id.0))
+        let sql = "SELECT id FROM groups WHERE network_id = $1 AND builtin";
+        self.query_opt(sql, &[&SqlNetwork(network)], |row| Ok(row.try_get::<_, SqlGroup>(0)?.0))
     }
 
     /// # Errors
     ///
     /// 写数据库失败，包括新名字和这个网络里的另一个分组不分大小写重名。
     pub fn rename_group(&self, id: GroupId, name: &str) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE groups SET name = ?2, folded = ?3 WHERE id = ?1", params![SqlGroup(id), name, folded(name)])?;
+        self.execute("UPDATE groups SET name = $2, folded = $3 WHERE id = $1", &[&SqlGroup(id), &name, &folded(name)])?;
         Ok(())
     }
 
@@ -126,7 +122,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn delete_group(&self, id: GroupId) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM groups WHERE id = ?1", params![SqlGroup(id)])?;
+        self.execute("DELETE FROM groups WHERE id = $1", &[&SqlGroup(id)])?;
         Ok(())
     }
 
@@ -136,8 +132,8 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn add_member(&self, group: GroupId, node: NodeId) -> Result<bool, StoreError> {
-        let sql = "INSERT OR IGNORE INTO group_members (group_id, node_id) VALUES (?1, ?2)";
-        Ok(self.conn.execute(sql, params![SqlGroup(group), SqlNode(node)])? > 0)
+        let sql = "INSERT INTO group_members (group_id, node_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
+        Ok(self.execute(sql, &[&SqlGroup(group), &SqlNode(node)])? > 0)
     }
 
     /// 把节点移出分组。返回它原来在不在里面。
@@ -146,8 +142,8 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn remove_member(&self, group: GroupId, node: NodeId) -> Result<bool, StoreError> {
-        let sql = "DELETE FROM group_members WHERE group_id = ?1 AND node_id = ?2";
-        Ok(self.conn.execute(sql, params![SqlGroup(group), SqlNode(node)])? > 0)
+        let sql = "DELETE FROM group_members WHERE group_id = $1 AND node_id = $2";
+        Ok(self.execute(sql, &[&SqlGroup(group), &SqlNode(node)])? > 0)
     }
 
     /// 整个替换一个节点所在的分组。内置分组不在 `groups` 里：每个节点本来就在。
@@ -156,7 +152,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_node_groups(&self, node: NodeId, groups: &BTreeSet<GroupId>) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM group_members WHERE node_id = ?1", params![SqlNode(node)])?;
+        self.execute("DELETE FROM group_members WHERE node_id = $1", &[&SqlNode(node)])?;
         for &group in groups {
             self.add_member(group, node)?;
         }
@@ -169,12 +165,9 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn pending_tokens_with_group(&self, group: GroupId) -> Result<Vec<u32>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT token_id FROM token_groups JOIN enroll_tokens ON enroll_tokens.id = token_groups.token_id
-             WHERE group_id = ?1 AND enroll_tokens.used_at IS NULL ORDER BY token_id",
-        )?;
-        let rows = statement.query_map(params![SqlGroup(group)], |row| row.get(0))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let sql = "SELECT token_id FROM token_groups JOIN enroll_tokens ON enroll_tokens.id = token_groups.token_id
+                   WHERE group_id = $1 AND enroll_tokens.used_at IS NULL ORDER BY token_id";
+        self.query(sql, &[&SqlGroup(group)], |row| Ok(row.try_get::<_, Int<u32>>(0)?.0))
     }
 }
 

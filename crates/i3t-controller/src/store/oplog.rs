@@ -1,11 +1,11 @@
 //! 操作记录：何时改了什么，说的是哪些东西。
 
 use i3t_model::admin::{LogEntry, LogRef, NetworkId, Timestamp};
-use rusqlite::types::Value;
-use rusqlite::{Row, params, params_from_iter};
 use serde_json::{Map, Value as JsonValue};
+use tokio_postgres::Row;
+use tokio_postgres::types::ToSql;
 
-use super::codec::{Json, SqlNetwork, Unsigned};
+use super::codec::{Int, Json, Read, SqlNetwork, Unsigned};
 use super::{Store, StoreError};
 
 /// 查操作记录的条件。都可以不写。
@@ -25,15 +25,15 @@ pub struct LogFilter {
 /// 最多留这么多条，再多就从最老的删起。个人用的 controller 一年也攒不到这个数。
 const KEEP: u32 = 10_000;
 
-fn from_row(row: &Row<'_>) -> rusqlite::Result<LogEntry> {
+fn from_row(row: &Row) -> Read<LogEntry> {
     Ok(LogEntry {
-        id: row.get::<_, Unsigned>("id")?.0,
-        at: row.get::<_, Unsigned>("at")?.0,
-        network: row.get::<_, Option<SqlNetwork>>("network_id")?.map(|network| network.0),
-        action: row.get("action")?,
-        detail: row.get("detail")?,
-        refs: row.get::<_, Json<Vec<LogRef>>>("refs")?.0,
-        params: row.get::<_, Json<Map<String, JsonValue>>>("params")?.0,
+        id: row.try_get::<_, Unsigned>("id")?.0,
+        at: row.try_get::<_, Unsigned>("at")?.0,
+        network: row.try_get::<_, Option<SqlNetwork>>("network_id")?.map(|network| network.0),
+        action: row.try_get("action")?,
+        detail: row.try_get("detail")?,
+        refs: row.try_get::<_, Json<Vec<LogRef>>>("refs")?.0,
+        params: row.try_get::<_, Json<Map<String, JsonValue>>>("params")?.0,
     })
 }
 
@@ -72,11 +72,12 @@ impl Store {
                 Map::new()
             }
         };
-        self.conn.execute(
-            "INSERT INTO oplog (at, network_id, action, detail, refs, params) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![Unsigned(at), network.map(SqlNetwork), action, detail, Json(refs), Json(&params)],
+        let id: i64 = self.query_one(
+            "INSERT INTO oplog (at, network_id, action, detail, refs, params) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            &[&Unsigned(at), &network.map(SqlNetwork), &action, &detail, &Json(refs), &Json(&params)],
+            |row| row.try_get(0),
         )?;
-        self.conn.execute("DELETE FROM oplog WHERE id <= ?1 - ?2", params![self.conn.last_insert_rowid(), KEEP])?;
+        self.execute("DELETE FROM oplog WHERE id <= $1", &[&(id - i64::from(KEEP))])?;
         Ok(())
     }
 
@@ -95,32 +96,33 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn oplog_filtered(&self, filter: &LogFilter) -> Result<Vec<LogEntry>, StoreError> {
-        let mut conditions: Vec<&str> = Vec::new();
-        let mut values: Vec<Value> = Vec::new();
+        // 每个条件的参数接着往下编号：放进 `values` 之后，它的长度就是这个参数的编号。
+        let mut conditions: Vec<String> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql + Sync>> = Vec::new();
         if let Some(before) = filter.before {
-            conditions.push("id < ?");
-            values.push(Value::Integer(i64::try_from(before).unwrap_or(i64::MAX)));
+            values.push(Box::new(i64::try_from(before).unwrap_or(i64::MAX)));
+            conditions.push(format!("id < ${}", values.len()));
         }
         if let Some(network) = filter.network {
-            conditions.push("network_id = ?");
-            values.push(Value::Integer(i64::from(network.0)));
+            values.push(Box::new(SqlNetwork(network)));
+            conditions.push(format!("network_id = ${}", values.len()));
         }
         if let Some(action) = &filter.action {
             // 不用 LIKE：操作的名字里有下划线，在 LIKE 里它是通配符。
-            conditions.push("(action = ? OR substr(action, 1, length(?) + 1) = ? || '.')");
-            values.extend([Value::Text(action.clone()), Value::Text(action.clone()), Value::Text(action.clone())]);
+            values.push(Box::new(action.clone()));
+            let action = values.len();
+            conditions.push(format!("(action = ${action} OR starts_with(action, ${action} || '.'))"));
         }
         if let Some(reference) = filter.reference {
-            // refs 是这里写进去的 JSON，写法固定，按子串找就是按元素找：`"id":3}` 的右括号挡住了 30、31……
-            let needle = serde_json::to_string(&reference).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            conditions.push("instr(refs, ?) > 0");
-            values.push(Value::Text(needle));
+            // refs 是一个 JSON 数组：要里面有这一项的。
+            values.push(Box::new(Json([reference])));
+            conditions.push(format!("refs @> ${}", values.len()));
         }
         let condition = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
-        values.push(Value::Integer(i64::from(filter.limit)));
-        let mut statement = self.conn.prepare(&format!("SELECT * FROM oplog {condition} ORDER BY id DESC LIMIT ?"))?;
-        let rows = statement.query_map(params_from_iter(values), from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        values.push(Box::new(Int(filter.limit)));
+        let sql = format!("SELECT * FROM oplog {condition} ORDER BY id DESC LIMIT ${}", values.len());
+        let params: Vec<&(dyn ToSql + Sync)> = values.iter().map(|value| &**value).collect();
+        self.query(&sql, &params, from_row)
     }
 }
 
@@ -133,7 +135,7 @@ mod tests {
 
     #[test]
     fn operations_are_listed_newest_first() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         store.log(10, None, "controller.start", "first start", json!({})).unwrap();
         store.log(20, Some(network), "node.rename", "node-1 -> nas-01", json!({ "node": 1, "node_name": "nas-01" })).unwrap();
@@ -149,7 +151,7 @@ mod tests {
     #[test]
     fn entries_can_be_paged_and_filtered_by_network_action_and_reference() {
         use i3t_model::admin::RefKind;
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         let node = |id| LogRef::new(RefKind::Node, id);
         store.log_refs(1, Some(network), "node.update", "a", &[node(3)], json!({})).unwrap();

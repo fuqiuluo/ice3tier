@@ -1,11 +1,12 @@
 //! 给界面画图的时间序列：每个点一行。
 
+use std::collections::BTreeMap;
+
 use i3t_model::admin::stats::Series;
 use i3t_model::admin::{NetworkId, Timestamp};
 use i3t_proto::NodeId;
-use rusqlite::params;
 
-use super::codec::{SqlNetwork, Unsigned};
+use super::codec::{Int, SqlNetwork, Unsigned};
 use super::{Store, StoreError};
 
 /// 时间序列里的一个点。
@@ -47,19 +48,31 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn insert_stats(&self, step: u32, points: &[StatPoint]) -> Result<(), StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "INSERT OR REPLACE INTO stats (network_id, series, node_id, step, at, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
+        // 一批点一条语句、一次往返。同一段在这一批里出现两次时留后一个，和一个一个写一样：
+        // 一条 `INSERT … ON CONFLICT` 不能两次碰同一行。
+        let mut latest = BTreeMap::new();
         for point in points {
-            statement.execute(params![
-                SqlNetwork(point.network),
-                code(point.series),
-                node_column(point.node),
-                step,
-                Unsigned(point.at),
-                point.value
-            ])?;
+            latest.insert((point.network, code(point.series), node_column(point.node), point.at), point.value);
         }
+        if latest.is_empty() {
+            return Ok(());
+        }
+        let (mut networks, mut series, mut nodes, mut times, mut values) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for ((network, code, node, at), value) in latest {
+            networks.push(SqlNetwork(network));
+            series.push(code);
+            nodes.push(Int(node));
+            times.push(Unsigned(at));
+            values.push(value);
+        }
+        self.execute(
+            "INSERT INTO stats (network_id, series, node_id, step, at, value)
+             SELECT network_id, series, node_id, $6::bigint, at, value
+             FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::double precision[])
+                  AS point (network_id, series, node_id, at, value)
+             ON CONFLICT (network_id, series, node_id, step, at) DO UPDATE SET value = excluded.value",
+            &[&networks, &series, &nodes, &times, &values, &Int(step)],
+        )?;
         Ok(())
     }
 
@@ -71,13 +84,14 @@ impl Store {
     /// 写数据库失败。
     pub fn roll_up_stats(&self, from_step: u32, to_step: u32, start: Timestamp) -> Result<usize, StoreError> {
         let end = start.saturating_add(u64::from(to_step));
-        Ok(self.conn.execute(
-            "INSERT OR REPLACE INTO stats (network_id, series, node_id, step, at, value)
-             SELECT network_id, series, node_id, ?2, ?3, AVG(value) FROM stats
-             WHERE step = ?1 AND at >= ?3 AND at < ?4
-             GROUP BY network_id, series, node_id",
-            params![from_step, to_step, Unsigned(start), Unsigned(end)],
-        )?)
+        self.execute(
+            "INSERT INTO stats (network_id, series, node_id, step, at, value)
+             SELECT network_id, series, node_id, $2::bigint, $3::bigint, AVG(value) FROM stats
+             WHERE step = $1 AND at >= $3 AND at < $4
+             GROUP BY network_id, series, node_id
+             ON CONFLICT (network_id, series, node_id, step, at) DO UPDATE SET value = excluded.value",
+            &[&Int(from_step), &Int(to_step), &Unsigned(start), &Unsigned(end)],
+        )
     }
 
     /// 删掉步长是 `step`、时间在 `before` 之前的点。返回删了几个。
@@ -86,7 +100,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn prune_stats(&self, step: u32, before: Timestamp) -> Result<usize, StoreError> {
-        Ok(self.conn.execute("DELETE FROM stats WHERE step = ?1 AND at < ?2", params![step, Unsigned(before)])?)
+        self.execute("DELETE FROM stats WHERE step = $1 AND at < $2", &[&Int(step), &Unsigned(before)])
     }
 
     /// 一条序列在 `[from, to]` 里步长是 `step` 的点，按时间排。
@@ -102,15 +116,12 @@ impl Store {
         step: u32,
         range: (Timestamp, Timestamp),
     ) -> Result<Vec<(Timestamp, f64)>, StoreError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT at, value FROM stats WHERE network_id = ?1 AND series = ?2 AND node_id = ?3 AND step = ?4 AND at >= ?5 AND at <= ?6
+        self.query(
+            "SELECT at, value FROM stats WHERE network_id = $1 AND series = $2 AND node_id = $3 AND step = $4 AND at >= $5 AND at <= $6
              ORDER BY at",
-        )?;
-        let rows = statement.query_map(
-            params![SqlNetwork(network), code(series), node_column(node), step, Unsigned(range.0), Unsigned(range.1)],
-            |row| Ok((row.get::<_, Unsigned>(0)?.0, row.get::<_, f64>(1)?)),
-        )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            &[&SqlNetwork(network), &code(series), &Int(node_column(node)), &Int(step), &Unsigned(range.0), &Unsigned(range.1)],
+            |row| Ok((row.try_get::<_, Unsigned>(0)?.0, row.try_get::<_, f64>(1)?)),
+        )
     }
 
     /// 表里一共有多少个点。测试和日志用。
@@ -119,7 +130,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn stats_count(&self) -> Result<u64, StoreError> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM stats", [], |row| row.get::<_, Unsigned>(0))?.0)
+        self.query_one("SELECT COUNT(*) FROM stats", &[], |row| Ok(row.try_get::<_, Unsigned>(0)?.0))
     }
 }
 
@@ -142,7 +153,7 @@ mod tests {
 
     #[test]
     fn points_are_read_back_per_series_node_and_step_and_rolled_up_into_averages() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let network = store.insert_network(&home()).unwrap();
         let points = [
             point(network, Series::NodeTx, Some(3), 3_600, 100.0),

@@ -338,7 +338,9 @@ fn only_affected_nodes_get_a_new_netmap() {
 #[test]
 fn a_restart_keeps_identity_versions_and_the_admin_token() {
     let dir = tempfile::tempdir().unwrap();
-    let opened = Controller::open(dir.path(), "ctl.example.com:20331".to_owned()).unwrap();
+    let scratch = crate::store::Scratch::new();
+    let database = scratch.database();
+    let opened = Controller::open(dir.path(), &database, "ctl.example.com:20331".to_owned()).unwrap();
     let admin_token = opened.admin_token.expect("第一次启动要生成管理令牌");
     assert!(opened.controller.is_admin_token(&admin_token) && !opened.controller.is_admin_token("wrong"));
     let controller_key = opened.controller.public_key();
@@ -351,7 +353,7 @@ fn a_restart_keeps_identity_versions_and_the_admin_token() {
     let expected = a.netmap().clone();
     drop(lab);
 
-    let reopened = Controller::open(dir.path(), "ctl.example.com:20331".to_owned()).unwrap();
+    let reopened = Controller::open(dir.path(), &database, "ctl.example.com:20331".to_owned()).unwrap();
     assert!(reopened.admin_token.is_none(), "管理令牌只在第一次启动时给出");
     assert!(reopened.controller.is_admin_token(&admin_token));
     assert_eq!(reopened.controller.public_key(), controller_key);
@@ -703,15 +705,16 @@ fn a_node_whose_relays_answer_only_over_tcp_is_held_without_udp_after_a_while_an
     use i3t_crypto::NodeKey;
     use i3t_model::control::{NameService, RelayTry, TryOutcome, VnetReport, VnetState};
 
-    use crate::store::Store;
+    use crate::store::{Scratch, Store};
 
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("controller.db");
+    let scratch = Scratch::new();
+    let database = scratch.database();
     let settle = Duration::from_millis(300);
     let timing =
         super::super::Timing { ack_coalesce: Duration::ZERO, report_coalesce: Duration::ZERO, no_udp_settle: settle, ..Default::default() };
-    let open =
-        || Controller::new(Store::open(&path).unwrap(), NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), timing).unwrap();
+    let open = || {
+        Controller::new(Store::open(&database).unwrap(), NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), timing).unwrap()
+    };
     let mut lab = Lab::around(open());
     let network = lab.network("home");
     let relay_hello = Hello { protocol: PROTOCOL_REVISION, ..super::super::testing::hello(CAN_DO_ALL) };

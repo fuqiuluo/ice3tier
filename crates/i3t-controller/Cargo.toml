@@ -11,6 +11,7 @@ description = "ice3tier 的 controller：存储、注册、访问规则编译、
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query"] }
 base64.workspace = true
+bytes.workspace = true
 flate2 = "1.1.11"
 hyper = { version = "1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
@@ -23,22 +24,28 @@ i3t-update = { path = "../i3t-update" }
 ipnet.workspace = true
 maxminddb = "0.33.0"
 ring.workspace = true
-rusqlite = { version = "0.43.0", features = ["bundled"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
 tokio-rustls.workspace = true
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", default-features = false, features = ["fs"] }
 tracing.workspace = true
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 
+[features]
+# 测试用的空数据库（`store::Scratch`、`Store::temporary`）：给别的包的测试用。
+testing = []
+
 [lints]
 workspace = true
 
 [dev-dependencies]
+# 这个包自己的集成测试（`tests/`）也要用测试用的空数据库。
+i3t-controller = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

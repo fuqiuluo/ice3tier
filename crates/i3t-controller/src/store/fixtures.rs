@@ -46,7 +46,7 @@ pub(crate) fn new_node(network: NetworkId, seed: u8) -> NewNode {
 
 /// 一个网络加 `count` 个节点。
 pub(crate) fn store_with_nodes(count: u8) -> (Store, NetworkId, Vec<NodeId>) {
-    let store = Store::open_in_memory().unwrap();
+    let store = Store::temporary();
     let network = store.insert_network(&home()).unwrap();
     let nodes = (1..=count).map(|seed| store.insert_node(&new_node(network, seed)).unwrap()).collect();
     (store, network, nodes)

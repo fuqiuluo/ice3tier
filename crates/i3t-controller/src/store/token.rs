@@ -7,9 +7,9 @@ use std::net::Ipv4Addr;
 
 use i3t_model::admin::{EnrollTokenInfo, GroupId, GroupRef, NetworkId, NodeRef, Timestamp, TokenState};
 use i3t_proto::NodeId;
-use rusqlite::{OptionalExtension, Row, named_params, params};
+use tokio_postgres::Row;
 
-use super::codec::{Json, SqlGroup, SqlIp, SqlNetwork, SqlNode, Unsigned, row_id};
+use super::codec::{Blob, Int, Json, Read, SqlGroup, SqlIp, SqlNetwork, SqlNode, Unsigned};
 use super::group::folded;
 use super::{DIGEST_LEN, Store, StoreError};
 
@@ -38,8 +38,8 @@ pub fn is_pending(token: &TokenRecord, now: Timestamp) -> bool {
 
 /// 读令牌时顺带取出用它加入的节点（没有用过或者那个节点后来被删掉时没有），和它预设的分组（JSON 数组）。
 const SELECT: &str = "SELECT enroll_tokens.*, nodes.name AS used_by_name, nodes.virtual_ip AS used_by_ip,
-                             (SELECT json_group_array(json_object('id', groups.id, 'name', groups.name,
-                                                                  'builtin', json(CASE WHEN groups.builtin THEN 'true' ELSE 'false' END)))
+                             (SELECT COALESCE(jsonb_agg(jsonb_build_object('id', groups.id, 'name', groups.name,
+                                                                           'builtin', groups.builtin)), '[]'::jsonb)
                               FROM token_groups JOIN groups ON groups.id = token_groups.group_id
                               WHERE token_groups.token_id = enroll_tokens.id) AS groups
                       FROM enroll_tokens LEFT JOIN nodes ON nodes.id = enroll_tokens.used_by";
@@ -58,23 +58,23 @@ pub struct NewToken {
     pub successor_of: Option<NodeId>,
 }
 
-fn from_row(row: &Row<'_>) -> rusqlite::Result<TokenRecord> {
-    let used_at = row.get::<_, Option<Unsigned>>("used_at")?.map(|at| at.0);
-    let used_by = match (row.get::<_, Option<SqlNode>>("used_by")?, row.get::<_, Option<String>>("used_by_name")?) {
-        (Some(id), Some(name)) => Some(NodeRef { id: id.0, name, virtual_ip: row.get::<_, SqlIp>("used_by_ip")?.0 }),
+fn from_row(row: &Row) -> Read<TokenRecord> {
+    let used_at = row.try_get::<_, Option<Unsigned>>("used_at")?.map(|at| at.0);
+    let used_by = match (row.try_get::<_, Option<SqlNode>>("used_by")?, row.try_get::<_, Option<String>>("used_by_name")?) {
+        (Some(id), Some(name)) => Some(NodeRef { id: id.0, name, virtual_ip: row.try_get::<_, SqlIp>("used_by_ip")?.0 }),
         _ => None,
     };
-    let mut groups = row.get::<_, Json<Vec<GroupRef>>>("groups")?.0;
+    let mut groups = row.try_get::<_, Json<Vec<GroupRef>>>("groups")?.0;
     groups.sort_by_cached_key(|group| (folded(&group.name), group.id));
     Ok(TokenRecord {
-        id: row.get("id")?,
-        network: row.get::<_, SqlNetwork>("network_id")?.0,
-        created_at: row.get::<_, Unsigned>("created_at")?.0,
-        expires_at: row.get::<_, Unsigned>("expires_at")?.0,
+        id: row.try_get::<_, Int<u32>>("id")?.0,
+        network: row.try_get::<_, SqlNetwork>("network_id")?.0,
+        created_at: row.try_get::<_, Unsigned>("created_at")?.0,
+        expires_at: row.try_get::<_, Unsigned>("expires_at")?.0,
         groups,
-        virtual_ip: row.get::<_, Option<SqlIp>>("virtual_ip")?.map(|ip| ip.0),
-        successor_of: row.get::<_, Option<SqlNode>>("successor_of")?.map(|node| node.0),
-        prefix: row.get("prefix")?,
+        virtual_ip: row.try_get::<_, Option<SqlIp>>("virtual_ip")?.map(|ip| ip.0),
+        successor_of: row.try_get::<_, Option<SqlNode>>("successor_of")?.map(|node| node.0),
+        prefix: row.try_get("prefix")?,
         state: if used_at.is_some() { TokenState::Used } else { TokenState::Pending },
         used_at,
         used_by,
@@ -86,22 +86,22 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn insert_token(&self, new: &NewToken) -> Result<u32, StoreError> {
-        self.conn.execute(
-            "INSERT INTO enroll_tokens (network_id, secret_hash, created_at, expires_at, virtual_ip, successor_of, prefix)
-             VALUES (:network, :hash, :created_at, :expires_at, :ip, :successor_of, :prefix)",
-            named_params! {
-                ":network": SqlNetwork(new.network),
-                ":hash": new.secret_hash,
-                ":prefix": new.prefix,
-                ":created_at": Unsigned(new.created_at),
-                ":expires_at": Unsigned(new.expires_at),
-                ":ip": new.virtual_ip.map(SqlIp),
-                ":successor_of": new.successor_of.map(SqlNode),
-            },
+        let id = self.insert(
+            "INSERT INTO enroll_tokens (network_id, secret_hash, prefix, created_at, expires_at, virtual_ip, successor_of)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id",
+            &[
+                &SqlNetwork(new.network),
+                &Blob(new.secret_hash),
+                &new.prefix,
+                &Unsigned(new.created_at),
+                &Unsigned(new.expires_at),
+                &new.virtual_ip.map(SqlIp),
+                &new.successor_of.map(SqlNode),
+            ],
         )?;
-        let id = row_id(self.conn.last_insert_rowid())?;
         for &group in &new.groups {
-            self.conn.execute("INSERT INTO token_groups (token_id, group_id) VALUES (?1, ?2)", params![id, SqlGroup(group)])?;
+            self.execute("INSERT INTO token_groups (token_id, group_id) VALUES ($1, $2)", &[&Int(id), &SqlGroup(group)])?;
         }
         Ok(id)
     }
@@ -112,16 +112,15 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn tokens(&self, network: NetworkId) -> Result<Vec<TokenRecord>, StoreError> {
-        let mut statement = self.conn.prepare(&format!("{SELECT} WHERE enroll_tokens.network_id = ?1 ORDER BY enroll_tokens.id"))?;
-        let rows = statement.query_map(params![SqlNetwork(network)], from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let sql = format!("{SELECT} WHERE enroll_tokens.network_id = $1 ORDER BY enroll_tokens.id");
+        self.query(&sql, &[&SqlNetwork(network)], from_row)
     }
 
     /// # Errors
     ///
     /// 读数据库失败。
     pub fn token(&self, id: u32) -> Result<Option<TokenRecord>, StoreError> {
-        Ok(self.conn.query_row(&format!("{SELECT} WHERE enroll_tokens.id = ?1"), params![id], from_row).optional()?)
+        self.query_opt(&format!("{SELECT} WHERE enroll_tokens.id = $1"), &[&Int(id)], from_row)
     }
 
     /// 按一次性密钥的哈希找还没用掉的令牌。
@@ -130,8 +129,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn token_by_hash(&self, secret_hash: &[u8; DIGEST_LEN]) -> Result<Option<TokenRecord>, StoreError> {
-        let sql = format!("{SELECT} WHERE enroll_tokens.secret_hash = ?1 AND enroll_tokens.used_at IS NULL");
-        Ok(self.conn.query_row(&sql, params![secret_hash], from_row).optional()?)
+        let sql = format!("{SELECT} WHERE enroll_tokens.secret_hash = $1 AND enroll_tokens.used_at IS NULL");
+        self.query_opt(&sql, &[&Blob(*secret_hash)], from_row)
     }
 
     /// 令牌被用掉了。它不再指向要继任的节点：那个节点紧接着就被删掉，指着它的话这一行会被一起删掉。
@@ -140,7 +139,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn consume_token(&self, id: u32, at: Timestamp) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE enroll_tokens SET used_at = ?2, successor_of = NULL WHERE id = ?1", params![id, Unsigned(at)])?;
+        self.execute("UPDATE enroll_tokens SET used_at = $2, successor_of = NULL WHERE id = $1", &[&Int(id), &Unsigned(at)])?;
         Ok(())
     }
 
@@ -150,7 +149,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn set_token_user(&self, id: u32, node: NodeId) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE enroll_tokens SET used_by = ?2 WHERE id = ?1", params![id, SqlNode(node)])?;
+        self.execute("UPDATE enroll_tokens SET used_by = $2 WHERE id = $1", &[&Int(id), &SqlNode(node)])?;
         Ok(())
     }
 
@@ -160,7 +159,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn delete_token(&self, id: u32) -> Result<bool, StoreError> {
-        Ok(self.conn.execute("DELETE FROM enroll_tokens WHERE id = ?1", params![id])? > 0)
+        Ok(self.execute("DELETE FROM enroll_tokens WHERE id = $1", &[&Int(id)])? > 0)
     }
 
     /// 清掉用掉或者过期已经超过 [`RETENTION_SECS`] 的令牌，返回清掉了几个。
@@ -170,10 +169,10 @@ impl Store {
     /// 写数据库失败。
     pub fn purge_expired_tokens(&self, now: Timestamp) -> Result<usize, StoreError> {
         let before = Unsigned(now.saturating_sub(RETENTION_SECS));
-        Ok(self.conn.execute(
-            "DELETE FROM enroll_tokens WHERE (used_at IS NULL AND expires_at <= ?1) OR (used_at IS NOT NULL AND used_at <= ?1)",
-            params![before],
-        )?)
+        self.execute(
+            "DELETE FROM enroll_tokens WHERE (used_at IS NULL AND expires_at <= $1) OR (used_at IS NOT NULL AND used_at <= $1)",
+            &[&before],
+        )
     }
 }
 

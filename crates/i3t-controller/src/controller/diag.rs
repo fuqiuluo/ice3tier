@@ -1039,13 +1039,13 @@ mod tests {
         let (mut lab, network, a, b) = two_nodes();
         let offline = lab.join_offline(network, &[], Declared::default());
         // 测试那一行写得进去，操作记录写不进去。
-        lab.controller.lock().store.execute_batch("CREATE TRIGGER no_log BEFORE INSERT ON oplog BEGIN SELECT RAISE(ABORT, 'no log'); END;");
+        lab.controller.lock().store.block("no_log", "INSERT ON oplog", None);
         assert!(lab.controller.start_test(network, &request(&a, &b)).is_err());
         assert!(lab.controller.start_test(network, &CreateTest { b: offline, ..request(&a, &b) }).is_err(), "做不了的测试也一样");
         assert!(lab.controller.tests(network, &TestQuery::default()).unwrap().is_empty(), "开始不了的测试不留一行");
         assert!(lab.controller.lock().diag.running.is_empty());
 
-        lab.controller.lock().store.execute_batch("DROP TRIGGER no_log;");
+        lab.controller.lock().store.unblock("no_log", "oplog");
         let view = lab.controller.start_test(network, &request(&a, &b)).unwrap();
         assert_eq!(view.state, TestState::Running, "马上可以再试，不用等间隔");
     }
@@ -1079,22 +1079,22 @@ mod tests {
         let mut members: Vec<Member> = (0..3).map(|_| lab.join_as(network, &modern_hello("0.2.0"))).collect();
         lab.settle(&mut members.iter_mut().collect::<Vec<_>>());
         // 结果照样更新得进去，新的测试插不进去。
-        let block = "CREATE TRIGGER no_new_test BEFORE INSERT ON tests BEGIN SELECT RAISE(ABORT, 'no new test'); END;";
-        let unblock = "DROP TRIGGER no_new_test;";
-        lab.controller.lock().store.execute_batch(block);
+        let block = |lab: &Lab| lab.controller.lock().store.block("no_new_test", "INSERT ON tests", None);
+        let unblock = |lab: &Lab| lab.controller.lock().store.unblock("no_new_test", "tests");
+        block(&lab);
         let run = lab.controller.start_matrix(network).unwrap();
         assert!(run.cells.iter().all(|cell| cell.state == CellState::Pending), "矩阵开始了，一对都还没开始：{:?}", run.cells);
 
         // 最后一对刚单独测过，先开始另外两对。
         let last = pair(members[1].id, members[2].id);
         lab.controller.lock().diag.last.insert(last, (Instant::now(), None));
-        lab.controller.lock().store.execute_batch(unblock);
+        unblock(&lab);
         lab.controller.lock().tests_tick(later(1));
         let running: Vec<u64> = lab.controller.lock().diag.running.keys().copied().collect();
         assert_eq!(running.len(), 2);
 
         lab.controller.lock().diag.last.clear();
-        lab.controller.lock().store.execute_batch(block);
+        block(&lab);
         let test = running[0];
         let (initiator, responder) = ends(&lab, network, test, &members.iter().collect::<Vec<_>>());
         send(&lab, initiator, initiator_report(test));
@@ -1103,7 +1103,7 @@ mod tests {
         let queued = |lab: &Lab| lab.controller.matrix(network).unwrap().cells.into_iter().find(|cell| (cell.a, cell.b) == last).unwrap();
         assert_eq!(queued(&lab).state, CellState::Pending);
 
-        lab.controller.lock().store.execute_batch(unblock);
+        unblock(&lab);
         lab.controller.lock().tests_tick(later(1));
         assert_eq!(queued(&lab).state, CellState::Running, "后台任务接着排");
     }
@@ -1121,12 +1121,11 @@ mod tests {
     /// 让这几个测试的结果写不进去，别的照常。
     fn stick(lab: &Lab, tests: &[u64]) {
         let ids = tests.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
-        let sql = format!("CREATE TRIGGER stuck BEFORE UPDATE ON tests WHEN OLD.id IN ({ids}) BEGIN SELECT RAISE(ABORT, 'stuck'); END;");
-        lab.controller.lock().store.execute_batch(&sql);
+        lab.controller.lock().store.block("stuck", "UPDATE ON tests", Some(&format!("OLD.id IN ({ids})")));
     }
 
     fn unstick(lab: &Lab) {
-        lab.controller.lock().store.execute_batch("DROP TRIGGER stuck;");
+        lab.controller.lock().store.unblock("stuck", "tests");
     }
 
     #[test]
@@ -1206,7 +1205,7 @@ mod tests {
         let (lab, network, _a, b) = two_nodes();
         // 接受方的连接已经断了，指令发不出去；测试的结果也写不进去。
         drop(b);
-        lab.controller.lock().store.execute_batch("CREATE TRIGGER stuck BEFORE UPDATE ON tests BEGIN SELECT RAISE(ABORT, 'stuck'); END;");
+        lab.controller.lock().store.block("stuck", "UPDATE ON tests", None);
         let run = lab.controller.start_matrix(network).unwrap();
         assert_eq!((run.state, run.finished, run.cells[0].state), (MatrixState::Running, 0, CellState::Running), "{:?}", run.cells);
         let test = run.cells[0].test.unwrap();
@@ -1298,10 +1297,10 @@ mod tests {
         let test = lab.controller.start_matrix(network).unwrap().cells[0].test.unwrap();
         // 操作记录满了：记一条要顺带清掉最老的，清不掉。
         lab.controller.lock().store.execute_batch(
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) \
-             INSERT INTO oplog (at, network_id, action, detail) SELECT 0, NULL, 'filler', '' FROM n; \
-             CREATE TRIGGER no_trim BEFORE DELETE ON oplog BEGIN SELECT RAISE(ABORT, 'no trim'); END;",
+            "INSERT INTO oplog (at, network_id, action, detail, refs, params) \
+             SELECT 0, NULL, 'filler', '', '[]', '{}' FROM generate_series(1, 10000)",
         );
+        lab.controller.lock().store.block("no_trim", "DELETE ON oplog", None);
         assert!(lab.controller.start_matrix(other).is_err());
         assert!(matches!(lab.controller.matrix(other), Err(Error::NotFound(_))), "矩阵没有开始");
         assert!(lab.controller.cancel_matrix(network).is_err());
@@ -1311,7 +1310,7 @@ mod tests {
         let logged = |lab: &Lab| lab.controller.oplog(10).unwrap().into_iter().filter(|entry| entry.action != "filler").count();
         assert_eq!(logged(&lab), 0, "操作记录里也没有");
 
-        lab.controller.lock().store.execute_batch("DROP TRIGGER no_trim;");
+        lab.controller.lock().store.unblock("no_trim", "oplog");
         assert_eq!(lab.controller.cancel_matrix(network).unwrap().state, MatrixState::Cancelled);
         assert_eq!(logged(&lab), 1);
     }
@@ -1354,11 +1353,8 @@ mod tests {
         lab.settle(&mut [&mut a, &mut b]);
         // 前一个网络排在最前面的那一对一直插不进去。
         let (first, second) = (members[0].id.get(), members[1].id.get());
-        let block = format!(
-            "CREATE TRIGGER stuck BEFORE INSERT ON tests WHEN NEW.node_a = {first} AND NEW.node_b = {second} \
-             BEGIN SELECT RAISE(ABORT, 'stuck'); END;"
-        );
-        lab.controller.lock().store.execute_batch(&block);
+        let stuck = format!("NEW.node_a = {first} AND NEW.node_b = {second}");
+        lab.controller.lock().store.block("stuck", "INSERT ON tests", Some(&stuck));
         lab.controller.start_matrix(network).unwrap();
         lab.controller.lock().diag.last.insert(pair(a.id, b.id), (Instant::now(), None));
         lab.controller.start_matrix(other).unwrap();
@@ -1369,7 +1365,7 @@ mod tests {
         assert_eq!(states(&lab), [CellState::Pending, CellState::Running, CellState::Running], "后面的两对照样开始");
         assert_eq!(lab.controller.matrix(other).unwrap().cells[0].state, CellState::Running, "别的网络也照样排");
 
-        lab.controller.lock().store.execute_batch("DROP TRIGGER stuck;");
+        lab.controller.lock().store.unblock("stuck", "tests");
         lab.controller.lock().tests_tick(later(2));
         assert_eq!(states(&lab), [CellState::Running; 3]);
     }

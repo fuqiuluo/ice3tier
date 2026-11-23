@@ -6,9 +6,9 @@ use i3t_model::admin::{ForwardInput, NetworkId};
 use i3t_model::netmap::{ForwardProtocol, ProxyProtocol};
 use i3t_proto::flow::Class;
 use ipnet::IpNet;
-use rusqlite::{OptionalExtension, Row, named_params, params};
+use tokio_postgres::Row;
 
-use super::codec::{Json, SqlNetwork, SqlNode, Text, row_id};
+use super::codec::{Int, Json, Read, SqlNetwork, SqlNode, Text};
 use super::{Store, StoreError};
 
 /// 一条存着的端口转发。它现在的状态不存，由 controller 现算。
@@ -19,20 +19,20 @@ pub struct ForwardRecord {
 }
 
 impl ForwardRecord {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(row: &Row) -> Read<Self> {
         Ok(Self {
-            id: row.get("id")?,
+            id: row.try_get::<_, Int<u32>>("id")?.0,
             config: ForwardInput {
-                name: row.get("name")?,
-                protocol: row.get::<_, Json<ForwardProtocol>>("protocol")?.0,
-                listen_node: row.get::<_, SqlNode>("listen_node")?.0,
-                bind: row.get::<_, Text<SocketAddr>>("bind")?.0,
-                target_node: row.get::<_, SqlNode>("target_node")?.0,
-                target_addr: row.get::<_, Text<SocketAddr>>("target_addr")?.0,
-                allow_from: row.get::<_, Json<Vec<IpNet>>>("allow_from")?.0,
-                enabled: row.get("enabled")?,
-                class: row.get::<_, Option<Json<Class>>>("class")?.map(|json| json.0),
-                proxy_protocol: row.get::<_, Option<Json<ProxyProtocol>>>("proxy_protocol")?.map(|json| json.0),
+                name: row.try_get("name")?,
+                protocol: row.try_get::<_, Json<ForwardProtocol>>("protocol")?.0,
+                listen_node: row.try_get::<_, SqlNode>("listen_node")?.0,
+                bind: row.try_get::<_, Text<SocketAddr>>("bind")?.0,
+                target_node: row.try_get::<_, SqlNode>("target_node")?.0,
+                target_addr: row.try_get::<_, Text<SocketAddr>>("target_addr")?.0,
+                allow_from: row.try_get::<_, Json<Vec<IpNet>>>("allow_from")?.0,
+                enabled: row.try_get("enabled")?,
+                class: row.try_get::<_, Option<Json<Class>>>("class")?.map(|json| json.0),
+                proxy_protocol: row.try_get::<_, Option<Json<ProxyProtocol>>>("proxy_protocol")?.map(|json| json.0),
             },
         })
     }
@@ -43,26 +43,25 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn insert_forward(&self, network: NetworkId, config: &ForwardInput) -> Result<u32, StoreError> {
-        self.conn.execute(
+        self.insert(
             "INSERT INTO forwards (network_id, name, protocol, listen_node, bind, target_node, target_addr, allow_from, enabled, class,
                                    proxy_protocol)
-             VALUES (:network, :name, :protocol, :listen_node, :bind, :target_node, :target_addr, :allow_from, :enabled, :class,
-                     :proxy_protocol)",
-            named_params! {
-                ":network": SqlNetwork(network),
-                ":name": config.name,
-                ":protocol": Json(config.protocol),
-                ":listen_node": SqlNode(config.listen_node),
-                ":bind": Text(config.bind),
-                ":target_node": SqlNode(config.target_node),
-                ":target_addr": Text(config.target_addr),
-                ":allow_from": Json(&config.allow_from),
-                ":enabled": config.enabled,
-                ":class": config.class.map(Json),
-                ":proxy_protocol": config.proxy_protocol.map(Json),
-            },
-        )?;
-        Ok(row_id(self.conn.last_insert_rowid())?)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING id",
+            &[
+                &SqlNetwork(network),
+                &config.name,
+                &Json(config.protocol),
+                &SqlNode(config.listen_node),
+                &Text(config.bind),
+                &SqlNode(config.target_node),
+                &Text(config.target_addr),
+                &Json(&config.allow_from),
+                &config.enabled,
+                &config.class.map(Json),
+                &config.proxy_protocol.map(Json),
+            ],
+        )
     }
 
     /// 一个网络的全部端口转发，按编号排。
@@ -71,9 +70,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn forwards(&self, network: NetworkId) -> Result<Vec<ForwardRecord>, StoreError> {
-        let mut statement = self.conn.prepare("SELECT * FROM forwards WHERE network_id = ?1 ORDER BY id")?;
-        let rows = statement.query_map(params![SqlNetwork(network)], ForwardRecord::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.query("SELECT * FROM forwards WHERE network_id = $1 ORDER BY id", &[&SqlNetwork(network)], ForwardRecord::from_row)
     }
 
     /// 只在这个网络里找。
@@ -82,8 +79,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn forward(&self, network: NetworkId, id: u32) -> Result<Option<ForwardRecord>, StoreError> {
-        let sql = "SELECT * FROM forwards WHERE network_id = ?1 AND id = ?2";
-        Ok(self.conn.query_row(sql, params![SqlNetwork(network), id], ForwardRecord::from_row).optional()?)
+        let sql = "SELECT * FROM forwards WHERE network_id = $1 AND id = $2";
+        self.query_opt(sql, &[&SqlNetwork(network), &Int(id)], ForwardRecord::from_row)
     }
 
     /// 整个替换一条转发。
@@ -92,24 +89,23 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn update_forward(&self, id: u32, config: &ForwardInput) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE forwards SET name = :name, protocol = :protocol, listen_node = :listen_node, bind = :bind,
-                                 target_node = :target_node, target_addr = :target_addr, allow_from = :allow_from, enabled = :enabled,
-                                 class = :class, proxy_protocol = :proxy_protocol
-             WHERE id = :id",
-            named_params! {
-                ":id": id,
-                ":name": config.name,
-                ":protocol": Json(config.protocol),
-                ":listen_node": SqlNode(config.listen_node),
-                ":bind": Text(config.bind),
-                ":target_node": SqlNode(config.target_node),
-                ":target_addr": Text(config.target_addr),
-                ":allow_from": Json(&config.allow_from),
-                ":enabled": config.enabled,
-                ":class": config.class.map(Json),
-                ":proxy_protocol": config.proxy_protocol.map(Json),
-            },
+        self.execute(
+            "UPDATE forwards SET name = $2, protocol = $3, listen_node = $4, bind = $5, target_node = $6, target_addr = $7,
+                                 allow_from = $8, enabled = $9, class = $10, proxy_protocol = $11
+             WHERE id = $1",
+            &[
+                &Int(id),
+                &config.name,
+                &Json(config.protocol),
+                &SqlNode(config.listen_node),
+                &Text(config.bind),
+                &SqlNode(config.target_node),
+                &Text(config.target_addr),
+                &Json(&config.allow_from),
+                &config.enabled,
+                &config.class.map(Json),
+                &config.proxy_protocol.map(Json),
+            ],
         )?;
         Ok(())
     }
@@ -118,7 +114,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn delete_forward(&self, id: u32) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM forwards WHERE id = ?1", params![id])?;
+        self.execute("DELETE FROM forwards WHERE id = $1", &[&Int(id)])?;
         Ok(())
     }
 }

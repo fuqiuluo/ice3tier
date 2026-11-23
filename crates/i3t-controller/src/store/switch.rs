@@ -4,13 +4,11 @@
 //! - 一对节点（两个方向一共）只留最近的 [`KEEP_SWITCHES`] 条，一个网络一共最多 [`KEEP_PER_NETWORK`] 条：
 //!   互相通信、又换过路的节点对再多，表的大小也有上限。
 
+use super::codec::{Int, Json, SqlNetwork, SqlNode, Unsigned};
+use super::{Store, StoreError};
 use i3t_model::admin::{KEEP_SWITCHES, NetworkId, SwitchView, Timestamp};
 use i3t_model::control::{Route, RouteCause};
 use i3t_proto::NodeId;
-use rusqlite::params;
-
-use super::codec::{Json, SqlNetwork, SqlNode, Unsigned};
-use super::{Store, StoreError};
 
 /// 一个网络一共最多留多少条换路的记录，再多就删最老的。
 pub const KEEP_PER_NETWORK: u32 = 10_000;
@@ -34,30 +32,30 @@ impl Store {
     ///
     /// 写数据库失败，包括两个节点有一个不存在。
     pub fn insert_switch(&self, switch: &NewSwitch) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO route_switches (network_id, from_node, to_node, at, previous, route, cause) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                SqlNetwork(switch.network),
-                SqlNode(switch.from),
-                SqlNode(switch.to),
-                Unsigned(switch.at),
-                Json(&switch.previous),
-                Json(&switch.route),
-                Json(&switch.cause)
+        self.execute(
+            "INSERT INTO route_switches (network_id, from_node, to_node, at, previous, route, cause) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &SqlNetwork(switch.network),
+                &SqlNode(switch.from),
+                &SqlNode(switch.to),
+                &Unsigned(switch.at),
+                &Json(&switch.previous),
+                &Json(&switch.route),
+                &Json(&switch.cause),
             ],
         )?;
         let keep = u32::try_from(KEEP_SWITCHES).unwrap_or(u32::MAX);
-        self.conn.execute(
-            "DELETE FROM route_switches WHERE network_id = ?1 AND ((from_node = ?2 AND to_node = ?3) OR (from_node = ?3 AND to_node = ?2))
+        self.execute(
+            "DELETE FROM route_switches WHERE network_id = $1 AND ((from_node = $2 AND to_node = $3) OR (from_node = $3 AND to_node = $2))
              AND id NOT IN (
-                 SELECT id FROM route_switches WHERE network_id = ?1 AND ((from_node = ?2 AND to_node = ?3) OR (from_node = ?3 AND to_node = ?2))
-                 ORDER BY at DESC, id DESC LIMIT ?4)",
-            params![SqlNetwork(switch.network), SqlNode(switch.from), SqlNode(switch.to), keep],
+                 SELECT id FROM route_switches WHERE network_id = $1 AND ((from_node = $2 AND to_node = $3) OR (from_node = $3 AND to_node = $2))
+                 ORDER BY at DESC, id DESC LIMIT $4)",
+            &[&SqlNetwork(switch.network), &SqlNode(switch.from), &SqlNode(switch.to), &Int(keep)],
         )?;
-        self.conn.execute(
-            "DELETE FROM route_switches WHERE network_id = ?1 AND id NOT IN (
-                 SELECT id FROM route_switches WHERE network_id = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![SqlNetwork(switch.network), KEEP_PER_NETWORK],
+        self.execute(
+            "DELETE FROM route_switches WHERE network_id = $1 AND id NOT IN (
+                 SELECT id FROM route_switches WHERE network_id = $1 ORDER BY id DESC LIMIT $2)",
+            &[&SqlNetwork(switch.network), &Int(KEEP_PER_NETWORK)],
         )?;
         Ok(())
     }
@@ -68,18 +66,15 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn switches(&self, from: NodeId, to: NodeId) -> Result<Vec<SwitchView>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT at, previous, route, cause FROM route_switches WHERE from_node = ?1 AND to_node = ?2 ORDER BY at DESC, id DESC",
-        )?;
-        let rows = statement.query_map(params![SqlNode(from), SqlNode(to)], |row| {
+        let sql = "SELECT at, previous, route, cause FROM route_switches WHERE from_node = $1 AND to_node = $2 ORDER BY at DESC, id DESC";
+        self.query(sql, &[&SqlNode(from), &SqlNode(to)], |row| {
             Ok(SwitchView {
-                at: row.get::<_, Unsigned>(0)?.0,
-                from: row.get::<_, Json<Route>>(1)?.0,
-                to: row.get::<_, Json<Route>>(2)?.0,
-                cause: row.get::<_, Json<RouteCause>>(3)?.0,
+                at: row.try_get::<_, Unsigned>(0)?.0,
+                from: row.try_get::<_, Json<Route>>(1)?.0,
+                to: row.try_get::<_, Json<Route>>(2)?.0,
+                cause: row.try_get::<_, Json<RouteCause>>(3)?.0,
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
 }
 

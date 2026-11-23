@@ -3,9 +3,9 @@
 use i3t_model::admin::NetworkId;
 use i3t_model::admin::diag::TestView;
 use i3t_proto::NodeId;
-use rusqlite::{OptionalExtension, params};
+use tokio_postgres::Row;
 
-use super::codec::{Json, SqlNetwork, SqlNode, Unsigned};
+use super::codec::{Int, Json, Read, SqlNetwork, SqlNode, Unsigned};
 use super::{Store, StoreError};
 
 /// 一对节点最多留多少个测试的结果，再多就删最老的。
@@ -18,11 +18,11 @@ impl Store {
     ///
     /// 写数据库失败，包括两个节点有一个不存在。
     pub fn insert_test(&self, view: &TestView) -> Result<u64, StoreError> {
-        self.conn.execute(
-            "INSERT INTO tests (network_id, node_a, node_b, started_at, view) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![SqlNetwork(view.network), SqlNode(view.a.id), SqlNode(view.b.id), Unsigned(view.started_at), Json(view)],
+        let id = self.query_one(
+            "INSERT INTO tests (network_id, node_a, node_b, started_at, view) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            &[&SqlNetwork(view.network), &SqlNode(view.a.id), &SqlNode(view.b.id), &Unsigned(view.started_at), &Json(view)],
+            |row| Ok(row.try_get::<_, Unsigned>(0)?.0),
         )?;
-        let id = u64::try_from(self.conn.last_insert_rowid()).unwrap_or(0);
         self.prune_tests(view.network, view.a.id, view.b.id)?;
         Ok(id)
     }
@@ -33,7 +33,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn update_test(&self, view: &TestView) -> Result<(), StoreError> {
-        self.conn.execute("UPDATE tests SET view = ?2 WHERE id = ?1", params![Unsigned(view.id), Json(view)])?;
+        self.execute("UPDATE tests SET view = $2 WHERE id = $1", &[&Unsigned(view.id), &Json(view)])?;
         Ok(())
     }
 
@@ -43,13 +43,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn test(&self, network: NetworkId, id: u64) -> Result<Option<TestView>, StoreError> {
-        let view = self
-            .conn
-            .query_row("SELECT view FROM tests WHERE id = ?1 AND network_id = ?2", params![Unsigned(id), SqlNetwork(network)], |row| {
-                row.get::<_, Json<TestView>>(0)
-            })
-            .optional()?;
-        Ok(view.map(|view| view.0))
+        let sql = "SELECT view FROM tests WHERE id = $1 AND network_id = $2";
+        self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], |row| Ok(row.try_get::<_, Json<TestView>>(0)?.0))
     }
 
     /// 最近的测试，新的在前。`pair` 有值时只要这一对节点的（先后无所谓）。
@@ -58,31 +53,27 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn tests(&self, network: NetworkId, pair: Option<(NodeId, NodeId)>, limit: u32) -> Result<Vec<TestView>, StoreError> {
-        let read = |row: &rusqlite::Row<'_>| row.get::<_, Json<TestView>>(0).map(|view| view.0);
-        let views = match pair {
-            Some((a, b)) => {
-                let mut statement = self.conn.prepare(
-                    "SELECT view FROM tests WHERE network_id = ?1 AND ((node_a = ?2 AND node_b = ?3) OR (node_a = ?3 AND node_b = ?2))
-                     ORDER BY id DESC LIMIT ?4",
-                )?;
-                let rows = statement.query_map(params![SqlNetwork(network), SqlNode(a), SqlNode(b), limit], read)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            }
+        let read = |row: &Row| -> Read<TestView> { Ok(row.try_get::<_, Json<TestView>>(0)?.0) };
+        match pair {
+            Some((a, b)) => self.query(
+                "SELECT view FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2))
+                 ORDER BY id DESC LIMIT $4",
+                &[&SqlNetwork(network), &SqlNode(a), &SqlNode(b), &Int(limit)],
+                read,
+            ),
             None => {
-                let mut statement = self.conn.prepare("SELECT view FROM tests WHERE network_id = ?1 ORDER BY id DESC LIMIT ?2")?;
-                let rows = statement.query_map(params![SqlNetwork(network), limit], read)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                let sql = "SELECT view FROM tests WHERE network_id = $1 ORDER BY id DESC LIMIT $2";
+                self.query(sql, &[&SqlNetwork(network), &Int(limit)], read)
             }
-        };
-        Ok(views)
+        }
     }
 
     fn prune_tests(&self, network: NetworkId, a: NodeId, b: NodeId) -> Result<(), StoreError> {
-        self.conn.execute(
-            "DELETE FROM tests WHERE network_id = ?1 AND ((node_a = ?2 AND node_b = ?3) OR (node_a = ?3 AND node_b = ?2)) AND id NOT IN (
-                 SELECT id FROM tests WHERE network_id = ?1 AND ((node_a = ?2 AND node_b = ?3) OR (node_a = ?3 AND node_b = ?2))
-                 ORDER BY id DESC LIMIT ?4)",
-            params![SqlNetwork(network), SqlNode(a), SqlNode(b), KEEP_PER_PAIR],
+        self.execute(
+            "DELETE FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2)) AND id NOT IN (
+                 SELECT id FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2))
+                 ORDER BY id DESC LIMIT $4)",
+            &[&SqlNetwork(network), &SqlNode(a), &SqlNode(b), &Int(KEEP_PER_PAIR)],
         )?;
         Ok(())
     }

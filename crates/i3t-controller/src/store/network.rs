@@ -4,9 +4,9 @@ use i3t_model::admin::{NetworkId, Timestamp};
 use i3t_model::netmap::{Reach, RoutingMode};
 use i3t_proto::flow::Class;
 use ipnet::Ipv4Net;
-use rusqlite::{OptionalExtension, Row, params};
+use tokio_postgres::Row;
 
-use super::codec::{Json, SqlNetwork, Text, Unsigned, row_id};
+use super::codec::{Int, Json, Read, SqlNetwork, Text, Unsigned};
 use super::{Store, StoreError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,21 +37,21 @@ impl NetworkRecord {
         format!("{}.i3t", self.name)
     }
 
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(row: &Row) -> Read<Self> {
         Ok(Self {
-            id: row.get::<_, SqlNetwork>("id")?.0,
-            name: row.get("name")?,
-            cidr: row.get::<_, Text<Ipv4Net>>("cidr")?.0,
-            routing: row.get::<_, Json<RoutingMode>>("routing")?.0,
-            max_relay_hops: row.get("max_relay_hops")?,
-            reach: row.get::<_, Json<Reach>>("reach")?.0,
-            created_at: row.get::<_, Unsigned>("created_at")?.0,
-            class: row.get::<_, Option<Json<Class>>>("class")?.map(|json| json.0),
-            ack_eliciting_threshold: row.get("ack_eliciting_threshold")?,
-            max_ack_delay_ms: row.get("max_ack_delay_ms")?,
-            bundle_small_packets: row.get("bundle_small_packets")?,
-            vnet_offload: row.get("vnet_offload")?,
-            vnet_mtu: row.get("vnet_mtu")?,
+            id: row.try_get::<_, SqlNetwork>("id")?.0,
+            name: row.try_get("name")?,
+            cidr: row.try_get::<_, Text<Ipv4Net>>("cidr")?.0,
+            routing: row.try_get::<_, Json<RoutingMode>>("routing")?.0,
+            max_relay_hops: row.try_get::<_, Int<u8>>("max_relay_hops")?.0,
+            reach: row.try_get::<_, Json<Reach>>("reach")?.0,
+            created_at: row.try_get::<_, Unsigned>("created_at")?.0,
+            class: row.try_get::<_, Option<Json<Class>>>("class")?.map(|json| json.0),
+            ack_eliciting_threshold: row.try_get::<_, Int<u32>>("ack_eliciting_threshold")?.0,
+            max_ack_delay_ms: row.try_get::<_, Int<u32>>("max_ack_delay_ms")?.0,
+            bundle_small_packets: row.try_get("bundle_small_packets")?,
+            vnet_offload: row.try_get("vnet_offload")?,
+            vnet_mtu: row.try_get::<_, Int<u16>>("vnet_mtu")?.0,
         })
     }
 }
@@ -79,26 +79,27 @@ impl Store {
     ///
     /// 写数据库失败，包括名字和已有的网络重复。
     pub fn insert_network(&self, new: &NewNetwork) -> Result<NetworkId, StoreError> {
-        self.conn.execute(
+        let id = self.insert(
             "INSERT INTO networks (name, cidr, routing, max_relay_hops, reach, created_at, class, ack_eliciting_threshold, max_ack_delay_ms,
                                    bundle_small_packets, vnet_offload, vnet_mtu)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                new.name,
-                Text(new.cidr),
-                Json(new.routing),
-                new.max_relay_hops,
-                Json(new.reach),
-                Unsigned(new.created_at),
-                new.class.map(Json),
-                new.ack_eliciting_threshold,
-                new.max_ack_delay_ms,
-                new.bundle_small_packets,
-                new.vnet_offload,
-                new.vnet_mtu
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             RETURNING id",
+            &[
+                &new.name,
+                &Text(new.cidr),
+                &Json(new.routing),
+                &Int(new.max_relay_hops),
+                &Json(new.reach),
+                &Unsigned(new.created_at),
+                &new.class.map(Json),
+                &Int(new.ack_eliciting_threshold),
+                &Int(new.max_ack_delay_ms),
+                &new.bundle_small_packets,
+                &new.vnet_offload,
+                &Int(new.vnet_mtu),
             ],
         )?;
-        let id = NetworkId(row_id(self.conn.last_insert_rowid())?);
+        let id = NetworkId(id);
         self.insert_builtin_group(id)?;
         Ok(id)
     }
@@ -107,14 +108,14 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn network(&self, id: NetworkId) -> Result<Option<NetworkRecord>, StoreError> {
-        Ok(self.conn.query_row("SELECT * FROM networks WHERE id = ?1", params![SqlNetwork(id)], NetworkRecord::from_row).optional()?)
+        self.query_opt("SELECT * FROM networks WHERE id = $1", &[&SqlNetwork(id)], NetworkRecord::from_row)
     }
 
     /// # Errors
     ///
     /// 读数据库失败。
     pub fn network_by_name(&self, name: &str) -> Result<Option<NetworkRecord>, StoreError> {
-        Ok(self.conn.query_row("SELECT * FROM networks WHERE name = ?1", params![name], NetworkRecord::from_row).optional()?)
+        self.query_opt("SELECT * FROM networks WHERE name = $1", &[&name], NetworkRecord::from_row)
     }
 
     /// 全部网络，按编号排。
@@ -123,9 +124,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn networks(&self) -> Result<Vec<NetworkRecord>, StoreError> {
-        let mut statement = self.conn.prepare("SELECT * FROM networks ORDER BY id")?;
-        let rows = statement.query_map([], NetworkRecord::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.query("SELECT * FROM networks ORDER BY id", &[], NetworkRecord::from_row)
     }
 
     /// 改网络的设置。名字和创建时间不改。
@@ -134,23 +133,23 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn update_network(&self, network: &NetworkRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE networks SET cidr = ?2, routing = ?3, max_relay_hops = ?4, reach = ?5, class = ?6,
-                                 ack_eliciting_threshold = ?7, max_ack_delay_ms = ?8, bundle_small_packets = ?9,
-                                 vnet_offload = ?10, vnet_mtu = ?11
-             WHERE id = ?1",
-            params![
-                SqlNetwork(network.id),
-                Text(network.cidr),
-                Json(network.routing),
-                network.max_relay_hops,
-                Json(network.reach),
-                network.class.map(Json),
-                network.ack_eliciting_threshold,
-                network.max_ack_delay_ms,
-                network.bundle_small_packets,
-                network.vnet_offload,
-                network.vnet_mtu
+        self.execute(
+            "UPDATE networks SET cidr = $2, routing = $3, max_relay_hops = $4, reach = $5, class = $6,
+                                 ack_eliciting_threshold = $7, max_ack_delay_ms = $8, bundle_small_packets = $9,
+                                 vnet_offload = $10, vnet_mtu = $11
+             WHERE id = $1",
+            &[
+                &SqlNetwork(network.id),
+                &Text(network.cidr),
+                &Json(network.routing),
+                &Int(network.max_relay_hops),
+                &Json(network.reach),
+                &network.class.map(Json),
+                &Int(network.ack_eliciting_threshold),
+                &Int(network.max_ack_delay_ms),
+                &network.bundle_small_packets,
+                &network.vnet_offload,
+                &Int(network.vnet_mtu),
             ],
         )?;
         Ok(())
@@ -162,7 +161,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn delete_network(&self, id: NetworkId) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM networks WHERE id = ?1", params![SqlNetwork(id)])?;
+        self.execute("DELETE FROM networks WHERE id = $1", &[&SqlNetwork(id)])?;
         Ok(())
     }
 }
@@ -174,7 +173,7 @@ mod tests {
 
     #[test]
     fn networks_round_trip_and_ids_are_not_reused() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let first = store.insert_network(&home()).unwrap();
         let record = store.network(first).unwrap().unwrap();
         assert_eq!(record.name, "home");
@@ -208,7 +207,7 @@ mod tests {
 
     #[test]
     fn two_networks_cannot_share_a_name() {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         store.insert_network(&home()).unwrap();
         assert!(store.insert_network(&home()).is_err());
     }

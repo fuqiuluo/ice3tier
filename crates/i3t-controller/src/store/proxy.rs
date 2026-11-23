@@ -1,6 +1,6 @@
 //! 代理：在节点 A 上监听，经出口节点 B 出去，认一对用户名和密码。
 //!
-//! 用户名和密码原样存着：管理员要能再看、再复制（数据库文件只有属主读得了，管理接口要管理令牌）。
+//! 用户名和密码原样存着：管理员要能再看、再复制（数据库要凭连接串里的密码才连得上，管理接口要管理令牌）。
 //! 节点拿到的只是按这一行的盐算出来的校验值（[`ProxyRecord::verifier`]）。
 
 use std::net::SocketAddr;
@@ -10,9 +10,9 @@ use i3t_model::netmap::{ListenerProtocol, Verifier};
 use i3t_proto::NodeId;
 use i3t_proto::flow::Class;
 use ipnet::IpNet;
-use rusqlite::{OptionalExtension, Row, named_params, params};
+use tokio_postgres::Row;
 
-use super::codec::{Json, SqlNetwork, SqlNode, Text, row_id};
+use super::codec::{Blob, Int, Json, Read, SqlNetwork, SqlNode, Text};
 use super::{Store, StoreError};
 
 /// 存着的一个代理。
@@ -48,22 +48,22 @@ impl ProxyRecord {
         (!anonymous).then(|| Verifier::derive(self.salt, self.username.as_bytes(), self.password.as_bytes()))
     }
 
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(row: &Row) -> Read<Self> {
         Ok(Self {
-            id: row.get("id")?,
-            node: row.get::<_, SqlNode>("node_id")?.0,
-            name: row.get("name")?,
-            bind: row.get::<_, Text<SocketAddr>>("bind")?.0,
-            protocol: row.get::<_, Json<ListenerProtocol>>("protocol")?.0,
-            exit: row.get::<_, Option<SqlNode>>("exit_id")?.map(|node| node.0),
-            username: row.get("username")?,
-            password: row.get("password")?,
-            salt: row.get("salt")?,
-            enabled: row.get("enabled")?,
-            allow_from: row.get::<_, Json<Vec<IpNet>>>("allow_from")?.0,
-            class: row.get::<_, Option<Json<Class>>>("class")?.map(|json| json.0),
-            optimistic: row.get("optimistic")?,
-            lane: row.get("lane")?,
+            id: row.try_get::<_, Int<u32>>("id")?.0,
+            node: row.try_get::<_, SqlNode>("node_id")?.0,
+            name: row.try_get("name")?,
+            bind: row.try_get::<_, Text<SocketAddr>>("bind")?.0,
+            protocol: row.try_get::<_, Json<ListenerProtocol>>("protocol")?.0,
+            exit: row.try_get::<_, Option<SqlNode>>("exit_id")?.map(|node| node.0),
+            username: row.try_get("username")?,
+            password: row.try_get("password")?,
+            salt: row.try_get::<_, Blob<{ Verifier::SALT_LEN }>>("salt")?.0,
+            enabled: row.try_get("enabled")?,
+            allow_from: row.try_get::<_, Json<Vec<IpNet>>>("allow_from")?.0,
+            class: row.try_get::<_, Option<Json<Class>>>("class")?.map(|json| json.0),
+            optimistic: row.try_get("optimistic")?,
+            lane: row.try_get("lane")?,
         })
     }
 }
@@ -75,26 +75,26 @@ impl Store {
     ///
     /// 写数据库失败，包括同一个节点上已经有同名的代理。
     pub fn insert_proxy(&self, proxy: &ProxyRecord) -> Result<u32, StoreError> {
-        self.conn.execute(
+        self.insert(
             "INSERT INTO proxies (node_id, name, bind, protocol, exit_id, username, password, salt, enabled, allow_from, class, optimistic, lane)
-             VALUES (:node, :name, :bind, :protocol, :exit, :username, :password, :salt, :enabled, :allow_from, :class, :optimistic, :lane)",
-            named_params! {
-                ":node": SqlNode(proxy.node),
-                ":name": proxy.name,
-                ":bind": Text(proxy.bind),
-                ":protocol": Json(proxy.protocol),
-                ":exit": proxy.exit.map(SqlNode),
-                ":username": proxy.username,
-                ":password": proxy.password,
-                ":salt": &proxy.salt[..],
-                ":enabled": proxy.enabled,
-                ":allow_from": Json(&proxy.allow_from),
-                ":class": proxy.class.map(Json),
-                ":optimistic": proxy.optimistic,
-                ":lane": proxy.lane,
-            },
-        )?;
-        Ok(row_id(self.conn.last_insert_rowid())?)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             RETURNING id",
+            &[
+                &SqlNode(proxy.node),
+                &proxy.name,
+                &Text(proxy.bind),
+                &Json(proxy.protocol),
+                &proxy.exit.map(SqlNode),
+                &proxy.username,
+                &proxy.password,
+                &Blob(proxy.salt),
+                &proxy.enabled,
+                &Json(&proxy.allow_from),
+                &proxy.class.map(Json),
+                &proxy.optimistic,
+                &proxy.lane,
+            ],
+        )
     }
 
     /// 一个网络里全部节点上的代理，按编号排。
@@ -103,11 +103,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn proxies(&self, network: NetworkId) -> Result<Vec<ProxyRecord>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT proxies.* FROM proxies JOIN nodes ON nodes.id = proxies.node_id WHERE nodes.network_id = ?1 ORDER BY proxies.id",
-        )?;
-        let rows = statement.query_map(params![SqlNetwork(network)], ProxyRecord::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let sql = "SELECT proxies.* FROM proxies JOIN nodes ON nodes.id = proxies.node_id WHERE nodes.network_id = $1 ORDER BY proxies.id";
+        self.query(sql, &[&SqlNetwork(network)], ProxyRecord::from_row)
     }
 
     /// 只在这个网络里找。
@@ -116,8 +113,8 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn proxy(&self, network: NetworkId, id: u32) -> Result<Option<ProxyRecord>, StoreError> {
-        let sql = "SELECT proxies.* FROM proxies JOIN nodes ON nodes.id = proxies.node_id WHERE nodes.network_id = ?1 AND proxies.id = ?2";
-        Ok(self.conn.query_row(sql, params![SqlNetwork(network), id], ProxyRecord::from_row).optional()?)
+        let sql = "SELECT proxies.* FROM proxies JOIN nodes ON nodes.id = proxies.node_id WHERE nodes.network_id = $1 AND proxies.id = $2";
+        self.query_opt(sql, &[&SqlNetwork(network), &Int(id)], ProxyRecord::from_row)
     }
 
     /// 整个替换编号是 `proxy.id` 的代理，包括它监听在哪个节点上。
@@ -126,27 +123,26 @@ impl Store {
     ///
     /// 写数据库失败，包括和同一个节点上的另一个代理重名。
     pub fn update_proxy(&self, proxy: &ProxyRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE proxies SET node_id = :node, name = :name, bind = :bind, protocol = :protocol, exit_id = :exit, username = :username,
-                                password = :password, salt = :salt, enabled = :enabled, allow_from = :allow_from, class = :class,
-                                optimistic = :optimistic, lane = :lane
-             WHERE id = :id",
-            named_params! {
-                ":id": proxy.id,
-                ":node": SqlNode(proxy.node),
-                ":name": proxy.name,
-                ":bind": Text(proxy.bind),
-                ":protocol": Json(proxy.protocol),
-                ":exit": proxy.exit.map(SqlNode),
-                ":username": proxy.username,
-                ":password": proxy.password,
-                ":salt": &proxy.salt[..],
-                ":enabled": proxy.enabled,
-                ":allow_from": Json(&proxy.allow_from),
-                ":class": proxy.class.map(Json),
-                ":optimistic": proxy.optimistic,
-                ":lane": proxy.lane,
-            },
+        self.execute(
+            "UPDATE proxies SET node_id = $2, name = $3, bind = $4, protocol = $5, exit_id = $6, username = $7, password = $8,
+                                salt = $9, enabled = $10, allow_from = $11, class = $12, optimistic = $13, lane = $14
+             WHERE id = $1",
+            &[
+                &Int(proxy.id),
+                &SqlNode(proxy.node),
+                &proxy.name,
+                &Text(proxy.bind),
+                &Json(proxy.protocol),
+                &proxy.exit.map(SqlNode),
+                &proxy.username,
+                &proxy.password,
+                &Blob(proxy.salt),
+                &proxy.enabled,
+                &Json(&proxy.allow_from),
+                &proxy.class.map(Json),
+                &proxy.optimistic,
+                &proxy.lane,
+            ],
         )?;
         Ok(())
     }
@@ -155,7 +151,7 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn delete_proxy(&self, id: u32) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM proxies WHERE id = ?1", params![id])?;
+        self.execute("DELETE FROM proxies WHERE id = $1", &[&Int(id)])?;
         Ok(())
     }
 }

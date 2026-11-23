@@ -1,4 +1,4 @@
-//! 测试用的小实验室：一个只在内存里的 controller，加上几个假装成节点的收件箱。
+//! 测试用的小实验室：一个开在临时数据库上的 controller，加上几个假装成节点的收件箱。
 //!
 //! 这里的"节点"不走 TLS，直接调用节点协议在 controller 一侧的入口，所以测的是规则和下发，不是连接本身。
 
@@ -59,7 +59,7 @@ impl Lab {
     }
 
     pub(crate) fn with_timing(timing: Timing) -> Self {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let controller = Controller::new(store, NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), timing).unwrap();
         Self { controller, next_key: 0 }
     }

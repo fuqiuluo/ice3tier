@@ -53,7 +53,7 @@ impl Running {
     }
 
     pub async fn start_with(timing: Timing, webui: WebUi) -> Self {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let controller = Controller::new(store, NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), timing).unwrap();
         Self::serve(controller, webui).await
     }
@@ -189,7 +189,7 @@ impl Publisher {
 
     /// 一个认这把钥匙、发布源指向这个目录的 controller。包缓存在 `cache` 里。
     pub fn controller(&self, timing: Timing, cache: &std::path::Path) -> Controller {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let controller = Controller::new(store, NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), timing)
             .unwrap()
             .with_release_keys(self.keys())

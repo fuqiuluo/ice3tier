@@ -65,7 +65,7 @@ impl Api {
     }
 
     fn with_webui(webui: &WebUi) -> Self {
-        let store = Store::open_in_memory().unwrap();
+        let store = Store::temporary();
         let controller =
             Controller::new(store, NodeKey::generate().unwrap(), "ctl.example.com:20331".to_owned(), Timing::default()).unwrap();
         Self::around(controller, webui)
