@@ -417,6 +417,36 @@ if [ "$os" = "Linux" ]; then
         sleep 1
     done
 
+    step "back up and restore with the commands of the deployment guide"
+    mkdir "$work/backup"
+    # Left over from an older backup and readable by everyone: the new files must not inherit that.
+    : > "$work/backup/controller.dump"
+    : > "$work/backup/controller.key"
+    chmod 644 "$work/backup/controller.dump" "$work/backup/controller.key"
+    (
+        cd "$work/backup"
+        sudo sh -c 'set -e; umask 077; rm -f controller.dump; pg_dump --format custom --file controller.dump "$(cat /var/lib/i3t-controller/database.url)"'
+        sudo install -m 600 /var/lib/i3t-controller/controller.key controller.key
+    )
+    for file in controller.dump controller.key; do
+        [ "$(sudo stat -c '%a %U' "$work/backup/$file")" = "600 root" ] || fail "the backup's $file is not root's and private"
+    done
+    # Into another empty database on this server. The dump is root's, so root reads it.
+    restored_database=$(new_database install_restored)
+    sudo pg_restore --no-owner --dbname "$restored_database" "$work/backup/controller.dump" \
+        || fail "the backup could not be restored with the documented command"
+    sudo systemctl stop i3t-controller
+    sudo install -o i3t-controller -g i3t-controller -m 600 "$work/backup/controller.key" /var/lib/i3t-controller/controller.key
+    sudo sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 --database-url "$restored_database" >/dev/null
+    ctl_database=$restored_database
+    i=0
+    until I3T_ADMIN_TOKEN="$ctl_token" "$dir/i3tctl" --json network list 2>/dev/null \
+        | python3 -I -c 'import json, sys; sys.exit(0 if any(n["name"] == "upgrade-check" for n in json.load(sys.stdin)) else 1)'; do
+        i=$((i + 1))
+        [ "$i" -lt 30 ] || fail "the restored controller does not answer with the old admin token, or lost its networks"
+        sleep 1
+    done
+
     step "/etc/i3t/controller.env stays root's and private when the address is set again"
     # What an admin puts there by hand may be a secret; an older install left the file readable by everyone.
     [ "$(sudo stat -c '%a %U' /etc/i3t/controller.env)" = "600 root" ] || fail "controller.env is not root's and private after install"
@@ -440,8 +470,11 @@ if [ "$os" = "Linux" ]; then
 
     step "a controller that was set up here is not replaced by one that cannot start"
     # Stopped by hand, and its database setting gone or empty: the script still knows a controller lives here.
+    # Nothing but a line end in the file, and an empty value in controller.env: the controller reads both as "no
+    # database", so the script must too.
     sudo systemctl stop i3t-controller
-    sudo sh -c ': > /var/lib/i3t-controller/database.url'
+    sudo sh -c 'echo > /var/lib/i3t-controller/database.url'
+    echo 'I3T_DATABASE_URL=""' | sudo tee -a /etc/i3t/controller.env >/dev/null
     if sh "$repo/deploy/install.sh" --from "$dir" --controller >"$work/ctl-stopped.out" 2>&1; then
         fail "a stopped controller without a database was upgraded anyway"
     fi
@@ -519,6 +552,10 @@ if [ "$os" = "Linux" ]; then
     sudo rmdir "$noexec"
     noexec=""
     [ "$(/usr/local/bin/i3t-controller --version)" = "i3t-controller 0.1.34" ] || fail "not 0.1.34: $(/usr/local/bin/i3t-controller --version)"
+    # The connection string was given, so the install goes through either way: what shows that the script found out
+    # that this release takes no database is that it said so.
+    grep -q 'does not use PostgreSQL' "$work/ctl-old.out" \
+        || fail "the script did not see that 0.1.34 takes no database: $(cat "$work/ctl-old.out")"
     old_token=$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-old.out" | head -n 1)
     [ -n "$old_token" ] || fail "0.1.34 did not print its admin token: $(cat "$work/ctl-old.out")"
     sudo test -f /var/lib/i3t-controller/controller.db || fail "0.1.34 did not create its database file"

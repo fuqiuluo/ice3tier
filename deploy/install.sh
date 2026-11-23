@@ -1443,16 +1443,18 @@ restart_controller() {
 }
 
 # Whether /etc/i3t/controller.env says which database to use (someone put it there by hand: this script never does).
-# A setting there wins over database.url, because the service gets it in its environment.
+# A setting there wins over database.url, because the service gets it in its environment. An empty value, quoted or
+# not, says nothing: the controller takes it the same way.
 controller_env_sets_database() {
     $SUDO test -f /etc/i3t/controller.env \
-        && $SUDO grep -q -e '^[[:space:]]*I3T_DATABASE_URL=[^[:space:]]' -e '^[[:space:]]*I3T_CONTROLLER_ARGS=.*--database-url' /etc/i3t/controller.env
+        && $SUDO grep -q -e "^[[:space:]]*I3T_DATABASE_URL=[\"']\{0,1\}[^\"'[:space:]]" \
+            -e '^[[:space:]]*I3T_CONTROLLER_ARGS=.*--database-url' /etc/i3t/controller.env
 }
 
-# Whether the installed controller already knows which database to use: the file this script writes (with something
-# in it), or a setting in /etc/i3t/controller.env.
+# Whether the installed controller already knows which database to use: the file this script writes (with more in it
+# than blanks and line ends, which is all the controller ignores), or a setting in /etc/i3t/controller.env.
 controller_has_database() {
-    $SUDO test -s /var/lib/i3t-controller/database.url || controller_env_sets_database
+    $SUDO grep -q '[^[:space:]]' /var/lib/i3t-controller/database.url 2>/dev/null || controller_env_sets_database
 }
 
 # Whether the service is up or is meant to be: running, starting, waiting for systemd to start it again, or given up
