@@ -9,7 +9,7 @@ mod texts;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -27,6 +27,10 @@ static WEBUI: &[Asset] = include!(concat!(env!("OUT_DIR"), "/webui_assets.rs"));
 /// 日志级别用这个环境变量调，写法和 `RUST_LOG` 相同，例如 `I3T_LOG=debug`。
 const LOG_ENV: &str = "I3T_LOG";
 
+/// 数据库的连接串也可以放在数据目录里的这个文件里，`--database-url` 和环境变量都没有给时读它。
+/// 安装脚本把连接串写在这里（只有 controller 的用户读得了），所以只凭数据目录就能启动、就能重新生成管理令牌。
+const DATABASE_URL_FILE: &str = "database.url";
+
 // 帮助的文字在文字目录里（`texts`），由 `command` 按语言装上去，所以这里不写文档注释：clap 会把它们当成说明。
 #[derive(Parser)]
 #[command(name = "i3t-controller", version)]
@@ -36,7 +40,7 @@ struct Args {
 
     /// 连接串里有密码：帮助里不显示环境变量的值，也不交给 clap 解析（它报错时会把值原样打出来），由 [`database`] 来读。
     #[arg(long, env = "I3T_DATABASE_URL", hide_env_values = true)]
-    database_url: String,
+    database_url: Option<String>,
 
     #[arg(long, env = "I3T_PUBLIC_ADDR", required_unless_present = "reset_admin_token")]
     public_addr: Option<String>,
@@ -111,15 +115,29 @@ fn init_logging(default: &str) {
     tracing_subscriber::fmt().with_env_filter(filter).with_ansi(std::io::stderr().is_terminal()).with_writer(std::io::stderr).init();
 }
 
-/// 读连接串。读不懂时只说哪里不对，不把连接串打出来：里面有密码。
-fn database(url: &str) -> anyhow::Result<Database> {
-    url.parse().map_err(|error| anyhow::Error::new(error).context(texts::texts().read_database_url))
+/// 连到哪个数据库：`--database-url`（或者环境变量）给的，没有给就读数据目录里的 [`DATABASE_URL_FILE`]。
+/// 读不懂时只说哪里不对，不把连接串打出来：里面有密码。
+fn database(data_dir: &Path, given: Option<&str>) -> anyhow::Result<Database> {
+    let t = texts::texts();
+    // 空的环境变量当作没有给。
+    let text = match given.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => url.to_owned(),
+        None => {
+            let path = data_dir.join(DATABASE_URL_FILE);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => text.trim().to_owned(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!((t.no_database_url)(&path.display().to_string())),
+                Err(error) => return Err(anyhow::Error::new(error).context((t.io)(&path.display().to_string()))),
+            }
+        }
+    };
+    text.parse().map_err(|error| anyhow::Error::new(error).context(t.read_database_url))
 }
 
 /// 重新生成管理令牌，打在标准输出上。不需要对外地址，也不会在写错的目录或者空的库里建出一个新的 controller。
 fn reset_admin_token(args: &Args) -> anyhow::Result<()> {
     init_logging("warn");
-    let database = database(&args.database_url)?;
+    let database = database(&args.data_dir, args.database_url.as_deref())?;
     let token = Controller::reset_admin_token(&args.data_dir, &database).context(texts::texts().reset_token)?;
     print_admin_token(&token);
     Ok(())
@@ -147,7 +165,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    let database = database(&args.database_url)?;
+    let database = database(&args.data_dir, args.database_url.as_deref())?;
     let opened = Controller::open(&args.data_dir, &database, public_addr.clone())
         .with_context(|| (t.open_data_dir)(&args.data_dir.display().to_string()))?;
     // 发布清单里的"需要的 controller 最低版本"是和可执行文件的版本比的。

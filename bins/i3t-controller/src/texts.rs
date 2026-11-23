@@ -34,6 +34,7 @@ pub struct Texts {
     pub io: fn(&str) -> String,
     pub key_file: fn(&str) -> String,
     pub key_generation: &'static str,
+    pub no_database_url: fn(&str) -> String,
     pub read_database_url: &'static str,
     pub bad_database_url: &'static str,
     pub connect_database: &'static str,
@@ -61,7 +62,7 @@ pub const fn texts_in(lang: Lang) -> &'static Texts {
 static ZH: Texts = Texts {
     about: "ice3tier controller：节点协议、管理 API 和 WebUI",
     data_dir: "数据目录：controller 的密钥和更新包的缓存。第一次启动时创建",
-    database_url: "PostgreSQL 的连接串，如 postgres://用户:密码@主机/库名。网络、节点和设置都存在这个库里",
+    database_url: "PostgreSQL 的连接串，如 postgres://用户:密码@主机/库名。网络、节点和设置都存在这个库里。没有给时读数据目录里的 database.url",
     public_addr: "节点连 controller 的地址，写进每个注册令牌。主机可以是域名",
     listen: "节点协议的监听地址（TCP；同一个端口号的 UDP 回答地址查询）",
     admin_listen: "管理 API 和 WebUI 的监听地址。远程管理用 SSH 端口转发",
@@ -88,7 +89,8 @@ static ZH: Texts = Texts {
     io: |path| format!("读写 {path} 失败"),
     key_file: |path| format!("controller 的密钥文件 {path} 读不懂"),
     key_generation: "生成 controller 的密钥失败",
-    read_database_url: "读 --database-url（I3T_DATABASE_URL）",
+    no_database_url: |path| format!("没有说用哪个数据库：给 --database-url（或者环境变量 I3T_DATABASE_URL），或者把连接串写进 {path}"),
+    read_database_url: "读数据库的连接串",
     bad_database_url: "连接串写得不对",
     connect_database: "连不上数据库",
     empty_database: "数据库里没有 controller 的表：连接串指的不是这个 controller 的库",
@@ -104,7 +106,7 @@ static ZH: Texts = Texts {
 static EN: Texts = Texts {
     about: "ice3tier controller: node protocol, admin API and WebUI",
     data_dir: "Data directory: the controller key and the cache of update packages. Created on first start",
-    database_url: "PostgreSQL connection string, e.g. postgres://USER:PASSWORD@HOST/DBNAME. Networks, nodes and settings are stored in this database",
+    database_url: "PostgreSQL connection string, e.g. postgres://USER:PASSWORD@HOST/DBNAME. Networks, nodes and settings are stored in this database. When not given, read from database.url in the data directory",
     public_addr: "Address nodes use to reach the controller, written into every enrollment token. The host may be a domain name",
     listen: "Node protocol listen address (TCP; UDP on the same port answers address queries)",
     admin_listen: "Admin API and WebUI listen address. For remote admin use SSH port forwarding",
@@ -131,7 +133,10 @@ static EN: Texts = Texts {
     io: |path| format!("Couldn't read or write {path}"),
     key_file: |path| format!("Controller key file {path} unreadable"),
     key_generation: "Generating the controller key failed",
-    read_database_url: "Reading --database-url (I3T_DATABASE_URL)",
+    no_database_url: |path| {
+        format!("No database given: pass --database-url (or set I3T_DATABASE_URL), or write the connection string into {path}")
+    },
+    read_database_url: "Reading the database connection string",
     bad_database_url: "Not a valid connection string",
     connect_database: "Couldn't connect to the database",
     empty_database: "The database has no controller tables: the connection string doesn't point at this controller's database",
@@ -216,19 +221,30 @@ mod tests {
     }
 
     #[test]
-    fn the_database_is_always_needed_and_its_password_never_shows() {
+    fn the_database_comes_from_the_option_or_from_a_file_in_the_data_dir_and_its_password_never_shows() {
         let parse = |args: &[&str]| {
             let args = ["i3t-controller", "--data-dir", "/var/lib/x", "--public-addr", "ctl:20331"].iter().chain(args).map(OsString::from);
-            try_parse_from::<crate::Args>(crate::command(Lang::English), Lang::English, args)
+            try_parse_from::<crate::Args>(crate::command(Lang::English), Lang::English, args).unwrap()
         };
-        // 测试的环境里可能设了 I3T_DATABASE_URL，那样不写这个参数也过得去：只在没有设时看这一条。
-        if std::env::var_os("I3T_DATABASE_URL").is_none() {
-            assert!(parse(&[]).is_err(), "没有连接串启动不了");
+        let dir = tempfile::tempdir().unwrap();
+        let given = parse(&["--database-url", DATABASE]).database_url;
+        assert!(crate::database(dir.path(), given.as_deref()).is_ok());
+
+        // 没有给、数据目录里也没有那个文件：说两种给法，带上文件的位置。
+        let said = describe(&crate::database(dir.path(), None).unwrap_err());
+        assert!(said.contains("--database-url") && said.contains("database.url"), "{said}");
+
+        // 安装脚本写的文件，末尾带换行。空的环境变量当作没有给。
+        std::fs::write(dir.path().join("database.url"), format!("{DATABASE}\n")).unwrap();
+        assert!(crate::database(dir.path(), None).is_ok());
+        assert!(crate::database(dir.path(), Some("")).is_ok());
+
+        // 读不懂的连接串：只说哪里不对，不把它打出来。
+        for bad in [parse(&["--database-url", "postgres://i3t:s3cret@db:notaport/i3t"]).database_url, None] {
+            std::fs::write(dir.path().join("database.url"), "postgres://i3t:s3cret@db:notaport/i3t").unwrap();
+            let said = describe(&crate::database(dir.path(), bad.as_deref()).unwrap_err());
+            assert!(!said.contains("s3cret") && !said.contains("postgres://"), "{said}");
         }
-        let args = parse(&["--database-url", "postgres://i3t:s3cret@db:notaport/i3t"]).unwrap();
-        let said = describe(&crate::database(&args.database_url).unwrap_err());
-        assert!(!said.contains("s3cret") && !said.contains("postgres://"), "{said}");
-        assert!(crate::database(&parse(&["--database-url", DATABASE]).unwrap().database_url).is_ok());
     }
 
     #[test]
