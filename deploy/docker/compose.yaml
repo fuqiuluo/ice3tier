@@ -20,6 +20,9 @@ services:
   postgres:
     image: postgres:18
     restart: unless-stopped
+    # The health check below looks at PID 1. A Docker daemon set up to give every container an init process would put
+    # that there instead.
+    init: false
     # No TCP: only the socket in /var/run/postgresql, which is the postgres-socket volume.
     command: ["postgres", "-c", "listen_addresses="]
     environment:

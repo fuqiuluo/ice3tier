@@ -150,6 +150,10 @@ docker run --rm --user postgres --entrypoint sh "$image" -c '
     if sh -c "$1" >/dev/null 2>&1; then exit 4; fi
 ' sh "$health" || fail "the health check passed on a server that is not the container's main process (or the probe could not run): $health"
 compose exec -T postgres sh -c "$health" >/dev/null || fail "the health check does not pass on the real server: $health"
+# docker 的守护进程可以设成默认给每个容器加一个 init 当 1 号进程（dockerd --init）。那样正式的服务器也不是 1 号进程，
+# 和上面那个一样永远不过：compose 文件里得写明这个服务不要 init。
+init=$(compose config --format json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["services"]["postgres"].get("init"))')
+[ "$init" = False ] || fail "the postgres service does not say init: false (it says: $init)"
 
 step "back up: the database and the key"
 mkdir "$work/backup"
