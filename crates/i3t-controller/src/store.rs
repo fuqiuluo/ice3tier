@@ -5,10 +5,24 @@
 //! 表上的唯一约束和外键只是最后一道保险。
 //!
 //! 一个 [`Store`] 是一条连接，方法是同步的：发出一条语句，等到结果才返回（见 [`session`]）。
-//! 表建在连接的 `search_path` 指的 schema 里，默认就是 `public`；一个数据库给一个 controller 用。
+//! 表建在连接的 `search_path` 里排在最前面的那个 schema 里，默认就是 `public`；一个数据库给一个 controller 用。
 //!
-//! 连接断了（数据库重启、网络闪断）时，下一次读写会重新连上再做。断的那一刻正在做的读写报错；
-//! 它要是在事务里，整个事务不算数，数据库那边已经撤销了。
+//! # 等多久
+//!
+//! 调用方是拿着 controller 的锁调用这里的，所以每一种等都有期限：
+//!
+//! - 连不上（包括连上了端口、对面却不答话）有总的期限；刚试过没连上的话，过一小会儿才再去连，这期间的读写马上失败
+//!   （[`StoreError::Disconnected`]），不是每一次都把期限等满。
+//! - 一条语句等回答有期限，过了就当这条连接坏了。
+//! - 别的连接占着锁时（有人在库里开着事务改同一行、锁了表）最多等 [`LOCK_TIMEOUT`]。刚等满过一次的话，接下来同样长的
+//!   一段时间里不再等：被占着的马上失败，没被占着的照常写。一把一直不放的锁因此最多让 controller 有一半的时间在等，
+//!   而且挡不住别的行。
+//!
+//! # 连接断了
+//!
+//! 连接断了（数据库重启、网络闪断）时，下一次读写会换一条新的连接再做。断的那一刻正在做的读写报错。
+//! 它要是在事务里，事务不算数，数据库那边已经撤销了，只有一种情况说不准：断在"提交"发出去之后、回答回来之前。
+//! 那时数据库可能已经提交了，也可能没有，这里报 [`StoreError::CommitUnknown`]，调用方不能当成"没有做"。
 
 mod codec;
 mod cooldown;
@@ -35,8 +49,9 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Config, Row};
 
@@ -56,17 +71,29 @@ pub use test::KEEP_PER_PAIR;
 pub use token::{NewToken, RETENTION_SECS, TokenRecord, is_pending, token_at};
 
 use codec::{Int, Read};
-use session::{Params, Session};
+use session::{CONNECT_TIMEOUT, Params, Session};
 
 /// SHA-256 的长度。令牌和 netmap 的摘要都是它。
 pub const DIGEST_LEN: usize = 32;
 
-/// 连接串里没有写超时的话，连不上时最多等这么久。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 别的连接占着一张表或者一行的锁时，一条语句最多等这么久，过了就失败。PostgreSQL 默认一直等下去。
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 刚等满过一次锁之后，"不等"的那段时间里用的期限：被占着的语句马上失败。不能是 0，0 是"一直等"。
+const NO_LOCK_WAIT: Duration = Duration::from_millis(1);
+
+/// 没连上之后至少、至多隔多久再去连。隔多久看那一次花了多久：马上被拒绝的可以很快再试，等满了期限的要多隔一会儿，
+/// 不然连不上的那段时间里 controller 就一直卡在"连"上。
+const RECONNECT_PAUSE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(30));
 
 /// 连接串里没有另外写的话，连接闲着这么久就发 TCP 保活，发出去的数据这么久没人确认就当连接断了。
 /// 数据库在别的机器上、中间的网络悄悄断掉时，靠它才不会一直等一个不会来的回答。
 const DEAD_PEER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 连接串里没有另外写的话，保活的探测隔这么久发一次，连着这么多次没有回音就当连接断了：
+/// 闲着的连接断了之后一分钟里发现，不靠系统的默认（Linux 上十几分钟）。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 3;
 
 /// `tokio-postgres` 自己的保活间隔。连接串里没有改它的话，这里换成 [`DEAD_PEER_TIMEOUT`]。
 const LIBRARY_KEEPALIVE_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
@@ -74,7 +101,8 @@ const LIBRARY_KEEPALIVE_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
 /// 连到哪个 PostgreSQL 数据库。从连接串来，两种写法都认：
 /// `postgres://用户:密码@主机:端口/库名`，或者 `host=… user=… dbname=…`（主机可以是放 Unix 套接字的目录）。
 ///
-/// 不支持 TLS：数据库要和 controller 在同一台机器或者一个可信的内网里。
+/// 不支持 TLS：数据库要和 controller 在同一台机器或者一个可信的内网里。连接串要求 TLS（`sslmode=require`）时
+/// 不收，而不是悄悄不加密地连。
 #[derive(Clone)]
 pub struct Database(Config);
 
@@ -82,7 +110,15 @@ impl FromStr for Database {
     type Err = StoreError;
 
     fn from_str(text: &str) -> Result<Self, StoreError> {
-        let mut config: Config = text.parse().map_err(StoreError::BadConnectionString)?;
+        // 解析的错误里会带着连接串的片段（拼错了 `postgres://` 时是整个连接串，连密码在内），所以不留它的原话。
+        let mut config: Config = text.trim().parse().map_err(|_| StoreError::BadConnectionString)?;
+        // 空的连接串解析得过去，要到连的时候才说没有主机。
+        if config.get_hosts().is_empty() {
+            return Err(StoreError::BadConnectionString);
+        }
+        if config.get_ssl_mode() == SslMode::Require {
+            return Err(StoreError::TlsUnsupported);
+        }
         if config.get_application_name().is_none() {
             config.application_name("i3t-controller");
         }
@@ -91,6 +127,12 @@ impl FromStr for Database {
         }
         if config.get_keepalives_idle() == LIBRARY_KEEPALIVE_IDLE {
             config.keepalives_idle(DEAD_PEER_TIMEOUT);
+        }
+        if config.get_keepalives_interval().is_none() {
+            config.keepalives_interval(KEEPALIVE_INTERVAL);
+        }
+        if config.get_keepalives_retries().is_none() {
+            config.keepalives_retries(KEEPALIVE_RETRIES);
         }
         if config.get_tcp_user_timeout().is_none() {
             config.tcp_user_timeout(DEAD_PEER_TIMEOUT);
@@ -124,7 +166,15 @@ pub struct Store {
     database: Database,
     session: RefCell<Session>,
     transaction: Cell<Transaction>,
-    /// 测试用：有几条语句是等锁等到超时才失败的。
+    /// 等锁平时肯等多久。
+    lock_patience: Cell<Duration>,
+    /// 刚等满过一次锁：到这个时刻之前不再等。
+    impatient_until: Cell<Option<Instant>>,
+    /// 连接上现在设的是不是"不等锁"。
+    impatient: Cell<bool>,
+    /// 刚试过没连上：到这个时刻之前不再去连。
+    reconnect_after: Cell<Option<Instant>>,
+    /// 测试用：有几条语句是把等锁的期限等满了才失败的。
     #[cfg(test)]
     lock_waits: Cell<usize>,
     /// 测试用的数据库：和这个 `Store` 一起丢掉。写在 `session` 后面，先关连接再删。
@@ -167,11 +217,16 @@ impl Store {
 
     fn prepare(database: &Database, migrations: &[&str], missing: Missing) -> Result<Self, StoreError> {
         let session = Session::connect(&database.0)?;
+        session.set_lock_timeout(LOCK_TIMEOUT)?;
         migrate(&session, migrations, missing)?;
         Ok(Self {
             database: database.clone(),
             session: RefCell::new(session),
             transaction: Cell::new(Transaction::None),
+            lock_patience: Cell::new(LOCK_TIMEOUT),
+            impatient_until: Cell::new(None),
+            impatient: Cell::new(false),
+            reconnect_after: Cell::new(None),
             #[cfg(test)]
             lock_waits: Cell::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -197,7 +252,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// `f` 返回的错误，或者开始、提交事务时数据库出的错。
+    /// `f` 返回的错误，或者开始、提交事务时数据库出的错。提交发出去了、回答没有回来时是
+    /// [`StoreError::CommitUnknown`]：这一种说不准事务算不算数。
     pub fn atomically<T, E: From<StoreError>>(&mut self, f: impl FnOnce(&Self) -> Result<T, E>) -> Result<T, E> {
         self.run(|session| session.batch("BEGIN"))?;
         self.transaction.set(Transaction::Open);
@@ -212,25 +268,35 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn set_read_only(&self, read_only: bool) {
         let value = if read_only { "on" } else { "off" };
-        self.session.borrow().batch(&format!("SET default_transaction_read_only = {value}")).unwrap();
+        self.run(|session| session.batch(&format!("SET default_transaction_read_only = {value}"))).unwrap();
     }
 
-    /// 测试用：等别的连接放开锁只等这么久，不等满平时的期限。
+    /// 测试用：等别的连接放开锁只等这么久，不等满平时的期限。刚等满过一次的那段"不等"也从头算。
     #[cfg(test)]
     pub(crate) fn set_lock_timeout(&self, timeout: Duration) {
+        self.lock_patience.set(timeout);
+        self.impatient_until.set(None);
+        self.impatient.set(false);
         self.session.borrow().set_lock_timeout(timeout).unwrap();
     }
 
-    /// 测试用：到现在为止有几条语句是等锁等到超时才失败的。每一条都是拿着 controller 的锁白等的一段时间。
+    /// 测试用：到现在为止有几条语句是把等锁的期限等满了才失败的。每一条都是拿着 controller 的锁白等的一段时间；
+    /// "不等"的那段时间里马上失败的不算。
     #[cfg(test)]
     pub(crate) fn lock_waits(&self) -> usize {
         self.lock_waits.get()
     }
 
+    /// 测试用：一条语句等回答只等这么久。
+    #[cfg(test)]
+    pub(crate) fn set_response_timeout(&self, timeout: Duration) {
+        self.session.borrow().set_response_timeout(timeout);
+    }
+
     /// 测试用：直接执行几条 SQL。
     #[cfg(test)]
     pub(crate) fn execute_batch(&self, sql: &str) {
-        self.session.borrow().batch(sql).unwrap();
+        self.run(|session| session.batch(sql)).unwrap();
     }
 
     /// 测试用：从现在起 `on`（比如 `INSERT ON tests`）报错，模拟一串写里只有前面的写进去了。
@@ -270,22 +336,66 @@ impl Store {
         Ok(())
     }
 
-    /// 在连接上做一件事。连接已经断了的话先换一条新的；事务开着时不换，新连接上没有那个事务。
-    fn run<T>(&self, f: impl FnOnce(&Session) -> Result<T, tokio_postgres::Error>) -> Result<T, StoreError> {
-        if self.transaction.get() == Transaction::None && self.session.borrow().is_closed() {
-            let session = Session::connect(&self.database.0)?;
-            *self.session.borrow_mut() = session;
-            tracing::info!("重新连上了数据库");
+    /// 在连接上做一件事。事务外面先看连接还在不在、等锁的期限对不对；事务里面不动这两样：
+    /// 新连接上没有那个事务，期限在事务里改了也会跟着事务一起撤销。
+    fn run<T>(&self, f: impl FnOnce(&Session) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        if self.transaction.get() == Transaction::None {
+            self.reconnect_if_closed()?;
+            self.settle_lock_timeout()?;
         }
         let result = f(&self.session.borrow());
-        if result.is_err() && self.transaction.get() == Transaction::Open {
-            self.transaction.set(Transaction::Failed);
+        if let Err(error) = &result {
+            if self.transaction.get() == Transaction::Open {
+                self.transaction.set(Transaction::Failed);
+            }
+            // 等满了一次：接下来同样长的一段时间里不再等。"不等"的时候失败的不算等过，不把这段时间往后推。
+            if error.is_lock_timeout() && !self.impatient.get() {
+                self.impatient_until.set(Some(Instant::now() + self.lock_patience.get()));
+                #[cfg(test)]
+                self.lock_waits.set(self.lock_waits.get() + 1);
+            }
         }
-        #[cfg(test)]
-        if result.as_ref().is_err_and(|error| error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE)) {
-            self.lock_waits.set(self.lock_waits.get() + 1);
+        result
+    }
+
+    /// 连接不能用了的话换一条新的。刚试过没连上的那一小会儿里不去连，直接说连不上。
+    fn reconnect_if_closed(&self) -> Result<(), StoreError> {
+        if !self.session.borrow().is_closed() {
+            return Ok(());
         }
-        Ok(result?)
+        if self.reconnect_after.get().is_some_and(|after| Instant::now() < after) {
+            return Err(StoreError::Disconnected);
+        }
+        let started = Instant::now();
+        let connected = Session::connect(&self.database.0).and_then(|session| {
+            session.set_lock_timeout(self.lock_patience.get())?;
+            Ok(session)
+        });
+        match connected {
+            Ok(session) => {
+                *self.session.borrow_mut() = session;
+                self.reconnect_after.set(None);
+                self.impatient.set(false);
+                tracing::info!("重新连上了数据库");
+                Ok(())
+            }
+            Err(error) => {
+                let pause = started.elapsed().clamp(RECONNECT_PAUSE.0, RECONNECT_PAUSE.1);
+                self.reconnect_after.set(Some(Instant::now() + pause));
+                Err(error)
+            }
+        }
+    }
+
+    /// 让连接上等锁的期限和现在该有的一致：刚等满过一次的那段时间里是"不等"，过了就恢复。
+    fn settle_lock_timeout(&self) -> Result<(), StoreError> {
+        let impatient = self.impatient_until.get().is_some_and(|until| Instant::now() < until);
+        if impatient != self.impatient.get() {
+            let timeout = if impatient { NO_LOCK_WAIT } else { self.lock_patience.get() };
+            self.session.borrow().set_lock_timeout(timeout)?;
+            self.impatient.set(impatient);
+        }
+        Ok(())
     }
 
     /// 执行一条语句，返回它改了几行。
@@ -330,9 +440,19 @@ impl OpenTransaction<'_> {
         if self.0.transaction.get() == Transaction::Failed {
             return Err(StoreError::Aborted);
         }
-        self.0.session.borrow().batch("COMMIT")?;
-        self.0.transaction.set(Transaction::None);
-        Ok(())
+        match self.0.session.borrow().batch("COMMIT") {
+            Ok(()) => {
+                self.0.transaction.set(Transaction::None);
+                Ok(())
+            }
+            // 数据库答了话、说提交不了：事务没有算数。连接早就不能用、提交根本没发出去的也是。
+            Err(error @ (StoreError::Disconnected | StoreError::Postgres(_))) if !error.left_unanswered() => Err(error),
+            // 发出去了，回答没有回来：数据库那边可能已经提交了。
+            Err(error) => {
+                self.0.transaction.set(Transaction::None);
+                Err(StoreError::CommitUnknown(Box::new(error)))
+            }
+        }
     }
 }
 
@@ -362,7 +482,7 @@ fn migrate(session: &Session, migrations: &[&str], missing: Missing) -> Result<(
         session.batch("BEGIN")?;
         let step = migrate_one(session, migrations, supported, missing);
         let done = match step {
-            Ok(done) => session.batch("COMMIT").map(|()| done).map_err(StoreError::from),
+            Ok(done) => session.batch("COMMIT").map(|()| done),
             Err(error) => Err(error),
         };
         match done {
@@ -378,15 +498,22 @@ fn migrate(session: &Session, migrations: &[&str], missing: Missing) -> Result<(
 }
 
 /// 在已经开始的事务里执行下一条还没执行的迁移，返回升到了第几版；已经是最新的话返回 `None`。
+///
+/// 表建在 `search_path` 里排在最前面的那个 schema 里（`current_schema()`），认版本号也只认那一个里的：
+/// 排在后面的 schema 里就算有一张同名的表（别的程序的，或者另一个 controller 的），也不是这里的。
 fn migrate_one(session: &Session, migrations: &[&str], supported: u32, missing: Missing) -> Result<Option<u32>, StoreError> {
-    session.batch("SELECT pg_advisory_xact_lock(hashtext(current_schema()))")?;
-    let exists: bool = session.query_one("SELECT to_regclass('schema_version') IS NOT NULL", &[])?.try_get(0)?;
+    let schema: Option<String> = session.query_one("SELECT current_schema()::text", &[])?.try_get(0)?;
+    let Some(schema) = schema else { return Err(StoreError::NoSchema) };
+    session.execute("SELECT pg_advisory_xact_lock(hashtext($1))", &[&schema])?;
+    let exists: bool =
+        session.query_one("SELECT to_regclass(format('%I.schema_version', $1::text)) IS NOT NULL", &[&schema])?.try_get(0)?;
     if !exists {
         if missing == Missing::Refuse {
             return Err(StoreError::Empty);
         }
         session.batch("CREATE TABLE schema_version (version BIGINT NOT NULL); INSERT INTO schema_version (version) VALUES (0);")?;
     }
+    // 上面确认了（或者刚建了）排在最前面的 schema 里有这张表，不写 schema 的名字找到的就是它。
     let found = session.query_one("SELECT version FROM schema_version", &[])?.try_get::<_, Int<u32>>(0)?.0;
     if found > supported {
         return Err(StoreError::NewerSchema { found, supported });
@@ -406,16 +533,31 @@ fn migrate_one(session: &Session, migrations: &[&str], supported: u32, missing: 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StoreError {
-    #[error("数据库的连接串写得不对")]
-    BadConnectionString(#[source] tokio_postgres::Error),
+    /// 连接串读不懂，或者里面没有主机。不带解析器的原话：那里面会有连接串的片段，连密码在内。
+    #[error("数据库的连接串写得不对：要写成 postgres://用户:密码@主机/库名")]
+    BadConnectionString,
+    #[error("连接串要求 TLS（sslmode=require），这个程序连数据库不支持 TLS：数据库要在同一台机器上或者可信的内网里")]
+    TlsUnsupported,
     #[error("连不上数据库")]
     Connect(#[source] tokio_postgres::Error),
+    #[error("连数据库等了 {} 秒没有连上（连上了端口、对面一直不答话也算）", .0.as_secs())]
+    ConnectTimedOut(Duration),
+    /// 连接断着，刚试过重新连、没连上：过一小会儿才再去连，这期间的读写直接是这个错。
+    #[error("和数据库的连接断了，刚试过没连上，过一会儿再试")]
+    Disconnected,
     #[error("起不了照看数据库连接的线程")]
     Driver(#[source] io::Error),
     #[error("数据库操作失败")]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("数据库 {} 秒没有回答", .0.as_secs())]
+    Unresponsive(Duration),
     #[error("事务里有一步失败了，整个事务没有提交")]
     Aborted,
+    /// 提交发出去了，回答没有回来：数据库那边可能已经提交了，也可能没有。
+    #[error("提交之后没有等到数据库的回答，不知道这次改动算不算数")]
+    CommitUnknown(#[source] Box<StoreError>),
+    #[error("search_path 里没有一个存在的 schema，表没有地方建")]
+    NoSchema,
     #[error("数据库里没有 controller 的表")]
     Empty,
     #[error("数据库是更新版本的程序写的（表结构第 {found} 版，这个程序只认识到第 {supported} 版）")]
@@ -423,32 +565,60 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// 这次失败是不是整个数据库的事：连不上、连接断了，数据库只读、正在关闭、没有空间，或者等别的连接放开锁等到了超时。
-    /// 这时换一行写、马上再写一次都是一样的结果，而且"等锁"的每一次都要先等满期限才失败。
+    /// 这次失败是不是整个数据库的事：连不上、连接断了、不答话，数据库只读、正在关闭、没有空间。
+    /// 这时换一行写、马上再写一次都是一样的结果。
     ///
-    /// 别的失败只和那一条语句有关，别的行照样写得进去：约束、触发器、读出来的值不对之类。
+    /// 别的失败只和那一条语句有关，别的行照样写得进去：约束、触发器、读出来的值不对、语句被取消之类。
+    /// 等锁等到了期限（[`StoreError::is_lock_timeout`]）也在这一边：被占着的可能只是这一行。
     #[must_use]
     pub fn is_database_wide(&self) -> bool {
         match self {
-            Self::Connect(_) | Self::Driver(_) => true,
+            Self::Connect(_)
+            | Self::ConnectTimedOut(_)
+            | Self::Disconnected
+            | Self::Driver(_)
+            | Self::Unresponsive(_)
+            | Self::CommitUnknown(_) => true,
             Self::Postgres(error) => match error.code() {
-                // 数据库答了话，说了是哪一类：连接出错（08）、资源不够（53，盘满、连接数满）、被管理员中断或者正在关闭（57）、
-                // 系统出错（58），再加上只读和等锁超时这两个。
+                // 数据库答了话，说了是哪一类：连接出错（08）、资源不够（53，盘满、连接数满）、系统出错（58），
+                // 正在关闭或者被管理员断开（57P01 到 57P05；57014 是只取消了这一条语句，不算），再加上只读。
                 Some(code) => {
-                    matches!(code.code().get(..2), Some("08" | "53" | "57" | "58"))
+                    matches!(code.code().get(..2), Some("08" | "53" | "58"))
+                        || matches!(code.code(), "57P01" | "57P02" | "57P03" | "57P04" | "57P05")
                         || *code == SqlState::READ_ONLY_SQL_TRANSACTION
-                        || *code == SqlState::LOCK_NOT_AVAILABLE
                 }
-                // 没有答话：连接已经断了，或者读写它的时候出了错。参数、结果转换不了的不算，那是这一条语句的事。
-                None => error.is_closed() || std::error::Error::source(error).is_some_and(|source| source.is::<io::Error>()),
+                None => self.left_unanswered(),
             },
-            Self::BadConnectionString(_) | Self::Aborted | Self::Empty | Self::NewerSchema { .. } => false,
+            Self::BadConnectionString | Self::TlsUnsupported | Self::Aborted | Self::NoSchema | Self::Empty | Self::NewerSchema { .. } => {
+                false
+            }
+        }
+    }
+
+    /// 这次失败是不是等别的连接放开锁等到了期限。被占着的可能是一整张表，也可能只是这一行：
+    /// 别的行多半照样写得进去，所以不该因为它就不去试别的。
+    #[must_use]
+    pub fn is_lock_timeout(&self) -> bool {
+        matches!(self, Self::Postgres(error) if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE))
+    }
+
+    /// 请求发出去了，数据库没有答话：连接断了、读写它出了错，或者等过了头。参数、结果转换不了的不算，那是这一条语句的事。
+    fn left_unanswered(&self) -> bool {
+        match self {
+            Self::Unresponsive(_) => true,
+            Self::Postgres(error) => {
+                error.code().is_none()
+                    && (error.is_closed() || std::error::Error::source(error).is_some_and(|source| source.is::<io::Error>()))
+            }
+            _ => false,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     const FIRST: &str = "CREATE TABLE a (x BIGINT NOT NULL);";
@@ -478,22 +648,214 @@ mod tests {
         assert!(!StoreError::NewerSchema { found: 2, supported: 1 }.is_database_wide());
         assert!(!StoreError::Aborted.is_database_wide());
 
-        // 别的连接锁着这张表：等到期限就失败，换一行写也一样。
+        // 别的连接锁着这张表：等到期限就失败。被占着的也可能只是一行，所以不算整个数据库的事，另有一个说法。
         let other = Store::open(&scratch.database()).unwrap();
         other.execute_batch("BEGIN; LOCK TABLE meta IN EXCLUSIVE MODE");
         store.set_lock_timeout(Duration::from_millis(50));
-        assert_eq!(store.lock_waits(), 0);
-        assert!(store.set_meta("k", b"w").unwrap_err().is_database_wide(), "等锁超时");
-        assert_eq!(store.lock_waits(), 1);
+        let locked = store.set_meta("k", b"w").unwrap_err();
+        assert!(locked.is_lock_timeout() && !locked.is_database_wide(), "等锁超时：{locked:?}");
         assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "读不用等这把锁");
         other.execute_batch("ROLLBACK");
         store.set_meta("k", b"x").unwrap();
+
+        // 只是这一条语句被取消了（这里是它自己超时），别的照常。
+        store.execute_batch("SET statement_timeout = 20");
+        let cancelled = store.execute("SELECT pg_sleep(5)", &[]).unwrap_err();
+        assert!(!cancelled.is_database_wide() && !cancelled.is_lock_timeout(), "{cancelled:?}");
+        store.execute_batch("SET statement_timeout = 0");
+        store.set_meta("k", b"y").unwrap();
 
         // 数据库把连接掐了；之后连不上。
         let terminated = store.execute("SELECT pg_terminate_backend(pg_backend_pid())", &[]).unwrap_err();
         assert!(terminated.is_database_wide(), "{terminated:?}");
         let nowhere: Database = "postgres://i3t@127.0.0.1:1/i3t".parse().unwrap();
         assert!(Store::open(&nowhere).err().expect("这个端口上没有数据库").is_database_wide());
+        assert!(StoreError::Disconnected.is_database_wide() && StoreError::Unresponsive(Duration::ZERO).is_database_wide());
+    }
+
+    #[test]
+    fn after_one_full_wait_for_a_lock_locked_rows_fail_at_once_and_other_rows_are_written() {
+        let scratch = Scratch::new();
+        let store = Store::open(&scratch.database()).unwrap();
+        store.set_meta("locked", b"1").unwrap();
+        store.set_meta("free", b"1").unwrap();
+        let other = Store::open(&scratch.database()).unwrap();
+        other.execute_batch("BEGIN; UPDATE meta SET value = '\\x02' WHERE key = 'locked'");
+
+        let patience = Duration::from_millis(300);
+        store.set_lock_timeout(patience);
+        let started = Instant::now();
+        assert!(store.set_meta("locked", b"3").unwrap_err().is_lock_timeout());
+        assert!(started.elapsed() >= patience, "头一次把期限等满");
+        assert_eq!(store.lock_waits(), 1);
+
+        // 刚等满过一次：同一行再写马上失败，不再等；没被占着的行照常写。
+        let started = Instant::now();
+        assert!(store.set_meta("locked", b"3").unwrap_err().is_lock_timeout());
+        assert!(store.set_meta("locked", b"3").unwrap_err().is_lock_timeout());
+        store.set_meta("free", b"2").unwrap();
+        assert!(started.elapsed() < patience, "这三次加起来也没有等满一次：{:?}", started.elapsed());
+        assert_eq!(store.lock_waits(), 1, "马上失败的不算等过");
+        assert_eq!(store.meta("free").unwrap().as_deref(), Some(b"2".as_slice()));
+
+        // 过了这一段，又肯等一次。
+        std::thread::sleep(patience);
+        assert!(store.set_meta("locked", b"3").unwrap_err().is_lock_timeout());
+        assert_eq!(store.lock_waits(), 2);
+
+        // 锁放开了：就算还在"不等"的那一段里，也写得进去。
+        other.execute_batch("ROLLBACK");
+        store.set_meta("locked", b"3").unwrap();
+    }
+
+    #[test]
+    fn a_lock_wait_inside_a_transaction_fails_the_transaction_and_the_next_one_does_not_wait() {
+        let scratch = Scratch::new();
+        let mut store = Store::open(&scratch.database()).unwrap();
+        store.set_meta("locked", b"1").unwrap();
+        let other = Store::open(&scratch.database()).unwrap();
+        other.execute_batch("BEGIN; UPDATE meta SET value = '\\x02' WHERE key = 'locked'");
+        let patience = Duration::from_millis(300);
+        store.set_lock_timeout(patience);
+
+        let waited: Result<(), StoreError> = store.atomically(|store| {
+            store.set_meta("free", b"1")?;
+            store.set_meta("locked", b"3")
+        });
+        assert!(waited.unwrap_err().is_lock_timeout());
+        assert_eq!(store.meta("free").unwrap(), None, "整个事务撤销了");
+
+        let started = Instant::now();
+        let again: Result<(), StoreError> = store.atomically(|store| store.set_meta("locked", b"3"));
+        assert!(again.unwrap_err().is_lock_timeout());
+        assert!(started.elapsed() < patience, "{:?}", started.elapsed());
+        assert_eq!(store.lock_waits(), 1);
+        other.execute_batch("ROLLBACK");
+    }
+
+    /// 接了连接、之后一个字节都不回的"数据库"。
+    fn silent_server() -> (std::net::TcpListener, Database) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let database = format!("postgres://i3t@127.0.0.1:{port}/i3t?connect_timeout=1").parse().unwrap();
+        (listener, database)
+    }
+
+    #[test]
+    fn a_server_that_accepts_and_never_answers_is_given_up_on() {
+        let (listener, database) = silent_server();
+        let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let started = Instant::now();
+        let error = Store::open(&database).err().expect("它不会答话");
+        assert!(matches!(error, StoreError::ConnectTimedOut(limit) if limit == Duration::from_secs(1)), "{error:?}");
+        assert!(error.is_database_wide());
+        assert!(started.elapsed() < Duration::from_secs(5), "到了期限就放弃：{:?}", started.elapsed());
+        drop(held.join().unwrap());
+    }
+
+    #[test]
+    fn a_statement_that_gets_no_answer_in_time_fails_and_the_connection_is_replaced() {
+        let store = Store::temporary();
+        store.set_meta("k", b"v").unwrap();
+        store.set_response_timeout(Duration::from_millis(100));
+        let started = Instant::now();
+        let error = store.execute("SELECT pg_sleep(30)", &[]).unwrap_err();
+        assert!(matches!(error, StoreError::Unresponsive(_)) && error.is_database_wide(), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "下一次读写换了一条新连接");
+    }
+
+    #[test]
+    fn after_a_failed_reconnect_the_next_calls_fail_at_once_until_the_pause_is_over() {
+        let scratch = Scratch::new();
+        let mut store = Store::open(&scratch.database()).unwrap();
+        store.set_meta("k", b"v").unwrap();
+        // 连接断了，数据库又搬去了一个不答话的地方：重新连要等满期限。
+        let (listener, nowhere) = silent_server();
+        let real = std::mem::replace(&mut store.database, nowhere);
+        assert!(store.execute("SELECT pg_terminate_backend(pg_backend_pid())", &[]).is_err());
+
+        let started = Instant::now();
+        assert!(matches!(store.meta("k"), Err(StoreError::ConnectTimedOut(_))));
+        let first = started.elapsed();
+        assert!(first >= Duration::from_secs(1), "{first:?}");
+
+        // 刚试过：这一会儿里不再去连，马上说连不上，不是每一次都等满期限。
+        let started = Instant::now();
+        for _ in 0..5 {
+            assert!(matches!(store.meta("k"), Err(StoreError::Disconnected)));
+        }
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+
+        // 过了这一会儿、数据库也回来了：照常。
+        store.database = real;
+        std::thread::sleep(first);
+        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()));
+        drop(listener);
+    }
+
+    #[test]
+    fn a_commit_that_gets_no_answer_is_reported_as_unknown_not_as_rolled_back() {
+        let mut store = Store::temporary();
+        // 提交要做的事（推迟到提交时才触发）要做上一阵：提交发出去了，在期限里等不到回答。
+        store.execute_batch(
+            "CREATE FUNCTION stall() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1.5); RETURN NULL; END $$;
+             CREATE CONSTRAINT TRIGGER stall AFTER INSERT OR UPDATE ON meta DEFERRABLE INITIALLY DEFERRED
+                 FOR EACH ROW EXECUTE FUNCTION stall();",
+        );
+        store.set_response_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let outcome: Result<(), StoreError> = store.atomically(|store| store.set_meta("k", b"v"));
+        let error = outcome.unwrap_err();
+        assert!(matches!(error, StoreError::CommitUnknown(_)) && error.is_database_wide(), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+
+        // 数据库那边其实还在做，做完就提交了：这次改动是算数的。调用方要是把这个错当成"没有做"，就错了。
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while store.meta("k").unwrap().is_none() {
+            assert!(Instant::now() < deadline, "数据库那边应该提交了");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_commit_the_database_refuses_is_a_plain_failure() {
+        let mut store = Store::temporary();
+        store.execute_batch(
+            "CREATE TABLE parent (id BIGINT PRIMARY KEY);
+             CREATE TABLE child (parent BIGINT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        );
+        // 外键推迟到提交时才查：提交被数据库拒绝，它答了话，事务确定没有算数。
+        let outcome: Result<(), StoreError> = store.atomically(|store| store.execute("INSERT INTO child VALUES (1)", &[]).map(|_| ()));
+        let error = outcome.unwrap_err();
+        assert!(matches!(error, StoreError::Postgres(_)) && !error.is_database_wide(), "{error:?}");
+        assert_eq!(store.query_one("SELECT COUNT(*) FROM child", &[], |row| row.try_get::<_, i64>(0)).unwrap(), 0);
+        store.atomically(|store| store.set_meta("k", b"v")).unwrap();
+    }
+
+    #[test]
+    fn the_tables_and_their_version_belong_to_the_first_schema_of_the_search_path() {
+        // search_path 里有两个 schema：前一个是空的，后一个里有别人的一张 schema_version。
+        let mine = Scratch::new();
+        let theirs = Scratch::new();
+        let admin = Store::prepare(&theirs.database(), &[], Missing::Create).unwrap();
+        admin.execute("UPDATE schema_version SET version = 99", &[]).unwrap();
+        let both = mine.database_with_path(&[mine.schema(), theirs.schema()]);
+
+        assert!(matches!(Store::open_existing(&both), Err(StoreError::Empty)), "前一个 schema 里没有表：不认后一个里的");
+        let store = Store::open(&both).unwrap();
+        assert_eq!(store.schema_version().unwrap(), u32::try_from(schema::MIGRATIONS.len()).unwrap());
+        store.set_meta("k", b"v").unwrap();
+        assert_eq!(number(&admin, "SELECT version FROM schema_version"), 99, "别人的版本号没有被改");
+        let only_mine = Store::open(&mine.database()).unwrap();
+        assert_eq!(only_mine.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "表建在前一个 schema 里");
+    }
+
+    #[test]
+    fn a_search_path_without_any_existing_schema_is_refused() {
+        let scratch = Scratch::new();
+        let nowhere = scratch.database_with_path(&["no_such_schema_anywhere"]);
+        assert!(matches!(Store::open(&nowhere), Err(StoreError::NoSchema)));
     }
 
     #[test]
@@ -620,17 +982,12 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_connection_is_replaced_on_the_next_use() {
+    fn a_dropped_connection_is_replaced_on_the_very_next_use() {
         let store = Store::temporary();
         store.set_meta("k", b"v").unwrap();
-        // 让数据库把这条连接掐掉：这一句自己拿不到回答。
-        assert!(store.execute("SELECT pg_terminate_backend(pg_backend_pid())", &[]).is_err());
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !store.session.borrow().is_closed() {
-            assert!(std::time::Instant::now() < deadline, "连接应该已经断了");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "下一次读写换了一条新连接");
+        // 让数据库把这条连接掐掉：这一句自己拿不到回答。数据库说了连接到此为止，不用等驱动线程发现套接字关了。
+        assert!(store.execute("SELECT pg_terminate_backend(pg_backend_pid())", &[]).unwrap_err().is_database_wide());
+        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "紧接着的读写就换了一条新连接");
     }
 
     #[test]
@@ -666,9 +1023,51 @@ mod tests {
             assert!(printed.contains("controller") && !printed.contains("s3cret"), "{printed}");
         }
         assert_eq!(url.0.get_connect_timeout(), Some(&CONNECT_TIMEOUT));
-        let own: Database = "postgres://db.example/x?connect_timeout=3&keepalives_idle=600".parse().unwrap();
+        assert_eq!(
+            (url.0.get_keepalives_idle(), url.0.get_keepalives_interval(), url.0.get_keepalives_retries()),
+            (DEAD_PEER_TIMEOUT, Some(KEEPALIVE_INTERVAL), Some(KEEPALIVE_RETRIES))
+        );
+        let own: Database =
+            "postgres://db.example/x?connect_timeout=3&keepalives_idle=600&keepalives_interval=7&keepalives_retries=9".parse().unwrap();
         assert_eq!(own.0.get_connect_timeout(), Some(&Duration::from_secs(3)), "连接串里写了的照它的");
         assert_eq!(own.0.get_keepalives_idle(), Duration::from_secs(600));
-        assert!(matches!("postgres://db.example:notaport/x".parse::<Database>(), Err(StoreError::BadConnectionString(_))));
+        assert_eq!((own.0.get_keepalives_interval(), own.0.get_keepalives_retries()), (Some(Duration::from_secs(7)), Some(9)));
+    }
+
+    #[test]
+    fn a_connection_string_that_cannot_be_read_is_refused_without_repeating_it() {
+        // 拼错了 postgres://：解析器把整个连接串当成一个不认识的选项，原话里有密码。
+        // 密码没有加引号、里面有空格和等号：同样会被原样说出来。
+        for bad in [
+            "postgre://i3t:s3cret@db.example/controller?x=1",
+            "postgres://i3t:s3cret@db.example:notaport/controller",
+            "host=db.example user=i3t password=s3cret word=more dbname=controller",
+            "host=db.example user=i3t password=s3cret extra",
+        ] {
+            let error = bad.parse::<Database>().expect_err(bad);
+            assert!(matches!(error, StoreError::BadConnectionString), "{bad}");
+            let mut said = format!("{error} {error:?}");
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                said.push_str(&format!(" {cause} {cause:?}"));
+                source = cause.source();
+            }
+            assert!(!said.contains("s3cret") && !said.contains("db.example"), "{said}");
+        }
+        // 空的、只有空白的、没有主机的：现在就说，不等到连的时候。
+        for empty in ["", "  \n", "user=i3t dbname=controller"] {
+            assert!(matches!(empty.parse::<Database>(), Err(StoreError::BadConnectionString)), "{empty:?}");
+        }
+        assert!("  postgres://i3t@db.example/controller\n".parse::<Database>().is_ok(), "前后的空白和换行不碍事");
+    }
+
+    #[test]
+    fn a_connection_string_that_asks_for_tls_is_refused_instead_of_connecting_in_the_clear() {
+        for wants_tls in ["postgres://i3t@db.example/controller?sslmode=require", "host=db.example user=i3t sslmode=require"] {
+            assert!(matches!(wants_tls.parse::<Database>(), Err(StoreError::TlsUnsupported)), "{wants_tls}");
+        }
+        for fine in ["postgres://i3t@db.example/controller?sslmode=disable", "postgres://i3t@db.example/controller?sslmode=prefer"] {
+            assert!(fine.parse::<Database>().is_ok(), "{fine}");
+        }
     }
 }

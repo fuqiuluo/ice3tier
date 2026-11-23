@@ -46,11 +46,23 @@ impl Scratch {
         Self { server, schema }
     }
 
+    /// 这个空数据库的 schema 的名字。
+    #[must_use]
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
     /// 连到这个空数据库的写法。
     #[must_use]
     pub fn database(&self) -> Database {
+        self.database_with_path(&[&self.schema])
+    }
+
+    /// 连到同一个服务器，`search_path` 依次是这几个 schema。
+    #[must_use]
+    pub fn database_with_path(&self, schemas: &[&str]) -> Database {
         let mut config = self.server.clone();
-        let search_path = format!("-c search_path={}", self.schema);
+        let search_path = format!("-c search_path={}", schemas.join(","));
         let options = match config.get_options() {
             Some(options) => format!("{options} {search_path}"),
             None => search_path,

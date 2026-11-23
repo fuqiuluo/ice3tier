@@ -60,6 +60,10 @@ impl FromStr for Source {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let text = s.trim();
+        // 地址和路径里都不该有控制字符（NUL、换行之类）：它会被存下来、写进操作记录、拿去拼请求。
+        if text.chars().any(char::is_control) {
+            return Err(InvalidSource(s.to_owned()));
+        }
         let is_url = ["http://", "https://"].iter().any(|scheme| text.strip_prefix(scheme).is_some_and(|rest| !rest.is_empty()));
         if is_url && !text.contains(char::is_whitespace) {
             return Ok(Self::Http(text.trim_end_matches('/').to_owned()));
@@ -260,6 +264,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(dir.path().to_str().unwrap().parse::<Source>().unwrap(), Source::Dir(dir.path().to_owned()));
         for bad in ["", "releases", "./releases", "ftp://x/y", "https://", "http://a b/c"] {
+            assert!(bad.parse::<Source>().is_err(), "{bad:?} 不应该被接受");
+        }
+        // 控制字符：存不进数据库的文本列（NUL），也不该出现在地址和路径里。
+        for bad in ["https://mirror.lan/a\0b", "https://mirror.lan/\u{7}", "/srv/rele\0ase"] {
             assert!(bad.parse::<Source>().is_err(), "{bad:?} 不应该被接受");
         }
         assert_eq!("http://mirror.lan/r/".parse::<Source>().unwrap().to_string(), "http://mirror.lan/r");

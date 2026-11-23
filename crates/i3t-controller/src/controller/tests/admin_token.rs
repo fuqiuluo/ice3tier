@@ -104,3 +104,86 @@ fn an_unreadable_key_or_an_unreachable_database_is_refused_and_the_token_stays()
     let reopened = Controller::open(&data, &database, ADDR.to_owned()).unwrap();
     assert!(reopened.controller.is_admin_token(&old), "原来的令牌还能用");
 }
+
+#[test]
+fn a_data_dir_and_a_database_of_different_controllers_are_not_put_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Scratch::new(), Scratch::new());
+    let (data_a, data_b) = (dir.path().join("a"), dir.path().join("b"));
+    let token_a = Controller::open(&data_a, &a.database(), ADDR.to_owned()).unwrap().admin_token.unwrap();
+    drop(Controller::open(&data_b, &b.database(), ADDR.to_owned()).unwrap());
+
+    // 拿着 b 的数据目录连 a 的库：不开，也不换掉 a 的管理令牌。
+    let refused = Controller::open(&data_b, &a.database(), ADDR.to_owned()).err().expect("密钥对不上");
+    assert!(matches!(&refused, Error::KeyMismatch { path } if *path == data_b.join(KEY_FILE)), "{refused:?}");
+    let refused = Controller::reset_admin_token(&data_b, &a.database()).unwrap_err();
+    assert!(matches!(refused, Error::KeyMismatch { .. }), "{refused:?}");
+
+    let reopened = Controller::open(&data_a, &a.database(), ADDR.to_owned()).unwrap();
+    assert!(reopened.admin_token.is_none() && reopened.controller.is_admin_token(&token_a), "a 的令牌没有动");
+}
+
+#[test]
+fn a_database_that_already_has_a_controller_is_not_given_a_new_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let data = dir.path().join("data");
+    let opened = Controller::open(&data, &database, ADDR.to_owned()).unwrap();
+    let (key, token) = (opened.controller.public_key(), opened.admin_token.unwrap());
+    drop(opened.controller);
+
+    // 恢复时忘了把密钥放回来，或者数据目录丢了：节点认的是原来那一把，生成一把新的只会让它们都连不回来。
+    let fresh = dir.path().join("fresh");
+    let refused = Controller::open(&fresh, &database, ADDR.to_owned()).err().expect("没有密钥");
+    assert!(matches!(&refused, Error::KeyMissing { path } if *path == fresh.join(KEY_FILE)), "{refused:?}");
+    assert!(listing(&fresh).is_empty(), "没有生成新的密钥");
+
+    // 把密钥放回来就照常。
+    fs::copy(data.join(KEY_FILE), fresh.join(KEY_FILE)).unwrap();
+    let restored = Controller::open(&fresh, &database, ADDR.to_owned()).unwrap();
+    assert!(restored.admin_token.is_none() && restored.controller.is_admin_token(&token));
+    assert_eq!(restored.controller.public_key(), key);
+}
+
+#[test]
+fn a_first_start_that_cannot_reach_the_database_leaves_no_key_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let nowhere: Database = "postgres://i3t@127.0.0.1:1/i3t".parse().unwrap();
+    let refused = Controller::open(&data, &nowhere, ADDR.to_owned()).err().expect("这个端口上没有数据库");
+    assert!(matches!(refused, Error::Store(StoreError::Connect(_))), "{refused:?}");
+    assert!(listing(&data).is_empty(), "没连上数据库：不留下一把密钥");
+
+    // 数据库好了之后的这一次才是第一次启动：生成密钥，给出管理令牌。
+    let scratch = Scratch::new();
+    let opened = Controller::open(&data, &scratch.database(), ADDR.to_owned()).unwrap();
+    assert!(opened.admin_token.is_some());
+    assert_eq!(listing(&data), [KEY_FILE]);
+}
+
+#[test]
+fn a_new_admin_token_that_cannot_be_logged_leaves_the_old_one_in_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let data = dir.path().join("data");
+    let opened = Controller::open(&data, &database, ADDR.to_owned()).unwrap();
+    let old = opened.admin_token.unwrap();
+    drop(opened.controller);
+
+    // 操作记录写不进去：换令牌和记这一条是一起的，一样没做成就都不算。
+    let other = Store::open(&database).unwrap();
+    other.block("no_log", "INSERT ON oplog", None);
+    assert!(matches!(Controller::reset_admin_token(&data, &database), Err(Error::Store(_))));
+    let reopened = Controller::open(&data, &database, ADDR.to_owned()).unwrap();
+    assert!(reopened.admin_token.is_none() && reopened.controller.is_admin_token(&old), "原来的令牌照旧有效");
+    assert!(reopened.controller.issue_admin_token().is_err());
+    assert!(reopened.controller.is_admin_token(&old));
+    drop(reopened);
+
+    other.unblock("no_log", "oplog");
+    let fresh = Controller::reset_admin_token(&data, &database).unwrap();
+    let reopened = Controller::open(&data, &database, ADDR.to_owned()).unwrap();
+    assert!(reopened.controller.is_admin_token(&fresh) && !reopened.controller.is_admin_token(&old));
+}

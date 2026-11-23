@@ -2,6 +2,7 @@
 //!
 //! 用户名和密码原样存着：管理员要能再看、再复制（数据库要凭连接串里的密码才连得上，管理接口要管理令牌）。
 //! 节点拿到的只是按这一行的盐算出来的校验值（[`ProxyRecord::verifier`]）。
+//! 密码不进日志：绑定它的时候包了一层（`codec::Secret`），驱动在 debug 级别打参数时看不到内容。
 
 use std::net::SocketAddr;
 
@@ -12,7 +13,7 @@ use i3t_proto::flow::Class;
 use ipnet::IpNet;
 use tokio_postgres::Row;
 
-use super::codec::{Blob, Int, Json, Read, SqlNetwork, SqlNode, Text};
+use super::codec::{Blob, Int, Json, Read, Secret, SqlNetwork, SqlNode, Text};
 use super::{Store, StoreError};
 
 /// 存着的一个代理。
@@ -86,7 +87,7 @@ impl Store {
                 &Json(proxy.protocol),
                 &proxy.exit.map(SqlNode),
                 &proxy.username,
-                &proxy.password,
+                &Secret(&proxy.password),
                 &Blob(proxy.salt),
                 &proxy.enabled,
                 &Json(&proxy.allow_from),
@@ -135,7 +136,7 @@ impl Store {
                 &Json(proxy.protocol),
                 &proxy.exit.map(SqlNode),
                 &proxy.username,
-                &proxy.password,
+                &Secret(&proxy.password),
                 &Blob(proxy.salt),
                 &proxy.enabled,
                 &Json(&proxy.allow_from),

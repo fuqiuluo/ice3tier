@@ -194,7 +194,8 @@ pub struct Status {
     /// 已知的最新发布比 controller 自己新时，是那个版本号。controller 不会自己更新，这只是提醒管理员手动更新。
     #[serde(default)]
     pub newer_version: Option<Version>,
-    /// controller 的数据目录（数据库、密钥、更新包的缓存都在里面），备份时拷贝它。不是从数据目录打开的（测试）时是 `null`。
+    /// controller 的数据目录：它的密钥和更新包的缓存。网络、节点和设置不在这里，在数据库里：
+    /// 备份要这里的密钥，加上数据库的转储。不是从数据目录打开的（测试）时是 `null`。
     #[serde(default)]
     pub data_dir: Option<String>,
 }

@@ -33,11 +33,16 @@ pub struct Texts {
     pub bad_public_addr: fn(&str) -> String,
     pub io: fn(&str) -> String,
     pub key_file: fn(&str) -> String,
+    pub key_mismatch: fn(&str) -> String,
+    pub key_missing: fn(&str) -> String,
     pub key_generation: &'static str,
     pub no_database_url: fn(&str) -> String,
     pub read_database_url: &'static str,
     pub bad_database_url: &'static str,
+    pub database_tls: &'static str,
     pub connect_database: &'static str,
+    pub connect_timed_out: fn(u64) -> String,
+    pub no_schema: &'static str,
     pub empty_database: &'static str,
     pub database: &'static str,
     pub newer_database: fn(u32, u32) -> String,
@@ -88,11 +93,16 @@ static ZH: Texts = Texts {
     bad_public_addr: |address| format!("--public-addr 要写成 主机:端口，如 ctl.example.com:20331，不能是 {address:?}"),
     io: |path| format!("读写 {path} 失败"),
     key_file: |path| format!("controller 的密钥文件 {path} 读不懂"),
+    key_mismatch: |path| format!("{path} 不是这个数据库的 controller 的密钥：数据目录和数据库对不上"),
+    key_missing: |path| format!("数据库里是一个已有的 controller 的数据，可是没有它的密钥 {path}：把备份的 controller.key 放回来"),
     key_generation: "生成 controller 的密钥失败",
     no_database_url: |path| format!("没有说用哪个数据库：给 --database-url（或者环境变量 I3T_DATABASE_URL），或者把连接串写进 {path}"),
     read_database_url: "读数据库的连接串",
-    bad_database_url: "连接串写得不对",
+    bad_database_url: "连接串写得不对：要写成 postgres://用户:密码@主机/库名",
+    database_tls: "连接串要求 TLS（sslmode=require），这个程序连数据库不支持 TLS：数据库要在同一台机器上，或者可信的内网里",
     connect_database: "连不上数据库",
+    connect_timed_out: |seconds| format!("连数据库等了 {seconds} 秒没有连上"),
+    no_schema: "search_path 里没有一个存在的 schema，表没有地方建",
     empty_database: "数据库里没有 controller 的表：连接串指的不是这个 controller 的库",
     database: "数据库出错",
     newer_database: |found, supported| format!("数据库是更新的版本写的（第 {found} 版，这个程序认到第 {supported} 版）"),
@@ -132,13 +142,24 @@ static EN: Texts = Texts {
     bad_public_addr: |address| format!("--public-addr takes HOST:PORT, e.g. ctl.example.com:20331, not {address:?}"),
     io: |path| format!("Couldn't read or write {path}"),
     key_file: |path| format!("Controller key file {path} unreadable"),
+    key_mismatch: |path| {
+        format!("{path} is not the key of this database's controller: the data directory and the database don't belong together")
+    },
+    key_missing: |path| {
+        format!(
+            "The database holds an existing controller's data, but its key {path} is missing: put the controller.key from the backup back"
+        )
+    },
     key_generation: "Generating the controller key failed",
     no_database_url: |path| {
         format!("No database given: pass --database-url (or set I3T_DATABASE_URL), or write the connection string into {path}")
     },
     read_database_url: "Reading the database connection string",
-    bad_database_url: "Not a valid connection string",
+    bad_database_url: "Not a valid connection string: write it as postgres://USER:PASSWORD@HOST/DBNAME",
+    database_tls: "The connection string asks for TLS (sslmode=require), which this program doesn't support for the database: keep the database on the same machine or a trusted private network",
     connect_database: "Couldn't connect to the database",
+    connect_timed_out: |seconds| format!("No connection to the database after {seconds} s"),
+    no_schema: "None of the schemas in the search_path exists, so there is nowhere to create the tables",
     empty_database: "The database has no controller tables: the connection string doesn't point at this controller's database",
     database: "Database error",
     newer_database: |found, supported| {
@@ -170,6 +191,8 @@ fn controller_error(error: &i3t_controller::Error, t: &Texts) -> String {
     match error {
         Error::Io { path, .. } => (t.io)(&path.display().to_string()),
         Error::Key { path, .. } => (t.key_file)(&path.display().to_string()),
+        Error::KeyMismatch { path } => (t.key_mismatch)(&path.display().to_string()),
+        Error::KeyMissing { path } => (t.key_missing)(&path.display().to_string()),
         Error::KeyGeneration(_) => t.key_generation.to_owned(),
         Error::Store(store) => store_error(store, t),
         Error::Tls(_) => t.tls.to_owned(),
@@ -184,8 +207,11 @@ fn controller_error(error: &i3t_controller::Error, t: &Texts) -> String {
 
 fn store_error(error: &StoreError, t: &Texts) -> String {
     match error {
-        StoreError::BadConnectionString(_) => t.bad_database_url.to_owned(),
-        StoreError::Connect(_) => t.connect_database.to_owned(),
+        StoreError::BadConnectionString => t.bad_database_url.to_owned(),
+        StoreError::TlsUnsupported => t.database_tls.to_owned(),
+        StoreError::Connect(_) | StoreError::Disconnected => t.connect_database.to_owned(),
+        StoreError::ConnectTimedOut(limit) => (t.connect_timed_out)(limit.as_secs()),
+        StoreError::NoSchema => t.no_schema.to_owned(),
         StoreError::Empty => t.empty_database.to_owned(),
         StoreError::NewerSchema { found, supported } => (t.newer_database)(*found, *supported),
         // 以后的版本新加的种类：说是数据库出错，细节在后面的来源里。
@@ -239,12 +265,29 @@ mod tests {
         assert!(crate::database(dir.path(), None).is_ok());
         assert!(crate::database(dir.path(), Some("")).is_ok());
 
-        // 读不懂的连接串：只说哪里不对，不把它打出来。
-        for bad in [parse(&["--database-url", "postgres://i3t:s3cret@db:notaport/i3t"]).database_url, None] {
-            std::fs::write(dir.path().join("database.url"), "postgres://i3t:s3cret@db:notaport/i3t").unwrap();
-            let said = describe(&crate::database(dir.path(), bad.as_deref()).unwrap_err());
-            assert!(!said.contains("s3cret") && !said.contains("postgres://"), "{said}");
+        // 读不懂的连接串：只说要怎么写，不把它打出来，一个片段都不带。拼错了 postgres:// 的那一种，
+        // 解析器的原话里是整个连接串；密码没加引号、里面有空格的那一种，原话里是密码的后半截。
+        for bad in [
+            "postgres://i3t:s3cret@db-host:notaport/i3t",
+            "postgre://i3t:s3cret@db-host/i3t?x=1",
+            "host=db-host user=i3t password=s3cret tail dbname=i3t",
+        ] {
+            for given in [parse(&["--database-url", bad]).database_url, None] {
+                std::fs::write(dir.path().join("database.url"), bad).unwrap();
+                let said = describe(&crate::database(dir.path(), given.as_deref()).unwrap_err());
+                assert!(said.contains(EN.bad_database_url) || said.contains(ZH.bad_database_url), "{said}");
+                for piece in ["s3cret", "db-host", "notaport", "tail", "postgre:"] {
+                    assert!(!said.contains(piece), "{bad}：{said}");
+                }
+            }
         }
+
+        // 空的 database.url 等于没有说；要 TLS 的不收，并且说为什么。
+        std::fs::write(dir.path().join("database.url"), " \n").unwrap();
+        let said = describe(&crate::database(dir.path(), None).unwrap_err());
+        assert!(said.contains("--database-url") && said.contains("database.url"), "{said}");
+        let said = describe(&crate::database(dir.path(), Some("postgres://i3t:s3cret@db-host/i3t?sslmode=require")).unwrap_err());
+        assert!(said.contains("TLS") && !said.contains("s3cret"), "{said}");
     }
 
     #[test]

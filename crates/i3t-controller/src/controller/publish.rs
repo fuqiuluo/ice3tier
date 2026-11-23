@@ -85,7 +85,7 @@ impl Inner {
                     // 网络读不出来，说不出"全部"是哪些：排上在线的。不在线的回来时拿到的本来就是那时的内容。
                     Seeds::All => self.live.iter().filter(|(_, live)| live.network == network).map(|(node, _)| *node).collect(),
                 };
-                if err.is_database_wide() {
+                if err.is_database_wide() || err.is_lock_timeout() {
                     self.back_off();
                 }
                 self.retry_later(network, nodes);
@@ -109,8 +109,7 @@ impl Inner {
                 Ok(()) => {
                     done.insert(node);
                 }
-                // 整个数据库都写不进去：别的节点也是一样的结果，不往下试。别的进程占着写锁时，每试一次都是
-                // 拿着 controller 的锁等满超时，一个节点等一次，所有连接和管理请求就都被拖住了。
+                // 整个数据库都写不进去：别的节点也是一样的结果，不往下试。
                 Err(err) if err.is_database_wide() => {
                     failed.extend(batch.range(node..).copied());
                     error = Some(err);
@@ -120,6 +119,12 @@ impl Inner {
                 // 只是这一个节点没做成，不耽误同一批里别的：各算各的，看到的是同一套"谁在等谁确认"。
                 // 不然一个一直记不下来的节点会把排在它后面的都挡住，比如等它停下来才能不认它的目的端。
                 Err(err) => {
+                    // 它那一行（或者整张表）被别的连接占着，等到了期限。等的时候 controller 的锁是拿着的，
+                    // 所以后台的重算过一会儿再来；存储在这之后的一小段时间里不再等（见 `Store` 的"等多久"），
+                    // 同一批里别的节点、别的网络照常往下做：没被占着的写得进去，被占着的马上失败、排回队列。
+                    if err.is_lock_timeout() {
+                        self.back_off();
+                    }
                     failed.insert(node);
                     error.get_or_insert(err);
                 }
@@ -146,7 +151,7 @@ impl Inner {
         self.wake.notify_one();
     }
 
-    /// 整个数据库刚读写不了：后台的重算过一会儿再碰它，见 [`Inner::flush_after`]。
+    /// 整个数据库刚读写不了，或者刚为一把锁等满了期限：后台的重算过一会儿再碰它，见 [`Inner::flush_after`]。
     fn back_off(&mut self) {
         self.flush_after = Some(Instant::now() + RETRY_DELAY);
     }

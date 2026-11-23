@@ -70,6 +70,8 @@ const KEY_FILE: &str = "controller.key";
 /// 用 SQLite 的版本（0.1.34 和更早）留在数据目录里的数据库文件。
 const OLD_DATABASE_FILE: &str = "controller.db";
 const ADMIN_TOKEN_META: &str = "admin_token_hash";
+/// 这个库是哪个 controller 的：它的公钥。数据目录里的密钥要和它是一对（见 [`bound_key`]）。
+const CONTROLLER_KEY_META: &str = "controller_key";
 
 /// 删掉的节点的虚拟 IP 和名字多久之后才能再分出去。
 const COOLDOWN_SECS: u64 = 90 * 24 * 60 * 60;
@@ -240,17 +242,20 @@ impl Controller {
     /// 打开数据目录和数据库：第一次启动时生成 controller 的密钥，在库里建表，生成管理令牌。
     ///
     /// 数据目录里只有 controller 的密钥和更新包的缓存；网络、节点和各项设置都在 `database` 里。
-    /// 两样要配着用：节点认的是这把密钥，库里记的是这把密钥名下的节点。
+    /// 两样要配着用：节点认的是这把密钥，库里记的是这把密钥名下的节点。库里记着它是哪把密钥的，
+    /// 对不上的不开：拿错了数据目录、连错了库，或者恢复时忘了把密钥放回来，都不会悄悄变成另一个 controller。
     ///
     /// `public_addr` 是节点连 controller 用的 `主机:端口`，会写进每个注册令牌。
     ///
     /// # Errors
     ///
-    /// 目录建不了、密钥文件读不出来，或者连不上数据库、读写它失败。
+    /// 目录建不了、密钥文件读不出来，连不上数据库、读写它失败，或者密钥和数据库对不上
+    /// （[`Error::KeyMismatch`]、[`Error::KeyMissing`]）。
     pub fn open(data_dir: &Path, database: &Database, public_addr: String) -> Result<Opened, Error> {
         fs::create_dir_all(data_dir).map_err(|source| Error::Io { path: data_dir.to_owned(), source })?;
-        let key = load_or_create_key(&data_dir.join(KEY_FILE))?;
+        // 先连数据库，再碰密钥：连不上的话不在数据目录里留下一把新生成的密钥。
         let store = Store::open(database)?;
+        let key = bound_key(&store, &data_dir.join(KEY_FILE))?;
         // 早先的版本把数据存在数据目录里的这个文件里。现在不读它了：升级上来的人看到一个空的 controller 时，日志里有原因。
         let old = data_dir.join(OLD_DATABASE_FILE);
         if old.exists() {
@@ -355,8 +360,9 @@ impl Controller {
     ///
     /// 随机数源不可用，或者写存储失败。
     pub fn issue_admin_token(&self) -> Result<String, Error> {
-        let inner = self.lock();
-        let (token, hash) = store_admin_token(&inner.store, inner.clock.now())?;
+        let mut inner = self.lock();
+        let now = inner.clock.now();
+        let (token, hash) = store_admin_token(&mut inner.store, now)?;
         *self.admin_token.lock().expect("admin token mutex poisoned") = Some(hash);
         Ok(token)
     }
@@ -369,18 +375,24 @@ impl Controller {
     ///
     /// 和 [`Controller::open`] 一样：密钥读不懂的话不做；表结构会升到这个程序的版本，之后更旧的程序就打不开它了。
     /// 和它不一样的是这里不建任何东西：`data_dir` 写错了、或者连到了一个空的库，不会在那里生成一个新的空 controller。
+    /// 库是另一个 controller 的（它记的不是这个数据目录里的密钥）时也不做：不会拿着这一个的数据目录换掉那一个的令牌。
     ///
     /// # Errors
     ///
     /// `data_dir` 里没有密钥（[`Error::NotDataDir`]）或者密钥读不懂，库里没有 controller 的表
-    /// （[`StoreError::Empty`](crate::store::StoreError::Empty)），连不上或者读写数据库失败，或者随机数源不可用。
+    /// （[`StoreError::Empty`](crate::store::StoreError::Empty)），库不是这把密钥的（[`Error::KeyMismatch`]），
+    /// 连不上或者读写数据库失败，或者随机数源不可用。
     pub fn reset_admin_token(data_dir: &Path, database: &Database) -> Result<String, Error> {
         let key = required(data_dir, KEY_FILE)?;
         // 密钥读不懂的话 controller 启动不了，换了令牌也用不上：现在就说，别等到启动时。
         let pem = fs::read_to_string(&key).map_err(|source| Error::Io { path: key.clone(), source })?;
-        NodeKey::from_pem(&pem).map_err(|source| Error::Key { path: key, source })?;
-        let store = Store::open_existing(database)?;
-        let (token, _) = store_admin_token(&store, Clock::default().now())?;
+        let node_key = NodeKey::from_pem(&pem).map_err(|source| Error::Key { path: key.clone(), source })?;
+        let mut store = Store::open_existing(database)?;
+        // controller 在一个库上启动过，库里就记着它的公钥。没有记的库没有哪个 controller 用过，也算对不上。
+        if store.meta(CONTROLLER_KEY_META)?.as_deref() != Some(node_key.public().as_bytes().as_slice()) {
+            return Err(Error::KeyMismatch { path: key });
+        }
+        let (token, _) = store_admin_token(&mut store, Clock::default().now())?;
         Ok(token)
     }
 
@@ -666,11 +678,15 @@ impl Clock {
 }
 
 /// 生成一个新的管理令牌，把它的哈希写进存储，记一条操作。返回明文和哈希。
-fn store_admin_token(store: &Store, now: Timestamp) -> Result<(String, [u8; DIGEST_LEN]), Error> {
+/// 换上一个新的管理令牌，并记一条操作。两样在一个事务里：记不下来的话原来的令牌照旧有效，
+/// 不会出现"原来的已经作废、新的却没有交到调用方手上"。
+fn store_admin_token(store: &mut Store, now: Timestamp) -> Result<(String, [u8; DIGEST_LEN]), Error> {
     let token = secret::generate()?;
     let hash = secret::sha256(token.as_bytes());
-    store.set_meta(ADMIN_TOKEN_META, &hash)?;
-    store.log(now, None, action::ADMIN_TOKEN, "生成了新的管理令牌", serde_json::json!({}))?;
+    store.atomically(|store| {
+        store.set_meta(ADMIN_TOKEN_META, &hash)?;
+        store.log(now, None, action::ADMIN_TOKEN, "生成了新的管理令牌", serde_json::json!({}))
+    })?;
     Ok((token, hash))
 }
 
@@ -684,19 +700,47 @@ fn required(dir: &Path, name: &'static str) -> Result<PathBuf, Error> {
     }
 }
 
-fn load_or_create_key(path: &Path) -> Result<NodeKey, Error> {
+/// 数据目录里的密钥，核对过它就是这个库的 controller 的那一把。
+///
+/// | 数据目录里 | 库里记着 | |
+/// |---|---|---|
+/// | 有密钥 | 同一把 | 平时的启动 |
+/// | 有密钥 | 没有记 | 这个库头一次有 controller 启动（新装，或者数据目录是从早先的版本留下来的）：记下它 |
+/// | 有密钥 | 另一把 | 数据目录和库对不上：不开 |
+/// | 没有 | 没有记 | 新装：生成一把，记下它 |
+/// | 没有 | 记着一把 | 库是一个已有的 controller 的，它的密钥没有带过来：不开，更不生成新的。节点认的是原来那一把，
+/// 换了它，已经加入的节点一个都连不回来 |
+fn bound_key(store: &Store, path: &Path) -> Result<NodeKey, Error> {
+    let recorded = store.meta(CONTROLLER_KEY_META)?;
+    let key = match (read_key(path)?, &recorded) {
+        (Some(key), _) => key,
+        (None, Some(_)) => return Err(Error::KeyMissing { path: path.to_owned() }),
+        (None, None) => create_key(path)?,
+    };
+    let public = key.public();
+    match recorded {
+        Some(recorded) if recorded == public.as_bytes() => {}
+        Some(_) => return Err(Error::KeyMismatch { path: path.to_owned() }),
+        None => store.set_meta(CONTROLLER_KEY_META, public.as_bytes())?,
+    }
+    Ok(key)
+}
+
+fn read_key(path: &Path) -> Result<Option<NodeKey>, Error> {
     match fs::read_to_string(path) {
-        Ok(pem) => NodeKey::from_pem(&pem).map_err(|source| Error::Key { path: path.to_owned(), source }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let key = NodeKey::generate().map_err(Error::KeyGeneration)?;
-            create_private_file(path)
-                .and_then(|file| write_synced(file, key.to_pem().as_bytes()))
-                .map_err(|source| Error::Io { path: path.to_owned(), source })?;
-            tracing::info!(path = %path.display(), public = %key.public(), "生成了 controller 的密钥");
-            Ok(key)
-        }
+        Ok(pem) => NodeKey::from_pem(&pem).map(Some).map_err(|source| Error::Key { path: path.to_owned(), source }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(Error::Io { path: path.to_owned(), source }),
     }
+}
+
+fn create_key(path: &Path) -> Result<NodeKey, Error> {
+    let key = NodeKey::generate().map_err(Error::KeyGeneration)?;
+    create_private_file(path)
+        .and_then(|file| write_synced(file, key.to_pem().as_bytes()))
+        .map_err(|source| Error::Io { path: path.to_owned(), source })?;
+    tracing::info!(path = %path.display(), public = %key.public(), "生成了 controller 的密钥");
+    Ok(key)
 }
 
 /// 新建一个只有属主可读的文件，已经有了就失败，不覆盖。密钥用它。

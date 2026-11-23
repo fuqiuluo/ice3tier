@@ -125,6 +125,8 @@ fn database(data_dir: &Path, given: Option<&str>) -> anyhow::Result<Database> {
         None => {
             let path = data_dir.join(DATABASE_URL_FILE);
             match std::fs::read_to_string(&path) {
+                // 一个空文件等于没有说：现在就讲，不等到连的时候才说没有主机。
+                Ok(text) if text.trim().is_empty() => bail!((t.no_database_url)(&path.display().to_string())),
                 Ok(text) => text.trim().to_owned(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!((t.no_database_url)(&path.display().to_string())),
                 Err(error) => return Err(anyhow::Error::new(error).context((t.io)(&path.display().to_string()))),

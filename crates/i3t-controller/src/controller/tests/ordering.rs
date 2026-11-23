@@ -577,17 +577,14 @@ fn a_revocation_takes_effect_in_time_even_if_the_initiators_netmap_can_never_be_
     assert!(source.netmap().peers.is_empty());
 }
 
-#[test]
-fn a_busy_database_is_waited_for_once_however_many_nodes_and_networks_are_due() {
-    let dir = tempfile::tempdir().unwrap();
-    let scratch = Scratch::new();
-    let database = scratch.database();
-    let mut lab = Lab::around(Controller::open(dir.path(), &database, "ctl.example.com:20331".to_owned()).unwrap().controller);
-    // 等锁只等一小会儿，不用真的等满平时的期限；等了几次由存储数着。
-    lab.controller.lock().store.set_lock_timeout(Duration::from_millis(50));
-    let waits = |lab: &Lab| lab.controller.lock().store.lock_waits();
-
-    // 两个网络，各有一个节点报了新的端点：每个网络里另外两个节点的 netmap 要变，报的那个自己的不变。
+/// 两个网络、各三个节点，各有一个节点报了新的端点：每个网络里另外两个节点的 netmap 要变，报的那个自己的不变。
+/// 等锁只等一小会儿（不用真的等满平时的期限），等满了几次由存储数着。
+fn two_networks_with_changes_due(
+    database: &crate::store::Database,
+    dir: &std::path::Path,
+) -> (Lab, Vec<i3t_model::admin::NetworkId>, Vec<Member>) {
+    let mut lab = Lab::around(Controller::open(dir, database, "ctl.example.com:20331".to_owned()).unwrap().controller);
+    lab.controller.lock().store.set_lock_timeout(LOCK_PATIENCE);
     let mut members = Vec::new();
     let mut networks = Vec::new();
     for name in ["home", "office"] {
@@ -598,35 +595,80 @@ fn a_busy_database_is_waited_for_once_however_many_nodes_and_networks_are_due() 
     lab.settle(&mut members.iter_mut().collect::<Vec<_>>());
     report_endpoints(&lab, &members[0], "203.0.113.9:1");
     report_endpoints(&lab, &members[3], "203.0.113.9:2");
-    let queued = |lab: &Lab| lab.controller.lock().dirty.len();
-    assert_eq!(queued(&lab), 6);
+    assert_eq!(lab.controller.lock().dirty.len(), 6);
+    (lab, networks, members)
+}
 
-    // 别的连接锁着节点那张表（读照常，写要等）。等它放开的那几秒是拿着 controller 的锁等的：只能等一次，
+/// 测试里等锁肯等的时间。存储等满一次之后，接下来同样长的一段里不再等。
+const LOCK_PATIENCE: Duration = Duration::from_millis(100);
+
+#[test]
+fn a_locked_table_is_waited_for_once_however_many_nodes_and_networks_are_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let (lab, networks, mut members) = two_networks_with_changes_due(&database, dir.path());
+    let waits = |lab: &Lab| lab.controller.lock().store.lock_waits();
+    let queued = |lab: &Lab| lab.controller.lock().dirty.len();
+
+    // 别的连接锁着节点那张表（读照常，写要等）。等它放开的那一阵是拿着 controller 的锁等的：只能等一次，
     // 不能每个节点、每个网络各等一次。
     let other = Store::open(&database).unwrap();
     other.execute_batch("BEGIN; LOCK TABLE nodes IN EXCLUSIVE MODE");
     let flush = |lab: &Lab| lab.controller.lock().flush_due(Instant::now() + PAST_RETRY);
     assert!(flush(&lab).is_err());
-    assert_eq!(waits(&lab), 1, "整个数据库都写不进去时，试一次就交回去");
-    assert_eq!(queued(&lab), 5, "只有头一个节点（它的内容没变，不用写）算做完了，其余的原样排着");
+    assert_eq!(waits(&lab), 1, "四个节点都写不进去，只有头一个把期限等满了，后面的马上失败");
+    assert_eq!(queued(&lab), 4, "每个网络里头一个节点内容没变、不用写，算做完了；其余的排回队列");
     assert_eq!(members.iter_mut().map(Member::receive).sum::<usize>(), 0);
 
-    // 刚等过一次。这时又有节点到期、后台任务又被叫醒（重试排上时叫的，节点的上报也会叫），也不马上再去写：
-    // 不然到期时间错开的节点会让 controller 一次接一次地拿着锁等，中间一点空都不留。
+    // 刚等过一次。这时又有节点到期、后台任务又被叫醒（重试排上时叫的，节点的上报也会叫），也不马上再去写。
     assert!(is_woken(&lab));
     lab.controller.lock().defer(networks[0], [members[1].id], Duration::ZERO);
     let again = lab.controller.lock().flush_due(Instant::now()).expect("没有去写，也就没有出错");
     assert!(again.is_some_and(|at| at > Instant::now()), "告诉后台任务过一会儿再来");
     assert_eq!(waits(&lab), 1, "退避的这一会儿里不碰数据库");
-    assert_eq!(queued(&lab), 5);
+    assert_eq!(queued(&lab), 4);
 
-    // 过了这一会儿再试一次，还是只等一次。
+    // 过了这一会儿（存储也重新肯等了）再试一次，还是只等一次。
+    std::thread::sleep(LOCK_PATIENCE);
     assert!(flush(&lab).is_err());
     assert_eq!(waits(&lab), 2);
 
     other.execute_batch("ROLLBACK");
     flush(&lab).unwrap();
     assert_eq!(members.iter_mut().map(Member::receive).collect::<Vec<_>>(), vec![0, 1, 1, 0, 1, 1], "放开之后都补发");
+}
+
+#[test]
+fn a_locked_row_holds_up_only_its_own_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let (lab, _networks, mut members) = two_networks_with_changes_due(&database, dir.path());
+    let waits = |lab: &Lab| lab.controller.lock().store.lock_waits();
+    let queued = |lab: &Lab| lab.controller.lock().dirty.len();
+    let flush = |lab: &Lab| lab.controller.lock().flush_due(Instant::now() + PAST_RETRY);
+
+    // 别的连接开着事务，改了一个节点的那一行还没有提交：只有这一行写不进去。它在第一个网络里排在前面。
+    let other = Store::open(&database).unwrap();
+    other.execute_batch(&format!("BEGIN; UPDATE nodes SET hostname = hostname WHERE id = {}", members[1].id.get()));
+    assert!(flush(&lab).is_err());
+    assert_eq!(waits(&lab), 1);
+    assert_eq!(
+        members.iter_mut().map(Member::receive).collect::<Vec<_>>(),
+        vec![0, 0, 1, 0, 1, 1],
+        "排在它后面的节点、别的网络，这一轮就都拿到了新的 netmap"
+    );
+    assert_eq!(queued(&lab), 1, "只有它排回队列");
+
+    // 下一轮它还是写不进去：马上失败，不再拿着 controller 的锁等。
+    assert!(flush(&lab).is_err());
+    assert_eq!(waits(&lab), 1);
+    assert_eq!(members[1].receive(), 0);
+
+    other.execute_batch("ROLLBACK");
+    flush(&lab).unwrap();
+    assert_eq!(members[1].receive(), 1, "放开之后补发");
 }
 
 #[test]

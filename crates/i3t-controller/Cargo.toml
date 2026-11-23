@@ -46,6 +46,8 @@ workspace = true
 [dev-dependencies]
 # 这个包自己的集成测试（`tests/`）也要用测试用的空数据库。
 i3t-controller = { path = ".", features = ["testing"] }
+# 测试里接住数据库驱动打的日志（它用的是 log）。
+log = "0.4"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

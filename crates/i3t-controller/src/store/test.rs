@@ -43,6 +43,10 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn test(&self, network: NetworkId, id: u64) -> Result<Option<TestView>, StoreError> {
+        // 编号是数据库发的，都放得进有符号的 64 位。放不进的不会是哪个测试的编号：没有这个测试，而不是出错。
+        if i64::try_from(id).is_err() {
+            return Ok(None);
+        }
         let sql = "SELECT view FROM tests WHERE id = $1 AND network_id = $2";
         self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], |row| Ok(row.try_get::<_, Json<TestView>>(0)?.0))
     }
@@ -76,5 +80,20 @@ impl Store {
             &[&SqlNetwork(network), &SqlNode(a), &SqlNode(b), &Int(KEEP_PER_PAIR)],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::fixtures::store_with_nodes;
+
+    #[test]
+    fn an_id_no_test_can_have_is_simply_not_found() {
+        let (store, network, _nodes) = store_with_nodes(2);
+        assert_eq!(store.test(network, 7).unwrap(), None);
+        // 放不进数据库的整数的编号：以前在绑定参数时出错（管理 API 上是 500），应该是"没有这个测试"。
+        for id in [u64::MAX, u64::try_from(i64::MAX).unwrap() + 1] {
+            assert_eq!(store.test(network, id).unwrap(), None, "{id}");
+        }
     }
 }

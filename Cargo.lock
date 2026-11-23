@@ -1085,6 +1085,7 @@ dependencies = [
  "i3t-underlay",
  "i3t-update",
  "ipnet",
+ "log",
  "maxminddb",
  "ring",
  "rustls",

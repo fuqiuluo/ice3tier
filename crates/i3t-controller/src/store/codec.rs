@@ -126,6 +126,34 @@ where
     }
 }
 
+/// 不能出现在日志里的文本：代理的密码。存进去的就是原文，只是打印出来（`Debug`）时不带内容：
+/// 日志级别开到 debug 时，数据库的驱动会把每条语句的参数用 `Debug` 打出来。
+pub(super) struct Secret<'a>(pub &'a str);
+
+impl Debug for Secret<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+impl ToSql for Secret<'_> {
+    fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Failure> {
+        self.0.to_sql(ty, out)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        <&str as ToSql>::accepts(ty)
+    }
+
+    to_sql_checked!();
+}
+
+/// PostgreSQL 的文本里放不了 NUL。合法的内容里没有它；可有的文本里带着节点报上来的话（更新失败的原因写进操作记录），
+/// 那里面有一个 NUL 不该让整条记录记不下来：去掉它。
+pub(super) fn without_nul(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\0') { text.replace('\0', "").into() } else { text.into() }
+}
+
 /// 存成 `BIGINT` 的无符号整数：编号、时间、版本号、计数。写的时候放不进、读的时候是负数或者超出 `T` 的范围，都是错。
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Int<T>(pub T);
@@ -302,6 +330,23 @@ mod tests {
         let mut out = BytesMut::new();
         Json(json!("\\u0000")).to_sql(&Type::JSONB, &mut out).unwrap();
         assert_eq!(Json::<String>::from_sql(&Type::JSONB, &out).unwrap().0, "\\u0000");
+    }
+
+    #[test]
+    fn a_secret_is_stored_as_it_is_and_printed_without_its_content() {
+        let mut out = BytesMut::new();
+        Secret("hunter2").to_sql(&Type::TEXT, &mut out).unwrap();
+        assert_eq!(&out[..], b"hunter2");
+        assert_eq!(format!("{:?}", Secret("hunter2")), "Secret(..)");
+        // 驱动打日志时拿到的是 `&dyn ToSql`。
+        let param: &(dyn ToSql + Sync) = &Secret("hunter2");
+        assert!(!format!("{param:?} {:?}", [param]).contains("hunter2"));
+    }
+
+    #[test]
+    fn nul_characters_are_dropped_from_text() {
+        assert_eq!(without_nul("a\0b\0"), "ab");
+        assert!(matches!(without_nul("plain"), std::borrow::Cow::Borrowed("plain")));
     }
 
     #[test]

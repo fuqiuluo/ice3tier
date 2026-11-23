@@ -110,6 +110,12 @@ pub enum Error {
     },
     #[error("网络端口出错")]
     Socket(#[source] std::io::Error),
+    /// 数据目录里的密钥和数据库里记的不是同一把：数据目录和数据库不是同一个 controller 的。
+    #[error("{} 不是这个数据库的 controller 的密钥：数据目录和数据库对不上", path.display())]
+    KeyMismatch { path: PathBuf },
+    /// 数据库里是一个已有的 controller 的数据，数据目录里却没有它的密钥。不生成新的：节点认的是原来那一把。
+    #[error("数据库里是一个已有的 controller 的数据，可是没有它的密钥 {}：把备份的密钥放回来", path.display())]
+    KeyMissing { path: PathBuf },
     /// 要重新生成管理令牌的目录不是 controller 的数据目录：缺了 `missing` 这个文件。
     #[error("{} 里没有 {missing}，不是 controller 的数据目录", dir.display())]
     NotDataDir { dir: PathBuf, missing: &'static str },
@@ -123,6 +129,11 @@ impl Error {
     /// 是不是整个数据库都读写不了（见 [`StoreError::is_database_wide`]）。这时别的节点、别的网络也是一样的结果，不用往下试。
     pub(crate) fn is_database_wide(&self) -> bool {
         matches!(self, Self::Store(err) if err.is_database_wide())
+    }
+
+    /// 是不是等别的连接放开锁等到了期限（见 [`StoreError::is_lock_timeout`]）。被占着的可能只是一行，别的照样写得进去。
+    pub(crate) fn is_lock_timeout(&self) -> bool {
+        matches!(self, Self::Store(err) if err.is_lock_timeout())
     }
 
     /// 给程序看的分类，管理 API 的应答里用它。
@@ -162,6 +173,8 @@ impl Error {
             | Self::Tls(_)
             | Self::Bind { .. }
             | Self::Socket(_)
+            | Self::KeyMismatch { .. }
+            | Self::KeyMissing { .. }
             | Self::NotDataDir { .. } => ErrorCode::Internal,
             Self::InField { error, .. } => error.code(),
         }
@@ -192,7 +205,7 @@ impl Error {
             Self::Encode(_) => "encode",
             Self::Random => "random",
             Self::Io { .. } => "io",
-            Self::Key { .. } | Self::KeyGeneration(_) => "key",
+            Self::Key { .. } | Self::KeyGeneration(_) | Self::KeyMismatch { .. } | Self::KeyMissing { .. } => "key",
             Self::Tls(_) => "tls",
             Self::Bind { .. } | Self::Socket(_) => "socket",
             Self::NotDataDir { .. } => "data_dir",

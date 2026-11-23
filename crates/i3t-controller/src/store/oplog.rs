@@ -5,7 +5,7 @@ use serde_json::{Map, Value as JsonValue};
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
 
-use super::codec::{Int, Json, Read, SqlNetwork, Unsigned};
+use super::codec::{Int, Json, Read, SqlNetwork, Unsigned, without_nul};
 use super::{Store, StoreError};
 
 /// 查操作记录的条件。都可以不写。
@@ -72,12 +72,16 @@ impl Store {
                 Map::new()
             }
         };
-        let id: i64 = self.query_one(
-            "INSERT INTO oplog (at, network_id, action, detail, refs, params) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        // 说明里会带着外面来的话（节点报的更新失败的原因、管理员填的发布源）：里面的 NUL 存不进文本列，去掉它，
+        // 不让整条记录、连同它所在的那次操作一起失败。`params` 是 JSON，另有同样的处理。
+        let (action, detail) = (without_nul(action), without_nul(detail));
+        self.execute(
+            "INSERT INTO oplog (at, network_id, action, detail, refs, params) VALUES ($1, $2, $3, $4, $5, $6)",
             &[&Unsigned(at), &network.map(SqlNetwork), &action, &detail, &Json(refs), &Json(&params)],
-            |row| row.try_get(0),
         )?;
-        self.execute("DELETE FROM oplog WHERE id <= $1", &[&(id - i64::from(KEEP))])?;
+        // 按条数删，不按编号算：编号是序列发的，撤销了的事务也占着号，编号差了一万不等于有一万条。
+        // 不到 KEEP 条时里面那一句找不到第 KEEP + 1 新的，什么都不删。
+        self.execute("DELETE FROM oplog WHERE id <= (SELECT id FROM oplog ORDER BY id DESC OFFSET $1 LIMIT 1)", &[&Int(KEEP)])?;
         Ok(())
     }
 
@@ -132,6 +136,39 @@ mod tests {
 
     use super::*;
     use crate::store::fixtures::home;
+
+    #[test]
+    fn old_entries_are_trimmed_by_count_not_by_how_far_the_ids_have_run() {
+        let store = Store::temporary();
+        store.log(10, None, "first", "", json!({})).unwrap();
+        // 编号往前跳了很多（撤销了的事务也占着号），条数却只有两条：早先的那一条不该被删。
+        store.execute_batch("SELECT setval(pg_get_serial_sequence('oplog', 'id'), 500000)");
+        store.log(20, None, "second", "", json!({})).unwrap();
+        assert_eq!(store.oplog(10).unwrap().iter().map(|entry| entry.action.as_str()).collect::<Vec<_>>(), ["second", "first"]);
+
+        // 真的满了才删最老的。
+        store.execute_batch(&format!(
+            "INSERT INTO oplog (at, network_id, action, detail, refs, params) \
+             SELECT 30, NULL, 'filler', '', '[]', '{{}}' FROM generate_series(1, {})",
+            KEEP - 2
+        ));
+        assert_eq!(store.query_one("SELECT COUNT(*) FROM oplog", &[], |row| row.try_get::<_, i64>(0)).unwrap(), i64::from(KEEP));
+        store.log(40, None, "newest", "", json!({})).unwrap();
+        assert_eq!(store.query_one("SELECT COUNT(*) FROM oplog", &[], |row| row.try_get::<_, i64>(0)).unwrap(), i64::from(KEEP));
+        let left = |action: &str| store.oplog_filtered(&LogFilter { limit: 1, action: Some(action.to_owned()), ..LogFilter::default() });
+        assert!(left("first").unwrap().is_empty(), "最老的一条删掉了");
+        assert_eq!(left("second").unwrap().len(), 1);
+        assert_eq!(left("newest").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_nul_in_the_text_of_an_entry_is_dropped_instead_of_failing_it() {
+        let store = Store::temporary();
+        store.log(10, None, "node.update\0", "节点说：坏\0了", json!({ "reason": "坏\0了" })).unwrap();
+        let entry = store.oplog(1).unwrap().remove(0);
+        assert_eq!((entry.action.as_str(), entry.detail.as_str()), ("node.update", "节点说：坏了"));
+        assert_eq!(entry.params["reason"], "坏了");
+    }
 
     #[test]
     fn operations_are_listed_newest_first() {

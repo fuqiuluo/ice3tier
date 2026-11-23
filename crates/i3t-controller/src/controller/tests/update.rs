@@ -423,6 +423,41 @@ fn packages_are_served_in_chunks_from_the_cache_and_a_download_can_resume() {
 }
 
 #[test]
+fn a_failure_reason_with_a_nul_in_it_is_recorded_like_any_other() {
+    let mut fleet = Fleet::new();
+    fleet.release();
+    let mut victim = fleet.node(OLD);
+    assert!(fleet.last_order(&mut victim).is_some());
+
+    // 节点报上来的原因里有一个 NUL。它要写进节点的失败记录（JSON）、暂停的记录，还有操作记录的说明（文本列）：
+    // 哪一处存不进去，这次上报就半途而废，同样的上报再来也不会重做。
+    let status = UpdateStatus::Failed {
+        version: Some(version(NEW)),
+        kind: FailureKind::VersionRejected,
+        reason: "自检没有通过：\0坏了".to_owned(),
+        cause: None,
+    };
+    victim.report_update(fleet.controller(), status);
+
+    assert_eq!(fleet.update_of(&victim).failure.expect("失败记下来了").reason, "自检没有通过：坏了");
+    let overview = fleet.controller().update_overview().unwrap();
+    assert_eq!(overview.paused.len(), 1, "这个版本照样暂停了");
+    let log = fleet.controller().oplog(10).unwrap();
+    let paused = log.iter().find(|entry| entry.action == "update.pause").expect("暂停记进了操作记录");
+    assert!(paused.detail.contains("自检没有通过：坏了"), "{}", paused.detail);
+}
+
+#[test]
+fn a_release_source_with_a_control_character_is_refused_before_anything_is_stored() {
+    let fleet = Fleet::new();
+    let before = fleet.controller().update_overview().unwrap();
+    let bad = UpdateSettings { source: Some(Some("https://mirror.lan/a\0b".to_owned())), ..UpdateSettings::default() };
+    assert_eq!(fleet.controller().set_update_settings(&bad).unwrap_err().code(), ErrorCode::InvalidRequest);
+    let after = fleet.controller().update_overview().unwrap();
+    assert_eq!((after.source, after.source_is_default), (before.source, before.source_is_default), "设置没有动");
+}
+
+#[test]
 fn a_version_failure_pauses_the_rollout_until_an_admin_resumes_it() {
     let mut fleet = Fleet::new();
     fleet.release();
