@@ -376,6 +376,42 @@ fn a_forward_may_leave_its_port_to_the_node_except_on_a_virtual_ip() {
     let vip = lab.controller.node(network.id, listen).unwrap().node.virtual_ip;
     let refused = lab.controller.create_forward(network.id, forward(listen, target, &format!("{vip}:0")));
     assert!(refused.is_err(), "虚拟 IP 上的转发不占端口，没有空闲的端口可挑");
+    let refused = lab.controller.create_forward(network.id, forward(listen, target, &format!("[::ffff:{vip}]:0")));
+    assert!(refused.is_err(), "写成 IPv4 映射的 IPv6 地址也是那个虚拟 IP");
+}
+
+#[test]
+fn a_forward_cannot_point_at_a_cloud_metadata_address_or_into_the_networks_own_range() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    let listen = lab.join_offline(network.id, &[], Declared::default());
+    let target = lab.join_offline(network.id, &[], CAN_DO_ALL);
+    lab.switch_on_forward_target(network.id, target);
+    let towards = |addr: &str| ForwardInput { target_addr: addr.parse().unwrap(), ..forward(listen, target, "127.0.0.1:0") };
+    let refusal = |addr: &str| match lab.controller.create_forward(network.id, towards(addr)) {
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    };
+
+    for metadata in ["169.254.169.254:80", "100.100.100.200:80", "168.63.129.16:53", "[fd00:ec2::254]:80", "[::ffff:169.254.169.254]:80"] {
+        assert!(refusal(metadata).is_some_and(|message| message.contains("元数据")), "{metadata}");
+    }
+    let vip = lab.controller.node(network.id, target).unwrap().node.virtual_ip;
+    for overlay in [format!("{vip}:8080"), format!("[::ffff:{vip}]:8080"), "10.66.200.9:22".to_owned()] {
+        assert!(refusal(&overlay).is_some_and(|message| message.contains("虚拟地址段")), "{overlay}");
+    }
+    // 回环、局域网、别的链路本地地址照常能配：端口转发就是访问它们的途径。
+    for reachable in ["127.0.0.1:5432", "192.168.1.10:80", "169.254.10.1:80", "[::1]:80", "10.67.0.1:80"] {
+        assert_eq!(refusal(reachable), None, "{reachable}");
+    }
+
+    // 改一条已有的转发时也查。
+    let kept = lab.controller.create_forward(network.id, towards("127.0.0.1:8080")).unwrap();
+    assert!(lab.controller.replace_forward(network.id, kept.id, towards("169.254.169.254:80")).is_err());
+    assert_eq!(
+        lab.controller.forwards(network.id).unwrap().iter().find(|entry| entry.id == kept.id).unwrap().target_addr,
+        towards("127.0.0.1:8080").target_addr
+    );
 }
 
 #[test]

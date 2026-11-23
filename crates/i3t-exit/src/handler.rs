@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use i3t_access::{ForwardHealth, NoRoutes, RouteAtStart, SharedRoutes, TargetCause, proxy_header};
+use i3t_access::{ForwardHealth, NoRoutes, OwnListener, RouteAtStart, SharedRoutes, TargetCause, proxy_header};
 use i3t_conn::contract::{DatagramSender, Datagrams};
 use i3t_conn::{Connector, Endpoint, RecvStream, SendStream};
 use i3t_flow::datagram::{self, Opener, OutboundSocket};
@@ -56,7 +56,8 @@ const BUSY_LOG_EVERY: Duration = Duration::from_secs(60);
 ///    - 互联网：本节点启用了出口，端口在允许的范围里；配额没有用完，发起节点对这个目标的建连预算没有用完；
 ///      解析出来的地址按地址族挑过之后，每个都过出站策略；
 ///    - 局域网：本节点启用了出口并打开了局域网开关，配额和建连预算同上，地址在本机网卡直连的网段里；
-///    - 本节点的端口：只用本机的非回环地址去连。那个端口上有监听在虚拟 IP 上的端口转发时，按那条转发处理：
+///    - 本节点的端口：只用本机的非回环地址去连，程序自己的监听（代理、端口转发、名字服务）占着的地址不连。
+///      那个端口上有监听在虚拟 IP 或者全部地址上的端口转发时，按那条转发处理（来源白名单按发起节点的虚拟 IP 查）：
 ///      目标是本节点就去连它指向的地址，目标是别的节点就到那个节点开一条流，把两条流接起来；
 ///    - 端口转发：必须是下发给本节点、并且由发起节点监听的那一条。不需要本节点是出口。
 /// 4. 连上目标之后回成功，开始搬运。发起节点更换公钥、失去访问权限，或者放行这条流的能力被收回（出口、局域网开关、
@@ -214,10 +215,10 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
                 let stream = self.outbound.lan(netmap, *addr).await?;
                 Ok((exit_traffic(stream), Grant::Lan))
             }
-            Target::Node { port } => match forward_on_virtual_ip(netmap, *port, ForwardProtocol::Tcp) {
+            Target::Node { port } => match forward_at_node_port(netmap, *port, ForwardProtocol::Tcp, &self.outbound.own_listeners()) {
                 Some(forward) if forward.target != netmap.me.id => {
                     let flow = self.onward(netmap, initiator, forward, open).await?;
-                    let grant = Grant::VirtualForward { port: *port, id: forward.id, target: forward.target, addr: None };
+                    let grant = Grant::VirtualForward { id: forward.id, bind: forward.bind, target: forward.target, addr: None };
                     Ok((Admitted::Onward(flow), grant))
                 }
                 Some(forward) => {
@@ -225,7 +226,8 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
                     let connected = self.outbound.forward(entry.addr).await;
                     self.forward_health.record(forward.id, connected.as_ref().map(drop).map_err(|reply| forward_cause(reply.status)));
                     let stream = present(connected?, &entry, initiator).await?;
-                    let grant = Grant::VirtualForward { port: *port, id: forward.id, target: forward.target, addr: Some(entry.addr) };
+                    let grant =
+                        Grant::VirtualForward { id: forward.id, bind: forward.bind, target: forward.target, addr: Some(entry.addr) };
                     Ok((local(stream), grant))
                 }
                 None => Ok((local(self.outbound.node_port(*port).await?), Grant::NodeService)),
@@ -292,7 +294,7 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
         Ok(())
     }
 
-    /// 监听在本节点虚拟 IP 上、目标是别的节点的端口转发：替发起节点到目标节点开一条流。
+    /// 对组网里的节点开着（监听在本节点的虚拟 IP 或者全部地址上）、目标是别的节点的端口转发：替发起节点到目标节点开一条流。
     ///
     /// 访问规则查两段：发起节点要能访问本节点（已经查过），本节点要能访问目标节点（目标节点自己还会按转发的编号再查一遍）。
     /// 往目标节点去的这一段和别的端口转发一样只走共用的连接，不走 ice3proxy。
@@ -490,13 +492,40 @@ fn forward_cause(status: Status) -> TargetCause {
     TargetCause::of(status).unwrap_or(TargetCause::Other)
 }
 
-/// 本节点上监听在自己的虚拟 IP 的 `port` 端口上的端口转发。这种转发不占操作系统的端口，别的节点访问这个端口时在这里接住。
-pub(crate) fn forward_on_virtual_ip(netmap: &Netmap, port: u16, protocol: ForwardProtocol) -> Option<&Forward> {
-    let bind = SocketAddr::new(IpAddr::V4(netmap.me.virtual_ip), port);
-    netmap.me.forwards.iter().find(|forward| forward.protocol == protocol && forward.bind == bind)
+/// 别的节点访问本节点的 `port` 端口时，接住它的那条端口转发：监听在本节点的虚拟 IP 上，或者监听在全部地址上
+/// （`0.0.0.0`、`[::]`）的。经虚拟网卡来的连接连到的是入口在操作系统里的监听；经流来的在这里接住，
+/// 发起节点是谁看连接的握手，来源白名单按它的虚拟 IP 查。
+///
+/// 监听在全部地址上的也要在这里接：把它当成本机的服务从本机去连的话，那个监听看到的来源是本机自己的地址，
+/// 只让局域网里的机器用的白名单就拦不住别的节点了。监听在别的某一个地址上的转发不是给组网里的节点用的，不在这里
+/// （出口也不去连它，见 [`Outbound::with_own_listeners`]）。
+///
+/// 端口写 0 的转发实际监听在哪个端口从 `listeners` 里找。两种都有时用虚拟 IP 上的那一条。
+pub(crate) fn forward_at_node_port<'n>(
+    netmap: &'n Netmap,
+    port: u16,
+    protocol: ForwardProtocol,
+    listeners: &[OwnListener],
+) -> Option<&'n Forward> {
+    let at_port = |forward: &Forward| match forward.bind.port() {
+        0 => listeners
+            .iter()
+            .any(|listener| listener.forward == Some(forward.id) && listener.protocol == protocol && listener.local.port() == port),
+        written => written == port,
+    };
+    let candidates = || netmap.me.forwards.iter().filter(|forward| forward.protocol == protocol && at_port(forward));
+    let own = IpAddr::V4(netmap.me.virtual_ip);
+    candidates()
+        .find(|forward| forward.bind.ip().to_canonical() == own)
+        .or_else(|| candidates().find(|forward| forward.bind.ip().is_unspecified()))
 }
 
-/// 监听在虚拟 IP 上的端口转发的来源白名单，按发起节点的虚拟 IP 查。
+/// `bind` 上的监听是不是对组网里的节点开着的：本节点的虚拟 IP，或者全部地址（见 [`forward_at_node_port`]）。
+pub(crate) fn faces_the_mesh(netmap: &Netmap, bind: SocketAddr) -> bool {
+    bind.ip().is_unspecified() || bind.ip().to_canonical() == IpAddr::V4(netmap.me.virtual_ip)
+}
+
+/// 对组网里的节点开着的端口转发的来源白名单，按发起节点的虚拟 IP 查。
 pub(crate) fn check_allow_list(initiator: &Peer, forward: &Forward) -> Result<(), Reply> {
     let from = IpAddr::V4(initiator.virtual_ip);
     if forward.allow_from.is_empty() || forward.allow_from.iter().any(|net| net.contains(&from)) {
@@ -506,7 +535,7 @@ pub(crate) fn check_allow_list(initiator: &Peer, forward: &Forward) -> Result<()
     }
 }
 
-/// 监听在虚拟 IP 上、目标是本节点自己的端口转发的目标一侧：最后要连的地址，和要不要发 PROXY protocol 的头。
+/// 对组网里的节点开着、目标是本节点自己的端口转发的目标一侧：最后要连的地址，和要不要发 PROXY protocol 的头。
 ///
 /// 目标是别的节点的不走这里，由出口接力（[`Exit`] 的文档）。
 pub(crate) fn virtual_forward_target(netmap: &Netmap, initiator: &Peer, forward: &Forward) -> Result<ForwardTarget, Reply> {
@@ -530,7 +559,7 @@ async fn present(mut stream: TcpStream, entry: &ForwardTarget, initiator: &Peer)
     let Some(version) = entry.proxy_protocol else { return Ok(stream) };
     let written = async {
         let (local, peer) = (stream.local_addr()?, stream.peer_addr()?);
-        let header = proxy_header::encode(version, initiator.virtual_ip, local.port(), peer);
+        let header = proxy_header::encode(version, SocketAddr::new(initiator.virtual_ip.into(), local.port()), peer);
         stream.write_all(&header).await
     };
     match written.await {

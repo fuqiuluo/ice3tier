@@ -212,6 +212,20 @@ impl<C: Connector + Datagrams> Access<C> {
         self.shared.forward_health.clone()
     }
 
+    /// 入口现在真的在监听的地址：代理、组网入口和端口转发里绑上了的那些。
+    #[must_use]
+    pub fn own_listeners(&self) -> Vec<OwnListener> {
+        let status = self.published.lock().expect("access status mutex poisoned");
+        let listening = |state: &ListenState, protocol, forward| match state {
+            ListenState::Listening { local } => Some(OwnListener { protocol, local: *local, forward }),
+            ListenState::PortInUse { .. } | ListenState::Failed { .. } | ListenState::Virtual | ListenState::Unsupported { .. } => None,
+        };
+        let proxies = status.proxies.iter().filter_map(|proxy| listening(&proxy.state, ForwardProtocol::Tcp, None));
+        let local = status.local.iter().filter_map(|entry| listening(&entry.state, ForwardProtocol::Tcp, None));
+        let forwards = status.forwards.iter().filter_map(|forward| listening(&forward.state, forward.protocol, Some(forward.id)));
+        proxies.chain(local).chain(forwards).collect()
+    }
+
     /// 开始或者结束排空。`Some(说明)` 时新的连接得到拒绝（见类型的文档），说明写进日志。
     pub fn set_draining(&self, draining: Option<String>) {
         *self.shared.draining.lock().expect("draining mutex poisoned") = draining;
@@ -419,6 +433,38 @@ pub struct ForwardStatus {
     pub traffic: Traffic,
     /// 最近一次这条转发的流在目标那里失败；之后成功过就是 `None`（[`crate::ForwardHealth`]）。
     pub target_failure: Option<TargetFailure>,
+}
+
+/// 本节点的程序自己在监听的一个地址：入口的代理、组网入口、端口转发（[`Access::own_listeners`]），
+/// 装配层还可以把程序里别处的监听也算进来（虚拟网卡的名字服务）。
+///
+/// 出口模块凭它认出"本节点的端口"里哪些其实是程序自己的监听。别的节点要访问本节点的一个端口时，出口用本机的地址去连本机的服务，
+/// 那条连接的来源是本机自己的地址；连到程序自己的监听上，监听按来源做的检查（来源白名单、只收本机和对端的虚拟 IP）
+/// 看到的就是本机，而不是真正来访问的那个节点。所以这些地址出口不去连。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnListener {
+    /// TCP 的监听还是 UDP 的端口。
+    pub protocol: ForwardProtocol,
+    /// 实际绑定的地址：配置里端口写 0 的，这里是挑定的端口。
+    pub local: SocketAddr,
+    /// 是端口转发的监听时，它的编号。
+    pub forward: Option<u32>,
+}
+
+impl OwnListener {
+    /// 发往 `addr` 的连接（`protocol` 是 UDP 时是报文）是不是落在这个监听上。
+    ///
+    /// 监听在全部地址上的，哪个地址上的这个端口都算它的：`[::]` 在有的系统上不收 IPv4 的，这里也按收算，
+    /// 宁可少连一个地址，不把来源洗成本机。
+    #[must_use]
+    pub fn receives(&self, protocol: ForwardProtocol, addr: SocketAddr) -> bool {
+        let covers = match self.local.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => addr.ip().to_canonical().is_ipv4(),
+            IpAddr::V6(ip) if ip.is_unspecified() => true,
+            ip => ip.to_canonical() == addr.ip().to_canonical(),
+        };
+        self.protocol == protocol && self.local.port() == addr.port() && covers
+    }
 }
 
 /// 一个监听现在的状态。
@@ -830,6 +876,26 @@ mod tests {
         assert_eq!(ListenCause::from(again.kind()), ListenCause::AddressInUse, "{again}");
         assert_eq!(ListenCause::from(io::ErrorKind::PermissionDenied), ListenCause::PermissionDenied);
         assert_eq!(ListenCause::from(io::ErrorKind::InvalidInput), ListenCause::Other);
+    }
+
+    #[test]
+    fn a_listener_takes_what_is_sent_to_its_own_address_and_port_or_to_any_address_when_bound_to_all() {
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let listener = |local: &str| OwnListener { protocol: ForwardProtocol::Tcp, local: at(local), forward: None };
+        let tcp = |listener: OwnListener, addr: &str| listener.receives(ForwardProtocol::Tcp, at(addr));
+
+        let on_lan = listener("192.168.1.5:8080");
+        assert!(tcp(on_lan, "192.168.1.5:8080") && tcp(on_lan, "[::ffff:192.168.1.5]:8080"));
+        assert!(!tcp(on_lan, "10.66.0.1:8080") && !tcp(on_lan, "192.168.1.5:8081") && !tcp(on_lan, "[2001:db8::5]:8080"));
+        assert!(!on_lan.receives(ForwardProtocol::Udp, at("192.168.1.5:8080")), "UDP 的同一个端口是另一回事");
+
+        let all_v4 = listener("0.0.0.0:8080");
+        assert!(tcp(all_v4, "192.168.1.5:8080") && tcp(all_v4, "10.66.0.1:8080"));
+        assert!(!tcp(all_v4, "[2001:db8::5]:8080") && !tcp(all_v4, "192.168.1.5:8081"));
+
+        let all = listener("[::]:8080");
+        assert!(tcp(all, "[2001:db8::5]:8080") && tcp(all, "192.168.1.5:8080"));
+        assert!(!tcp(all, "192.168.1.5:8081"));
     }
 
     #[test]

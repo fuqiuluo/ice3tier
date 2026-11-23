@@ -18,9 +18,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use i3t_access::OwnListener;
 use i3t_conn::Endpoint;
 use i3t_model::Netmap;
 use i3t_model::control::{Firewall, NameService, RuleState, VnetCause, VnetReport, VnetState};
+use i3t_model::netmap::ForwardProtocol;
 use i3t_vnet::device::{DeviceError, DeviceSpec, Platform, Tun};
 use i3t_vnet::engine::{Counters, Engine, Stopped};
 use i3t_vnet::machine::{Machine, Program, Shell, missing_privilege};
@@ -43,11 +45,13 @@ const RECHECK: Duration = Duration::from_secs(5);
 pub(crate) struct Status {
     pub(crate) state: VnetState,
     pub(crate) firewall: Firewall,
+    /// 名字服务在这个地址上答查询；没有开起来（或者网卡没装着）时是 `None`。
+    name_service: Option<SocketAddr>,
 }
 
 impl Status {
     fn of(state: VnetState) -> Self {
-        Self { state, firewall: Firewall::default() }
+        Self { state, firewall: Firewall::default(), name_service: None }
     }
 }
 
@@ -88,7 +92,7 @@ impl Vnet {
 
     /// 现在的状态和这次运行以来的计数。
     pub(crate) fn report(&self) -> VnetReport {
-        let Status { state, firewall } = self.status.borrow().clone();
+        let Status { state, firewall, name_service: _ } = self.status.borrow().clone();
         let traffic = self.counters.snapshot();
         VnetReport {
             state,
@@ -99,6 +103,15 @@ impl Vnet {
             received_bytes: traffic.received_bytes,
             dropped: traffic.dropped,
         }
+    }
+
+    /// 名字服务现在的监听（本节点虚拟 IP 的 53 端口，UDP）；没有开着时是 `None`。
+    ///
+    /// 名字服务只答本机来的查询，认的是来源地址。出口替别的节点连"本节点的端口"时用的是本机的地址，所以要知道这个监听在哪里，
+    /// 绕开它（`i3t_exit::Outbound::with_own_listeners`）。
+    pub(crate) fn name_listener(&self) -> Option<OwnListener> {
+        let local = self.status.borrow().name_service?;
+        Some(OwnListener { protocol: ForwardProtocol::Udp, local, forward: None })
     }
 
     /// 拆掉装进系统里的东西，等拆完。再调用什么也不做。
@@ -364,7 +377,8 @@ impl Session {
         let (names, responder) = start_names(parts.netmap.clone(), own, &device_name, &netmap.network.domain).await;
         let engine = Engine::new(Arc::new(tun), Arc::clone(&parts.endpoint), parts.netmap.clone(), Arc::clone(&parts.counters));
         let engine = tokio::spawn(engine.run());
-        let status = Status { state: VnetState::Installed { device: device_name.clone(), mtu, names }, firewall };
+        let name_service = responder.as_ref().map(|_| SocketAddr::from((own, i3t_vnet::DNS_PORT)));
+        let status = Status { state: VnetState::Installed { device: device_name.clone(), mtu, names }, firewall, name_service };
         let session = Self { device_name, plan, domain: netmap.network.domain.clone(), firewall: parts.firewall, status, names: responder };
         Ok((session, engine))
     }

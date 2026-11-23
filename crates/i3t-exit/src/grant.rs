@@ -13,7 +13,7 @@ use i3t_model::Netmap;
 use i3t_model::netmap::{ExitRole, ForwardProtocol};
 use i3t_proto::{NodeId, PublicKey};
 
-use crate::handler::{check_allow_list, forward_on_virtual_ip};
+use crate::handler::{check_allow_list, faces_the_mesh};
 
 /// 放行时凭的是什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,9 +24,10 @@ pub(crate) enum Grant {
     Lan,
     /// 本节点自己的服务：只要访问规则还允许。
     NodeService,
-    /// 监听在本节点虚拟 IP 的 `port` 端口上、编号是 `id`、目标是 `target` 节点的端口转发。
+    /// 对组网里的节点开着的端口转发（[`forward_at_node_port`](crate::handler::forward_at_node_port)）：编号是 `id`，
+    /// 监听在 `bind` 上（本节点的虚拟 IP 或者全部地址），目标是 `target` 节点。
     /// 目标是本节点时 `addr` 是它指向的地址，否则是 `None`。
-    VirtualForward { port: u16, id: u32, target: NodeId, addr: Option<SocketAddr> },
+    VirtualForward { id: u32, bind: SocketAddr, target: NodeId, addr: Option<SocketAddr> },
     /// 下发给本节点、由发起节点监听的 `id` 号端口转发，指向 `addr`。
     Forward { id: u32, addr: SocketAddr },
 }
@@ -60,9 +61,15 @@ impl Grant {
                 Some(ExitRole { lan: true, .. }) => None,
             },
             Self::NodeService => None,
-            Self::VirtualForward { port, id, target, addr } => {
-                let current = forward_on_virtual_ip(netmap, port, protocol).filter(|forward| forward.id == id && forward.target == target);
-                let Some(forward) = current else { return Some("这条端口转发被删掉或者改了") };
+            Self::VirtualForward { id, bind, target, addr } => {
+                // 监听的地址连同端口都要没变：改了就是另一个监听，原来那个端口上的流不再归它。
+                let current =
+                    netmap.me.forwards.iter().find(|forward| {
+                        forward.id == id && forward.protocol == protocol && forward.bind == bind && forward.target == target
+                    });
+                let Some(forward) = current.filter(|forward| faces_the_mesh(netmap, forward.bind)) else {
+                    return Some("这条端口转发被删掉或者改了");
+                };
                 if check_allow_list(initiator, forward).is_err() {
                     Some("发起节点不再在这条端口转发的来源白名单里")
                 } else if target == netmap.me.id {
@@ -246,7 +253,8 @@ pub(crate) mod tests {
         // 由别的节点监听的那一条，不是 laptop 的。
         assert!(listed.withdrawn(&netmap(), node(NAS), TCP, Some(peer(NAS).key)).is_some());
 
-        let to_self = Grant::VirtualForward { port: 9100, id: 7, target: node(GW), addr: Some("127.0.0.1:8081".parse().unwrap()) };
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let to_self = Grant::VirtualForward { id: 7, bind: at("10.66.0.2:9100"), target: node(GW), addr: Some(at("127.0.0.1:8081")) };
         assert_eq!(withdrawn(to_self, &netmap(), TCP), None);
         assert!(withdrawn(to_self, &after(|netmap| netmap.me.forwards.retain(|forward| forward.id != 7)), TCP).is_some());
         assert!(withdrawn(to_self, &after(|netmap| netmap.me.forward_targets.retain(|entry| entry.id != 7)), TCP).is_some());
@@ -257,10 +265,57 @@ pub(crate) mod tests {
         let narrowed = after(|netmap| netmap.me.forwards[0].allow_from = vec!["10.66.0.3/32".parse().unwrap()]);
         assert!(withdrawn(to_self, &narrowed, TCP).is_some(), "发起节点不再在来源白名单里");
 
-        let onward = Grant::VirtualForward { port: 5353, id: 8, target: node(NAS), addr: None };
+        let onward = Grant::VirtualForward { id: 8, bind: at("10.66.0.2:5353"), target: node(NAS), addr: None };
         let udp = ForwardProtocol::Udp;
         assert_eq!(withdrawn(onward, &netmap(), udp), None);
         assert!(withdrawn(onward, &after(|netmap| netmap.peers[1].outbound = false), udp).is_some());
         assert!(withdrawn(onward, &after(|netmap| netmap.me.forwards[1].target = node(LAPTOP)), udp).is_some());
+
+        // 监听在全部地址上的一样；改成只监听某一个别的地址，就不再是对组网里的节点开着的了。
+        let everywhere = after(|netmap| netmap.me.forwards[0].bind = at("0.0.0.0:9100"));
+        let on_all = Grant::VirtualForward { id: 7, bind: at("0.0.0.0:9100"), target: node(GW), addr: Some(at("127.0.0.1:8081")) };
+        assert_eq!(withdrawn(on_all, &everywhere, TCP), None);
+        assert!(withdrawn(on_all, &netmap(), TCP).is_some(), "监听的地址改了");
+        let on_lan = Grant::VirtualForward { id: 7, bind: at("192.168.1.5:9100"), target: node(GW), addr: Some(at("127.0.0.1:8081")) };
+        assert!(withdrawn(on_lan, &after(|netmap| netmap.me.forwards[0].bind = at("192.168.1.5:9100")), TCP).is_some());
+    }
+
+    #[test]
+    fn a_node_port_is_taken_by_the_forward_on_the_virtual_ip_or_on_every_address() {
+        use i3t_access::OwnListener;
+
+        use crate::handler::forward_at_node_port;
+
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let bound = |bind: &str| after(|netmap| netmap.me.forwards[0].bind = at(bind));
+        let taken =
+            |netmap: &Netmap, port, listeners: &[OwnListener]| forward_at_node_port(netmap, port, TCP, listeners).map(|forward| forward.id);
+
+        assert_eq!(taken(&netmap(), 9100, &[]), Some(7));
+        assert_eq!(taken(&netmap(), 9101, &[]), None);
+        assert_eq!(forward_at_node_port(&netmap(), 9100, ForwardProtocol::Udp, &[]).map(|forward| forward.id), None, "协议也要对得上");
+        for everywhere in ["0.0.0.0:9100", "[::]:9100", "[::ffff:10.66.0.2]:9100"] {
+            assert_eq!(taken(&bound(everywhere), 9100, &[]), Some(7), "{everywhere}");
+        }
+        // 只监听在别的某一个地址上的不是给组网里的节点用的。
+        for elsewhere in ["192.168.1.5:9100", "127.0.0.1:9100", "[2001:db8::5]:9100", "10.66.0.3:9100"] {
+            assert_eq!(taken(&bound(elsewhere), 9100, &[]), None, "{elsewhere}");
+        }
+
+        // 端口写 0 的：入口挑定了哪个端口，就在哪个端口上接。
+        let any_port = bound("0.0.0.0:0");
+        let chosen = OwnListener { protocol: TCP, local: at("0.0.0.0:40123"), forward: Some(7) };
+        assert_eq!(taken(&any_port, 40123, &[chosen]), Some(7));
+        assert_eq!(taken(&any_port, 40124, &[chosen]), None);
+        assert_eq!(taken(&any_port, 40123, &[]), None, "还没有绑上");
+        assert_eq!(taken(&any_port, 40123, &[OwnListener { forward: Some(8), ..chosen }]), None, "那是别的转发挑的端口");
+
+        // 两种都有时用虚拟 IP 上的那一条。
+        let both = after(|netmap| {
+            let mut everywhere = netmap.me.forwards[0].clone();
+            (everywhere.id, everywhere.bind) = (17, at("0.0.0.0:9100"));
+            netmap.me.forwards.insert(0, everywhere);
+        });
+        assert_eq!(taken(&both, 9100, &[]), Some(7));
     }
 }

@@ -6,9 +6,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use i3t_access::OwnListener;
 use i3t_model::Netmap;
 use i3t_model::control::exit_test::{ConnectStep, ExitTestCause, ExitTestResult, ExitVia, ResolveStep};
-use i3t_model::netmap::{ExitRole, IpFamily, Network};
+use i3t_model::netmap::{self, ExitRole, ForwardProtocol, IpFamily, Network};
 use i3t_proto::NodeId;
 use i3t_proto::flow::{Host, Reply, Status};
 use ipnet::IpNet;
@@ -57,12 +58,16 @@ pub struct Outbound<S = Os> {
 /// 本节点自己对外的地址从哪里问，见 [`Outbound::with_own_endpoints`]。
 type OwnEndpoints = Box<dyn Fn() -> Vec<SocketAddr> + Send + Sync>;
 
+/// 本节点的程序自己的监听从哪里问，见 [`Outbound::with_own_listeners`]。
+type OwnListeners = Box<dyn Fn() -> Vec<OwnListener> + Send + Sync>;
+
 struct Inner<S> {
     system: S,
     netmap: watch::Receiver<Arc<Netmap>>,
     dns: Mutex<DnsCache>,
     interfaces: Mutex<Option<Interfaces>>,
     own_endpoints: Option<OwnEndpoints>,
+    own_listeners: Option<OwnListeners>,
     lookups: Lookups,
 }
 
@@ -138,8 +143,15 @@ impl<S> std::fmt::Debug for Outbound<S> {
 impl<S: System> Outbound<S> {
     /// `netmap` 是本节点当前的那一份：查覆盖网的地址段、出口测试时用，那时没有别人给出该按哪一版配置判断。
     pub fn new(netmap: watch::Receiver<Arc<Netmap>>, system: S) -> Self {
-        let inner =
-            Inner { system, netmap, dns: Mutex::default(), interfaces: Mutex::new(None), own_endpoints: None, lookups: Lookups::default() };
+        let inner = Inner {
+            system,
+            netmap,
+            dns: Mutex::default(),
+            interfaces: Mutex::new(None),
+            own_endpoints: None,
+            own_listeners: None,
+            lookups: Lookups::default(),
+        };
         Self { inner: Arc::new(inner) }
     }
 
@@ -157,6 +169,26 @@ impl<S: System> Outbound<S> {
     pub fn with_own_endpoints(mut self, own: impl Fn() -> Vec<SocketAddr> + Send + Sync + 'static) -> Self {
         Arc::get_mut(&mut self.inner).expect("with_own_endpoints 要在克隆拨号器之前调用").own_endpoints = Some(Box::new(own));
         self
+    }
+
+    /// 本节点的程序自己的监听从哪里问：装配时交进来入口的监听（`i3t_access::Access::own_listeners`），
+    /// 加上程序里别处的（虚拟网卡的名字服务）。
+    ///
+    /// 别的节点访问"本节点的端口"时，出口不去连这些地址（[`OwnListener`] 的文档）；其中监听在全部地址上的端口转发，
+    /// 出口自己按那条转发接住，来源按发起节点算。不设时出口只认得 netmap 里写明了端口的端口转发。
+    ///
+    /// # Panics
+    ///
+    /// 在克隆之后调用：克隆出来的是同一个拨号器，这个设置要在交出去之前定下来。
+    #[must_use]
+    pub fn with_own_listeners(mut self, own: impl Fn() -> Vec<OwnListener> + Send + Sync + 'static) -> Self {
+        Arc::get_mut(&mut self.inner).expect("with_own_listeners 要在克隆拨号器之前调用").own_listeners = Some(Box::new(own));
+        self
+    }
+
+    /// 本节点的程序自己现在在监听的地址。
+    pub(crate) fn own_listeners(&self) -> Vec<OwnListener> {
+        self.inner.own_listeners.as_ref().map(|own| own()).unwrap_or_default()
     }
 
     /// 互联网目标：本节点必须是出口，端口要在允许的范围里，解析出来的每一个地址都要过出站策略。
@@ -237,7 +269,7 @@ impl<S: System> Outbound<S> {
         }
         let ip = addr.ip().to_canonical();
         let attached = self.interfaces()?.iter().any(|net| !net.addr().is_loopback() && subnet_contains(net, ip));
-        let refused = if ip.is_loopback() || policy::is_link_local(ip) || policy::is_cloud_metadata(ip) {
+        let refused = if ip.is_loopback() || policy::is_link_local(ip) || netmap::is_cloud_metadata(ip) {
             Some("回环、链路本地和云平台的元数据地址不算局域网")
         } else if netmap.network.is_overlay_address(ip) {
             Some("覆盖网的地址不算局域网")
@@ -336,18 +368,30 @@ impl<S: System> Outbound<S> {
     /// 所以只监听 127.0.0.1 的服务连不上，不会因为装了这个程序就对组网可见；要暴露这样的服务得显式配端口转发。
     /// 本机有几个地址就挨个试：服务可能只监听在其中一个上。
     pub(crate) async fn node_port(&self, port: u16) -> Result<TcpStream, Reply> {
-        let targets = self.node_targets(port)?;
+        let targets = self.node_targets(port, ForwardProtocol::Tcp)?;
         self.connect_first(targets, LOCAL_CONNECT_TIMEOUT, Via::Direct).await
     }
 
     /// 本机的非回环地址加上 `port`，IPv4 在前：只监听 0.0.0.0 的服务最常见。
-    fn node_targets(&self, port: u16) -> Result<Vec<SocketAddr>, Reply> {
+    ///
+    /// 程序自己的监听占着的地址不在里面（[`with_own_listeners`](Self::with_own_listeners)）：从本机连过去，
+    /// 那个监听看到的来源是本机，不是真正来访问的节点。本机别的程序的服务不受影响，只监听在本节点虚拟 IP 上的也照样连。
+    fn node_targets(&self, port: u16, protocol: ForwardProtocol) -> Result<Vec<SocketAddr>, Reply> {
         let interfaces = self.interfaces()?;
         let own = interfaces.iter().map(IpNet::addr).filter(|ip| !(ip.is_loopback() || ip.is_unspecified() || policy::is_link_local(*ip)));
         let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = own.partition(IpAddr::is_ipv4);
-        let targets: Vec<SocketAddr> = v4.into_iter().chain(v6).map(|ip| SocketAddr::new(ip, port)).collect();
-        if targets.is_empty() {
+        let addresses: Vec<SocketAddr> = v4.into_iter().chain(v6).map(|ip| SocketAddr::new(ip, port)).collect();
+        if addresses.is_empty() {
             return Err(Reply::new(Status::Unreachable, "这个节点没有非回环的地址，它上面的服务不可达"));
+        }
+        let listeners = self.own_listeners();
+        let targets: Vec<SocketAddr> =
+            addresses.into_iter().filter(|addr| !listeners.iter().any(|listener| listener.receives(protocol, *addr))).collect();
+        if targets.is_empty() {
+            return Err(Reply::new(
+                Status::PolicyDenied,
+                "这个端口上是这个节点的代理或者端口转发的监听，不当成它上面的服务去连：给组网里的节点用的端口转发要监听在虚拟 IP 或者全部地址上",
+            ));
         }
         Ok(targets)
     }
@@ -356,7 +400,7 @@ impl<S: System> Outbound<S> {
     ///
     /// TCP 可以挨个地址去试哪个连得上，UDP 没有"连上"这回事，试不了；只监听在别的地址上的服务要配端口转发。
     pub(crate) fn udp_node(&self, port: u16) -> Result<SocketAddr, Reply> {
-        let targets = self.node_targets(port)?;
+        let targets = self.node_targets(port, ForwardProtocol::Udp)?;
         targets.first().copied().ok_or_else(|| Reply::new(Status::Unreachable, "这个节点没有非回环的地址"))
     }
 
@@ -366,18 +410,26 @@ impl<S: System> Outbound<S> {
     }
 
     /// 端口转发指向的地址。回环地址和局域网地址都可以：下发给本节点的端口转发就是访问它们的显式途径。
-    /// 覆盖网的地址不连（[`Outbound::not_overlay`]）。
+    /// 覆盖网的地址和云平台的元数据地址不连（[`Outbound::forwardable`]）。
     pub(crate) async fn forward(&self, addr: SocketAddr) -> Result<TcpStream, Reply> {
-        self.not_overlay(addr)?;
+        self.forwardable(addr)?;
         self.connect_first([addr], CONNECT_TIMEOUT, Via::Direct).await
     }
 
-    /// 本节点自己去连的地址不能是覆盖网的地址：那些地址只在组网里有意义，到它们的连接是到那个节点开的流。
-    /// 端口转发写了这样的地址、或者一个域名解析成了这样的地址时直接拒绝，不当作普通的地址去连：
+    /// 端口转发指向的地址里本节点不去连的两种。流和数据报用的是同一份检查。
+    ///
+    /// 覆盖网的地址只在组网里有意义，到它们的连接是到那个节点开的流。端口转发写了这样的地址时直接拒绝，不当作普通的地址去连：
     /// 虚拟网卡装着的时候，那样的连接会经网卡绕回组网里，替别人连的就成了以本节点的身份访问别的节点。
-    pub(crate) fn not_overlay(&self, addr: SocketAddr) -> Result<(), Reply> {
-        if self.inner.netmap.borrow().network.is_overlay_address(addr.ip().to_canonical()) {
+    ///
+    /// 云平台的元数据地址读得到云主机的凭据。端口转发的目标是 controller 下发的，本机不用另外声明，
+    /// 所以这一条写死在节点上：controller 上配了什么都一样。
+    pub(crate) fn forwardable(&self, addr: SocketAddr) -> Result<(), Reply> {
+        let ip = addr.ip().to_canonical();
+        if self.inner.netmap.borrow().network.is_overlay_address(ip) {
             return Err(Reply::new(Status::PolicyDenied, "目标是覆盖网的地址：要访问那个节点，开到它的流"));
+        }
+        if netmap::is_cloud_metadata(ip) {
+            return Err(Reply::new(Status::PolicyDenied, "目标是云平台的元数据地址，这个节点不替别人连它"));
         }
         Ok(())
     }

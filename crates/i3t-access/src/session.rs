@@ -13,7 +13,7 @@ use i3t_conn::contract::Datagrams;
 use i3t_flow::datagram::Opener;
 use i3t_flow::{Carriage, End, FlowError, Framing, Summary};
 use i3t_model::Netmap;
-use i3t_model::netmap::{Forward, ListenerProtocol};
+use i3t_model::netmap::{self, Forward, ListenerProtocol};
 use i3t_proto::flow::{Host, Open, Origin, Reason, Target};
 use i3t_proto::{NodeId, PublicKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,7 +26,7 @@ use crate::entry::{Entry, Gate, LocalEntry};
 use crate::failure::Failure;
 use crate::first_data::{self, FIRST_BYTE_WAIT};
 use crate::forward_health::{ForwardHealth, TargetCause};
-use crate::manager::{Connection, PortBook};
+use crate::manager::{Connection, PortBook, allowed, virtual_ip_admits};
 use crate::message::{Parsed, Parser};
 use crate::route::{self, Route};
 use crate::routes::{RouteAtStart, RouteSpan, SharedRoutes};
@@ -557,18 +557,19 @@ pub(crate) async fn forward<C: Connector + Datagrams>(
     }
 }
 
-/// 监听在本节点虚拟 IP 上、目标也在本节点的端口转发（比如"10.77.0.1 上回环里的服务转发到 10.77.0.1:8080"），
-/// 别的节点经虚拟网卡连进来：本节点自己去连目标，两条 TCP 接起来。和别的节点经流来访问时出口模块做的一样：
-/// 只连下发给本节点、由本节点自己监听的那一条转发指向的地址，覆盖网的地址不连，要求的话先发 PROXY protocol 的头。
+/// 监听和目标都在本节点上的端口转发（比如把回环里的服务转发到本节点的虚拟 IP `10.77.0.1:8080` 上，别的节点经虚拟网卡连进来；
+/// 监听也可以在别的地址上，那时连进来的是那块网卡上的机器）：本节点自己去连目标，两条 TCP 接起来。
+/// 和别的节点经流来访问时出口模块做的一样：只连下发给本节点、由本节点自己监听的那一条转发指向的地址，
+/// 覆盖网的地址和云平台的元数据地址不连，要求的话先发 PROXY protocol 的头。
 ///
 /// 连进来的是谁看来源地址：经虚拟网卡进来的包的来源核对过是那个对端的虚拟 IP，访问规则不允许它访问本节点时它的 TCP 握手进不来；
-/// 接受连接时已经查过来源是可以访问本节点的节点或者本机（[`crate::manager::virtual_ip_admits`]：从别的网卡进来的不收），
-/// 和来源白名单（`allow_from`）。
+/// 接受连接时已经查过监听在虚拟 IP 上的只收可以访问本节点的节点和本机（[`crate::manager::virtual_ip_admits`]：从别的网卡进来的不收），
+/// 和来源白名单（`allow_from`）。这两项和这条转发本身，netmap 变了之后再核对，不成立了这条连接就重置（[`withdrawn_here`]）。
 async fn forward_here<C: Connector + Datagrams>(
     shared: &Shared<C>,
     netmap: &Netmap,
     forward: &Forward,
-    stream: TcpStream,
+    mut stream: TcpStream,
     from: SocketAddr,
     connection: &Connection,
 ) {
@@ -583,14 +584,19 @@ async fn forward_here<C: Connector + Datagrams>(
         shared.forward_health.record(forward.id, Err(TargetCause::NotDeclared));
         return reset(stream);
     };
-    if netmap.network.is_overlay_address(entry.addr.ip().to_canonical()) {
+    let target_ip = entry.addr.ip().to_canonical();
+    if netmap.network.is_overlay_address(target_ip) {
         tracing::info!(forward = forward.id, target = %entry.addr, "重置了一条端口转发的连接：目标是覆盖网的地址，本节点不当普通地址去连");
+        return reset(stream);
+    }
+    if netmap::is_cloud_metadata(target_ip) {
+        tracing::info!(forward = forward.id, target = %entry.addr, "重置了一条端口转发的连接：目标是云平台的元数据地址，本节点不替别人连它");
         return reset(stream);
     }
     let mut target = match i3t_underlay::tcp_mss::connect(entry.addr).await {
         Ok(target) => target,
         Err(error) => {
-            tracing::info!(forward = forward.id, target = %entry.addr, %error, "端口转发的目标连不上，重置了经虚拟网卡进来的连接");
+            tracing::info!(forward = forward.id, target = %entry.addr, %error, "端口转发的目标连不上，重置了监听上的连接");
             let cause = match error.kind() {
                 io::ErrorKind::ConnectionRefused => TargetCause::Refused,
                 io::ErrorKind::TimedOut => TargetCause::Timeout,
@@ -602,10 +608,11 @@ async fn forward_here<C: Connector + Datagrams>(
         }
     };
     shared.forward_health.record(forward.id, Ok(()));
-    if let (Some(version), std::net::IpAddr::V4(client)) = (entry.proxy_protocol, from.ip().to_canonical()) {
-        let header = crate::proxy_header::encode(version, client, from.port(), target.peer_addr().unwrap_or(entry.addr));
+    // 要求了头就一定发：来源是 IPv6 的也写得出来。不发的话，认这个头的服务会把客户端的头几个字节当成头，来源随客户端写。
+    if let Some(version) = entry.proxy_protocol {
+        let header = crate::proxy_header::encode(version, from, target.peer_addr().unwrap_or(entry.addr));
         if let Err(error) = target.write_all(&header).await {
-            tracing::info!(forward = forward.id, %error, "目标在收到 PROXY protocol 的头之前断开了，重置了经虚拟网卡进来的连接");
+            tracing::info!(forward = forward.id, %error, "目标在收到 PROXY protocol 的头之前断开了，重置了监听上的连接");
             return reset(stream);
         }
     }
@@ -614,19 +621,71 @@ async fn forward_here<C: Connector + Datagrams>(
             tracing::debug!(%error, "打不开内核保活");
         }
     }
-    let mut stream = stream;
-    match tokio::io::copy_bidirectional(&mut stream, &mut target).await {
-        Ok((up, down)) => {
+    let copied = tokio::select! {
+        biased;
+        why = withdrawn_here(shared.netmap.clone(), forward, entry.addr, from) => Err(why),
+        copied = tokio::io::copy_bidirectional(&mut stream, &mut target) => Ok(copied),
+    };
+    match copied {
+        Ok(Ok((up, down))) => {
             let meter = IngressMeter { listen: &connection.traffic, exit: None };
             meter.record(true, usize::try_from(up).unwrap_or(usize::MAX));
             meter.record(false, usize::try_from(down).unwrap_or(usize::MAX));
-            tracing::info!(forward = forward.id, sent = up, received = down, "经虚拟网卡进来的端口转发的连接结束");
+            tracing::info!(forward = forward.id, sent = up, received = down, "监听和目标都在本节点上的端口转发的连接结束");
         }
-        Err(error) => {
-            tracing::info!(forward = forward.id, %error, "经虚拟网卡进来的端口转发的连接异常结束");
+        Ok(Err(error)) => {
+            tracing::info!(forward = forward.id, %error, "监听和目标都在本节点上的端口转发的连接异常结束");
             reset(stream);
         }
+        Err(why) => {
+            tracing::info!(forward = forward.id, %from, why, "重置一条已经建立的端口转发的连接：它不再被允许");
+            reset(stream);
+            reset(target);
+        }
     }
+}
+
+/// 等到 netmap 不再让 `from` 的这条连接接着用 `forward`（监听和目标都在本节点上、指向 `target` 的那一条），返回原因。
+///
+/// 一上来先按现在的 netmap 查一遍：接受连接之后、连上目标之前的变化也算。
+async fn withdrawn_here(mut netmap: watch::Receiver<Arc<Netmap>>, forward: &Forward, target: SocketAddr, from: SocketAddr) -> &'static str {
+    let mut why = None;
+    let withdrawn = netmap.wait_for(|current| {
+        why = withdrawn_by(current, forward, target, from);
+        why.is_some()
+    });
+    // 等到的那一版 netmap 的引用不带过下面的 await。
+    let withdrawn = withdrawn.await.is_ok();
+    match why.filter(|_| withdrawn) {
+        Some(why) => why,
+        // 发送端没了表示节点正在关闭，连接留给进程的退出去结束。
+        None => future::pending().await,
+    }
+}
+
+/// 按 `netmap`，`from` 的连接还能不能接着用 `forward`（监听和目标都在本节点上、指向 `target` 的那一条）；不能时返回给人看的原因。
+///
+/// 和接受连接时查的是同样几项：这条转发还在、监听的地址和目标节点没有变，来源过得了虚拟 IP 的限制和白名单，指向的地址没有变。
+fn withdrawn_by(netmap: &Netmap, forward: &Forward, target: SocketAddr, from: SocketAddr) -> Option<&'static str> {
+    let same = |current: &&Forward| {
+        current.id == forward.id && current.protocol == forward.protocol && current.bind == forward.bind && current.target == netmap.me.id
+    };
+    let Some(current) = netmap.me.forwards.iter().find(same) else {
+        return Some("这条端口转发被删掉或者改了");
+    };
+    if !virtual_ip_admits(netmap, current.bind, from) {
+        return Some("来源不再是可以访问本节点的节点");
+    }
+    if !allowed(&current.allow_from, from) {
+        return Some("来源不再在这条端口转发的白名单里");
+    }
+    let points_to = netmap
+        .me
+        .forward_targets
+        .iter()
+        .find(|entry| entry.id == forward.id && entry.listener == netmap.me.id && entry.protocol == forward.protocol)
+        .map(|entry| entry.addr);
+    (points_to != Some(target)).then_some("这条端口转发指向的地址被删掉或者改了")
 }
 
 /// 写进 OPEN 的客户端地址。本机的程序连过来时不带：回环地址对另一头没有意义。
@@ -655,7 +714,55 @@ pub(crate) fn log_summary(peer: NodeId, request: &Open, summary: &Summary, route
 
 #[cfg(test)]
 mod tests {
+    use i3t_model::netmap::{ForwardProtocol, ForwardTarget};
+
     use super::*;
+
+    #[test]
+    fn a_connection_through_a_forward_to_this_node_holds_only_while_everything_it_was_admitted_on_does() {
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let (target, peer, local) = (at("127.0.0.1:8081"), at("10.66.0.2:40000"), at("192.168.1.9:40000"));
+        let me = crate::route::tests::netmap().me.id;
+        let forward =
+            |bind: &str| Forward { id: 9, protocol: ForwardProtocol::Tcp, bind: at(bind), target: me, allow_from: Vec::new(), class: None };
+        let with = |forward: &Forward| {
+            let mut netmap = crate::route::tests::netmap();
+            netmap.me.forwards = vec![forward.clone()];
+            netmap.me.forward_targets =
+                vec![ForwardTarget { id: 9, protocol: ForwardProtocol::Tcp, addr: target, listener: me, proxy_protocol: None }];
+            netmap
+        };
+        let (on_virtual_ip, everywhere) = (forward("10.66.0.1:8080"), forward("0.0.0.0:8080"));
+        assert_eq!(withdrawn_by(&with(&on_virtual_ip), &on_virtual_ip, target, peer), None);
+        assert_eq!(withdrawn_by(&with(&everywhere), &everywhere, target, local), None);
+
+        // 转发删掉了、换了监听的地址、改成指向别的节点。
+        let mut netmap = with(&everywhere);
+        netmap.me.forwards.clear();
+        assert!(withdrawn_by(&netmap, &everywhere, target, local).is_some());
+        assert!(withdrawn_by(&with(&forward("0.0.0.0:8081")), &everywhere, target, local).is_some());
+        let mut netmap = with(&everywhere);
+        netmap.me.forwards[0].target = netmap.peers[0].id;
+        assert!(withdrawn_by(&netmap, &everywhere, target, local).is_some());
+
+        // 白名单收紧了：不在里面的断开，还在里面的留着。
+        let mut netmap = with(&everywhere);
+        netmap.me.forwards[0].allow_from = vec!["192.168.1.0/24".parse().unwrap()];
+        assert_eq!(withdrawn_by(&netmap, &everywhere, target, local), None);
+        assert!(withdrawn_by(&netmap, &everywhere, target, peer).is_some());
+
+        // 监听在虚拟 IP 上的：对端不再能访问本节点。
+        let mut netmap = with(&on_virtual_ip);
+        netmap.peers.iter_mut().for_each(|peer| peer.inbound = false);
+        assert!(withdrawn_by(&netmap, &on_virtual_ip, target, peer).is_some());
+
+        // 指向的地址改了、没有了。
+        let mut netmap = with(&everywhere);
+        netmap.me.forward_targets[0].addr = at("127.0.0.1:8082");
+        assert!(withdrawn_by(&netmap, &everywhere, target, local).is_some());
+        netmap.me.forward_targets.clear();
+        assert!(withdrawn_by(&netmap, &everywhere, target, local).is_some());
+    }
 
     #[test]
     fn loopback_clients_are_not_reported_as_the_origin() {

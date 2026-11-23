@@ -4,7 +4,7 @@
 //! 节点不需要知道标签和访问规则，它拿到的是编译之后的结果（每个对端上的 [`Peer::inbound`] 和 [`Peer::outbound`]）。
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 
@@ -144,6 +144,23 @@ impl Network {
             IpAddr::V6(_) => false,
         }
     }
+}
+
+/// 各家云平台的实例元数据地址。
+const CLOUD_METADATA: [IpAddr; 4] = [
+    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+    IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
+    IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16)),
+    IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
+];
+
+/// `ip` 是不是某个云平台的实例元数据地址。IPv4 映射的 IPv6 地址按里面的 IPv4 地址判断。
+///
+/// 能读到它就能拿到云主机的凭据，所以节点替别人连的地址里哪一种都不放行它：出口的互联网目标和局域网目标，
+/// 端口转发指向的地址。controller 也不收指向它的端口转发。
+#[must_use]
+pub fn is_cloud_metadata(ip: IpAddr) -> bool {
+    CLOUD_METADATA.contains(&ip.to_canonical())
 }
 
 pub(crate) const fn default_max_relay_hops() -> u8 {
@@ -794,7 +811,8 @@ pub struct Forward {
     pub id: u32,
     pub protocol: ForwardProtocol,
     /// 监听地址。IP 是本节点的虚拟 IP 时只对组网里被允许的节点可达：经虚拟网卡来的连到这个地址上的监听，
-    /// 经流来的（没有网卡的节点、SOCKS5 入口）由目标一侧接住。
+    /// 经流来的（没有网卡的节点、SOCKS5 入口）由目标一侧接住。监听在全部地址上（`0.0.0.0`、`[::]`）的对组网里的节点也一样，
+    /// 来源白名单按发起节点的虚拟 IP 查；只监听在别的某一个地址上的，组网里的节点经流到不了。
     pub bind: SocketAddr,
     pub target: NodeId,
     #[serde(default)]
@@ -881,6 +899,16 @@ mod tests {
             assert_eq!(profile.spelling().parse::<Profile>().unwrap(), profile);
         }
         assert!("fast".parse::<Profile>().is_err());
+    }
+
+    #[test]
+    fn cloud_metadata_addresses_are_recognised_in_every_form() {
+        for address in ["169.254.169.254", "100.100.100.200", "168.63.129.16", "fd00:ec2::254", "::ffff:169.254.169.254"] {
+            assert!(is_cloud_metadata(address.parse().unwrap()), "{address}");
+        }
+        for address in ["169.254.169.253", "192.168.1.1", "127.0.0.1", "fd00:ec2::255"] {
+            assert!(!is_cloud_metadata(address.parse().unwrap()), "{address}");
+        }
     }
 
     fn minimal() -> Netmap {

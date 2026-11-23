@@ -377,6 +377,8 @@ fn api_error(error: &ApiError) -> String {
                 Some("missing") => "missing",
                 Some("not_relay") => "not an enabled relay",
                 Some("not_connectable") => "not a connectable address",
+                Some("cloud_metadata") => "a cloud metadata address can't be a target",
+                Some("overlay_address") => "an address inside the network's own range can't be a target",
                 Some("not_allowed") => "not allowed",
                 Some("duplicate") => "repeated",
                 Some("with_successor") => "can't be set together with a successor",

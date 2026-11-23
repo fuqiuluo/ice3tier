@@ -36,7 +36,8 @@ pub use admission::HandshakeLimits;
 pub use entry::LocalEntry;
 pub use forward_health::{ForwardHealth, TargetCause, TargetFailure};
 pub use manager::{
-    Access, AccessStatus, Active, ForwardStatus, ListenCause, ListenState, ListenerStatus, NoPortBook, PortBook, ProxyStatus, Traffic,
+    Access, AccessStatus, Active, ForwardStatus, ListenCause, ListenState, ListenerStatus, NoPortBook, OwnListener, PortBook, ProxyStatus,
+    Traffic,
 };
 pub use route::is_lan_literal;
 pub use routes::{CurrentRoute, NoRoutes, RouteAtStart, RouteLabel, RouteSpan, Routes, SharedRoutes};

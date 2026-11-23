@@ -52,14 +52,6 @@ const BLOCKED_V6: [(Ipv6Net, &str); 4] = [
     (v6(0x3fff, 0, 20), "文档用地址"),
 ];
 
-/// 各家云平台的实例元数据地址。能读到它就能拿到云主机的凭据，所以在哪种目标下都不放行。
-const CLOUD_METADATA: [IpAddr; 4] = [
-    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
-    IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
-    IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16)),
-    IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
-];
-
 /// `ip` 不是全球可路由的单播地址时，返回它是什么地址（用在拒绝的说明里）。
 ///
 /// IPv4 映射的 IPv6 地址按里面的 IPv4 地址判断。
@@ -69,11 +61,6 @@ pub(crate) fn not_public(ip: IpAddr) -> Option<&'static str> {
         IpAddr::V6(ip) if !GLOBAL_UNICAST_V6.contains(&ip) => Some("不是全球单播的 IPv6 地址"),
         IpAddr::V6(ip) => BLOCKED_V6.iter().find(|(net, _)| net.contains(&ip)).map(|&(_, what)| what),
     }
-}
-
-/// `ip` 是不是某个云平台的实例元数据地址。
-pub(crate) fn is_cloud_metadata(ip: IpAddr) -> bool {
-    CLOUD_METADATA.contains(&ip.to_canonical())
 }
 
 /// `ip` 是不是链路本地地址。这类地址要带着网卡才有意义，而且云平台的元数据服务就在这一段里。
@@ -188,13 +175,11 @@ mod tests {
     }
 
     #[test]
-    fn cloud_metadata_addresses_are_recognised_in_every_form() {
+    fn cloud_metadata_addresses_are_never_public() {
         for address in ["169.254.169.254", "100.100.100.200", "168.63.129.16", "fd00:ec2::254", "::ffff:169.254.169.254"] {
-            assert!(is_cloud_metadata(ip(address)), "{address}");
+            assert!(i3t_model::netmap::is_cloud_metadata(ip(address)), "{address}");
             assert!(not_public(ip(address)).is_some(), "{address}");
         }
-        assert!(!is_cloud_metadata(ip("169.254.169.253")));
-        assert!(!is_cloud_metadata(ip("192.168.1.1")));
     }
 
     #[test]

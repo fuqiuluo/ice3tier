@@ -1,7 +1,9 @@
 //! 端口转发的增删改，和每条转发现在的状态。
 
+use std::net::IpAddr;
+
 use i3t_model::admin::{Forward, ForwardInput, ForwardStatus, LogRef, NetworkId, RefKind, action};
-use i3t_model::netmap::ForwardProtocol;
+use i3t_model::netmap::{ForwardProtocol, is_cloud_metadata};
 use serde_json::{Value, json};
 
 use super::nodes::{is_connectable, require_node};
@@ -151,7 +153,7 @@ fn check(store: &Store, network: NetworkId, replacing: Option<&ForwardRecord>, m
     }
     // 端口写 0 是让监听节点自己挑一个空闲的端口（挑定之后重启不变，挑的是哪个看它的上报）。
     // 虚拟 IP 上的转发不占操作系统的端口，没有"空闲的端口"可挑，要写明。
-    if config.bind.port() == 0 && config.bind.ip() == std::net::IpAddr::V4(listener.virtual_ip) {
+    if config.bind.port() == 0 && config.bind.ip().to_canonical() == IpAddr::V4(listener.virtual_ip) {
         return Err(Error::invalid_field("bind", "zero_port", "监听在虚拟 IP 上的端口转发要写明端口，不能是 0"));
     }
     // PROXY protocol 的头是给 TCP 的服务读的：v1 没有 UDP 的写法，v2 的要加在每个报文前面，认它的 UDP 服务几乎没有。
@@ -163,6 +165,23 @@ fn check(store: &Store, network: NetworkId, replacing: Option<&ForwardRecord>, m
             "target_addr",
             "not_connectable",
             format!("目标地址 {} 不是一个能连上的地址", config.target_addr),
+        ));
+    }
+    // 下面两种地址目标节点不会去连（它自己也查），这里就不收：配上了也只是一条不通的转发。
+    let target_ip = config.target_addr.ip().to_canonical();
+    if is_cloud_metadata(target_ip) {
+        return Err(Error::invalid_field(
+            "target_addr",
+            "cloud_metadata",
+            format!("目标地址 {} 是云平台的元数据地址，端口转发不能指向它", config.target_addr),
+        ));
+    }
+    let cidr = store.network(network)?.ok_or(Error::NotFound(Entity::Network))?.cidr;
+    if matches!(target_ip, IpAddr::V4(ip) if cidr.contains(&ip)) {
+        return Err(Error::invalid_field(
+            "target_addr",
+            "overlay_address",
+            format!("目标地址 {} 在网络的虚拟地址段 {cidr} 里：这里填目标节点自己去连的地址（回环或者它所在的局域网）", config.target_addr),
         ));
     }
     // 端口写 0 的各挑各的端口，不算冲突。

@@ -13,7 +13,7 @@
 //!
 //! 上下文没有报文往来超过 [`IDLE_TIMEOUT`] 就回收，发起方下次要用时再开。
 //!
-//! 监听在本节点虚拟 IP 上、目标是别的节点的 UDP 端口转发要接力：目标第一次出现时，本节点到转发的目标节点开一个自己的
+//! 对组网里的节点开着（监听在本节点的虚拟 IP 或者全部地址上）、目标是别的节点的 UDP 端口转发要接力：目标第一次出现时，本节点到转发的目标节点开一个自己的
 //! 数据报上下文（访问规则两段都要允许），之后发往这个端口的报文都从那个上下文转过去，回来的报文报成从这个端口来的。
 
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use crate::grant::Grant;
-use crate::handler::{check_allow_list, forward_on_virtual_ip, virtual_forward_target};
+use crate::handler::{check_allow_list, forward_at_node_port, virtual_forward_target};
 use crate::limits::Limits;
 use crate::outbound::{Asker, Outbound};
 use crate::stats::Counters;
@@ -110,7 +110,7 @@ enum Outcome {
         exit_traffic: bool,
         grant: Grant,
     },
-    /// 监听在本节点虚拟 IP 上、目标是 `node` 的 UDP 端口转发：经本节点到 `node` 的上下文接力。
+    /// 对组网里的节点开着、目标是 `node` 的 UDP 端口转发：经本节点到 `node` 的上下文接力。
     Onward {
         forward: u32,
         node: NodeId,
@@ -478,7 +478,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                 let addr = self.outbound.lan_target(netmap, *addr)?;
                 return Ok(Checked::Address(Destination { addr, source: target.clone(), exit_traffic: true, grant: Grant::Lan }));
             }
-            Target::Node { port } => match forward_on_virtual_ip(netmap, *port, ForwardProtocol::Udp) {
+            Target::Node { port } => match forward_at_node_port(netmap, *port, ForwardProtocol::Udp, &self.outbound.own_listeners()) {
                 Some(forward) if forward.target != netmap.me.id => {
                     // 访问规则两段：发起节点能访问本节点（上面查过），本节点能访问目标节点。目标节点还会按编号再查一遍。
                     check_allow_list(initiator, forward)?;
@@ -488,13 +488,13 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                             "这条端口转发的目标节点不在本节点的 netmap 里，或者访问规则不允许本节点访问它",
                         ));
                     }
-                    let grant = Grant::VirtualForward { port: *port, id: forward.id, target: forward.target, addr: None };
+                    let grant = Grant::VirtualForward { id: forward.id, bind: forward.bind, target: forward.target, addr: None };
                     return Ok(Checked::Onward { forward: forward.id, node: forward.target, grant });
                 }
                 Some(forward) => {
                     let addr = virtual_forward_target(netmap, initiator, forward)?.addr;
-                    self.outbound.not_overlay(addr)?;
-                    (addr, Grant::VirtualForward { port: *port, id: forward.id, target: forward.target, addr: Some(addr) })
+                    self.outbound.forwardable(addr)?;
+                    (addr, Grant::VirtualForward { id: forward.id, bind: forward.bind, target: forward.target, addr: Some(addr) })
                 }
                 None => (self.outbound.udp_node(*port)?, Grant::NodeService),
             },
@@ -506,7 +506,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                     .find(|entry| entry.id == *id && entry.listener == self.peer && entry.protocol == ForwardProtocol::Udp);
                 match listed {
                     Some(entry) => {
-                        self.outbound.not_overlay(entry.addr)?;
+                        self.outbound.forwardable(entry.addr)?;
                         (entry.addr, Grant::Forward { id: *id, addr: entry.addr })
                     }
                     None => return Err(Reply::new(Status::UnknownForward, "没有下发给这个节点、由发起节点监听的这条 UDP 端口转发")),
