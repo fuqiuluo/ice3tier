@@ -60,7 +60,8 @@ impl Inner {
     /// 重算 `seeds` 和被它们牵连的节点的 netmap，内容变了的下发。
     /// `force` 指定的节点即使内容没变也发一份：它刚连上来，不知道它手上是哪一版。
     ///
-    /// 出错时没算完的节点已经排上了重试，后台任务也叫醒了：调用方把错误交回去就行，不用自己再排。
+    /// 一个节点没做成不耽误别的。返回的是头一个错误；没做成的节点已经排上了重试，后台任务也叫醒了，
+    /// 调用方把错误交回去就行，不用自己再排。
     pub(crate) fn refresh(&mut self, network: NetworkId, seeds: Seeds, force: Option<NodeId>) -> Result<(), Error> {
         let view = match NetworkView::load(&self.store, network) {
             Ok(Some(view)) => view,
@@ -84,19 +85,23 @@ impl Inner {
             self.sync.entry(*node).or_default();
         }
         let batch = self.reconcile(&view, &access, &seeds);
+        // 一个节点没做成不耽误同一批里别的：各算各的，看到的是同一套"谁在等谁确认"。
+        // 不然一个一直记不下来的节点会把排在它后面的都挡住，比如等它停下来才能不认它的目的端。
+        let mut failed = BTreeSet::new();
+        let mut first_error = None;
         for &node in &batch {
             if let Err(err) = self.publish(&view, &access, node, force == Some(node)) {
-                // 这一个和排在它后面的都还没算完。`reconcile` 已经替它们登记了等待，
-                // 不重试的话它们要到下一次碰巧有别的变化才会拿到新的 netmap。
-                self.retry_later(network, batch.range(node..).copied());
-                return Err(err);
+                failed.insert(node);
+                first_error.get_or_insert(err);
             }
         }
-        Ok(())
+        // `reconcile` 已经替没做成的登记了等待，不重试的话它们要到下一次碰巧有别的变化才会拿到新的 netmap。
+        self.retry_later(network, failed);
+        first_error.map_or(Ok(()), Err)
     }
 
     /// 这些节点的重算没做成：过一会儿再试，并且叫醒后台任务，让它到点来做。
-    /// 一个节点都没有时（要重算整个网络，网络读不出来，又没有谁在线）没有排上谁，就不叫。
+    /// 一个节点都没有时（都做成了；或者要重算整个网络，网络读不出来，又没有谁在线）没有排上谁，就不叫。
     fn retry_later(&mut self, network: NetworkId, nodes: impl IntoIterator<Item = NodeId>) {
         let mut nodes = nodes.into_iter().peekable();
         if nodes.peek().is_none() {

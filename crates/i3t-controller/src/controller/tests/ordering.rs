@@ -239,15 +239,27 @@ fn stored(lab: &Lab, node: NodeId) -> NetmapState {
 const BLOCK_VERSIONS: &str =
     "CREATE TRIGGER no_netmap BEFORE UPDATE OF netmap_version ON nodes BEGIN SELECT RAISE(ABORT, 'no netmap'); END;";
 const UNBLOCK_VERSIONS: &str = "DROP TRIGGER no_netmap;";
-/// "发到了哪一版"记不进存储，别的照常能写。
-const BLOCK_SENT: &str = "CREATE TRIGGER no_sent BEFORE UPDATE OF sent_version ON nodes BEGIN SELECT RAISE(ABORT, 'no sent'); END;";
-const UNBLOCK_SENT: &str = "DROP TRIGGER no_sent;";
 /// 规则读不出来（临时表挡在真的表前面，列对不上），写不受影响：重算一开头读网络就失败。
 const BLOCK_READING: &str = "CREATE TEMP TABLE rules (shadow INTEGER);";
 const UNBLOCK_READING: &str = "DROP TABLE temp.rules;";
 
 fn sql(lab: &Lab, sql: &str) {
     lab.controller.lock().store.execute_batch(sql);
+}
+
+/// 只有这一个节点的那一列写不进存储，别的节点照常。用 `unblock` 恢复。
+fn block_column_of(lab: &Lab, column: &str, node: NodeId) {
+    let id = node.get();
+    sql(
+        lab,
+        &format!(
+            "CREATE TRIGGER no_{column} BEFORE UPDATE OF {column} ON nodes WHEN NEW.id = {id} BEGIN SELECT RAISE(ABORT, 'blocked'); END;"
+        ),
+    );
+}
+
+fn unblock(lab: &Lab, column: &str) {
+    sql(lab, &format!("DROP TRIGGER no_{column};"));
 }
 
 /// 后台任务现在是不是被叫醒了。问一次就算它醒过一次。
@@ -345,7 +357,7 @@ fn an_acknowledgement_the_store_could_not_record_still_lets_the_peer_go_on() {
 }
 
 #[test]
-fn nodes_behind_a_failed_one_in_the_same_push_are_not_forgotten() {
+fn a_node_that_could_not_be_recorded_does_not_hold_up_the_others_in_the_same_push() {
     let mut lab = Lab::new();
     let network = lab.network("home");
     drop_default_rule(&lab, network.id);
@@ -354,7 +366,32 @@ fn nodes_behind_a_failed_one_in_the_same_push_are_not_forgotten() {
     let mut second = lab.join(network.id, &["dst"]);
     lab.settle(&mut [&mut source, &mut first, &mut second]);
 
-    // 规则存下来了，可是给第一个目的端记新版本号时写不进去：这一次下发到它为止，第二个目的端还没轮到。
+    // 规则存下来了，可是第一个目的端的新版本号写不进去。排在它后面的第二个照常下发，不等它。
+    block_column_of(&lab, "netmap_version", first.id);
+    assert!(lab.controller.create_rule(network.id, &one_way(&lab, network.id)).is_err());
+    assert_eq!((first.receive(), second.receive()), (0, 1));
+    assert_eq!(relations(second.netmap()), vec![(source.id, true, false)]);
+    assert_eq!(lab.controller.lock().dirty.keys().copied().collect::<Vec<_>>(), vec![first.id], "只有没做成的排着重试");
+    unblock(&lab, "netmap_version");
+
+    tick_after(&lab, PAST_RETRY).unwrap();
+    first.receive();
+    assert_eq!(relations(first.netmap()), vec![(source.id, true, false)], "失败的那个过一会儿重试");
+    lab.settle(&mut [&mut source, &mut first, &mut second]);
+    assert_eq!(peer_ids(source.netmap()), vec![first.id, second.id], "两个目的端都确认之后，发起端可以访问它们");
+}
+
+#[test]
+fn every_node_that_failed_in_a_push_is_tried_again() {
+    let mut lab = Lab::new();
+    let network = lab.network("home");
+    drop_default_rule(&lab, network.id);
+    let mut source = lab.join(network.id, &["src"]);
+    let mut first = lab.join(network.id, &["dst"]);
+    let mut second = lab.join(network.id, &["dst"]);
+    lab.settle(&mut [&mut source, &mut first, &mut second]);
+
+    // 谁的新版本号都写不进去：两个目的端都没做成，都要重试。
     sql(&lab, BLOCK_VERSIONS);
     assert!(lab.controller.create_rule(network.id, &one_way(&lab, network.id)).is_err());
     assert_eq!(first.receive() + second.receive(), 0);
@@ -363,10 +400,10 @@ fn nodes_behind_a_failed_one_in_the_same_push_are_not_forgotten() {
     tick_after(&lab, PAST_RETRY).unwrap();
     first.receive();
     second.receive();
-    assert_eq!(relations(first.netmap()), vec![(source.id, true, false)], "失败的那个过一会儿重试");
-    assert_eq!(relations(second.netmap()), vec![(source.id, true, false)], "排在它后面的也没有落下");
+    assert_eq!(relations(first.netmap()), vec![(source.id, true, false)]);
+    assert_eq!(relations(second.netmap()), vec![(source.id, true, false)]);
     lab.settle(&mut [&mut source, &mut first, &mut second]);
-    assert_eq!(peer_ids(source.netmap()), vec![first.id, second.id], "两个目的端都确认之后，发起端可以访问它们");
+    assert_eq!(peer_ids(source.netmap()), vec![first.id, second.id]);
 }
 
 #[test]
@@ -408,18 +445,18 @@ fn a_snapshot_that_went_out_is_not_sent_again_when_recording_it_failed() {
         lab.controller.update_node(network.id, renamed_id, &request)
     };
 
-    // 第一个节点的新 netmap 发出去了，只是"发到了哪一版"记不下来；第二个还没轮到。
-    sql(&lab, BLOCK_SENT);
+    // 第一个节点的新 netmap 发出去了，只是"发到了哪一版"记不下来。排在它后面的照常下发、照常记。
+    block_column_of(&lab, "sent_version", first.id);
     assert!(rename("moved").is_err());
-    assert_eq!((first.receive(), second.receive()), (1, 0));
+    assert_eq!((first.receive(), second.receive()), (1, 1));
+    assert_eq!(second.netmap().peer(renamed.id).unwrap().name, "moved");
     let version = first.netmap().version;
     assert_eq!(lab.controller.node(network.id, first.id).unwrap().node.sent_version, version, "发出去了就算发了");
-    sql(&lab, UNBLOCK_SENT);
+    assert_eq!(stored(&lab, second.id).sent, second.netmap().version);
+    unblock(&lab, "sent_version");
 
     tick_after(&lab, PAST_RETRY).unwrap();
-    assert_eq!(first.receive(), 0, "已经发出去的那一版不重发");
-    assert_eq!(second.receive(), 1, "排在它后面的补发");
-    assert_eq!(second.netmap().peer(renamed.id).unwrap().name, "moved");
+    assert_eq!((first.receive(), second.receive()), (0, 0), "已经发出去的那一版不重发");
     lab.settle(&mut [&mut first, &mut second, &mut renamed]);
     assert_eq!((first.netmap().version, renamed.netmap().me.name.as_str()), (version, "moved"));
     assert_eq!(lab.controller.node(network.id, first.id).unwrap().node.acked_version, version, "节点的确认对得上");
@@ -506,6 +543,42 @@ fn a_failed_push_that_leaves_nobody_to_retry_does_not_wake_the_background_task()
     sql(&lab, UNBLOCK_READING);
     let other = lab.connect(other.key, Declared::default()).unwrap();
     assert!(other.netmap().peers.is_empty(), "不在线的节点回来时拿到的是那时的内容");
+}
+
+#[test]
+fn a_revocation_takes_effect_in_time_even_if_the_initiators_netmap_can_never_be_recorded() {
+    let timeout = Duration::from_millis(50);
+    let mut lab = Lab::with_timing(impatient(timeout));
+    let (network, mut source, mut destination) = two_unconnected(&mut lab);
+    let rule = add_rule(&lab, network, "src", "dst", Direction::OneWay);
+    lab.settle(&mut [&mut source, &mut destination]);
+
+    // 只有发起端的新版本号一直记不下来，目的端照常能写。
+    block_column_of(&lab, "netmap_version", source.id);
+    assert!(lab.controller.delete_rule(network, rule).is_err());
+    assert_eq!(source.receive() + destination.receive(), 0);
+    assert_eq!(relations(&lab.netmap(destination.id)), vec![(source.id, true, false)], "先等发起端停");
+
+    // 等满了超时：发起端那一版发没发出去，都不能再拖着目的端。
+    std::thread::sleep(timeout * 2);
+    assert!(tick_after(&lab, PAST_RETRY).is_err(), "发起端还是记不下来");
+    destination.receive();
+    assert!(destination.netmap().peers.is_empty(), "撤销生效的期限不取决于发起端那一版记不记得下来");
+
+    // 发起端一直在重试、一直失败：不会把等待重新挂起来，也不会把许可还给它。
+    for _ in 0..3 {
+        assert!(tick_after(&lab, PAST_RETRY).is_err());
+    }
+    assert_eq!(destination.receive(), 0);
+    assert!(lab.netmap(destination.id).peers.is_empty());
+    assert!(!lab.controller.lock().sync[&source.id].is_waiting());
+    assert_eq!(source.receive(), 0);
+
+    // 能记了之后，发起端照旧收到撤销。
+    unblock(&lab, "netmap_version");
+    tick_after(&lab, PAST_RETRY).unwrap();
+    source.receive();
+    assert!(source.netmap().peers.is_empty());
 }
 
 #[test]
