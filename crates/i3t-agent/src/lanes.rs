@@ -652,16 +652,10 @@ mod tests {
                 let peer_id = with_peer(&mut map, 2, LaneMode::Always);
                 map.peers[0].key = peer_key.public();
                 let (netmap_tx, netmap_rx) = watch::channel(Arc::new(map));
-                let endpoint = Arc::new(
-                    Endpoint::bind(EndpointConfig {
-                        key: Arc::clone(&key),
-                        bind: "127.0.0.1:0".parse().unwrap(),
-                        netmap: netmap_rx.clone(),
-                        addr_servers: Vec::new(),
-                    })
-                    .unwrap(),
-                );
+                let endpoint = Arc::new(bind_relay_endpoint(&key, &netmap_rx));
                 let lanes = Arc::new(NodeLanes::new(&key, Arc::clone(&endpoint)).unwrap());
+                // 先同步应用初始 netmap，确保 relay 的 TCP handoff 在对端开始拨号前已就绪。
+                lanes.apply(&netmap_rx.borrow());
                 let acceptor = lanes.acceptor();
                 let follow = tokio::spawn(Arc::clone(&lanes).follow(netmap_rx));
                 let peer = Lanes::new(&peer_key, LaneConfig::default()).unwrap();
@@ -707,6 +701,37 @@ mod tests {
             .await
             .expect("lane 应当在身份吊销时结束");
         }
+    }
+
+    /// 绑定测试用 relay 端点，选择 TCP 与 UDP 均空闲的回环端口（relay 会在同端口号监听 TCP）。
+    fn bind_relay_endpoint(key: &Arc<NodeKey>, netmap: &watch::Receiver<Arc<Netmap>>) -> Endpoint {
+        let mut last_error = String::new();
+        for attempt in 0..100 {
+            let bound = if attempt % 2 == 0 {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let bind = probe.local_addr().unwrap();
+                drop(probe);
+                Endpoint::bind(EndpointConfig { key: Arc::clone(key), bind, netmap: netmap.clone(), addr_servers: Vec::new() })
+                    .map_err(|error| format!("{error:?}"))
+            } else {
+                Endpoint::bind(EndpointConfig {
+                    key: Arc::clone(key),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    netmap: netmap.clone(),
+                    addr_servers: Vec::new(),
+                })
+                .map_err(|error| format!("{error:?}"))
+                .and_then(|endpoint| match std::net::TcpListener::bind(endpoint.local_addr()) {
+                    Ok(_) => Ok(endpoint),
+                    Err(error) => Err(format!("TCP {}：{error}", endpoint.local_addr())),
+                })
+            };
+            match bound {
+                Ok(endpoint) => return endpoint,
+                Err(error) => last_error = error,
+            }
+        }
+        panic!("找不到 TCP 和 UDP 都空闲的端口，最后一次失败：{last_error}");
     }
 
     /// 一个对端的空状况。`PeerLaneStatus` 在别的 crate 里、不能直接写出来，借 `Lanes` 造一个。
