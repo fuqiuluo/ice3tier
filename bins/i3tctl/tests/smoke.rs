@@ -155,7 +155,7 @@ async fn the_command_line_drives_a_running_controller() {
     let missing = fixture.command().args(["--url", &url, "status"]).output().await.unwrap();
     assert!(!missing.status.success() && text(&missing.stderr).contains("I3T_ADMIN_TOKEN"), "{}", text(&missing.stderr));
     let unreachable = fixture.command().args(["--url", "http://127.0.0.1:1", "--token", "x", "status"]).output().await.unwrap();
-    assert!(!unreachable.status.success() && text(&unreachable.stderr).contains("连不上"), "{}", text(&unreachable.stderr));
+    assert!(!unreachable.status.success() && text(&unreachable.stderr).contains("无法连接"), "{}", text(&unreachable.stderr));
 
     // 网络。
     assert!(fixture.fails(&["node", "list"]).await.contains("network create"), "还没有网络时要告诉人怎么办");
@@ -245,7 +245,7 @@ async fn the_command_line_drives_a_running_controller() {
     let found = &nas["relay"]["addresses"][0];
     assert_eq!(found["source"], "observed", "{nas}");
     let shown = fixture.ok(&["node", "show", "nas-01"]).await;
-    assert!(shown.contains(&format!("{}（controller 看到的）", found["address"].as_str().unwrap())), "{shown}");
+    assert!(shown.contains(&format!("{}（controller 观测）", found["address"].as_str().unwrap())), "{shown}");
     assert!(nas["exit"]["ports"].is_null() && nas["exit"]["lan"] == true);
     fixture.ok(&["node", "set", "laptop", "--pin", "nas-01"]).await;
     assert!(fixture.ok(&["node", "list"]).await.contains("中继、出口"));
@@ -287,7 +287,7 @@ async fn the_command_line_drives_a_running_controller() {
 
     // 代理、端口转发、节点对。
     let refused = fixture.fails(&["proxy", "add", "laptop", "192.168.1.5:1080", "nas-01"]).await;
-    assert!(refused.contains("exit_not_enabled") && refused.contains("没有启用出口"), "出口停用着：{refused}");
+    assert!(refused.contains("exit_not_enabled") && refused.contains("未启用出口"), "出口停用着：{refused}");
     fixture.ok(&["exit", "enable", "nas-01"]).await;
     let proxy = fixture.json(&["proxy", "add", "laptop", "192.168.1.5:1080", "nas-01", "--allow-from", "192.168.1.0/24"]).await;
     let password = proxy["password"].as_str().unwrap().to_owned();
@@ -305,7 +305,7 @@ async fn the_command_line_drives_a_running_controller() {
     // 这两个假装的节点说的是最初那一版节点协议，不懂 ice3proxy。
     assert_eq!((&chosen["lane"], &chosen["lane_effect"]["blocked"][0]["reason"]), (&json!(true), &json!("node_too_old")), "{chosen}");
     let shown = fixture.ok(&["proxy", "show", &proxy_id]).await;
-    assert!(Fixture::has_line(&shown, &["ice3proxy", "是", "未生效"]) && Fixture::has_line(&shown, &["laptop 的版本太旧"]), "{shown}");
+    assert!(Fixture::has_line(&shown, &["ice3proxy", "是", "未生效"]) && Fixture::has_line(&shown, &["laptop 版本过旧"]), "{shown}");
     assert!(Fixture::has_line(&fixture.ok(&["proxy", "list"]).await, &["laptop-1080", "未生效"]));
     let second = fixture.json(&["proxy", "add", "laptop", "127.0.0.1:1090", "nas-01", "--ice3proxy"]).await;
     assert_eq!(second["lane"], true, "写了 --ice3proxy 就走");
@@ -483,7 +483,7 @@ async fn updates_routes_and_paths_can_be_driven_from_the_command_line() {
         row("laptop").contains("0.2.0") && row("laptop").contains("是") && row("laptop").contains("有新版本 0.2.0（安全更新）"),
         "{nodes}"
     );
-    assert!(row("node-2").contains("版本太旧") && row("node-2").contains("开"), "{nodes}");
+    assert!(row("node-2").contains("版本过旧") && row("node-2").contains("开"), "{nodes}");
     let detail = fixture.ok(&["node", "show", "laptop"]).await;
     assert!(
         Fixture::has_line(&detail, &["主机名", "Laptop.lan"]) && Fixture::has_line(&detail, &["更新", "有新版本 0.2.0（安全更新）"]),
@@ -504,13 +504,13 @@ async fn updates_routes_and_paths_can_be_driven_from_the_command_line() {
     // 强制更新：包还没有取回来时先排着；取回来之后指令发出去。
     assert!(fixture.fails(&["update", "node", "node-2"]).await.contains("cannot_self_update"));
     let queued = fixture.ok(&["update", "node", "laptop", "--drain"]).await;
-    assert!(queued.contains("等待下载包"), "{queued}");
+    assert!(queued.contains("等待下载安装包"), "{queued}");
     let controller = Arc::clone(&fixture.controller);
     tokio::task::spawn_blocking(move || controller.fetch_packages().unwrap()).await.unwrap();
     let update = fixture.json(&["update", "node", "laptop", "--drain"]).await;
     assert_eq!(update["ordered"], serde_json::json!({ "version": "0.2.0", "timing": "after_drain" }));
     let all = fixture.ok(&["update", "all"]).await;
-    assert!(Fixture::has_line(&all, &["已下发", "laptop"]) && Fixture::has_line(&all, &["跳过 node-2", "版本太旧"]), "{all}");
+    assert!(Fixture::has_line(&all, &["已下发", "laptop"]) && Fixture::has_line(&all, &["跳过 node-2", "版本过旧"]), "{all}");
     fixture.report(&laptop, Report { update: Some(UpdateStatus::Draining { version: "0.2.0".parse().unwrap() }), ..Report::default() });
     assert!(fixture.ok(&["update", "nodes"]).await.contains("正在排空"));
 
@@ -524,7 +524,7 @@ async fn updates_routes_and_paths_can_be_driven_from_the_command_line() {
     fixture.report(&laptop, Report { update: Some(failed), ..Report::default() });
     let paused = fixture.ok(&["update", "show"]).await;
     assert!(paused.contains("0.2.0 已暂停：laptop") && paused.contains("i3tctl update resume 0.2.0"), "{paused}");
-    assert!(paused.contains("自检没有通过（退出码 1）：config.toml unreadable"), "按原因的代码写：{paused}");
+    assert!(paused.contains("自检未通过（退出码 1）：config.toml unreadable"), "按原因的代码写：{paused}");
     assert!(fixture.ok(&["update", "nodes"]).await.contains("不再自动重试"));
     let english = fixture.english(&["update", "show"]).await;
     assert!(english.contains("Self-check failed (exit code 1): config.toml unreadable"), "{english}");
@@ -548,12 +548,12 @@ async fn updates_routes_and_paths_can_be_driven_from_the_command_line() {
     assert_eq!(fixture.json(&["routes"]).await["entries"][0]["stale"], false);
     // laptop 懂路由查询但不会回答（它只是个收件箱），等几秒之后退回到上报的数据；它没有上报过。
     let path = fixture.ok(&["path", "laptop", "node-2"]).await;
-    assert!(Fixture::has_line(&path, &["laptop → node-2", "没有数据"]), "{path}");
+    assert!(Fixture::has_line(&path, &["laptop → node-2", "无数据"]), "{path}");
     assert!(
         path.contains("node-2 → laptop  直连 203.0.113.9:20330  7") && Fixture::has_line(&path, &["node-2 → laptop", "上报"]),
         "{path}"
     );
-    assert!(path.contains("用的是它的上报"), "{path}");
+    assert!(path.contains("当前使用其上报数据"), "{path}");
     fixture.english(&["path", "laptop", "node-2"]).await;
     assert_eq!(fixture.json(&["path", "node-2", "laptop"]).await["forward"]["source"], "report");
     assert!(fixture.fails(&["path", "laptop", "laptop"]).await.contains("invalid_request"));
@@ -593,7 +593,7 @@ async fn active_tests_and_the_matrix_are_run_and_shown_from_the_command_line() {
     }
     let shown = fixture.ok(&["tests", "show", &id.to_string()]).await;
     assert!(shown.contains(&format!("测试 #{id}  laptop → nas  完成")) && shown.contains("直连：是（打洞、640 ms）"), "{shown}");
-    assert!(shown.contains("laptop：连上了") && shown.contains("nas：连上了"), "{shown}");
+    assert!(shown.contains("laptop：已连接") && shown.contains("nas：已连接"), "{shown}");
     let english = fixture.english(&["tests", "show", &id.to_string()]).await;
     assert!(english.contains("Direct: yes (hole punched, 640 ms)"), "{english}");
     let listed = fixture.ok(&["tests", "list", "nas", "laptop"]).await;
@@ -603,13 +603,13 @@ async fn active_tests_and_the_matrix_are_run_and_shown_from_the_command_line() {
 
     // 版本太旧的节点：测试立刻失败，说是哪个节点。等结果的这一种也马上返回。
     let refused = fixture.ok(&["test", "laptop", "old"]).await;
-    assert!(refused.contains("没有做成：old：版本太旧，不支持主动测试"), "{refused}");
+    assert!(refused.contains("测试失败：old：版本过旧，不支持主动测试"), "{refused}");
 
     // 全网矩阵：开始（不等）、看、取消。
     let run = fixture.json(&["tests", "matrix", "--no-wait"]).await;
     assert_eq!((run["total"].as_u64(), run["state"].as_str()), (Some(3), Some("running")));
     let matrix = fixture.ok(&["tests", "matrix", "--show"]).await;
-    assert!(matrix.starts_with("全网矩阵 #1  进行中") && matrix.contains("old：版本太旧"), "{matrix}");
+    assert!(matrix.starts_with("全网矩阵 #1  进行中") && matrix.contains("old：版本过旧"), "{matrix}");
     fixture.english(&["tests", "matrix", "--show"]).await;
     let cancelled = fixture.ok(&["tests", "matrix", "--cancel"]).await;
     assert!(cancelled.starts_with("全网矩阵 #1  已取消"), "{cancelled}");

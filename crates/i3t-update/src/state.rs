@@ -1,7 +1,7 @@
-//! 更新的持久状态：哪个版本换上去了还没确认，哪些版本在这台机器上失败过。
+//! 更新持久化状态：记录待确认的已安装版本以及本机历史上失败过的版本。
 //!
-//! 存在状态目录的 `update/state.json` 里。写它的和读它的常常不是同一个版本的程序：记下"待确认"的是旧程序，
-//! 启动时读它的是新程序；换回之后读失败记录的又是旧程序。所以字段只增不改，读的时候忽略不认识的。
+//! 存储在状态目录的 `update/state.json` 中。读写双方通常分属不同版本：写入“待确认”记录的是旧版本，
+//! 启动时读取它的是新版本；回滚后读取失败记录的又是旧版本。因此字段只增不改，反序列化时忽略未知字段。
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -15,8 +15,8 @@ use crate::error::UpdateError;
 
 const STATE_FILE: &str = "state.json";
 
-/// 失败记录留多少条。一个版本只占一条，新版本装成之后旧的记录会被清掉，所以正常情况下只有零到一条；
-/// 上限只是防止文件在意料之外的情况下一直变长。
+/// 保留的失败记录数量上限。每个版本仅保留一条，新版本确认后旧记录会被清除，正常情况下仅有 0 至 1 条；
+/// 设置上限仅用于防止异常场景下状态文件无限增长。
 const MAX_FAILURES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -27,33 +27,33 @@ pub(crate) struct State {
     pub failed: Vec<FailedVersion>,
 }
 
-/// 一个已经换上去、还没有被确认的版本。
+/// 已安装但尚未确认的新版本记录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Pending {
     pub version: Version,
-    /// 被换下来、留作备份的那个版本。
+    /// 被替换并留作备份的上一版本。
     pub previous: Version,
-    /// 新程序已经启动过几次。
+    /// 新版本已尝试启动的次数。
     pub starts: u32,
-    /// 什么时候换上去的，Unix 秒。
+    /// 新版本的安装时间（Unix 时间戳，单位：秒）。
     pub since: u64,
 }
 
 impl Pending {
-    /// 换上去之后过了多久。系统时钟被往回拨过的话算作刚换上去。
+    /// 计算距离安装经过的时间。若系统时钟被回拨，则视为 0 秒（刚刚安装）。
     pub fn age(&self, now: u64) -> Duration {
         Duration::from_secs(now.saturating_sub(self.since))
     }
 }
 
-/// 一个在这台机器上失败过的版本：自检没有通过，或者装上之后没能连上 controller、被换回了。
+/// 本机历史上更新失败的版本记录：包括自检失败，或安装后未能连接 controller 而触发回滚的版本。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailedVersion {
     pub version: Version,
     pub reason: String,
-    /// 什么时候失败的，Unix 秒。
+    /// 失败时间（Unix 时间戳，单位：秒）。
     pub at: u64,
-    /// `reason` 的代码。这个字段出现之前记下的失败没有。
+    /// 对应 `reason` 的结构化原因代码。旧版本写入的记录中可能缺失该字段。
     #[serde(default)]
     pub cause: Option<UpdateCause>,
 }
@@ -63,7 +63,7 @@ impl State {
         self.failed.iter().find(|failure| &failure.version == version)
     }
 
-    /// 记下一次失败。同一个版本只留最近的一次。
+    /// 记录一次版本失败。同一版本仅保留最近一条记录。
     pub fn record_failure(&mut self, version: Version, reason: String, cause: UpdateCause) {
         self.failed.retain(|failure| failure.version != version);
         self.failed.push(FailedVersion { version, reason, at: now(), cause: Some(cause) });
@@ -71,13 +71,13 @@ impl State {
         self.failed.drain(..excess);
     }
 
-    /// `version` 装成了：它和比它旧的版本的失败记录不再有意义。
+    /// 版本 `version` 已确认更新成功，清除该版本及更早版本的失败记录。
     pub fn forget_failures_up_to(&mut self, version: &Version) {
         self.failed.retain(|failure| &failure.version > version);
     }
 }
 
-/// 现在的时间，Unix 秒。
+/// 当前系统时间（Unix 时间戳，单位：秒）。
 pub(crate) fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since_epoch| since_epoch.as_secs())
 }
@@ -92,25 +92,25 @@ impl StateFile {
         Self { path: update_dir.join(STATE_FILE) }
     }
 
-    /// 文件不存在就是"什么都没有发生过"。文件坏了是错误，不能当成什么都没有：那样会丢掉待确认的记录，备份就再也不会被换回了。
+    /// 状态文件不存在时返回空状态。若文件损坏则返回错误，而不能按空状态处理，否则会丢失待确认记录导致无法回滚备份。
     pub fn load(&self) -> Result<State, UpdateError> {
         match fs::read(&self.path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| UpdateError::State { path: self.path.clone(), source }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(State::default()),
-            Err(error) => Err(UpdateError::io("读", &self.path)(error)),
+            Err(error) => Err(UpdateError::io("读取", &self.path)(error)),
         }
     }
 
-    /// 先写临时文件再改名，并且落盘之后才返回：调用方接下来要换程序文件，这条记录得先稳稳地在盘上。
+    /// 先写入临时文件再原子重命名，并在同步落盘后返回：调用方随后将替换可执行文件，状态记录必须先可靠落盘。
     pub fn save(&self, state: &State) -> Result<(), UpdateError> {
-        let bytes = serde_json::to_vec_pretty(state).expect("状态里只有字符串和整数，序列化不会失败");
+        let bytes = serde_json::to_vec_pretty(state).expect("更新状态序列化失败");
         let temporary = self.path.with_extension("json.tmp");
         let write = || -> io::Result<()> {
             let mut file = File::create(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, &self.path)?;
-            // 目录在 Windows 上不能这样打开；那里改名的落盘由文件系统的日志保证。
+            // Windows 不支持以只读句柄打开目录进行同步；重命名持久化由文件系统日志保证。
             if cfg!(unix)
                 && let Some(dir) = self.path.parent()
             {
@@ -118,7 +118,7 @@ impl StateFile {
             }
             Ok(())
         };
-        write().map_err(UpdateError::io("写", &self.path))
+        write().map_err(UpdateError::io("写入", &self.path))
     }
 }
 

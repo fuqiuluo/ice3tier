@@ -606,7 +606,7 @@ def two_islands(lab: Lab, work: Path, t: Checks) -> None:
     cause = (path.get("forward") or {}).get("cause") or {}
     t.check("路径的原因：没有两端都用得上的中继", cause.get("code") == "no_shared_relay", str(path.get("forward", {}).get("reason")))
     shown = controller.host.run(binary("i3tctl"), "--token", controller.token, "path", str(o.id), str(a.id), check=False).stdout
-    t.check("i3tctl path 写着为什么经一串中继（中继写的是名字）", "没有两端都用得上的中继" in shown and f"{p.name} → {h.name}" in shown, shown)
+    t.check("i3tctl path 写着为什么经一串中继（中继写的是名字）", "没有两端均可用的中继" in shown and f"{p.name} → {h.name}" in shown, shown)
     print(f"   计时：节点加入到外面的节点用上家里的服务 {took:.1f} 秒", flush=True)
 
     # 一个两边都连得上的中继出现了：这一对少绕路，换到它上面。
@@ -683,7 +683,7 @@ def idle_held_offline(lab: Lab, work: Path, t: Checks) -> None:
     controller.ctl("exit", "enable", str(b.id))
     controller.add_proxy(a, b)
     url, expect = f"http://{web.ip}/", lab.hosts["nat-b"].ip
-    closed, held = "和对端的连接结束", "空闲的连接先不关"
+    closed, held = "和对端的连接结束", "暂不回收空闲连接"
 
     t.check("打洞直连，a 经 b 访问", reaches(a, url, b, expect, timeout=40))
     try:

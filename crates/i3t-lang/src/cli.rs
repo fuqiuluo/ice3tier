@@ -2,7 +2,7 @@
 //! 默认值和环境变量的写法，以及解析出错时的那几句话。
 //!
 //! 各个程序先把自己的说明（命令、参数、值的名字）写到 `Command` 上，再交给 [`localize`] 换掉剩下的英文；
-//! 解析用 [`parse`]，出错时按语言写出来。clap 不认识的错误（极少见的几种，见 [`render_error`]）照它自己的英文写。
+//! 使用 [`parse`] 解析命令行，出错时按目标语言输出提示。clap 无法识别的极少数错误（见 [`render_error`]）沿用其默认英文提示。
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -62,20 +62,20 @@ pub static ZH: ClapTexts = ClapTexts {
     default: |value| format!("默认 {value}"),
     env: |name| format!("环境变量 {name}"),
     error: "错误:",
-    unknown_argument: |arg| format!("不认识的参数 {arg}"),
-    unknown_command: |name| format!("没有命令 {name}"),
-    did_you_mean: |candidate| format!("要写的是 {candidate}？"),
+    unknown_argument: |arg| format!("未知参数 {arg}"),
+    unknown_command: |name| format!("未知命令 {name}"),
+    did_you_mean: |candidate| format!("是否要输入 {candidate}？"),
     tip: |tip| format!("提示：{tip}"),
-    missing_value: |arg| format!("{arg} 后面要写一个值"),
-    invalid_value: |arg, value| format!("{arg} 不能是 {value}"),
-    possible_values: |values| format!("可以写：{values}"),
+    missing_value: |arg| format!("{arg} 缺少参数值"),
+    invalid_value: |arg, value| format!("{arg} 的值 {value} 无效"),
+    possible_values: |values| format!("可选值：{values}"),
     missing_arguments: |args| format!("缺少 {args}"),
-    missing_command: |name| format!("{name} 后面要写一个子命令"),
-    conflict: |arg, other| format!("{arg} 和 {other} 不能一起写"),
-    repeated: |arg| format!("{arg} 只能写一次"),
-    value_count: |arg| format!("{arg} 的值的个数不对"),
-    no_equals: |arg| format!("{arg} 的值要用等号接着写：{arg}=…"),
-    not_utf8: "参数不是合法的 UTF-8",
+    missing_command: |name| format!("{name} 缺少子命令"),
+    conflict: |arg, other| format!("{arg} 与 {other} 不能同时使用"),
+    repeated: |arg| format!("{arg} 不能重复指定"),
+    value_count: |arg| format!("{arg} 的参数值数量不正确"),
+    no_equals: |arg| format!("{arg} 需使用等号指定值：{arg}=…"),
+    not_utf8: "参数不是有效的 UTF-8",
     more: |help| format!("更多信息见 {help}"),
 };
 
@@ -262,8 +262,8 @@ pub fn exit(error: &clap::Error, lang: Lang) -> ! {
 
 /// 一个命令行解析的错误写成 `lang` 的样子：哪里不对、怎么写才对、用法，和去哪里看更多。
 ///
-/// clap 带着细节（哪个参数、哪个值、可以写什么）的错误都按语言写；说不出细节的极少数几种（I/O、格式化出错这类和命令行无关的）
-/// 照 clap 自己的英文写。
+/// clap 提供上下文详情（参数名、参数值、可选值）的错误均按目标语言输出；无此类详情的极少数错误（如 I/O、格式化错误等与命令行无关的错误）
+/// 则沿用 clap 默认英文输出。
 #[must_use]
 pub fn render_error(error: &clap::Error, lang: Lang) -> String {
     let texts = lang.clap();
@@ -335,7 +335,7 @@ pub fn has_chinese(text: &str) -> bool {
 /// 英文里一个数后面直接跟着复数名词、而这个数是 1 的地方（`1 nodes`）：返回那两个词。测试拿 1 去调文字目录里带数的函数，
 /// 用它检查英文没有写成这个样子；要么用中性的写法（`nodes: 1`、`nodes 1`），要么分单复数。
 ///
-/// 只认单独的 `1`（前面可以是括号），不认 `v1`、`#1`、`1.5`、`1/2` 里的；后面的词全是字母、以 `s` 结尾，
+/// 仅匹配独立的 `1`（前面可带括号），不匹配 `v1`、`#1`、`1.5`、`1/2` 中的 `1`；后续词须全为字母且以 `s` 结尾，
 /// 单位 `ms` 和几个以 `s` 结尾的动词（`1 is …`）不算。
 #[must_use]
 pub fn plural_after_one(text: &str) -> Option<String> {
@@ -470,11 +470,11 @@ mod tests {
 
         let error = parse(Lang::ZhCn, &["demo", "set", "--mode", "on", "--level", "x"]).unwrap_err();
         let text = render_error(&error, Lang::ZhCn);
-        assert!(text.contains("不能是 x") && text.contains("要写 0 到 255 的数"), "{text}");
+        assert!(text.contains("的值 x 无效") && text.contains("要写 0 到 255 的数"), "{text}");
 
         let error = parse(Lang::ZhCn, &["demo", "renam"]).unwrap_err();
         let text = render_error(&error, Lang::ZhCn);
-        assert!(text.contains("没有命令 renam") && text.contains("要写的是 rename？"), "{text}");
+        assert!(text.contains("未知命令 renam") && text.contains("是否要输入 rename？"), "{text}");
         assert!(!has_chinese(&render_error(&parse(Lang::English, &["demo", "renam"]).unwrap_err(), Lang::English)));
         for lang in Lang::ALL {
             for args in [&["demo", "--bogus"][..], &["demo"], &["demo", "rename", "a", "b", "c"]] {

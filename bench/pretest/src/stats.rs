@@ -22,12 +22,12 @@ pub struct ProcessUsage {
 }
 
 impl ProcessUsage {
-    /// 本进程（所有线程）用掉的 CPU 时间和内存峰值。读不到时返回 `None`，报告里就不带这一项。
+    /// 当前进程（所有线程）消耗的 CPU 时间和内存峰值。无法读取时返回 `None`，报告中将省略该项。
     pub fn of_this_process() -> Option<Self> {
         match platform::usage() {
             Ok(usage) => Some(usage),
             Err(err) => {
-                eprintln!("读不到本进程的资源占用：{err:#}");
+                eprintln!("无法读取当前进程的资源占用：{err:#}");
                 None
             }
         }

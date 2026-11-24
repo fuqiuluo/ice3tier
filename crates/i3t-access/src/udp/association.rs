@@ -138,14 +138,14 @@ pub(crate) async fn run<C: Connector + Datagrams>(
     let (relay, relay_addr) = match bound.await {
         Ok(bound) => bound,
         Err(error) => {
-            tracing::warn!(%error, "拒绝了一个 UDP ASSOCIATE 请求：绑不出中继端口");
-            // 写不出去说明客户端已经走了。
+            tracing::warn!(%error, "已拒绝 UDP ASSOCIATE 请求：绑定中继端口失败");
+            // 写入失败说明客户端已断开。
             let _ = control.write_all(&socks5::reply(socks5::ReplyCode::GeneralFailure)).await;
             return;
         }
     };
     if let Err(error) = control.write_all(&socks5::associated(relay_addr)).await {
-        return tracing::debug!(%error, "客户端在应答写出去之前断开了");
+        return tracing::debug!(%error, "客户端在写入应答前已断开");
     }
     tracing::debug!(relay = %relay_addr, "UDP 关联建立");
 
@@ -169,7 +169,7 @@ pub(crate) async fn run<C: Connector + Datagrams>(
         tokio::select! {
             // TCP 连接上不该再有数据，有也不看；它一结束，关联就结束。
             read = control.read(&mut ignored) => match read {
-                Ok(0) => break "客户端关掉了 TCP 连接".to_owned(),
+                Ok(0) => break "客户端关闭了 TCP 连接".to_owned(),
                 Ok(_) => {}
                 Err(error) => break format!("TCP 连接出错：{error}"),
             },
@@ -184,7 +184,7 @@ pub(crate) async fn run<C: Connector + Datagrams>(
                 }
                 match source_address(&netmap, peer, source) {
                     Some((host, port)) => association.deliver_to_client(host, port, &payload).await,
-                    None => tracing::debug!(%peer, "丢掉对端节点送回来的一个报文：它的来源在 SOCKS5 里写不出来"),
+                    None => tracing::debug!(%peer, "已丢弃对端节点返回的报文：来源地址无法以 SOCKS5 格式编码"),
                 }
             }
         }
@@ -199,7 +199,7 @@ impl<C: Connector + Datagrams> Association<'_, C> {
     async fn on_client_datagram(&mut self, from: SocketAddr, datagram: &[u8]) {
         if !self.client.admits(from) {
             self.tally.dropped += 1;
-            return tracing::debug!(%from, "丢掉 UDP 中继端口上的一个报文：不是建立这个关联的客户端发来的");
+            return tracing::debug!(%from, "已丢弃 UDP 中继端口收到的报文：来源非当前关联的客户端");
         }
         let packet = match UdpPacket::parse(datagram) {
             Ok(packet) => packet,
@@ -251,7 +251,7 @@ impl<C: Connector + Datagrams> Association<'_, C> {
             }
         } else {
             self.tally.dropped += 1;
-            tracing::trace!(%peer, "丢掉客户端发来的一个 UDP 报文：到对端节点的上下文还没开好，或者来不及发");
+            tracing::trace!(%peer, "已丢弃客户端发送的 UDP 报文：到对端节点的数据报上下文尚未就绪或发送队列已满");
         }
     }
 
@@ -265,7 +265,7 @@ impl<C: Connector + Datagrams> Association<'_, C> {
                 self.tally.to_client += 1;
                 self.meter.record(false, data.len());
             }
-            Err(error) => tracing::debug!(%error, "一个 UDP 报文没有发回客户端"),
+            Err(error) => tracing::debug!(%error, "向客户端返回 UDP 报文失败"),
         }
     }
 
@@ -303,7 +303,7 @@ async fn serve_peer<C: Connector + Datagrams>(
             queued = outgoing.recv() => match queued {
                 Some(Outgoing { target, payload }) => {
                     if let Err(error) = sender.send(&target, &payload).await {
-                        tracing::debug!(%peer, %error, "一个 UDP 报文没有发给对端节点");
+                        tracing::debug!(%peer, %error, "向对端节点发送 UDP 报文失败");
                     }
                 }
                 // 关联结束了。
@@ -315,7 +315,7 @@ async fn serve_peer<C: Connector + Datagrams>(
                         return context.close().await;
                     }
                 }
-                Err(end) => return tracing::debug!(%peer, ?end, "到对端节点的数据报上下文结束了，下一个报文会重新开"),
+                Err(end) => return tracing::debug!(%peer, ?end, "到对端节点的数据报上下文已结束，后续收到报文时将重新建立"),
             },
         }
     }

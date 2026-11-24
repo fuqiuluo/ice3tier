@@ -53,7 +53,7 @@ pub struct Codes {
     pub address_source: fn(AddressSource) -> &'static str,
     /// controller 对一个节点的提醒，一短句。
     pub node_warning: fn(&NodeWarning) -> String,
-    /// 一个节点最近一次试某个 relay 的结果：`UDP`、`只有 TCP`、`连不上`。
+    /// 节点最近一次探测某个 relay 的结果：`UDP`、`仅 TCP`、`不可达`。
     pub try_outcome: fn(TryOutcome) -> &'static str,
     /// controller 为什么不接受这个节点（`i3t join` 被拒绝时）。
     pub reject_cause: fn(RejectCause) -> &'static str,
@@ -61,11 +61,11 @@ pub struct Codes {
     pub api_error: fn(&ApiError) -> String,
     pub lane_block: fn(&LaneBlock, Names<'_>) -> String,
     pub forward_status: fn(ForwardStatus) -> &'static str,
-    /// 端口转发的目标为什么连不上，一短句：`目标拒绝连接`。
+    /// 端口转发目标连接失败原因，简短说明：`目标拒绝连接`。
     pub target_cause: fn(TargetCause) -> &'static str,
-    /// 出口测试里一步为什么没有成功，一短句：`端口 8080 不在允许的范围里`。
+    /// 出口测试中某一步骤失败的原因，简短说明：`端口 8080 不在出口允许的范围里`。
     pub exit_test_cause: fn(&ExitTestCause) -> String,
-    /// 出口经什么连目标：`直接连`、`经上游代理`。
+    /// 出口连接目标的方式：`直连`、`经上游代理`。
     pub exit_via: fn(ExitVia) -> &'static str,
     pub token_state: fn(TokenState) -> &'static str,
     /// 一个代理现在能不能用，一短句：`监听在 127.0.0.1:1080`、`出口离线`。
@@ -81,10 +81,10 @@ pub struct Codes {
     pub hop_source: fn(HopSource) -> &'static str,
     pub path_pick: fn(PathPick) -> &'static str,
     pub transfer_end: fn(TransferEnd) -> &'static str,
-    /// 虚拟网卡的状态，一短句：装着（网卡、MTU、名字怎么解析）、关着、装不上（为什么）。
+    /// 虚拟网卡的状态，简短说明：已启用（设备、MTU、名称解析方式）、已关闭、不可用（原因）。
     pub vnet_state: fn(&VnetState) -> String,
     pub vnet_cause: fn(&VnetCause) -> String,
-    /// 程序加的两条防火墙规则，一短句：`放行开着，防冒充开着`。
+    /// 程序添加的两条防火墙规则状态，简短说明：`放行已启用，防冒充已启用`。
     pub firewall: fn(&Firewall) -> String,
     pub name_service: fn(&NameService) -> String,
     /// QoS 的一个取值的名字：`自动`、`低延迟`、`不丢包`、`后台`。配置和命令行上照旧写 `auto` 这些。
@@ -356,14 +356,14 @@ mod tests {
     fn a_chain_used_in_the_default_mode_says_no_single_relay_serves_both_ends() {
         let names: Names<'_> = &name;
         let zh = Lang::ZhCn.codes();
-        assert_eq!((zh.route_cause)(&RouteCause::NoSharedRelay { hint: None }, names), "没有两端都用得上的中继，经多个中继");
+        assert_eq!((zh.route_cause)(&RouteCause::NoSharedRelay { hint: None }, names), "没有两端均可用的中继，经多级中继");
         assert_eq!(
             (zh.route_cause)(&RouteCause::NoSharedRelay { hint: Some(RouteHint::DirectTimeouts) }, names),
-            "直连探测连续超时；没有两端都用得上的中继，经多个中继"
+            "直连探测连续超时；没有两端均可用的中继，经多级中继"
         );
         let en = Lang::English.codes();
         assert_eq!((en.route_cause)(&RouteCause::NoSharedRelay { hint: None }, names), "No relay serves both ends, via a chain of relays");
-        assert_eq!((zh.choice)(ChoiceCode::NoSharedRelay), "没有两端都用得上的中继，经多个中继");
+        assert_eq!((zh.choice)(ChoiceCode::NoSharedRelay), "没有两端均可用的中继，经多级中继");
     }
 
     #[test]
@@ -374,8 +374,8 @@ mod tests {
             guard: RuleState::Failed { cause: VnetCause::ProgramMissing { program: "nft".into() } },
         };
         let zh = Lang::ZhCn.codes();
-        assert_eq!((zh.firewall)(&without_iptables), "放行不需要，防冒充开着");
-        assert_eq!((zh.firewall)(&neither), "放行不需要，防冒充加不上（找不到 nft（装 nftables））");
+        assert_eq!((zh.firewall)(&without_iptables), "放行不需要，防冒充已启用");
+        assert_eq!((zh.firewall)(&neither), "放行不需要，防冒充添加失败（未找到 nft（请安装 nftables））");
         let en = Lang::English.codes();
         assert_eq!((en.firewall)(&without_iptables), "accept not needed, anti-spoofing on");
         assert_eq!((en.firewall)(&neither), "accept not needed, anti-spoofing failed (nft not found (install nftables))");

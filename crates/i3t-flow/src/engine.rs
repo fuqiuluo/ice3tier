@@ -10,7 +10,7 @@
 //!   一条静默的流不占管道，只占它的两个 socket。
 //! - 系统调用用 rustix 的安全封装，这里没有 `unsafe`。
 //!
-//! 结束的规矩和流的契约一样：来源读到 EOF，目标发 FIN（只关写的一半，另一个方向照常）；任何一头出错，
+//! 结束语义与流契约一致：来源读到 EOF 时向目标发送 FIN（仅关闭写半部，另一方向继续）；任一端出错时，
 //! 调用方把两头都重置，绝不能用 FIN 结束，否则被截断的数据看起来像正常结束。
 
 use std::convert::Infallible;
@@ -45,14 +45,14 @@ mod socket {
     /// 关闭时发 RST 而不是 FIN。
     pub(super) fn rst_on_close(stream: &TcpStream) {
         if let Err(error) = stream.set_zero_linger() {
-            tracing::warn!(%error, "设置不了 SO_LINGER，搬运中断时对端可能看到正常结束");
+            tracing::warn!(%error, "设置 SO_LINGER 失败，转发中断时对端可能视为正常关闭");
         }
     }
 
     /// 两个方向都正常结束了：关闭时按正常的 FIN 走。
     pub(super) fn graceful_close(stream: &TcpStream) {
         if let Err(error) = i3t_underlay::tcp_reset::graceful_close(stream) {
-            tracing::debug!(%error, "恢复不了 SO_LINGER，正常结束的连接会以 RST 关闭");
+            tracing::debug!(%error, "禁用 SO_LINGER 失败，关闭连接时可能发送 RST");
         }
     }
 
@@ -62,7 +62,7 @@ mod socket {
         rst_on_close(stream);
         #[cfg(target_os = "linux")]
         if let Err(error) = rustix::net::connect_unspec(stream) {
-            tracing::debug!(%error, "立刻重置连接失败，等它被关闭时再发 RST");
+            tracing::debug!(%error, "立即重置连接失败，将在连接关闭时发送 RST");
         }
     }
 
@@ -101,13 +101,13 @@ impl Gate for Open {
 #[derive(Debug, thiserror::Error)]
 pub enum PumpError<S> {
     /// 读来源出错（对方重置了连接、保活超时）。
-    #[error("读来源出错")]
+    #[error("读取来源数据失败")]
     Read(#[source] io::Error),
     /// 写目标出错，或者给目标发 FIN 出错。
-    #[error("写目标出错")]
+    #[error("写入目标数据失败")]
     Write(#[source] io::Error),
     /// 关卡叫停了。
-    #[error("被叫停")]
+    #[error("转发被中止")]
     Stopped(S),
 }
 
@@ -318,11 +318,11 @@ mod linux {
     impl Pipe {
         fn new() -> io::Result<Self> {
             let (read, write) = rustix::pipe::pipe_with(PipeFlags::NONBLOCK | PipeFlags::CLOEXEC)?;
-            // 非 root 时同一个用户的管道总容量有上限（`fs.pipe-user-pages-soft`），超了就设不大，用系统给的大小照样能搬，只是慢一些。
+            // 非 root 用户受管道总容量上限（`fs.pipe-user-pages-soft`）限制，超出上限时无法调大容量，退回系统默认大小仍可继续转发，仅吞吐略低。
             let size = match rustix::pipe::fcntl_setpipe_size(&write, PIPE_SIZE) {
                 Ok(size) => size,
                 Err(error) => {
-                    tracing::debug!(%error, "管道设不到 256 KB，用系统默认的大小");
+                    tracing::debug!(%error, "设置管道容量为 256 KB 失败，改用系统默认大小");
                     rustix::pipe::fcntl_getpipe_size(&write)?
                 }
             };

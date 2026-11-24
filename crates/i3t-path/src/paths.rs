@@ -31,17 +31,17 @@ use crate::report::{BackboneRow, PathReport};
 use crate::table::{Clock, Packets, PeerSlot, Shared, Table};
 use crate::{LocalRelay, RouteChange, Status};
 
-/// 交给控制任务的内部事件最多攒多少。
+/// 交给控制任务的内部事件队列上限。
 const CTRL_QUEUE: usize = 1024;
-/// 收包路径交给控制任务的帧最多攒多少，relay 来的和别的各一个队列。满了就丢：它们都是有重试的握手和探测，
-/// 而且这样陌生人灌不爆内存。
+/// 收包路径提交给控制任务的帧队列上限（relay 与其他来源各独立队列）。队列满时丢弃：此类帧均为带重试的握手与探测，
+/// 同时可防止未知来源耗尽内存。
 const FRAME_QUEUE: usize = 512;
-/// 不走 UDP 缓冲区直达的包（TCP 中转来的等）最多攒多少。满了之后 TCP 那边停下来等。
+/// 非 UDP 缓冲区直达数据包（如 TCP 中继收到的数据包）的队列上限；队列满时 TCP 侧背压等待。
 const INBOUND_QUEUE: usize = 1024;
-/// 换路事件的订阅者最多落后多少条。
+/// 路由变更事件的订阅者允许落后的最大条数。
 const CHANGE_BACKLOG: usize = 256;
 
-/// 建路径层要的东西。
+/// 创建路径层所需的配置。
 #[derive(Debug)]
 pub struct PathConfig {
     pub key: Arc<NodeKey>,
@@ -118,18 +118,18 @@ impl Paths {
         if paths.shared.port.local_addr().ip().is_unspecified()
             && let Err(error) = paths.start_lan_discovery(LanConfig::default())
         {
-            tracing::debug!(%error, "局域网发现启动不了，同一个局域网里的对端只能靠上报的地址去找");
+            tracing::debug!(%error, "局域网发现启动失败，同一局域网内的对端将仅通过上报地址进行发现");
         }
         paths
     }
 
-    /// 开始在本地网段上发信标、听对端的信标。看到的对端成为直连的候选地址，照样要验证过才用。
+    /// 启动本地网段信标收发。发现的对端地址将作为直连候选，仍需验证后方可使用。
     ///
-    /// 端口绑在未指定地址上时 [`new`](Self::new) 已经用默认参数调用过它；再调用会换成新的参数。要在 tokio 运行时里调用。
+    /// 当端口绑定在未指定地址时，[`new`](Self::new) 已使用默认参数启动；重复调用将替换为新配置。需在 tokio 运行时内调用。
     ///
     /// # Errors
     ///
-    /// 组播的 socket 建不起来（端口被不肯共用的程序占着，或者系统不让用组播）。
+    /// 组播 socket 创建失败（例如端口被独占进程占用，或系统禁止组播）。
     ///
     /// # Panics
     ///
@@ -138,7 +138,7 @@ impl Paths {
         let queue = self.shared.from_peers.clone();
         let port = self.shared.port.local_addr().port();
         let discovery = LanDiscovery::start(config, self.public, port, move |sighting| {
-            // 信标每隔几秒就来一个，控制任务忙的时候丢掉这一个没有关系。
+            // 信标每隔数秒发送一次，入队失败时丢弃无影响。
             let _queued = queue.try_send(Ctrl::Lan(sighting));
         })?;
         *self.shared.lan.lock().expect("lan discovery mutex poisoned") = Some(discovery);
@@ -152,7 +152,7 @@ impl Paths {
     /// 测试靠它把请求指向假的网关。
     pub fn start_port_mapping(&self, config: PortMapConfig) {
         if self.shared.ctrl.try_send(Ctrl::PortMap(config)).is_err() {
-            tracing::warn!("控制任务忙不过来，端口映射没有启动");
+            tracing::warn!("端口映射请求入队失败，未启动");
         }
     }
 
@@ -171,12 +171,12 @@ impl Paths {
     /// 只能设一次。
     pub fn set_local_relay(&self, relay: Arc<dyn LocalRelay>) {
         if self.shared.local_relay.set(relay).is_err() {
-            tracing::warn!("路径层的本地 relay 已经设过了，忽略这一次");
+            tracing::warn!("路径层本地 relay 已设置，忽略重复调用");
         }
     }
 
-    /// 给本节点的 relay 的入口：别的 relay 拨进来的骨干 TCP 上归路径层的事从这里交进来，骨干走着 TCP 的那几段的情况从这里问
-    /// （[`crate::backbone`]），交给 relay 的 `set_backbone_inbox`。它只拿着控制任务的队列和那张表，relay 拿着它不会让路径层释放不掉。
+    /// 返回提供给本节点 relay 的骨干收件箱：用于提交外部 relay 拨入骨干 TCP 上的路径层事件，以及查询走 TCP 的骨干链路状态
+    /// （[`crate::backbone`]），应传入 relay 的 `set_backbone_inbox`。其仅持有控制任务队列与门控表，不会阻止路径层释放。
     #[must_use]
     pub fn backbone_inbox(&self) -> crate::BackboneInbox {
         crate::BackboneInbox { ctrl: self.shared.ctrl.clone(), gates: Arc::clone(&self.shared.gates) }
@@ -194,7 +194,7 @@ impl Paths {
     /// 对端 `from` 发来了一条信令。来源必须是可信的：controller 转来的，或者和 `from` 的已认证连接里收到的。
     pub fn handle_signal(&self, from: NodeId, signal: Signal) {
         if self.shared.ctrl.try_send(Ctrl::Signal { from, signal }).is_err() {
-            tracing::debug!(peer = %from, "控制任务忙不过来，丢掉一条信令");
+            tracing::debug!(peer = %from, "信令入队失败，已丢弃");
         }
     }
 
@@ -237,7 +237,7 @@ impl Paths {
     ///
     /// # Errors
     ///
-    /// 只会返回 [`io::ErrorKind::WouldBlock`]：现在发不了，等 [`writable`](Self::writable) 之后再试。
+    /// 仅可能返回 [`io::ErrorKind::WouldBlock`]：当前不可发送，需等待 [`writable`](Self::writable) 后重试。
     pub fn try_send(&self, peer: NodeId, packets: &Packets<'_>) -> io::Result<()> {
         let table = self.shared.table();
         match table.peers.get(&peer) {
@@ -246,20 +246,20 @@ impl Paths {
         }
     }
 
-    /// 到 `peer` 现在是不是直连：包直接发到它的地址上，不经任何 relay。不认识这个对端、没有路时是 `false`。
+    /// 查询到 `peer` 当前是否走直连（数据包直接发往对端地址，不经过任何 relay）。对端未知或无可用路由时返回 `false`。
     #[must_use]
     pub fn is_direct(&self, peer: NodeId) -> bool {
         self.shared.table().peers.get(&peer).is_some_and(|slot| slot.is_direct())
     }
 
-    /// 把一批丢了也没关系的包直接发到 `peer` 的地址上，不等。到它现在不是直连，或者端口忙着，这一批就丢掉。
-    /// 返回发出去了没有。
+    /// 将一批允许丢弃的数据包直接发往 `peer` 地址（不等待）。若当前非直连或端口繁忙，则丢弃该批数据包。
+    /// 返回是否发送成功。
     ///
-    /// 这种包没有人管它的量，所以只走直连；到对端的路经 relay 时（先问 [`is_direct`](Self::is_direct)），
-    /// 调用方该把东西交给有拥塞控制的连接，经 [`try_send`](Self::try_send) 发。
+    /// 此类数据包不受拥塞控制，因此仅限直连使用；经 relay 转发时（先检查 [`is_direct`](Self::is_direct)），
+    /// 调用方应将其交由带拥塞控制的连接通过 [`try_send`](Self::try_send) 发送。
     ///
-    /// 不等 [`writable`](Self::writable) 的调用方用这个，不用 [`try_send`](Self::try_send)：那个入口说过一次"现在发不了"之后，
-    /// 要等到有人等来了可写才会再去问内核。
+    /// 不等待 [`writable`](Self::writable) 的调用方应使用此方法而非 [`try_send`](Self::try_send)：后者返回一次 `WouldBlock` 后，
+    /// 需等待下一次可写就绪事件才会重新尝试内核发送。
     pub fn send_direct(&self, peer: NodeId, packets: &Packets<'_>) -> bool {
         self.shared.table().peers.get(&peer).is_some_and(|slot| slot.send_direct(&self.shared, packets))
     }
@@ -338,10 +338,10 @@ impl Paths {
         self.shared.port.may_fragment()
     }
 
-    /// 本地的 relay 收到了发给本节点的中转帧（从它的 TCP 中转腿上）：`packet` 是去掉中转头之后的连接包。
+    /// 本地 relay 从 TCP 中继连接收到发往本节点的中转帧：`packet` 为去除中转头部后的连接数据包。
     pub fn deliver_local(&self, src: NodeId, packet: Bytes) {
         if self.shared.inbound.try_send((src, packet)).is_err() {
-            tracing::trace!(peer = %src, "连接层来不及收，丢掉一个包");
+            tracing::trace!(peer = %src, "连接层接收队列入队失败，已丢弃数据包");
         }
     }
 
@@ -371,7 +371,7 @@ impl Paths {
         self.status().public_addresses.clone()
     }
 
-    /// 映射出来的端口是不是随对端变化。要有两个以上的观察点才知道；是的话这台机器所在的网络基本打不了洞。
+    /// 映射端口是否随对端地址变化（需至少两个观察点方可判断；若变化，当前网络通常无法完成 NAT 打洞）。
     #[must_use]
     pub fn mapping_varies(&self) -> Option<bool> {
         self.status().mapping_varies
@@ -383,10 +383,10 @@ impl Paths {
         self.status().attached.clone()
     }
 
-    /// 本节点试过的各个 relay 连没连上、它们看到的本节点 IP，报给 controller 用。
+    /// 本节点探测过的各 relay 可达状态及其观测到的本节点 IP，用于上报给 controller。
     ///
-    /// 试的是 netmap 里的每个 relay：挂靠的、经过的用会话（UDP 和 TCP 一起），别的每分钟用 UDP 问一次延迟，问不到的每十分钟
-    /// 用会话试一次（同一时刻只试一个）。有会话的排在前面，最多 [`i3t_model::control::MAX_RELAY_TRIES`] 个。
+    /// 探测对象为 netmap 中的所有 relay：已挂靠或经由的 relay 通过会话（同时尝试 UDP 与 TCP）检测，其余每分钟以 UDP 探测一次延迟，
+    /// 未响应者每十分钟通过会话探测一次（同一时刻仅探测一个）。已建立会话的排在最前，最多返回 [`i3t_model::control::MAX_RELAY_TRIES`] 条。
     #[must_use]
     pub fn relay_tries(&self) -> Vec<i3t_model::control::RelayTry> {
         self.status().relay_tries.clone()
@@ -436,7 +436,7 @@ impl Paths {
     pub fn open_test(&self, spec: TestSpec) -> TestGuard {
         let test = spec.test;
         if self.shared.ctrl.try_send(Ctrl::OpenTest(spec)).is_err() {
-            tracing::warn!(test, "控制任务忙不过来，主动测试的时间窗没有打开");
+            tracing::warn!(test, "主动测试开启请求入队失败，时间窗未打开");
         }
         TestGuard { ctrl: self.shared.ctrl.clone(), test }
     }
@@ -445,21 +445,21 @@ impl Paths {
     ///
     /// # Errors
     ///
-    /// 测试没有打开、对端不在 netmap 里、此刻走不了这条路径，或者本节点的路径限制不允许。
+    /// 测试未开启、对端不在 netmap 中、当前路径不可达，或被本节点路径策略禁止。
     pub async fn train(&self, spec: TrainSpec) -> Result<TrainReport, TrainError> {
         let (reply, answer) = oneshot::channel();
         self.shared.ctrl.send(Ctrl::Train { spec, reply }).await.map_err(|_| TrainError::Stopped)?;
         answer.await.map_err(|_| TrainError::Stopped)?
     }
 
-    /// 把到 `peer` 的路暂时固定在 `path` 上，最多 `limit`（不超过 [`crate::diag::MAX_PIN`]）。
-    /// 丢弃返回的值就解除；到期也会自己解除。这条路此刻走不了时照常按选路规则走，路通了再换过去。
+    /// 将到 `peer` 的路由临时固定在 `path` 上，最长持续 `limit`（不超过 [`crate::diag::MAX_PIN`]）。
+    /// 丢弃返回值或到期后自动解除。若固定路径当前不可达，仍按常规选路规则转发，待其恢复后再切换过去。
     #[must_use]
     pub fn pin(&self, peer: NodeId, path: TestPath, limit: Duration) -> RoutePin {
         let id = self.next_pin.fetch_add(1, Ordering::Relaxed);
         let pin = Pin { id, path, until: Instant::now() + limit };
         if self.shared.ctrl.try_send(Ctrl::Pin { peer, pin }).is_err() {
-            tracing::warn!(%peer, "控制任务忙不过来，没有固定到对端的路");
+            tracing::warn!(%peer, "路径固定请求入队失败，未固定到对端的路由");
         }
         // 固定之后马上重新选路，不等下一个定时器。
         let _queued = self.shared.ctrl.try_send(Ctrl::Wake);
@@ -517,7 +517,7 @@ impl Paths {
                 let queued =
                     self.relayed_probe(peer, frame).is_some_and(|inbound| self.shared.queue_frame(self.shared.port.local_addr(), inbound));
                 if !queued {
-                    tracing::trace!(%peer, "丢掉一个经 relay 来的探测：控制任务忙不过来，或者它不属于任何打开着的测试");
+                    tracing::trace!(%peer, "经 relay 接收的探测未入队，已丢弃（队列不可用或不属于已开启的测试）");
                 }
                 continue;
             }
@@ -533,8 +533,8 @@ impl Paths {
         filled
     }
 
-    /// 处理一个接收缓冲区。里面可能是来自同一个地址的多个数据报，种类和去向各不相同，逐个看：
-    /// 连接包就地挪到缓冲区开头留给连接层，别的当场分发。返回留下来的那一段。
+    /// 处理单个接收缓冲区。其中可能包含来自同一地址、类型和去向各异的多个数据报，逐个分类处理：
+    /// 连接数据包原地移至缓冲区起始位置留给连接层，其余数据报当场分发。返回保留部分的数据元信息。
     fn demux(&self, table: &Table, raw: &RecvMeta, buf: &mut [u8]) -> Option<PacketMeta> {
         let data = &mut buf[..raw.len];
         let stride = raw.stride.max(1);
@@ -566,7 +566,7 @@ impl Paths {
                         }
                         Some(_) => {
                             if self.shared.inbound.try_send((slot.id, Bytes::copy_from_slice(&data[packet]))).is_err() {
-                                tracing::trace!(peer = %slot.id, "连接层来不及收，丢掉一个包");
+                                tracing::trace!(peer = %slot.id, "连接层接收队列入队失败，已丢弃数据包");
                             }
                         }
                     }
@@ -574,7 +574,7 @@ impl Paths {
                 Verdict::Relay => for_relay = Some(for_relay.map_or(offset..end, |span| span.start..end)),
                 Verdict::Control(frame) => {
                     if !self.shared.queue_frame(raw.addr, frame) {
-                        tracing::trace!(from = %raw.addr, "控制任务忙不过来，丢掉一帧");
+                        tracing::trace!(from = %raw.addr, "控制帧入队失败，已丢弃");
                     }
                 }
                 Verdict::Drop => {}
@@ -731,9 +731,9 @@ pub struct RoutePin {
 
 impl Drop for RoutePin {
     fn drop(&mut self) {
-        // 队列满了也没有关系：固定有期限，到了控制任务自己会解除。
+        // 入队失败无妨：固定存在期限，到期后控制任务会自动解除。
         if self.ctrl.try_send(Ctrl::Unpin { peer: self.peer, id: self.id }).is_err() {
-            tracing::debug!(peer = %self.peer, "控制任务忙不过来，固定的路等到期自己解除");
+            tracing::debug!(peer = %self.peer, "解除路径固定请求入队失败，将等待到期自动解除");
         }
         let _queued = self.ctrl.try_send(Ctrl::Wake);
     }
@@ -762,7 +762,7 @@ enum Verdict<'t> {
     Drop,
 }
 
-/// 一个接收缓冲区里留给连接层的那一段：都来自同一个对端，除了最后一个都一样长。
+/// 接收缓冲区中保留给连接层的连续数据片段：均来自同一对端，除最后一个包外长度相同。
 struct Kept<'t> {
     slot: &'t Arc<PeerSlot>,
     stride: usize,

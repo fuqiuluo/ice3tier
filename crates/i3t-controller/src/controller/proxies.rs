@@ -2,11 +2,11 @@
 //!
 //! 一个代理是"在节点 A 上监听，经出口节点 B 出去，认一对用户名和密码"。B 必须是另一个、启用了出口的节点，
 //! 访问规则要让 A 能访问 B。这几条在新建和修改时查（修改时只在会让它生效的那一下查，见 [`check`]）；
-//! 之后出口被停用、规则变了，代理留着、照样下发、照样监听，状态说明它为什么用不了。
+//! 此后若出口被停用或访问规则变更，代理记录保持不变并继续下发与监听，通过状态字段说明其不可用原因。
 //!
-//! 代理可以选 ice3proxy（`lane`）：选了的代理的 TCP 流不管路上有没有 UDP 都走它，开不出时退回共用的连接。
-//! A 和 B 之间因此备着 ice3proxy（`crate::netmap::LanePairs`）；代理的视图说它在这一对之间起不起作用、为什么，
-//! 和两个节点报上来的、和对方之间的 lane。
+//! 代理可选择启用 ice3proxy（`lane`）：启用后该代理的 TCP 流无论路径是否支持 UDP 均优先走 lane，无法建立时回退至共用的连接。
+//! A 与 B 之间据此配置 ice3proxy（`crate::netmap::LanePairs`）；代理视图会展示其在该节点对之间是否生效及原因，
+//! 以及两端分别上报的 lane 状态。
 
 use i3t_model::admin::{CreateProxy, LaneBlock, LaneEffect, LaneSide, LogRef, NetworkId, Proxy, ProxyStatus, RefKind, UpdateProxy, action};
 use i3t_model::control::{LANE_REVISION, ListenState, ListenTraffic};
@@ -116,7 +116,7 @@ impl Controller {
             next.optimistic = optimistic.unwrap_or(next.optimistic);
             next.lane = lane.unwrap_or(next.lane);
             let record = check(store, network, Some(&before), next)?;
-            // 用户名或者密码变了就换一个盐：旧的校验值对新的一对没有用，也看不出两次是不是同一个密码。
+            // 用户名或密码变更时重新生成盐值：使旧校验值失效，同时避免暴露两次密码是否相同。
             let record = if (&record.username, &record.password) == (&before.username, &before.password) {
                 record
             } else {
@@ -165,7 +165,7 @@ impl Inner {
     }
 
     /// 管理接口里的一个代理：存着的设置，加上按 controller 知道的算出来的状态和监听节点报的用量；
-    /// 选了 ice3proxy 的，还有它起不起作用、两边报的 lane。
+    /// 启用了 ice3proxy 的代理，额外附带生效评估与两端上报的 lane 状态。
     pub(crate) fn proxy_view(&self, view: &NetworkView, access: &AccessMap<'_>, record: &ProxyRecord) -> Proxy {
         let report = self.live.get(&record.node).and_then(|live| live.proxies.iter().find(|report| report.id == record.id));
         // 节点报的是它手上那一版的：地址刚改过、它还没换过来时，那份状态说的是旧地址。
@@ -199,7 +199,7 @@ impl Inner {
         }
     }
 
-    /// ice3proxy 在代理监听的节点 `node` 和它的出口 `exit` 之间起不起作用。
+    /// 评估 ice3proxy 在代理监听节点 `node` 与出口节点 `exit` 之间是否生效。
     ///
     /// 要一边能被拨（另一边启用了 relay、有已知的地址：relay 在它的端口上听 TCP），两个节点都懂 ice3proxy
     /// （只看在线的：离线的不知道它说的是第几版，等它上线再说），访问规则让监听的节点访问出口。
@@ -230,12 +230,12 @@ impl Inner {
         let summary = if effective {
             let dialers = dialers.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join("、");
             format!(
-                "由 {dialers} 拨对方的 TCP 端口；这个代理的每条 TCP 流独占一条 TCP，取不到时悄悄改走共用的连接。\
-                 两个节点之间共用的连接照常保持：UDP 的数据报和别的流（端口转发、没选 ice3proxy 的代理）走它，\
-                 路由视图显示的是它的路；走 ice3proxy 的流不换路。"
+                "由 {dialers} 拨号连接对端的 TCP 端口；该代理的每条 TCP 流独占一条 TCP 连接，无法获取时自动回退到共用的连接。\
+                 两节点间共用的连接仍保持不变：UDP 数据报与其他流（端口转发、未启用 ice3proxy 的代理）继续使用共用的连接，\
+                 路由视图展示的也是该连接的路径；经由 ice3proxy 的流不会切换路径。"
             )
         } else {
-            "ice3proxy 不起作用，这个代理的流都走共用的连接（见 blocked）。".to_owned()
+            "ice3proxy 当前未生效，该代理的所有流均使用共用的连接（原因见 blocked）。".to_owned()
         };
         LaneEffect { effective, blocked, dialers, summary }
     }
@@ -247,7 +247,7 @@ impl Inner {
         Some(LaneSide { node, lanes, reported_secs_ago: live.reported_at.map(|at| at.elapsed().as_secs()) })
     }
 
-    /// 排在前面的先看：没有出口、停用了的不看别的；节点不在线、没有报、监听不上的不看出口；在监听才看出口用不用得了。
+    /// 按优先级依次判定：缺少出口或已停用时直接返回；监听节点离线、未上报或监听失败时不检查出口；仅在监听正常时再检查出口可用性。
     fn status_of(&self, view: &NetworkView, access: &AccessMap<'_>, record: &ProxyRecord, reported: Option<&ListenState>) -> ProxyStatus {
         let Some(exit) = record.exit.and_then(|exit| view.nodes.get(&exit)) else { return ProxyStatus::ExitMissing };
         if !record.enabled {
@@ -262,7 +262,7 @@ impl Inner {
             Some(ListenState::Failed { detail, cause } | ListenState::Unsupported { detail, cause }) => {
                 return ProxyStatus::BindFailed { detail: detail.clone(), cause: *cause };
             }
-            // 代理不会监听在虚拟 IP 上；比这个 controller 新的节点报的、不认识的状态也当作还没有报。
+            // 代理不会监听在虚拟 IP 上；高版本节点上报的未知监听状态也按尚未上报处理。
             Some(ListenState::Virtual | ListenState::Unknown) | None => return ProxyStatus::Pending,
         };
         if exit.exit.is_none() {
@@ -281,7 +281,7 @@ impl Inner {
 fn check(store: &Store, network: NetworkId, before: Option<&ProxyRecord>, mut record: ProxyRecord) -> Result<ProxyRecord, Error> {
     let node = require_node(store, network, record.node).in_field("node")?;
     if record.bind.port() == 0 {
-        return Err(Error::invalid_field("bind", "zero_port", "代理的监听端口不能是 0"));
+        return Err(Error::invalid_field("bind", "zero_port", "代理的监听端口不能为 0"));
     }
     let siblings: Vec<ProxyRecord> = store
         .proxies(network)?
@@ -299,7 +299,7 @@ fn check(store: &Store, network: NetworkId, before: Option<&ProxyRecord>, mut re
         Some(exit) => {
             let exit = require_node(store, network, exit).in_field("exit")?;
             // 出口和规则只在会让它生效的那一下查：新建、启用、换了出口或者监听的节点。只改名字、改密码不因为出口后来被停用而被拦住，
-            // 那时它照样留着，状态说明为什么用不了。
+            // 此时代理仍保留，通过状态字段说明其不可用原因。
             let unchanged = before.is_some_and(|before| before.enabled && before.exit == record.exit && before.node == record.node);
             if record.enabled && !unchanged {
                 if exit.exit.is_none() {
@@ -311,7 +311,7 @@ fn check(store: &Store, network: NetworkId, before: Option<&ProxyRecord>, mut re
                 }
             }
         }
-        None if record.enabled => return Err(Error::invalid_field("exit", "required", "这个代理还没有出口：选好出口才能启用")),
+        None if record.enabled => return Err(Error::invalid_field("exit", "required", "该代理尚未指定出口：请先指定出口后再启用")),
         None => {}
     }
 
@@ -320,12 +320,12 @@ fn check(store: &Store, network: NetworkId, before: Option<&ProxyRecord>, mut re
             return Err(Error::invalid_field(field, "too_long", format!("最长 {MAX_CREDENTIAL_LEN} 字节")));
         }
         if value.chars().any(char::is_control) {
-            return Err(Error::invalid_field(field, "malformed", "不能有控制字符"));
+            return Err(Error::invalid_field(field, "malformed", "不能包含控制字符"));
         }
     }
     // HTTP 的 Basic 认证按第一个冒号切分用户名和密码。
     if record.username.contains(':') {
-        return Err(Error::invalid_field("username", "malformed", "用户名里不能有冒号"));
+        return Err(Error::invalid_field("username", "malformed", "用户名中不能包含冒号"));
     }
     match (record.username.is_empty(), record.password.is_empty()) {
         (true, false) => return Err(Error::CredentialsIncomplete.in_field("username")),
@@ -340,7 +340,7 @@ fn check(store: &Store, network: NetworkId, before: Option<&ProxyRecord>, mut re
     }
     if let Some(other) = siblings.iter().find(|other| other.bind == record.bind) {
         return Err(Error::Conflict {
-            with: Entity::Proxy, message: format!("这个节点上的代理 {} 已经监听在 {}", other.name, other.bind)
+            with: Entity::Proxy, message: format!("该节点上的代理 {} 已监听在 {}", other.name, other.bind)
         }
         .in_field("bind"));
     }

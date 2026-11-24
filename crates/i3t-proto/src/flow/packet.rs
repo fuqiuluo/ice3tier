@@ -7,7 +7,7 @@ use super::dgram::{FLAG_FRAGMENT, FLAG_TO_INITIATOR, Fragment, FrameError, Recip
 
 /// 首字节里的这一位说明这是一个网络包帧。比它旧的节点把这一位当作保留位，带着它的数据报一律丢掉。
 const FLAG_PACKET: u8 = 0b0000_0100;
-/// 网络包帧的首字节里的这一位说明帧里合着好几个包（[`PacketHeader::Bundle`]）。不认识它的节点把它当作保留位，
+/// 网络包帧首字节的该位表示帧内合并了多个数据包（[`PacketHeader::Bundle`]）。不支持该特性的节点会将其视为保留位，
 /// 这样的帧一律丢掉，所以只发给握手时说过自己认识的对端。
 const FLAG_BUNDLE: u8 = 0b0000_1000;
 /// 网络包帧的首字节里必须是 0 的位：bit 0（数据报上下文才分接受方和发起方）和 bit 4～7。
@@ -32,7 +32,7 @@ pub enum Channel {
 }
 
 impl Channel {
-    /// 空的帧、首字节里有这个程序不认识的位的帧返回 `None`，应该直接丢掉。
+    /// 空帧或首字节包含未知标志位的帧返回 `None`，应直接丢弃。
     #[must_use]
     pub fn peek(frame: &[u8]) -> Option<Self> {
         let &flags = frame.first()?;
@@ -82,8 +82,8 @@ impl PacketHeader {
     ///
     /// # Errors
     ///
-    /// 不是网络包帧、标志里有不认识的位、帧比头还短，或者头自相矛盾（片数不在 2～[`MAX_PACKET_PIECES`] 之间、
-    /// 片序号不小于片数，又是一片又合着好几个包）。这样的帧应该直接丢掉。
+    /// 非网络包帧、标志包含未知位、帧长度短于帧头，或帧头无效（片数不在 2～[`MAX_PACKET_PIECES`] 之间、
+    /// 片序号不小于片数，或同时设置了分片与合并标志）。此类帧应直接丢弃。
     pub fn decode(frame: &[u8]) -> Result<(Self, &[u8]), FrameError> {
         let truncated = FrameError::Truncated { len: frame.len() };
         let (&flags, rest) = frame.split_first().ok_or(truncated)?;
@@ -107,8 +107,8 @@ impl PacketHeader {
 
 /// 合在一帧里的各个 IP 包，按发的一方放进去的顺序。
 ///
-/// 帧的头（[`PacketHeader::Bundle`]）后面每个包是两字节的长度（大端）接着包本身，一个挨一个到帧的末尾。
-/// 读到坏的地方给出一个错误，然后就结束：坏的那个之前的包是好的。
+/// 帧头（[`PacketHeader::Bundle`]）之后依次为各数据包：2 字节大端长度紧跟数据包本体，连续排列至帧尾。
+/// 遇到无效条目时返回错误并终止迭代，此前已产出的包仍有效。
 #[derive(Debug, Clone)]
 pub struct Bundled<'a> {
     rest: &'a [u8],
@@ -131,7 +131,7 @@ impl<'a> Bundled<'a> {
     ///
     /// # Errors
     ///
-    /// 包是空的，或者超过 [`MAX_PACKET_LEN`]：长度写不进两个字节。`frame` 不变。
+    /// 数据包为空或长度超过 [`MAX_PACKET_LEN`]（无法编码为 2 字节无符号整数）。失败时 `frame` 保持不变。
     pub fn push(frame: &mut Vec<u8>, packet: &[u8]) -> Result<(), PieceError> {
         let len = u16::try_from(packet.len()).ok().filter(|len| *len != 0).ok_or(PieceError::PacketTooLarge { len: packet.len() })?;
         frame.extend_from_slice(&len.to_be_bytes());
@@ -162,7 +162,7 @@ impl<'a> Iterator for Bundled<'a> {
     }
 }
 
-/// 一个装不下一帧的 IP 包切成的帧，按片序号的顺序。除了最后一片，每一帧都正好是 `max_len` 字节。
+/// 超出单帧容量的 IP 包拆分所得各帧，按片序号递增排列。除最后一片外，每帧长度均等于 `max_len` 字节。
 #[derive(Debug, Clone)]
 pub struct PacketPieces<'a> {
     message: u16,
@@ -174,11 +174,11 @@ pub struct PacketPieces<'a> {
 impl<'a> PacketPieces<'a> {
     /// 把 `packet` 切成每帧不超过 `max_len` 字节的几片。`message` 是这个包的包号：同一个对端最近切过的包里不重复就行。
     ///
-    /// 只在一帧装不下的时候用：装得下的包用 [`PacketHeader::Whole`] 发，不带分片头。
+    /// 仅在单帧无法容纳时使用：单帧可容纳的数据包使用 [`PacketHeader::Whole`] 发送，不带分片头。
     ///
     /// # Errors
     ///
-    /// 包超过 [`MAX_PACKET_LEN`]，或者切成 [`MAX_PACKET_PIECES`] 片也装不下。
+    /// 数据包超过 [`MAX_PACKET_LEN`]，或即使分为 [`MAX_PACKET_PIECES`] 片仍无法容纳。
     pub fn split(message: u16, packet: &'a [u8], max_len: usize) -> Result<Self, PieceError> {
         if packet.len() > MAX_PACKET_LEN {
             return Err(PieceError::PacketTooLarge { len: packet.len() });
@@ -211,14 +211,14 @@ impl Iterator for PacketPieces<'_> {
     }
 }
 
-/// 一个网络包切不了的原因。
+/// 网络包无法分片的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PieceError {
-    #[error("网络包有 {len} 字节，最短 1 字节，最长 {MAX_PACKET_LEN} 字节")]
+    #[error("网络包长度为 {len} 字节，允许范围为 1 到 {MAX_PACKET_LEN} 字节")]
     PacketTooLarge { len: usize },
-    #[error("连接一次只能发 {max_len} 字节的数据报，{len} 字节的网络包切成 {MAX_PACKET_PIECES} 片也装不下")]
+    #[error("单次数据报最大长度为 {max_len} 字节，{len} 字节网络包即使分为 {MAX_PACKET_PIECES} 片仍无法容纳")]
     FrameTooSmall { len: usize, max_len: usize },
-    #[error("{len} 字节的网络包一帧（{max_len} 字节）就装得下，不用切")]
+    #[error("{len} 字节网络包可装入单帧（上限 {max_len} 字节），无需分片")]
     FitsWhole { len: usize, max_len: usize },
 }
 

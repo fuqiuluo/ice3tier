@@ -279,7 +279,7 @@ pub struct MemoryDatagrams {
 }
 
 impl MemoryDatagrams {
-    /// `datagram` 该进 `peer` 的哪个队列。首字节看不出是给哪一侧的数据报没有队列可进，和真的连接一样直接丢掉。
+    /// 决定 `datagram` 应进入 `peer` 的哪一侧队列。若首字节无法识别目标侧，则与真实连接一致，直接丢弃。
     fn queue(&self, state: &MeshState, peer: NodeId, datagram: &[u8]) -> Result<Option<mpsc::Sender<Datagram>>, DatagramSendError> {
         let node = state.nodes.get(&peer).filter(|_| !state.partitions.contains(&Link::between(self.id, peer)));
         let node = node.ok_or(DatagramSendError::NotConnected(peer))?;
@@ -311,7 +311,7 @@ impl DatagramSender for MemoryDatagrams {
     async fn send_reliable(&self, peer: NodeId, datagram: Bytes) -> Result<(), DatagramSendError> {
         let queue = self.queue(&self.mesh.lock(), peer, &datagram)?;
         let Some(queue) = queue else { return Ok(()) };
-        let closed = |_| DatagramSendError::ConnectionLost { peer, reason: "对端已经不在这张网上".to_owned() };
+        let closed = |_| DatagramSendError::ConnectionLost { peer, reason: "对端已离开网络".to_owned() };
         queue.send(Datagram { peer: self.id, payload: datagram }).await.map_err(closed)
     }
 }
@@ -355,7 +355,7 @@ impl Pipe {
         self.state.lock().expect("pipe mutex poisoned")
     }
 
-    /// 异常结束这个方向。已经异常结束过的不变：先到的那个原因算数。
+    /// 异常结束该方向。若此前已异常结束则保持不变，以最先到达的原因生效。
     fn abort(&self, abort: Abort) {
         let mut state = self.lock();
         if state.aborted.is_none() {
@@ -367,7 +367,7 @@ impl Pipe {
 }
 
 fn connection_lost() -> io::Error {
-    io::Error::new(io::ErrorKind::ConnectionAborted, "和对端节点的连接断开了")
+    io::Error::new(io::ErrorKind::ConnectionAborted, "与对端节点的连接已断开")
 }
 
 /// 流的发送方向。
@@ -382,8 +382,8 @@ impl MemorySend {
         match state.aborted {
             Some(Abort::Stopped(code)) => Err(StreamAborted::Stopped(code).into()),
             Some(Abort::Lost) => Err(connection_lost()),
-            Some(Abort::Reset(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "这个方向已经被自己重置了")),
-            None if state.finished => Err(io::Error::new(io::ErrorKind::BrokenPipe, "这个方向已经正常结束了")),
+            Some(Abort::Reset(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "当前发送方向已重置")),
+            None if state.finished => Err(io::Error::new(io::ErrorKind::BrokenPipe, "当前发送方向已正常关闭")),
             None => Ok(()),
         }
     }
@@ -454,7 +454,7 @@ impl AsyncRead for MemoryRecv {
             Some(Abort::Reset(code)) => return Poll::Ready(Err(StreamAborted::Reset(code).into())),
             Some(Abort::Lost) => return Poll::Ready(Err(connection_lost())),
             Some(Abort::Stopped(_)) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::NotConnected, "这个方向已经被自己叫停了")));
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::NotConnected, "当前接收方向已中止")));
             }
             None => {}
         }

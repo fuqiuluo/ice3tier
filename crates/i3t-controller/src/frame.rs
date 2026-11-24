@@ -14,21 +14,21 @@ pub enum FrameError {
     Io(#[from] io::Error),
     #[error("一帧有 {len} 字节，超过上限 {max}")]
     TooLong { len: usize, max: usize },
-    /// 帧是完整的，只是内容解析不了。连接还可以接着用。
+    /// 帧完整，内容无法解析，连接仍可继续使用。
     #[error("帧的内容不是期望的 JSON")]
     Json(#[from] serde_json::Error),
 }
 
 /// 读一帧。对端在两帧之间正常关闭连接时返回 `None`。
 ///
-/// `max_len` 是这一帧最长多少字节：还没认出对方是谁时用小的上限，免得随便一个连接就让 controller 分配一大块内存。
+/// `max_len` 是这一帧最长多少字节：尚未识别对端身份时使用较小的上限，避免任意连接导致 controller 分配过大内存。
 ///
 /// # Errors
 ///
-/// 读失败、长度超过上限，或者内容解析不了。
+/// 读取失败、帧长度超过上限，或内容无法解析。
 pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(reader: &mut R, max_len: usize) -> Result<Option<T>, FrameError> {
     let len = match reader.read_u32().await {
-        // 放不进 usize 的长度一定超过了上限。
+        // 超出 usize 范围的长度必然超过上限。
         Ok(len) => usize::try_from(len).unwrap_or(usize::MAX),
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(err.into()),

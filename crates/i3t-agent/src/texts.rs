@@ -75,48 +75,48 @@ pub(crate) const fn texts_in(lang: Lang) -> &'static Texts {
 
 static ZH: Texts = Texts {
     template: TEMPLATE_ZH,
-    read_config: |path| format!("读配置文件 {}", path.display()),
-    config_error: |path| format!("配置文件 {} 有错", path.display()),
-    write_config: |path| format!("写配置文件 {}", path.display()),
+    read_config: |path| format!("读取配置文件 {}", path.display()),
+    config_error: |path| format!("配置文件 {} 存在错误", path.display()),
+    write_config: |path| format!("写入配置文件 {}", path.display()),
     create_config: |path| format!("创建配置文件 {}", path.display()),
-    port_zero: "port 不能是 0：别的节点要按固定的端口找它",
+    port_zero: "port 不能为 0：其他节点需要通过固定端口访问本节点",
     proxy_not_loopback: |name, addr| {
         format!(
-            "{name} = \"{addr}\" 不是回环地址：本机的组网入口只能写 127.0.0.1 或 [::1]。给别的机器用的、经出口出去的代理在 WebUI 的代理里配置。"
+            "{name} = \"{addr}\" 不是回环地址：本机组网入口仅允许绑定 127.0.0.1 或 [::1]。面向其他机器、经出口转发的代理请在 WebUI 的代理中配置。"
         )
     },
-    metrics_not_loopback: |addr| format!("metrics.listen = \"{addr}\" 不是回环地址：指标接口没有认证，只能写 127.0.0.1 或 [::1]。"),
-    same_proxy_address: |addr| format!("proxy.socks5 和 proxy.http 不能用同一个地址 {addr}"),
+    metrics_not_loopback: |addr| format!("metrics.listen = \"{addr}\" 不是回环地址：指标接口无认证保护，仅允许绑定 127.0.0.1 或 [::1]。"),
+    same_proxy_address: |addr| format!("proxy.socks5 与 proxy.http 不能使用相同地址 {addr}"),
     unknown_setting: |other| {
-        format!("没有设置项 {other}：可以写 can-exit、can-relay、relay-address、throughput-tests、profile、network、firewall、mtu、offload")
+        format!("未知设置项 {other}：支持 can-exit、can-relay、relay-address、throughput-tests、profile、network、firewall、mtu、offload")
     },
-    not_a_switch: |other| format!("\"{other}\" 不是开关的值：写 on 或 off"),
-    unknown_profile: |other| format!("没有档位 \"{other}\"：可以写 low-footprint、balanced、high-throughput"),
+    not_a_switch: |other| format!("\"{other}\" 不是有效的开关值：请填写 on 或 off"),
+    unknown_profile: |other| format!("未知性能档位 \"{other}\"：支持 low-footprint、balanced、high-throughput"),
     bad_relay_address: |text| {
-        format!("\"{text}\" 不能作为中继地址：写别的节点连得上的“地址:端口”，比如 \"203.0.113.9:40330\"，或者 \"off\"")
+        format!("\"{text}\" 不是有效的中继地址：请填写其他节点可达的“地址:端口”（如 \"203.0.113.9:40330\"）或 \"off\"")
     },
-    bad_mtu: |text| format!("虚拟网卡的 MTU 不能是 \"{text}\"：写 576 到 1500 之间的字节数（默认 1280）"),
-    performance_range: |key, low, high| format!("performance.{key} 要在 {low} 到 {high} 之间"),
-    not_an_address: |text| format!("\"{text}\" 不是地址：写成 \"127.0.0.1:1080\" 这样的“地址:端口”，或者 \"off\""),
+    bad_mtu: |text| format!("无效的虚拟网卡 MTU \"{text}\"：请填写 576 至 1500 之间的字节数（默认 1280）"),
+    performance_range: |key, low, high| format!("performance.{key} 必须在 {low} 至 {high} 之间"),
+    not_an_address: |text| format!("\"{text}\" 不是有效地址：请填写“地址:端口”（如 \"127.0.0.1:1080\"）或 \"off\""),
     create_state_dir: |path| format!("创建状态目录 {}", path.display()),
-    restrict_state_dir: |path| format!("收紧状态目录 {} 的权限", path.display()),
-    parse_key: |path| format!("私钥文件 {} 读不懂", path.display()),
-    read_key: |path| format!("读私钥文件 {}", path.display()),
+    restrict_state_dir: |path| format!("设置状态目录 {} 权限", path.display()),
+    parse_key: |path| format!("无法解析私钥文件 {}", path.display()),
+    read_key: |path| format!("读取私钥文件 {}", path.display()),
     generate_key: "生成节点私钥",
-    find_program: "找不到正在运行的程序文件",
-    not_a_token: "这不是注册令牌：令牌以 i3t- 开头，在 WebUI 的“添加节点”里生成",
-    not_joined: "还没有加入网络",
-    enroll_timeout: "controller 没有按时回答注册请求",
-    enroll_rejected: |reason| format!("controller 拒绝了注册：{reason}"),
-    enroll_try_later: |reason| format!("controller 暂时处理不了注册，令牌没有用掉，稍后再试：{reason}"),
-    enroll_unexpected: |kind| format!("controller 的回答不对：{kind}"),
-    enroll_closed: "controller 没有回答就关闭了连接",
+    find_program: "无法定位当前运行的可执行文件路径",
+    not_a_token: "无效的注册令牌：令牌以 i3t- 开头，可在 WebUI 的“添加节点”中生成",
+    not_joined: "尚未加入网络",
+    enroll_timeout: "等待 controller 响应注册请求超时",
+    enroll_rejected: |reason| format!("controller 拒绝了注册请求：{reason}"),
+    enroll_try_later: |reason| format!("controller 暂时无法处理注册请求，令牌未被消耗，请稍后重试：{reason}"),
+    enroll_unexpected: |kind| format!("收到 controller 的意外响应：{kind}"),
+    enroll_closed: "controller 未响应即关闭了连接",
     connect: CONNECT_ZH,
     probe_close: "关闭连接",
     probe_refused: "controller 拒绝了握手",
-    query_running: |error| format!("问不到正在运行的节点：{error}"),
-    status_unreadable: "正在运行的节点给的状态读不懂",
-    bad_peer: |peer| format!("{peer:?} 不是节点名或者虚拟 IP"),
+    query_running: |error| format!("查询运行中节点状态失败：{error}"),
+    status_unreadable: "无法解析运行中节点返回的状态数据",
+    bad_peer: |peer| format!("{peer:?} 不是有效的节点名称或虚拟 IP"),
 };
 
 /// 中文的连接说明。长连接的日志一直用这一份。
@@ -125,7 +125,7 @@ pub(crate) const CONNECT_ZH: Connect = Connect {
     server_name: "构造 TLS 服务器名",
     tcp: |address| format!("连接 controller {address}"),
     nodelay: "设置 TCP_NODELAY",
-    handshake: "和 controller 的 TLS 握手",
+    handshake: "与 controller 的 TLS 握手",
     timeout: |address| format!("连接 controller {address} 超时"),
 };
 
@@ -187,64 +187,64 @@ static EN: Texts = Texts {
     bad_peer: |peer| format!("{peer:?} isn't a node name or virtual IP"),
 };
 
-const TEMPLATE_ZH: &str = r#"# ice3tier 节点的配置。改完重启 i3t 生效。`i3t set …` 改的也是这个文件。
+const TEMPLATE_ZH: &str = r#"# ice3tier 节点配置文件。修改后重启 i3t 生效，`i3t set …` 也会修改此文件。
 
-# 节点的 UDP 端口。启用为中继的节点在同一个端口号上还监听 TCP。
+# 节点的 UDP 端口。启用为中继的节点同时在相同端口号监听 TCP。
 port = 20330
 
-# 这台机器声明可以承担什么。声明本身不启用任何东西：要管理员在 WebUI 上启用；没有声明的启用不了。
+# 本机声明可承担的角色。声明本身不启用任何角色，需由管理员在 WebUI 中启用；未声明的角色无法启用。
 [declare]
-# 出口：别的节点的流量从这台机器的网络出去。
+# 出口：其他节点的流量经本机网络出站。
 exit = false
-# 中继：为别的节点转发。别的节点连得上它的端口就行，谁连得上它，它就是谁的中继。
+# 中继：为其他节点转发流量。能够访问该端口的节点即可使用本节点作为中继。
 relay = false
-# 中继的另一个地址，只有机房或路由器把另一个 IP 上的端口映射到这台机器时才要写，比如：
+# 中继的额外外部地址：仅在机房或路由器将另一 IP 的端口映射到本机时需要填写，例如：
 # relay_address = "203.0.113.9:40330"
-# 也可以执行 i3t set relay-address 203.0.113.9:40330。别的地址由 controller 自己找出来。
+# 也可执行 i3t set relay-address 203.0.113.9:40330。其余地址由 controller 自动发现。
 
-# 本机的组网入口：这台机器上的程序经它访问组网里的节点（只到节点，不经出口，不认证）。默认不开：
-# 有虚拟网卡时直接连虚拟 IP 就行，装不了网卡的机器才用得上。要开就写回环上的地址，比如 socks5 = "127.0.0.1:1080"。
-# 它们的流只走共用的连接，不走 ice3proxy。经出口出去的代理（和它的 ice3proxy 选项）在 WebUI 的代理里配置。
+# 本机组网入口：供本机程序访问组网内节点（仅通往节点，不经出口，无认证）。默认关闭：
+# 启用虚拟网卡时可直接访问虚拟 IP，仅在无法安装虚拟网卡的机器上需要使用。如需开启请填写回环地址，例如 socks5 = "127.0.0.1:1080"。
+# 本机入口的流仅经共用连接传输，不使用 ice3proxy。经出口出站的代理（及其 ice3proxy 选项）请在 WebUI 的代理中配置。
 [proxy]
 socks5 = "off"
 http = "off"
 
-# 本机的指标接口（Prometheus）：http://<地址>/metrics。只能绑回环地址。不需要的写 "off"。
+# 本机指标接口（Prometheus）：http://<地址>/metrics。仅允许绑定回环地址，不需要时填写 "off"。
 [metrics]
 listen = "127.0.0.1:20333"
 
 # 管理员发起的主动测试。
 [tests]
-# 接受吞吐测试：每个方向最多 5 秒或 20 MB。按流量计费的机器可以写 false（i3t set throughput-tests off）。
+# 接受吞吐测试：单方向上限为 5 秒或 20 MB。按流量计费的机器可设为 false（i3t set throughput-tests off）。
 throughput = true
 
-# 性能档位：low-footprint（一个核、几百 MB 内存的机器）、balanced、high-throughput（对端多、流量大）。
-# controller 给这个节点选了档位时以它为准。i3t set profile <档位> 改的是这一行。
+# 性能档位：low-footprint（单核、数百 MB 内存机器）、balanced、high-throughput（多对端、大流量场景）。
+# 若 controller 为本节点指定了档位，则以 controller 配置为准。i3t set profile <档位> 会修改此行。
 [performance]
 profile = "balanced"
-# 下面各项不写就用档位的值；写了就盖过档位，不管档位是谁选的。
-# threads = 2               # 工作线程。只有一个对端在忙的机器、纯粹的中继写 1 最快。改了要重启
-# stream_buffer_kb = 16     # 每条流每个方向的搬运缓冲
-# stream_window_kb = 2048   # 每条流的接收窗口，最大 2048
-# connection_window_mb = 64 # 一条连接上收、发各自最多压住多少数据
-# idle_close_secs = 300     # 没有流之后多久关闭连接，0 是不关
-# return_memory = false     # 每分钟把空着的内存还给系统
+# 下列参数未填写时使用档位默认值；填写后将覆盖档位配置（无论档位由本机还是 controller 指定）。
+# threads = 2               # 工作线程数。仅单对端活跃或纯中继节点设为 1 性能最佳；修改后需重启
+# stream_buffer_kb = 16     # 每条流单方向的传输缓冲大小
+# stream_window_kb = 2048   # 每条流的接收窗口大小，最大 2048
+# connection_window_mb = 64 # 单条连接收发方向各自允许积压的数据上限
+# idle_close_secs = 300     # 无活跃流后关闭空闲连接的等待时长，0 表示不自动关闭
+# return_memory = false     # 每分钟将空闲堆内存归还操作系统
 
-# 虚拟网卡：本机的程序直接用虚拟 IP 或者 <名字>.<网络的域名> 访问别的节点，像一个局域网。节点停下时拆掉。
-# 要 root（Linux 上 CAP_NET_ADMIN 就够）；Windows 上要以管理员运行，程序旁边要有 wintun.dll。装不上时代理和端口转发照常。
-# i3t set network off 关掉它，i3t network status 列出装了什么。
+# 虚拟网卡：本机程序可直接通过虚拟 IP 或 <名称>.<网络域名> 访问其他节点，如同局域网。节点停止时自动清理。
+# 需要 root 权限（Linux 下具备 CAP_NET_ADMIN 即可）；Windows 下需以管理员身份运行且程序同目录需有 wintun.dll。初始化失败时代理和端口转发仍可用。
+# 执行 i3t set network off 可关闭，执行 i3t network status 可查看已安装状态。
 [network]
 enabled = true
-# 防火墙：放行从虚拟网卡进来的、丢掉从别的网卡进来却自称来自虚拟地址段的（Linux），放行虚拟地址段（Windows）。
-# 写 false（i3t set firewall off）程序就一条规则也不碰，从虚拟网卡进来的由这台机器自己的防火墙管。
+# 防火墙：放行经虚拟网卡入站的流量，丢弃经其他网卡入站但源地址属于虚拟地址段的流量（Linux），放行虚拟地址段（Windows）。
+# 设为 false（i3t set firewall off）时程序不修改任何防火墙规则，虚拟网卡流量由本机防火墙自行管理。
 firewall = true
-# 网卡的 MTU（字节，576 到 1500；i3t set mtu 1280）。写 1280 是跟着网络的默认值（管理员在 controller 上定）；
-# 写别的值就用它，只管这台机器的网卡，别的节点设得不一样也通。
-# 一般不用动：比 1280 大，包多半要切成两片发，反而慢；底下的线路包长特别小时才值得调小。
+# 虚拟网卡 MTU（字节，576 至 1500；i3t set mtu 1280）。设为 1280 表示跟随网络默认值（由管理员在 controller 上配置）；
+# 设为其他值时仅对本机虚拟网卡生效，其他节点配置不同也可互通。
+# 通常无需修改：大于 1280 可能导致数据包分片并降低性能；仅在底层链路 MTU 极小时调小。
 mtu = 1280
-# Linux：网卡和内核之间一次交接一大块数据，不是一个个的包，流量大时省 CPU；内核不给时程序自己退回去。
-# 一般不用动：经网卡的传输卡住或者内容不对时，写 false（i3t set offload off）看是不是它。
-# 管理员在 controller 上把网络的这一项关了的话，这里开着也不用。
+# Linux：启用虚拟网卡与内核之间的分片卸载（GSO/GRO），高吞吐场景可降低 CPU 占用；内核不支持时自动回退。
+# 通常无需修改：若经虚拟网卡传输出现卡顿或数据异常，可设为 false（i3t set offload off）排查。
+# 若管理员在 controller 上关闭了网络级分片卸载，此处开启也不会生效。
 offload = true
 
 [log]

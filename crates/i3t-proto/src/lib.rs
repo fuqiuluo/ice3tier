@@ -13,8 +13,8 @@
 //! | [`backbone`] | relay 之间的骨干延迟矩阵，以及 relay 的过载和下线通知 |
 //! | [`beacon`] | 局域网发现的信标 |
 //! | [`flow`] | 建流请求与应答 |
-//! | [`sealed`] | 虚拟网卡的 IP 包不进 QUIC、单独加密之后的格式 |
-//! | [`tcp_frame`] | UDP 用不了的节点把同样的包装进一条 TCP 时的分帧 |
+//! | [`sealed`] | 不经 QUIC、单独加密传输的虚拟网卡 IP 包格式 |
+//! | [`tcp_frame`] | 无法使用 UDP 的节点在 TCP 连接上传输数据报的分帧格式 |
 
 pub mod addr;
 pub mod backbone;

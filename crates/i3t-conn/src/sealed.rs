@@ -1,4 +1,4 @@
-//! 封好的网络包：虚拟网卡的 IP 包不进 QUIC，单独加密之后直接交给路径层。
+//! 独立加密的网络包通道：虚拟网卡 IP 包绕过 QUIC，单独加密后直接交由路径层发送。
 //!
 //! # 为什么不走连接的数据报
 //!
@@ -26,7 +26,7 @@
 //! # 对端重启
 //!
 //! 对端的进程换了，密钥就没了，本端发的包在它那里解不开，也没有任何回音。走 QUIC 时对端会回一个无状态重置，
-//! 一个往返就知道；这里靠同样的机制：在发、却有一阵没有收到对端任何封好的包时，隔一会儿在连接上发一个空的数据报
+//! 一个往返即可感知；此处复用相同机制：持续发送但一段时间未收到对端任何封包时，周期性在连接上发送空数据报
 //! （[`Session::probe_due`]）。对端还在就只是确认它；换了进程就回重置，连接关闭，上层重建。
 
 use std::collections::{HashMap, VecDeque};
@@ -48,10 +48,10 @@ use crate::quic::{ALPN_BUNDLES, ALPN_SEALED};
 /// 从握手里导出密钥时的标签。换格式或者换算法时要换一个，新旧两种包就互相解不开。
 const EXPORT_LABEL: &[u8] = b"EXPORTER-i3t-sealed-packets-1";
 const KEY_LEN: usize = 32;
-/// 导出的那一段：连接标识，拨号一方发的那个方向的密钥，接受一方发的那个方向的密钥。
+/// 导出的密钥材料布局：连接标识（4 字节）、拨号方发送方向密钥、接受方发送方向密钥。
 const MATERIAL_LEN: usize = 4 + 2 * KEY_LEN;
 
-/// 一个方向上最多发这么多个包。到不了：每秒一百万个也要十四万年；留着是为了序号绝不绕回去重复。
+/// 单个方向允许发送的最大包数。实际不可能达到（即使每秒百万包也需约十四万年），设置该上限以保证序号永不回绕复用。
 const COUNTER_LIMIT: u64 = 1 << 62;
 /// 认证失败的包到了这么多个，这把密钥就不再用（RFC 9001 §6.6 给 ChaCha20-Poly1305 的上限）。
 const FORGERY_LIMIT: u64 = 1 << 36;
@@ -67,7 +67,7 @@ const REPLAY_WORD_BITS: u64 = 64;
 /// 攒成一批一起交给内核的封好的包最多几个。一批最大的也就两万多字节，远在一次发送的上限（64 KB）之内。
 pub(crate) const BATCH_PACKETS: usize = 16;
 
-/// 认不出是哪条连接的包（连接标识还没有登记）先留这么多个、这么久。
+/// 尚未匹配到已登记会话的包（连接标识尚未注册）的最大暂存数量与最长保留时间。
 ///
 /// 握手完成的一方马上就能发，另一方登记密钥要晚几毫秒：这中间到的包不留的话，一条新连接上的头几个包
 /// （TCP 的 SYN、第一个 ping）必丢，上层要等一秒的重传。
@@ -80,18 +80,18 @@ pub enum PacketTransport {
     /// 对端也这样声明的连接上，单独加密、直接走路径层；别的连接走数据报。还认识一帧里合着好几个小包的。
     #[default]
     Sealed,
-    /// 和 [`Sealed`](Self::Sealed) 一样，只是不认识一帧里合着好几个包的：有合并小包之前的程序是这样的。
+    /// 与 [`Sealed`](Self::Sealed) 相同，但不支持单帧合并多个小包，对应合并小包特性引入前的旧版本行为。
     /// 测试新旧程序之间怎么来往时用。
     SealedOneByOne,
-    /// 一律走连接的数据报，和不认识封好的包的旧程序一样。做对比测试时用。
+    /// 一律走 QUIC 连接数据报，与不支持独立封包的旧版本一致，用于对比测试。
     Datagram,
 }
 
 impl PacketTransport {
-    /// 指定走哪一种的环境变量，取值 `on`（默认）、`unbundled`（封好的包照旧，不认识合在一起的小包）或 `off`。做对比测试时用。
+    /// 指定网络包传输模式的环境变量，可选 `on`（默认）、`unbundled`（启用独立封包但不支持合并小包）或 `off`，用于对比测试。
     pub const ENV: &str = "I3T_SEALED_PACKETS";
 
-    /// 环境变量 [`Self::ENV`] 指定的那一种；没有设置或者值看不懂时用默认的。
+    /// 返回环境变量 [`Self::ENV`] 指定的模式；未设置或取值无效时使用默认值。
     #[must_use]
     pub fn from_env() -> Self {
         std::env::var(Self::ENV).map_or_else(|_| Self::default(), |value| Self::from_env_value(&value))
@@ -103,7 +103,7 @@ impl PacketTransport {
             "unbundled" => Self::SealedOneByOne,
             "off" => Self::Datagram,
             _ => {
-                tracing::warn!(%value, "环境变量 {} 的值不是 on、unbundled 或 off，照默认的来（on）", Self::ENV);
+                tracing::warn!(%value, "环境变量 {} 的值无效（仅支持 on、unbundled 或 off），使用默认值 on", Self::ENV);
                 Self::default()
             }
         }
@@ -140,19 +140,19 @@ pub(crate) enum Role {
     Acceptor,
 }
 
-/// 密钥用到头了：序号发完了，或者认证失败的包到了上限。这条连接该关掉重建。
+/// 会话密钥已达使用上限（发送序号耗尽或认证失败计数达到上限），连接需关闭重建。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("这条连接上封包的密钥用到头了")]
+#[error("该连接的封包会话密钥已达使用上限")]
 pub(crate) struct Spent;
 
 /// 一个封好的包为什么没有收下。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum Rejected {
-    #[error("序号见过了，或者比重放窗口还旧")]
+    #[error("序号重复或已超出重放窗口")]
     Replayed,
-    #[error("校验对不上")]
+    #[error("消息认证校验失败")]
     Forged,
-    #[error("序号超出了发的一方会用的范围")]
+    #[error("序号超出发送方允许范围")]
     OutOfRange,
 }
 
@@ -196,7 +196,7 @@ impl Session {
     }
 
     fn from_material(material: &[u8; MATERIAL_LEN], role: Role) -> Self {
-        let (id, keys) = material.split_first_chunk::<4>().expect("导出的那一段比连接标识长");
+        let (id, keys) = material.split_first_chunk::<4>().expect("导出密钥材料长度不小于 4 字节连接标识");
         let (from_dialer, from_acceptor) = keys.split_at(KEY_LEN);
         let key = |bytes: &[u8]| LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, bytes).expect("ChaCha20-Poly1305 的密钥是 32 字节"));
         let (sealing, opening) = match role {
@@ -234,7 +234,7 @@ impl Session {
         out.reserve(SealedHeader::OVERHEAD + frame.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(frame);
-        // 只有内容长到算法处理不了（几百 GB）才会失败。
+        // 仅当明文长度超出算法上限（数百 GB）时才会失败。
         let Ok(tag) = self.sealing.seal_in_place_separate_tag(nonce(counter), Aad::from(header), &mut out[start + SealedHeader::LEN..])
         else {
             out.truncate(start);
@@ -248,7 +248,7 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// 序号是发的一方不会用的，重放的，或者校验对不上的。
+    /// 序号超出允许范围、属于重放包，或消息认证校验失败。
     pub(crate) fn open<'a>(&self, header: SealedHeader, packet: &'a mut [u8]) -> Result<&'a [u8], Rejected> {
         // 守规矩的对端发不出这么大的序号（[`seal`](Self::seal) 到这里就停了）。校验对得上也不收：拿着密钥的对端要是故意发一个
         // 最大的序号，重放窗口记"下一个"时就没有数可记了。
@@ -308,7 +308,7 @@ impl Session {
         (heard != 0).then(|| self.created + Duration::from_millis(heard - 1))
     }
 
-    /// 刚发了一个包：现在该不该让连接去问一下对端还在不在。返回真的那一次由调用方去问，之后一阵子都返回假。
+    /// 发送封包后检查是否需要通过 QUIC 连接探测对端存活。返回 `true` 时由调用方触发一次探测，随后在间隔期内返回 `false`。
     pub(crate) fn probe_due(&self) -> bool {
         let every = u64::try_from(PROBE_EVERY.as_millis()).unwrap_or(u64::MAX);
         let now = self.millis();
@@ -321,7 +321,7 @@ impl Session {
         now.saturating_sub(probed) >= every && self.probed.compare_exchange(probed, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
 
-    /// 密钥是不是用到头了。到头了的连接该关掉，重建之后是新的密钥。
+    /// 返回会话密钥是否已达使用上限；达到上限的连接需关闭并重建以协商新密钥。
     pub(crate) fn is_spent(&self) -> bool {
         self.next.load(Ordering::Relaxed) >= COUNTER_LIMIT || self.forged.load(Ordering::Relaxed) >= FORGERY_LIMIT
     }
@@ -330,7 +330,7 @@ impl Session {
 /// 攒着等一起交给路径层的封好的包：发给同一个对端，首尾相接，等长，只有最后一个可以短。
 /// 这正是一次系统调用发得出去的样子（内核按固定的长度切开）。
 ///
-/// 虚拟网卡一口气读出来的几个包多半是同一条流的，一样长；一个一个地发，每个包一次系统调用，大流量时一半的 CPU 花在这上面。
+/// 从虚拟网卡单次读取的多个数据包通常属于同一流且长度相同；逐包发送会导致每包一次系统调用，高吞吐场景下消耗大量 CPU。
 #[derive(Debug, Default)]
 pub(crate) struct Batch {
     /// 发给谁、用的哪个会话。空着的时候是 `None`。
@@ -503,7 +503,7 @@ impl EarlyPackets {
         wanted.into_iter().filter(|early| early.at.elapsed() <= EARLY_MAX_AGE).map(|early| early.packet).collect()
     }
 
-    /// 隔一阵把所有对端名下过期的清掉：没等到密钥的包（对端手上的密钥已经作废了）不能一直占着内存。
+    /// 定期清理所有对端下已过期的暂存包，避免始终未等到会话密钥的包（如对端持有已失效密钥）持续占用内存。
     /// 每次留包、取包、连接结束时都会走到这里，真正去清的间隔不短于 [`EARLY_MAX_AGE`]。
     fn sweep(&mut self) {
         if self.swept.is_some_and(|at| at.elapsed() < EARLY_MAX_AGE) {
@@ -543,7 +543,7 @@ impl Inbox {
         self.early().take(peer, session.id)
     }
 
-    /// 补收 [`admit`](Self::admit) 交出来的包。这期间那个会话要是已经撤掉了（对端被吊销），它们解不开，重新留着等到过期。
+    /// 补收由 [`admit`](Self::admit) 返回的早到包。若期间该会话已被移除（对端被吊销），这些包无法解密，将重新暂存直至过期。
     pub(crate) fn deliver_early(&self, peer: NodeId, early: Vec<Vec<u8>>) {
         for mut packet in early {
             self.receive(peer, &mut packet);
@@ -586,22 +586,22 @@ impl Inbox {
     /// 路径层送上来一个 `peer` 发来的封好的包。解得开、里面是网络包帧的排进队列，其余的丢掉。
     pub(crate) fn receive(&self, peer: NodeId, packet: &mut [u8]) {
         let Some(header) = SealedHeader::parse(packet) else {
-            return tracing::trace!(%peer, len = packet.len(), "丢掉一个封好的包：短得不成格式");
+            return tracing::trace!(%peer, len = packet.len(), "丢弃封包：长度不足，格式无效");
         };
         let session = self.sessions.read().expect("sealed session table lock poisoned").get(&(peer, header.session)).cloned();
         let Some(session) = session else {
-            // 连接标识还没有登记：多半是对端握手完成得比本端早了几毫秒，先留着。也可能是对端手上的密钥已经作废
-            // （本端重启过），那样的留一会儿就过期了。
+            // 连接标识尚未登记：通常是对端早几毫秒完成握手，先暂存等待；也可能是对端仍持有已作废密钥
+            // （如本端重启过），此类包将在超时后自动过期清理。
             return self.early().hold(peer, header.session, packet);
         };
         match session.open(header, packet) {
             Ok(frame) if Channel::peek(frame) == Some(Channel::Packet) => {
                 if self.packets.try_send(Datagram { peer, payload: Bytes::copy_from_slice(frame) }).is_err() {
-                    tracing::trace!(%peer, "丢掉一个网络包：虚拟网卡的队列满了，或者本端正在关闭");
+                    tracing::trace!(%peer, "丢弃网络包：虚拟网卡接收队列已满或本端正在关闭");
                 }
             }
-            Ok(_) => tracing::trace!(%peer, "丢掉一个封好的包：里面不是网络包帧"),
-            Err(rejected) => tracing::trace!(%peer, %rejected, "丢掉一个封好的包"),
+            Ok(_) => tracing::trace!(%peer, "丢弃封包：载荷不是网络包帧"),
+            Err(rejected) => tracing::trace!(%peer, %rejected, "丢弃封包"),
         }
     }
 }

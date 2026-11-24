@@ -36,18 +36,18 @@ pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// UDP 端口转发的会话没有报文往来多久之后回收。
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// 端口写 0 的端口转发挑定的端口记在哪里（挑定之后固定下来，重启不变）。
+/// 端口为 0 的端口转发所分配端口的持久化存储（分配后固定，重启不变）。
 ///
-/// 装配层把它存在节点的状态目录里。记着的端口下次启动时被别的程序占了，这条转发处于"端口被占用"的状态，
-/// 不会换一个端口：换了的话，用它的人手里的端口号就悄悄失效了。
+/// 装配层将其保存在节点的状态目录中。若记录的端口下次启动时被其他程序占用，该转发将处于“端口被占用”状态，
+/// 而不会重新分配端口：否则使用方已记录的端口号会悄然失效。
 pub trait PortBook: Send + Sync + 'static {
-    /// 这条转发上次挑定的端口。
+    /// 查询该转发上次分配的端口。
     fn port(&self, forward: u32) -> Option<u16>;
-    /// 这条转发挑定了 `port`。
+    /// 记录该转发已分配的 `port`。
     fn remember(&self, forward: u32, port: u16);
 }
 
-/// 不记：每次都让系统重新挑。静态模式和测试用。
+/// 不做持久化：每次启动均由系统重新分配。用于静态模式和测试。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoPortBook;
 
@@ -68,8 +68,8 @@ impl PortBook for NoPortBook {
 /// UDP 也从这里进来：SOCKS5 上的 UDP ASSOCIATE，以及协议是 UDP 的端口转发。它们到对端节点走数据报上下文，
 /// 所以 `C` 除了能开流，还要能收发数据报。
 ///
-/// 节点排空时（[`Access::set_draining`]）监听照常开着，新的请求得到明确的拒绝：代理回 SOCKS5 的 0x01、
-/// HTTP 的 503；端口转发没有地方回错误，TCP 的连接被重置，UDP 不建新的会话。已经建立的连接照常跑完。
+/// 节点排空时（[`Access::set_draining`]）监听器保持开启，新请求将被明确拒绝：代理返回 SOCKS5 的 0x01
+/// 或 HTTP 的 503；端口转发无错误回传机制，TCP 连接会被重置，UDP 不建立新会话。已建立的连接继续运行直至结束。
 pub struct Access<C: Datagrams> {
     pub(crate) shared: Arc<Shared<C>>,
     published: Mutex<AccessStatus>,
@@ -121,7 +121,7 @@ impl<C: Connector + Datagrams> Access<C> {
         self
     }
 
-    /// 本机配置文件里的组网入口：不认证、只通到组网里的节点（[`LocalEntry`]）。不设时没有。
+    /// 本机配置文件定义的组网入口：无需认证、仅可访问组网内节点（[`LocalEntry`]）。未设置时不启用。
     ///
     /// # Panics
     ///
@@ -132,7 +132,7 @@ impl<C: Connector + Datagrams> Access<C> {
         self
     }
 
-    /// 端口写 0 的端口转发挑定的端口记在哪里。不设时每次启动都重新挑。
+    /// 端口为 0 的端口转发所分配端口的持久化存储。未设置时每次启动均重新分配。
     ///
     /// # Panics
     ///
@@ -191,7 +191,7 @@ impl<C: Connector + Datagrams> Access<C> {
                         break;
                     }
                     () = time::sleep(RETRY_INTERVAL), if any_failed => break,
-                    // 连接层关掉了：数据报不会再来，监听照常维护到节点关闭。
+                    // 连接层已关闭：不再接收数据报，监听器继续维护至节点关闭。
                     () = &mut datagrams, if pumping => pumping = false,
                 }
             }
@@ -208,7 +208,7 @@ impl<C: Connector + Datagrams> Access<C> {
         status
     }
 
-    /// 端口转发的目标最近连不上的记录。出口模块接住监听在虚拟 IP 上的转发时记到同一份里。
+    /// 端口转发目标近期连接失败的记录。出口模块处理监听在虚拟 IP 上的转发时共用同一份记录。
     #[must_use]
     pub fn forward_health(&self) -> ForwardHealth {
         self.shared.forward_health.clone()
@@ -253,7 +253,7 @@ impl<C: Connector + Datagrams> Access<C> {
             if wanted.iter().any(|(key, _)| *key == existing.key) {
                 kept.push(existing);
             } else {
-                tracing::info!(listen = %existing.key, "netmap 里不再有这个监听，关掉它（已经建立的连接不受影响）");
+                tracing::info!(listen = %existing.key, "netmap 中已移除该监听，正在关闭（已建立的连接不受影响）");
                 existing.close().await;
             }
         }
@@ -278,11 +278,11 @@ impl<C: Connector + Datagrams> Access<C> {
                             (state, serving)
                         }
                         Plan::Virtual { listener: false } => {
-                            tracing::info!(listen = %key, "这条 UDP 端口转发监听在本节点的虚拟 IP 上、目标是本节点自己：只经流来访问，不占用操作系统的端口");
+                            tracing::info!(listen = %key, "该 UDP 端口转发监听在本节点虚拟 IP 且目标为本节点自身，仅通过流访问，不绑定操作系统端口");
                             (ListenState::Virtual, None)
                         }
                         Plan::Unsupported { reason, cause } => {
-                            tracing::warn!(listen = %key, reason, "这条端口转发不能用");
+                            tracing::warn!(listen = %key, reason, "该端口转发配置不受支持，无法启用");
                             (ListenState::Unsupported { reason: reason.to_owned(), cause }, None)
                         }
                     };
@@ -313,18 +313,18 @@ impl<C: Connector + Datagrams> Access<C> {
         *self.published.lock().expect("access status mutex poisoned") = status;
     }
 
-    /// 绑定 `key` 的地址并开始接受连接。绑不上时不是错误，而是一个要报告的状态。
+    /// 绑定 `key` 对应的地址并开始接受连接。绑定失败不视为致命错误，而是作为状态上报。
     ///
-    /// `previous_failure` 是上一次失败的原因：重试时原因没变就不再记日志。
-    /// 监听在本节点虚拟 IP 上的端口转发：别的节点经虚拟网卡来连，所以在虚拟 IP 上真的监听。经流来的
-    /// （本机的 SOCKS5 入口、没有网卡的节点）照旧由出口模块接住。
+    /// `previous_failure` 为上次失败的原因：重试时若原因未变，则不重复记录日志。
+    /// 监听在本节点虚拟 IP 上的端口转发：对端节点会经虚拟网卡连接，因此在虚拟 IP 上实际绑定监听；经流接入的请求
+    /// （如本机 SOCKS5 入口或未启用虚拟网卡的节点）仍由出口模块处理。
     ///
-    /// Linux 上用 `IP_FREEBIND`：地址还不在网卡上（网卡还没装好、或者装不了）也绑得上，网卡装好的那一刻就收得到连接。
-    /// 别的平台没有它：地址不在本机时（第三项是真）状态是 [`ListenState::Virtual`]，之后隔一阵再试，网卡装好之后就绑上了。
+    /// Linux 上启用 `IP_FREEBIND`：即使虚拟 IP 尚未配置到网卡（网卡未就绪或初始化失败）也可绑定，待网卡就绪即可接收连接。
+    /// 其他平台不支持该选项：地址在本机不可用时（返回值的第三项为 `true`）状态为 [`ListenState::Virtual`]，之后定期重试，待网卡就绪后完成绑定。
     async fn listen_virtual(&self, key: &Key, counters: &Counters) -> (ListenState, Option<Serving>, bool) {
         match self.listen(key, counters, None).await {
             (ListenState::Failed { cause: ListenCause::AddressNotAvailable, .. }, None) => {
-                tracing::info!(listen = %key, "这条端口转发监听在本节点的虚拟 IP 上，虚拟网卡还没有装上：先只经流来访问，网卡装上之后再监听");
+                tracing::info!(listen = %key, "该端口转发监听在本节点虚拟 IP，虚拟网卡尚未就绪，暂仅通过流访问，待虚拟网卡就绪后再监听");
                 (ListenState::Virtual, None, true)
             }
             (state, serving) => (state, serving, false),
@@ -333,7 +333,7 @@ impl<C: Connector + Datagrams> Access<C> {
 
     async fn listen(&self, key: &Key, counters: &Counters, previous_failure: Option<&str>) -> (ListenState, Option<Serving>) {
         let configured = key.bind();
-        // 端口写 0 的端口转发：用上次挑定的端口；还没挑过就让系统挑一个，记下来。
+        // 端口为 0 的端口转发：优先使用上次分配的端口；尚未分配则由系统自动分配并记录。
         let (bind, chosen_now) = match key {
             Key::Forward { id, .. } if configured.port() == 0 => match self.shared.ports.port(*id) {
                 Some(port) => (SocketAddr::new(configured.ip(), port), false),
@@ -348,7 +348,7 @@ impl<C: Connector + Datagrams> Access<C> {
             Key::Proxy { .. } | Key::Local { .. } => (ForwardProtocol::Tcp, None),
         };
         let claim = |local| self.shared.own_listeners.claim(OwnListener { protocol, local, forward });
-        // 只登记绑上了的（[`OwnListeners::claim`]）：绑不上的隔一阵重试一次，那个端口多半在别的程序手里。
+        // 仅登记绑定成功的监听（[`OwnListeners::claim`]）：绑定失败的监听会定期重试，其端口可能正被其他程序占用。
         let started = match key {
             Key::Forward { id, protocol: ForwardProtocol::Udp, .. } => udp_socket(bind, free).map(|socket| {
                 let local = socket.local_addr().unwrap_or(bind);
@@ -361,7 +361,7 @@ impl<C: Connector + Datagrams> Access<C> {
             Key::Forward { protocol: ForwardProtocol::Tcp, .. } | Key::Proxy { .. } | Key::Local { .. } => {
                 tcp_bound(bind, free).and_then(|socket| {
                     let local = socket.local_addr().unwrap_or(bind);
-                    // 绑上了、还没有开始监听，这时连不进来：先登记，再开始监听。
+                    // 已绑定但尚未开始监听，此时不会接受连接：先完成登记，再开始监听。
                     let claim = claim(local);
                     let listener = socket.listen(TCP_BACKLOG)?;
                     let task = tokio::spawn(accept_loop(Arc::clone(&self.shared), key.clone(), listener, counters.clone()));
@@ -372,7 +372,7 @@ impl<C: Connector + Datagrams> Access<C> {
         match started {
             Ok((local, serving)) => {
                 if let (true, Key::Forward { id, .. }) = (chosen_now, key) {
-                    tracing::info!(listen = %key, port = local.port(), "端口转发的端口写的是 0，挑定了这个端口，之后重启也用它");
+                    tracing::info!(listen = %key, port = local.port(), "端口转发配置端口为 0，已自动分配并持久化该监听端口，重启后将继续使用");
                     self.shared.ports.remember(*id, local.port());
                 }
                 tracing::info!(listen = %key, %local, "开始监听");
@@ -381,7 +381,7 @@ impl<C: Connector + Datagrams> Access<C> {
             Err(error) => {
                 let reason = error.to_string();
                 if previous_failure != Some(reason.as_str()) {
-                    tracing::warn!(listen = %key, %bind, %reason, "绑定失败，这个监听处于失败状态，之后会重试");
+                    tracing::warn!(listen = %key, %bind, %reason, "监听绑定失败，将在后续重试");
                 }
                 let state = match ListenCause::from(error.kind()) {
                     ListenCause::AddressInUse => ListenState::PortInUse { reason },
@@ -446,7 +446,7 @@ pub struct ForwardStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ListenState {
-    /// 正在监听。`local` 是实际绑定的地址：配置里端口写 0 时，这里是挑定的端口。
+    /// 正在监听。`local` 为实际绑定的地址：配置端口为 0 时，此处为实际分配的端口。
     Listening { local: SocketAddr },
     /// 端口已经被别的程序占用（原因的种类就是 [`ListenCause::AddressInUse`]）。不去抢，每隔一段时间和每次 netmap 变化时重试。
     PortInUse { reason: String },
@@ -564,8 +564,8 @@ impl std::fmt::Display for Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Plan {
     Bind,
-    /// 监听在本节点的虚拟 IP 上。`listener` 是假的时候不在操作系统里监听：目标是本节点自己的 UDP 转发，
-    /// 本节点到不了自己的数据报上下文，只经流来访问（出口模块接住）。
+    /// 监听在本节点的虚拟 IP 上。`listener` 为 `false` 时不在操作系统中绑定监听：目标是本节点自身的 UDP 转发，
+    /// 本节点无法访问自身的数据报上下文，仅通过流访问（由出口模块处理）。
     Virtual {
         listener: bool,
     },
@@ -586,7 +586,7 @@ fn wanted(netmap: &Netmap, local: &[LocalEntry]) -> Vec<(Key, Plan)> {
         let plan = if forward.bind.ip().to_canonical() != IpAddr::V4(netmap.me.virtual_ip) {
             Plan::Bind
         } else if forward.bind.port() == 0 {
-            Plan::Unsupported { reason: "监听在虚拟 IP 上的端口转发要写明端口号", cause: ListenCause::VirtualPortZero }
+            Plan::Unsupported { reason: "监听在虚拟 IP 上的端口转发必须指定端口号", cause: ListenCause::VirtualPortZero }
         } else {
             Plan::Virtual { listener: !(forward.protocol == ForwardProtocol::Udp && forward.target == netmap.me.id) }
         };
@@ -609,7 +609,7 @@ struct Bound {
     counters: Counters,
     /// 开着时有值。
     serving: Option<Serving>,
-    /// 监听在虚拟 IP 上、这个地址还不在本机（虚拟网卡没装上，没有 `IP_FREEBIND` 的平台上）：隔一阵再试。
+    /// 监听在虚拟 IP 上但该地址尚未在本机生效（虚拟网卡未就绪且平台不支持 `IP_FREEBIND`）：定期重试绑定。
     awaiting_address: bool,
 }
 
@@ -621,7 +621,7 @@ struct Serving {
 }
 
 impl Bound {
-    /// 关掉监听，等到 socket 真的关上再返回，这样紧接着绑同一个地址不会撞上自己。
+    /// 关闭监听并等待 socket 完全释放后再返回，避免紧接着重绑同一地址时发生冲突。
     async fn close(mut self) {
         if let Some(Serving { task, _claim }) = self.serving.take() {
             task.abort();
@@ -642,8 +642,8 @@ impl Drop for Bound {
 /// TCP 的监听上排队的连接最多这么多条，和 `i3t_underlay::tcp_mss::listen` 一样。
 const TCP_BACKLOG: u32 = 1024;
 
-/// 绑好了、还没有开始监听的 TCP socket，开始监听留给调用方：这中间连不进来，调用方趁这时把它登记成程序自己的监听。
-/// 别的和 `i3t_underlay::tcp_mss::listen` 做的一样。`free` 时（地址是本节点的虚拟 IP）地址还不在网卡上也绑得上（[`free_bind`]）。
+/// 创建已绑定但尚未开始监听的 TCP socket，由调用方执行 listen：在此间隙内不会接受连接，调用方可先将其登记为本程序自有监听。
+/// 其余行为与 `i3t_underlay::tcp_mss::listen` 一致。`free` 为 `true`（本节点虚拟 IP）时，即使地址尚未在网卡上生效也可绑定（[`free_bind`]）。
 fn tcp_bound(bind: SocketAddr, free: bool) -> io::Result<TcpSocket> {
     let socket = if bind.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
     #[cfg(unix)]
@@ -693,11 +693,11 @@ async fn accept_loop<C: Connector + Datagrams>(shared: Arc<Shared<C>>, key: Key,
                         Refusal::VirtualIp => tracing::debug!(
                             listen = %key,
                             %from,
-                            "拒绝了一条连接：监听在本节点的虚拟 IP 上，来源既不是本机，也不是可以访问本节点的节点（多半是从别的网卡进来的）"
+                            "已拒绝连接：该端口监听在本节点虚拟 IP 上，来源既非本机，也非有权访问本节点的对端节点"
                         ),
                         Refusal::AllowList => {
                             if let Some(more) = refusals.due(time::Instant::now()) {
-                                tracing::info!(listen = %key, %from, more, "拒绝了一条连接：来源不在白名单里");
+                                tracing::info!(listen = %key, %from, more, "已拒绝连接：来源地址不在白名单中");
                             }
                         }
                         Refusal::Gone => {}
@@ -761,11 +761,11 @@ async fn serve<C: Connector + Datagrams>(
     pass: Option<Pass>,
 ) {
     if let Err(error) = stream.set_nodelay(true) {
-        tracing::debug!(%error, "设置不了 TCP_NODELAY");
+        tracing::debug!(%error, "启用 TCP_NODELAY 失败");
     }
     // 流没有空闲时限，客户端悄悄消失（断电、换了网络）时靠内核保活发现，这条连接经过的流和出口上的连接才会释放。
     if let Err(error) = i3t_flow::keep_alive(&stream) {
-        tracing::debug!(%error, "客户端连接打不开内核保活，客户端悄悄消失时这条连接要等到有数据要发才会发现");
+        tracing::debug!(%error, "无法为客户端连接启用内核保活，若客户端异常断开，将在后续发送数据时才能检测到");
     }
     // 下面都找得到：接受连接时在同一份 netmap 里找过（[`Key::admits`]）。
     match key {
@@ -826,10 +826,10 @@ impl Key {
 /// 监听在本节点虚拟 IP 上的（端口转发、代理、组网入口）只收经虚拟网卡来的和本机自己的：来源是可以访问本节点的节点的虚拟 IP、
 /// 本节点的虚拟 IP 或者回环。监听在别的地址上的不管。和来源白名单（[`allowed`]）都要过。
 ///
-/// 经虚拟网卡进来的包，来源核对过是那个节点的虚拟 IP，访问规则不允许它访问本节点时它开不了会话。可 Linux 按"弱主机模型"收包：
-/// 发往虚拟 IP 的包从别的网卡进来也收，同一个局域网里的机器（或者上游的路由器）把虚拟 IP 指到这台机器，就能用它自己的真实地址
-/// 连上这里，访问规则管不到它。虚拟网卡的防火墙规则挡在前面；这里再挡一道：防火墙的开关关着、规则装不上、别的系统打开了转发时
-/// 也挡得住。Docker 桥接网络里的容器连宿主机的虚拟 IP 也因此不行（它们和局域网里的机器分不开）。
+/// 经虚拟网卡进入的数据包已核对来源为对端节点的虚拟 IP，访问规则不允许访问本节点时无法建立会话。但 Linux 默认采用“弱主机模型”接收数据包：
+/// 发往虚拟 IP 的包即使从其他网卡进入也会被接收，同一局域网的主机（或上游路由器）若将虚拟 IP 路由到本机，即可用其真实地址
+/// 连接到此端口，从而绕过访问规则。虚拟网卡的防火墙规则负责前端拦截；此处作为第二道校验：即使防火墙开关关闭、规则安装失败或系统开启了转发，
+/// 仍可拦截此类连接。Docker 桥接网络中的容器访问宿主机虚拟 IP 同样会被拒绝（无法与局域网主机区分）。
 pub(crate) fn virtual_ip_admits(netmap: &Netmap, bind: SocketAddr, from: SocketAddr) -> bool {
     let own = netmap.me.virtual_ip;
     if bind.ip().to_canonical() != IpAddr::V4(own) {

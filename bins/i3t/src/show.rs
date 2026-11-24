@@ -214,8 +214,8 @@ pub fn ping(asked: &str, report: &PingReport) -> bool {
     true
 }
 
-/// `i3t ping` 量的这段时间里走的路。开始和结束时的路不一样才写成"开始 → 结束"：中间换过又换回来的，对看结果的人来说路没有变。
-/// relay 写名字，和 `i3t routes` 一样；旧版本的节点不给名字，那时写编号。
+/// 展示 `i3t ping` 测量期间使用的路径。仅当起止路径不同时显示"开始 → 结束"；若中途切换后又切回原路径，则按未变化展示。
+/// 中继与 `i3t routes` 一致显示名称；旧版本节点未提供名称时回退显示编号。
 fn ping_route(report: &PingReport) -> String {
     let (t, lang) = context();
     let codes = lang.codes();

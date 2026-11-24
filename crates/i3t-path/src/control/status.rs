@@ -16,7 +16,7 @@ use crate::routing::PathId;
 use crate::timing::Rtt;
 
 impl Control {
-    /// 本节点试过的各个 relay 连没连上，报给 controller。有会话的在前，然后是连得上的、连不上的，最多 [`MAX_RELAY_TRIES`] 个。
+    /// 汇总本节点探测过的各 relay 可达状态并上报给 controller。按已建立会话、可达、不可达排序，最多返回 [`MAX_RELAY_TRIES`] 条。
     pub(super) fn relay_tries(&self, now: Instant) -> Vec<RelayTry> {
         let mut tries: Vec<(bool, RelayTry)> = self
             .relays

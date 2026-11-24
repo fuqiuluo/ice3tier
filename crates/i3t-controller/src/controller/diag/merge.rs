@@ -8,7 +8,7 @@ use i3t_model::control::diag::{Decision, HostReport, PathMeasure, PathPick, Test
 use i3t_model::control::{Route, TestReport};
 use i3t_proto::NodeId;
 
-/// 指令发出之前就知道做不了的几项和原因。
+/// 下发指令前即可确定无法执行的测试项及其原因。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Skips {
     /// 直连能力和直连质量（有一端只经 relay）。
@@ -153,7 +153,7 @@ fn host_result(node: NodeId, last: Option<&TestReport>, finished: bool) -> HostR
     HostResult { node, state, problem, report }
 }
 
-/// 直连没有成功时最能说明问题的那个原因：UDP 不通、端口映射随对端变化这类说得出是哪个节点的，排在"超时"前面。
+/// 直连失败时最具诊断价值的根因：可定位到具体节点的原因（如 UDP 不通、端口映射随对端变化）优先于「超时」。
 fn direct_problem(sides: &[DirectSideView]) -> TestProblem {
     const ORDER: [TestCode; 7] = [
         TestCode::UdpBlocked,
@@ -269,7 +269,7 @@ fn decision_view(decision: &Decision, from: NodeId, to: NodeId) -> DecisionView 
     }
 }
 
-/// 测试结束时的状态：被取消的是取消；一端整个拒绝了、或者发起方什么都没报的是失败；别的是做完了。
+/// 测试结束时的最终状态：被取消时为取消；任一端整体拒绝或发起方无任何上报时为失败；其余情况为已完成。
 pub(crate) fn final_state(
     cancelled: bool,
     initiator: Option<&TestReport>,

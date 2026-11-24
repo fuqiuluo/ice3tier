@@ -123,7 +123,7 @@ impl Book {
 pub struct LaneStatus {
     /// 全节点的合计（从启动算起，对端去掉之后也不减）。
     pub total: LaneCounts,
-    /// 别人拨进来、没有成功的握手，按原因分。分不到对端名下，只有全节点的。
+    /// 拨入连接握手失败的分类统计。由于未能归属到具体对端，仅统计节点级总计。
     pub handshake_failures: HandshakeFailures,
     /// 每个打开了 ice3proxy 的对端。
     pub peers: Vec<PeerLaneStatus>,
@@ -134,7 +134,7 @@ pub struct LaneStatus {
 #[non_exhaustive]
 pub struct PeerLaneStatus {
     pub peer: NodeId,
-    /// 本节点拨不拨它（它的 TCP 端口本节点连得上，并且按设置现在要用）。
+    /// 本节点是否主动向其拨号（其 TCP 端口可达且当前配置已启用）。
     pub dials: bool,
     /// 和它之间的控制 lane 在不在：本节点拨它时是本节点拨的那条，否则是它拨来的那条。
     pub control: bool,
@@ -160,9 +160,9 @@ pub struct LaneCounts {
     /// 其中池是空的、要等补拨的次数，和一共等了多久。
     pub claims_waited: u64,
     pub claim_wait: Duration,
-    /// 取不到 lane 的次数（池空等满了、控制 lane 不在、对方要走了、当场拨也没拨通）。
+    /// 获取 lane 失败的次数（池耗尽超时、控制 lane 未建立、对端正在排空或按需拨号失败）。
     pub claims_failed: u64,
-    /// 本来要走 lane、因为取不到 lane 改走了共用连接的流。
+    /// 原计划走 lane，因获取 lane 失败而回退至共用连接的流数量。
     pub fallbacks: u64,
     /// 本节点拨号失败的次数。
     pub dial_failures: u64,
@@ -182,7 +182,7 @@ pub struct LaneCounts {
 pub struct HandshakeFailures {
     /// 没有在时限之内完成（包括连上来什么都不发的）。
     pub deadline: u64,
-    /// 对方的公钥不认识或者已经吊销。
+    /// 对端公钥未知或已吊销。
     pub unknown_key: u64,
     /// 别的 TLS 错误。
     pub tls: u64,

@@ -1,4 +1,4 @@
-//! 地址查询的发起方：向一组服务器问"你看到我的地址是什么"。格式见 [`i3t_proto::addr`]。
+//! 地址查询发起方：向一组服务器查询其观察到的本节点地址。格式见 [`i3t_proto::addr`]。
 //!
 //! 这里不碰 socket 的接收：应答和别的数据报一样从那个唯一的 UDP 端口进来，由收包的一方认出是地址查询的应答之后
 //! 交给 [`AddrQuery::handle_reply`]。
@@ -31,7 +31,7 @@ pub struct Observation {
 #[derive(Debug)]
 struct Server {
     addr: SocketAddr,
-    /// 最近一次查询的随机数。只认带着它的应答，不在路径上的人就伪造不了。
+    /// 最近一次查询的随机数。仅接受携带相同随机数的应答，防止路径外伪造。
     pending: Option<[u8; 8]>,
     last_sent: Option<Instant>,
     observation: Option<Observation>,
@@ -55,7 +55,7 @@ impl AddrQuery {
         Self { servers }
     }
 
-    /// 向到了该问的时候的服务器各发一个查询。定时调用，间隔由这里掌握。
+    /// 向到达查询间隔的服务器发送查询请求。需定时调用，重试与刷新间隔由内部控制。
     pub fn poll(&mut self, port: &UdpPort, now: Instant) {
         for server in &mut self.servers {
             let fresh = server.observation.is_some_and(|observation| now.duration_since(observation.at) < OBSERVATION_TTL);
@@ -70,7 +70,7 @@ impl AddrQuery {
         }
     }
 
-    /// 处理一个应答。来源不是问过的服务器，或者随机数对不上最近那次查询时返回 `None`，应答被忽略。
+    /// 处理一个应答。若来源不在已查询服务器列表中，或随机数与最近一次查询不匹配，则返回 `None` 并忽略该应答。
     pub fn handle_reply(&mut self, from: SocketAddr, reply: &Reply, now: Instant) -> Option<Observation> {
         let server = self.servers.iter_mut().find(|server| server.addr == from)?;
         if server.pending != Some(reply.nonce) {

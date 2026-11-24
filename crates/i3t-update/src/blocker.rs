@@ -1,15 +1,15 @@
-//! 这个节点能不能自己更新。
+//! 检测当前节点是否支持自动更新。
 //!
-//! 判断故意做得简单，宁可漏判也不去猜：漏判的后果只是 WebUI 上"立即更新"点了之后报一个明确的错，
-//! 误判的后果是一个本来能更新的节点被标成不能。三条依次检查：
+//! 判断策略保持保守，宁可漏判也不做猜测：漏判仅会导致在 WebUI 中点击“立即更新”时返回明确错误，
+//! 而误判会将原本可自动更新的节点标记为不可更新。按以下三项依次检查：
 //!
-//! 1. **在容器里**（只看 Linux）：有 `/.dockerenv`（Docker）或 `/run/.containerenv`（Podman），
-//!    或者环境变量里有 `KUBERNETES_SERVICE_HOST`（Kubernetes）或非空的 `container`（Podman、systemd-nspawn 等会设）。
-//!    像虚拟机一样用的系统容器（LXC）里，服务进程看不到这些标记，按普通机器对待：它的文件系统是持久的，自己更新没有问题。
-//! 2. **包管理器装的**：只看程序文件的路径。在 `/usr` 下面（`/usr/local` 除外）、`/bin`、`/sbin`、`/nix/store`、`/snap`、
-//!    `/opt/homebrew`、`/home/linuxbrew` 里，或者路径中有一级目录叫 `Cellar`、`WindowsApps`、`WinGet`、`scoop`、`chocolatey`。
-//!    不去问 dpkg 或 rpm。
-//! 3. **目录不可写**：在程序文件所在的目录里实际建一个文件试试。只读挂载、权限不够、服务单元的保护选项，都是这样才试得出来。
+//! 1. **容器环境**（仅限 Linux）：存在 `/.dockerenv`（Docker）或 `/run/.containerenv`（Podman），
+//!    或设置了 `KUBERNETES_SERVICE_HOST`（Kubernetes）或非空的 `container` 环境变量（Podman、systemd-nspawn 等会设置）。
+//!    在类似虚拟机使用的系统容器（LXC）中，服务进程看不到这些标记，按普通主机处理：其文件系统持久存在，可以正常自动更新。
+//! 2. **包管理器安装**：仅根据可执行文件路径判断。位于 `/usr` 下（`/usr/local` 除外）、`/bin`、`/sbin`、`/nix/store`、`/snap`、
+//!    `/opt/homebrew`、`/home/linuxbrew` 中，或路径包含名为 `Cellar`、`WindowsApps`、`WinGet`、`scoop`、`chocolatey` 的目录组件。
+//!    不查询 dpkg 或 rpm。
+//! 3. **目录不可写**：在可执行文件所在目录实际创建临时文件以探测写入权限。只读挂载、权限不足、服务单元保护选项均需通过实际写入检测。
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -18,36 +18,36 @@ use std::path::{Path, PathBuf};
 
 use i3t_model::update::SelfUpdateBlocker;
 
-/// 放着这些文件就说明在容器里。
+/// 存在这些文件即视为运行在容器环境中。
 const CONTAINER_MARKER_FILES: [&str; 2] = ["/.dockerenv", "/run/.containerenv"];
 
-/// 设了这些环境变量（并且不是空的）就说明在容器里。
+/// 设置了这些非空环境变量即视为运行在容器环境中。
 const CONTAINER_MARKER_VARS: [&str; 2] = ["KUBERNETES_SERVICE_HOST", "container"];
 
-/// 这些目录归包管理器管。
+/// 由包管理器管理的安装根目录。
 const MANAGED_ROOTS: [&str; 7] = ["/usr", "/bin", "/sbin", "/nix/store", "/snap", "/opt/homebrew", "/home/linuxbrew"];
 
-/// `/usr` 下面留给手动安装的那一块。
+/// `/usr` 下供手动安装使用的子目录。
 const UNMANAGED_ROOT: &str = "/usr/local";
 
-/// 路径里有一级目录叫这些名字，说明是包管理器放的：Homebrew、Windows 应用商店、winget、Scoop、Chocolatey。
+/// 路径中包含这些目录名时，视为由包管理器安装（Homebrew、Windows 应用商店、winget、Scoop、Chocolatey）。
 const MANAGED_DIR_NAMES: [&str; 5] = ["Cellar", "WindowsApps", "WinGet", "scoop", "chocolatey"];
 
-/// 正在运行的程序文件的真实路径（符号链接已经解开）。
+/// 获取当前运行的可执行文件的规范路径（已解析符号链接）。
 ///
-/// 进程一启动就要调用并把结果留着：程序文件被换过之后，系统报出来的"自己的路径"指向的就不是原来的位置了。
+/// 应在进程启动时立即调用并保存结果：可执行文件被替换后，系统返回的当前程序路径可能不再指向原位置。
 ///
 /// # Errors
 ///
-/// 系统给不出当前程序的路径。
+/// 无法获取或规范化当前可执行文件路径时返回错误。
 pub fn current_program() -> io::Result<PathBuf> {
     std::env::current_exe()?.canonicalize()
 }
 
-/// 这个节点不能自己更新的原因；能的话是 `None`。`program` 是 [`current_program`] 的结果。
+/// 检测当前节点无法自动更新的原因；支持自动更新时返回 `None`。`program` 为 [`current_program`] 的返回值。
 ///
-/// 会在程序所在的目录里建一个文件再删掉，所以只在启动时调用一次，结果报给 controller 并交给
-/// [`UpdaterConfig::blocker`](crate::UpdaterConfig::blocker)。
+/// 该函数会在可执行文件所在目录创建并删除一个临时探测文件，因此仅应在启动时调用一次，并将结果上报给 controller
+/// 及传入 [`UpdaterConfig::blocker`](crate::UpdaterConfig::blocker)。
 #[must_use]
 pub fn self_update_blocker(program: &Path) -> Option<SelfUpdateBlocker> {
     let blocker = if cfg!(target_os = "linux") && in_container(Path::exists, |name| std::env::var_os(name)) {
@@ -60,7 +60,7 @@ pub fn self_update_blocker(program: &Path) -> Option<SelfUpdateBlocker> {
         None
     };
     if let Some(blocker) = blocker {
-        tracing::info!(program = %program.display(), reason = %blocker, "这个节点不能自己更新");
+        tracing::info!(program = %program.display(), reason = %blocker, "当前节点无法自动更新");
     }
     blocker
 }
@@ -83,7 +83,7 @@ fn dir_is_writable(program: &Path) -> bool {
     let probe = dir.join(format!(".i3t-update-probe-{}", std::process::id()));
     let created = OpenOptions::new().write(true).create(true).truncate(true).open(&probe).is_ok();
     if created && let Err(error) = fs::remove_file(&probe) {
-        tracing::warn!(path = %probe.display(), %error, "删不掉试写用的文件");
+        tracing::warn!(path = %probe.display(), %error, "删除目录可写性探测文件失败");
     }
     created
 }

@@ -47,8 +47,8 @@ impl Recovery {
 
     /// 设到一条 TCP 上。返回两项是不是都设上了。
     ///
-    /// 先设放弃时限再设上限；上限设不上（内核没有这个选项）时把放弃时限撤掉，这条连接和以前完全一样。
-    /// 设不上不是错误：只是断开之后恢复得慢一些。
+    /// 先设置放弃时限，再设置重传上限；若无法设置重传上限（内核不支持该选项），则清除放弃时限，使连接保持原默认行为。
+    /// 设置失败不视为错误，仅意味着断网后的恢复速度较慢。
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn apply(self, socket: &impl AsFd) -> bool {
         if switched_off() {
@@ -56,15 +56,15 @@ impl Recovery {
         }
         let sock = socket2::SockRef::from(socket);
         if let Err(error) = sock.set_tcp_user_timeout(Some(self.give_up)) {
-            tracing::debug!(%error, "设置不了 TCP_USER_TIMEOUT，重传上限也不设");
+            tracing::debug!(%error, "设置 TCP_USER_TIMEOUT 失败，跳过重传超时上限设置");
             return false;
         }
         match linux::set_rto_max(socket.as_fd(), self.rto_max) {
             Ok(()) => true,
             Err(error) => {
-                tracing::debug!(%error, "这个内核不能给重传定时器设上限，放弃时限也撤掉");
+                tracing::debug!(%error, "无法设置 TCP 重传超时上限，接下来尝试清除 TCP_USER_TIMEOUT");
                 if let Err(error) = sock.set_tcp_user_timeout(None) {
-                    tracing::debug!(%error, "撤不掉 TCP_USER_TIMEOUT");
+                    tracing::debug!(%error, "无法清除 TCP_USER_TIMEOUT 设置");
                 }
                 false
             }
@@ -113,9 +113,9 @@ mod linux {
     /// 设 `TCP_RTO_MAX_MS`。socket2 和 rustix 都还没有这个选项，只能直接调 `setsockopt`。
     pub(super) fn set_rto_max(socket: BorrowedFd<'_>, cap: Duration) -> io::Result<()> {
         let millis = libc::c_int::try_from(cap.as_millis()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let len = libc::socklen_t::try_from(size_of::<libc::c_int>()).expect("一个 int 的长度装得进 socklen_t");
-        // SAFETY: `socket` 是借来的、活着的文件描述符；指针指向栈上的一个 `c_int`，长度就是它的长度，内核只读不写，
-        // 调用结束之后不再用这个指针。选项不认识时内核返回错误，不会碰这块内存之外的东西。
+        let len = libc::socklen_t::try_from(size_of::<libc::c_int>()).expect("c_int 字节长度应可转换为 socklen_t");
+        // SAFETY: `socket` 是有效的借用文件描述符；指针指向栈上的 `c_int`，长度即为其字节长度，内核只读不写，
+        // 调用结束后不再使用该指针。内核不支持该选项时会返回错误，不会越界访问内存。
         let result = unsafe { libc::setsockopt(socket.as_raw_fd(), libc::IPPROTO_TCP, TCP_RTO_MAX_MS, (&raw const millis).cast(), len) };
         if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
@@ -144,12 +144,12 @@ mod tests {
         let recovery = Recovery::giving_up_after(Duration::from_secs(30));
         let applied = recovery.apply(&stream);
         let user_timeout = socket2::SockRef::from(&stream).tcp_user_timeout().unwrap();
-        assert_eq!(applied, rto_cap_supported(), "内核支持时设得上，不支持时设不上");
+        assert_eq!(applied, rto_cap_supported(), "内核支持时应设置成功，不支持时应返回 false");
         if applied {
             assert_eq!(user_timeout, Some(Duration::from_secs(30)));
             assert_eq!(rto_max_of(&stream), Some(2000));
         } else {
-            assert_eq!(user_timeout, None, "上限设不上时放弃时限也不留");
+            assert_eq!(user_timeout, None, "重传上限设置失败时应同步清除 TCP_USER_TIMEOUT");
         }
     }
 }

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct VnetReport {
     #[serde(flatten)]
     pub state: VnetState,
-    /// 程序加的两条防火墙规则。网卡没有装上、或者本机的开关关着时两条都是 `off`。
+    /// 程序添加的两条防火墙规则。虚拟网卡未启用或本机防火墙开关关闭时，两条均为 `off`。
     #[serde(default)]
     pub firewall: Firewall,
     /// 这次运行以来经虚拟网卡发给别的节点、从别的节点收进来（写进网卡）的包和字节（IP 包的长度）。
@@ -39,43 +39,43 @@ pub enum VnetState {
         mtu: u16,
         names: NameService,
     },
-    /// 本机关着（配置文件的 `[network] enabled`，`i3t set network off`）。
+    /// 本机已关闭（配置文件中的 `[network] enabled`，或 `i3t set network off`）。
     Off,
-    /// 本机开着，但是装不上。系统里什么都没有留下；代理和端口转发照常。
+    /// 本机已开启，但未能启用或运行中出错关闭；系统不残留配置，代理和端口转发不受影响。
     Failed { cause: VnetCause },
     /// 这个平台上没有（Linux、Windows、macOS 之外的）。
     Unsupported,
-    /// 比这个程序新的节点报的、这里不认识的状态。
+    /// 较新版本节点上报的未知状态。
     #[serde(other)]
     Unknown,
 }
 
-/// 虚拟网卡装着时，`<节点>.<网络的域名>` 怎么解析。
+/// 虚拟网卡启用时，`<节点>.<网络的域名>` 的解析方式。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum NameService {
     /// systemd-resolved 把网络的域名交给本节点的名字服务：本机的程序直接用名字就行。
     Resolved,
-    /// 名字服务开着（本节点虚拟 IP 的 53 端口），这台机器没有 systemd-resolved：名字要写进 `/etc/hosts`（`i3t hosts`），
-    /// 或者让本机的解析器把网络的域名转给它。
+    /// 名称解析服务已运行（监听于本节点虚拟 IP 的 53 端口），但本机无 systemd-resolved：需通过 `i3t hosts` 写入 `/etc/hosts`，
+    /// 或将本机解析器配置为把网络域名转发至该地址。
     NoResolver,
-    /// 名字服务没有开起来，或者 systemd-resolved 不接受设置。按虚拟 IP 访问照常可用。
+    /// 名称解析服务未能启动，或 systemd-resolved 拒绝配置；按虚拟 IP 访问仍正常可用。
     Failed { cause: VnetCause },
     #[serde(other)]
     Unknown,
 }
 
-/// 虚拟网卡（或者它的一部分：防火墙规则、名字服务）装不上的原因，给界面按自己的语言写。
+/// 虚拟网卡及其组件（防火墙规则、名称解析服务）不可用的原因码，供界面按当前语言展示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum VnetCause {
     /// 节点进程缺这些能力：`CAP_NET_ADMIN`、`CAP_NET_BIND_SERVICE`（写法和 systemd 的 `AmbientCapabilities=` 一样）。
     NoPermission { missing: Vec<String> },
-    /// 打不开建虚拟网卡用的设备（Linux 上是 `/dev/net/tun`），`detail` 是系统的原话。容器里常见：要把这个设备给它。
+    /// 无法打开创建虚拟网卡所需的设备（Linux 上为 `/dev/net/tun`），`detail` 为系统返回的原始错误信息。容器环境常见，需挂载该设备。
     NoDevice { detail: String },
-    /// 网卡建不起来，`detail` 是系统的原话。
+    /// 虚拟网卡创建或运行出错，`detail` 为系统返回的原始错误信息。
     DeviceFailed { detail: String },
-    /// Windows：程序旁边没有 Wintun 的驱动文件（`wintun.dll`），`path` 是找的位置。
+    /// Windows：程序目录中缺少 Wintun 驱动文件（`wintun.dll`），`path` 为查找路径。
     DriverMissing { path: String },
     /// 系统里没有这个程序：`ip`（iproute2）、`nft`（nftables）、`iptables`。
     ProgramMissing { program: String },
@@ -83,12 +83,12 @@ pub enum VnetCause {
     CommandFailed { program: String, detail: String },
     /// 这个地址的端口被占着（名字服务的 53 端口）。
     PortInUse { address: SocketAddr },
-    /// 别的原因绑不上这个地址，`detail` 是系统的原话。
+    /// 因其他原因无法绑定该地址，`detail` 为系统返回的原始错误信息。
     BindFailed { address: SocketAddr, detail: String },
     /// 网络的地址段和这台机器所在的一个真实网络重叠，装上会把它从那个网络上切下来。`with` 是重叠的那个地址或者路由，
     /// 写法和 `ip` 一样：`192.168.1.5/24 dev eth0`、`10.0.0.0/8 dev tun0`。
     RangeInUse { with: String },
-    /// 比这个程序新的节点报的、这里不认识的原因。
+    /// 较新版本节点上报的未知原因。
     #[serde(other)]
     Unknown,
 }
@@ -111,18 +111,18 @@ pub struct Firewall {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RuleState {
     On,
-    /// 没有装：本机的开关关着，或者网卡没有装上。
+    /// 未添加：本机开关已关闭，或虚拟网卡未启用。
     #[default]
     Off,
-    /// 装不上。网卡照样装着，这条规则管的事由这台机器自己的防火墙定。
+    /// 添加失败。虚拟网卡仍正常运行，相关流量策略由本机现有防火墙决定。
     Failed {
         cause: VnetCause,
     },
     /// 这个平台上程序不加这条规则：macOS 上两条都不加（不碰 pf）；Windows 上不加防冒充的那条（它默认按强主机模型收包）。
     Unsupported,
-    /// 这台机器上用不着这条规则，没有加。只有 Linux 上的放行会这样：这条规则是为了抢在 ufw 这类防火墙经 `iptables`
-    /// 填满的 INPUT 链前面，没有 `iptables` 的机器上没有这样的链可抢。手写的 nftables 规则集挡住入站，那是机器主人自己的防火墙，
-    /// 另一张表里的规则本来也越不过它。
+    /// 本机无需该规则，因此未添加。仅 Linux 的放行规则会出现此状态：该规则用于在 ufw 等防火墙通过 `iptables`
+    /// 填充的 INPUT 链之前放行流量，无 `iptables` 的系统不存在此类链。若主机管理员自行配置了拦截入站的 nftables 规则集，
+    /// 另一张表中的规则本身也无法绕过。
     NotNeeded,
     #[serde(other)]
     Unknown,
@@ -141,10 +141,10 @@ pub struct VnetDrops {
     /// 对端发来的 ICMP 重定向也算在这里。
     #[serde(default)]
     pub not_allowed: u64,
-    /// 本机发出的包送不到：地址段里不是节点的地址、没有网卡的节点、连不上的节点，等连接的时候排不下。
+    /// 本机发出的数据包无法送达：目标为地址段内未分配地址、未启用虚拟网卡的节点、不可达节点，或等待建连时发送队列已满。
     #[serde(default)]
     pub unreachable: u64,
-    /// 读不懂的：不是 IPv4、头不对、片拼不起来（重叠、对不上），和不该被切开的包（TCP、ICMP 差错报文）。
+    /// 无法解析的数据包：非 IPv4、报文头无效、分片无法重组（重叠或长度不匹配），以及不应分片的报文（TCP、ICMP 差错报文）。
     #[serde(default)]
     pub malformed: u64,
 }

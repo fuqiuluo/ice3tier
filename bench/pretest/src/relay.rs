@@ -225,7 +225,7 @@ impl Relay {
     async fn serve_tcp(&self, stream: TcpStream) -> anyhow::Result<()> {
         stream.set_nodelay(true)?;
         let (mut reader, writer) = stream.into_split();
-        let first = read_frame(&mut reader).await?.context("TCP 一连上就关了")?;
+        let first = read_frame(&mut reader).await?.context("TCP 连接建立后立即关闭")?;
         let Some(Frame::Register { id }) = Frame::parse(&first) else {
             anyhow::bail!("TCP 上的第一帧不是登记帧");
         };

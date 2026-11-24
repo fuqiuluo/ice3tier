@@ -1,5 +1,5 @@
 //! 全网矩阵：对网络里所有的节点对做直连能力和延迟测试，分批进行，同时最多 [`CONCURRENCY`] 个。
-//! 吞吐不进矩阵。每一对是一个普通的测试（历史里看得到），矩阵只记它们的进度和摘要。
+//! 矩阵不包含吞吐测试。每对节点对应一次常规主动测试（可在历史记录中查询），矩阵仅维护其进度与摘要。
 //!
 //! 节点不在线、版本太旧、访问规则没有连通的节点对不测，格子里写明原因。同一对节点刚单独测过的，等它过了间隔再测。
 //! 矩阵只在内存里：controller 重启之后没有了，每一对的结果还在各自的测试里。
@@ -28,13 +28,13 @@ pub(crate) struct Matrix {
     started: Instant,
     /// 还没开始的节点对，按顺序。
     pending: Vec<(NodeId, NodeId)>,
-    /// 正在跑的测试和它们的节点对，包括已经结束、结果还没存下来的：它们都存下来了矩阵才算结束。
+    /// 正在进行的测试及其节点对，包含已得出结果但尚未持久化的测试：需待全部结果落盘后矩阵才视为结束。
     running: BTreeMap<u64, (NodeId, NodeId)>,
     /// 管理员取消了，还有测试没有收尾：不再开始新的；测试都收尾了才算取消完，这之前不能开始下一次。
     cancelling: bool,
     /// 开始下一对时存储出错了：这个时刻之前不再排。
     retry_at: Option<Instant>,
-    /// 正在排。开始一对时节点掉线、别的测试随之结束，不再从那里重入，外面那一圈接着排。
+    /// 调度重入保护标记：启动某对节点时若发生节点掉线并触发其他测试结束，不从回调重入调度，而是由外层循环继续调度。
     scheduling: bool,
 }
 
@@ -77,14 +77,14 @@ impl Controller {
         let record = inner.require_network(network)?;
         if let Some(matrix) = inner.diag.matrices.get(&network) {
             if matrix.cancelling {
-                return Err(Error::Busy("这个网络的全网矩阵正在取消，还有测试的结果没存下来，稍后再试".to_owned()));
+                return Err(Error::Busy("该网络的全网矩阵正在取消，仍有测试结果等待持久化，请稍后再试".to_owned()));
             }
             if !matrix.is_finished() {
-                return Err(Error::Busy("这个网络正在跑全网矩阵，等它结束或者取消它".to_owned()));
+                return Err(Error::Busy("该网络正在执行全网矩阵，请等待其完成或先将其取消".to_owned()));
             }
             let wait = MATRIX_INTERVAL.saturating_sub(matrix.started.elapsed());
             if !wait.is_zero() {
-                return Err(Error::TooSoon(format!("上一次全网矩阵刚开始不久，{} 秒之后再试", wait.as_secs().max(1))));
+                return Err(Error::TooSoon(format!("距离上一次全网矩阵启动间隔过短，请 {} 秒后再试", wait.as_secs().max(1))));
             }
         }
         let nodes = inner.store.nodes(network)?;
@@ -128,7 +128,7 @@ impl Controller {
         let detail = format!("开始全网矩阵：{} 个节点，{} 对，其中 {} 对要测", nodes.len(), run.total, pending.len());
         let params = json!({ "matrix": id, "nodes": nodes.len(), "pairs": run.total, "testing": pending.len() });
         let refs = [LogRef::new(RefKind::Network, network.0)];
-        // 操作记录和它顺带的清理在一个事务里：写不进去时什么都没有变，可以再试。
+        // 操作记录与顺带的清理操作在同一事务中执行：写入失败时状态保持不变，可重试。
         inner.store.atomically(|store| store.log_refs(run.started_at, Some(network), action::TEST_MATRIX, &detail, &refs, params))?;
         tracing::info!(network = %network, matrix = id, pairs = run.total, testing = pending.len(), "开始全网矩阵");
         let mut matrix = Matrix {
@@ -159,10 +159,10 @@ impl Controller {
         inner.matrix_run(network)
     }
 
-    /// 取消正在跑的全网矩阵：正在跑的测试取消，还没开始的不再开始。
+    /// 取消进行中的全网矩阵：取消运行中的测试，不再调度尚未开始的节点对。
     ///
-    /// 测试都收尾了矩阵才算取消完。有测试的结果存不下来时，它们的结果已经定成取消，后台任务接着存，存下来了矩阵才算取消完；
-    /// 这期间可以再取消一次，不能开始下一次。
+    /// 全部测试完成收尾后矩阵才视为取消完成。若有测试结果持久化失败，其状态已固定为已取消，由后台任务继续重试持久化，全部持久化后矩阵才结束取消；
+    /// 在此期间可再次调用取消接口，但不能启动新的全网矩阵。
     ///
     /// # Errors
     ///
@@ -179,7 +179,7 @@ impl Controller {
             let (id, at) = (matrix.run.id, inner.clock.now());
             let refs = [LogRef::new(RefKind::Network, network.0)];
             let params = json!({ "matrix": id });
-            // 操作记录和它顺带的清理在一个事务里：写不进去时什么都没有变，可以再试。
+            // 操作记录与顺带的清理操作在同一事务中执行：写入失败时状态保持不变，可重试。
             inner
                 .store
                 .atomically(|store| store.log_refs(at, Some(network), action::TEST_MATRIX_CANCEL, "取消了全网矩阵", &refs, params))?;
@@ -196,12 +196,12 @@ impl Controller {
             }
         }
         let tests: Vec<u64> = inner.diag.matrices.get(&network).map(|matrix| matrix.running.keys().copied().collect()).unwrap_or_default();
-        // 先把结果都定成取消（已经定下的不变），再一个个存：存下来时给节点发结束，节点可能因此掉线，
-        // 那时它参与的别的测试按掉线结束，定下的结果照样是取消。
+        // 先将所有测试结果固定为已取消（已定型的保持不变），再逐个持久化：持久化后会向节点发送终止消息，若节点因此断线，
+        // 其参与的其他测试虽按断线收尾，但已固定的结果仍保持为已取消。
         for &test in &tests {
             inner.fix_outcome(test, true);
         }
-        // 一个存不下来不耽误别的；存不下来的后台任务接着存。
+        // 单个测试持久化失败不阻塞其余测试；失败项留待后台任务继续持久化。
         let mut failed = None;
         for test in tests {
             // 前面结束的测试给节点发结束时，节点可能掉线，连带结束了这一个。
@@ -266,16 +266,16 @@ impl Inner {
     }
 
     fn retry_matrix_later(&mut self, network: NetworkId, now: Instant, error: &Error) {
-        tracing::warn!(network = %network, "全网矩阵开始下一对时出错，{} 秒后再试：{error}", STORE_RETRY.as_secs());
+        tracing::warn!(network = %network, "全网矩阵启动下一对测试失败，{} 秒后重试：{error}", STORE_RETRY.as_secs());
         if let Some(matrix) = self.diag.matrices.get_mut(&network) {
             matrix.retry_at = Some(now + STORE_RETRY);
         }
     }
 
-    /// 出错时排着的还排着：这一对开始了（或者知道它不用测了）才从排着的里面拿掉。
+    /// 出错时待测队列保持不变：仅当该节点对已启动（或确认无需测试）时才将其移出队列。
     ///
-    /// 开始不了的一对排到最后，这一轮就停下：下一轮先排别的对，一对一直开始不了也挡不住后面的；
-    /// 存储整个写不进去时一轮也只多试一次，不会把排着的每一对都试一遍。
+    /// 无法启动的节点对移至队尾并结束本轮调度：下一轮优先尝试其余节点对，避免单对持续失败阻塞队列；
+    /// 当整个存储不可写时，每轮也仅额外尝试一次，不会遍历重试全部待测节点对。
     fn try_schedule_matrix(&mut self, network: &NetworkRecord, now: Instant) -> Result<(), Error> {
         loop {
             let Some(matrix) = self.diag.matrices.get(&network.id).filter(|matrix| !matrix.is_finished()) else { return Ok(()) };
@@ -313,7 +313,7 @@ impl Inner {
                     return Err(error);
                 }
             };
-            // 还在进行中的（包括结果定下了、还没存下来的）记进矩阵，格子里显示它在测；存下来时矩阵才填上结果。
+            // 仍在进行中的测试（包括结果已定型但尚未持久化的）记入矩阵并显示为测试中，待持久化后再填入最终结果。
             let shown = self.diag.running.get(&view.id).map(|running| running.view(false));
             if let Some(matrix) = self.diag.matrices.get_mut(&network.id) {
                 // 按值拿掉，不靠找它时的位置：开始一对时节点可能掉线、别的测试随之结束，不去假设这中间 `pending` 没被动过。
@@ -349,9 +349,9 @@ impl Inner {
             fill_cell(cell, view);
         }
         state.count_finished();
-        // 最后一个测试存下来了，矩阵就结束了（在取消的就算取消完了），不用等下面读存储。
+        // 最后一个测试持久化完成后矩阵即结束（处于取消中则标记为已取消），无需等待后续读取存储。
         self.finish_matrix_if_done(network);
-        // 已经做成了的事之后接着排，排不上不算它失败：排着的还排着，后台任务隔一会儿再排。
+        // 调度后续节点对；若此次调度失败不影响已完成项，待测队列保持不变，由后台任务稍后重试。
         self.schedule_network_matrix(network, Instant::now());
     }
 
@@ -365,7 +365,7 @@ impl Inner {
         matrix.cancelling = false;
         matrix.run.finished_at = Some(now);
         matrix.count_finished();
-        tracing::info!(network = %network, matrix = matrix.run.id, state = ?matrix.run.state, "全网矩阵结束了");
+        tracing::info!(network = %network, matrix = matrix.run.id, state = ?matrix.run.state, "全网矩阵已结束");
     }
 
     /// 矩阵里有排着的节点对时，什么时候再来看：在等间隔过去的隔一秒，开始不了的到再试的时刻。

@@ -222,7 +222,7 @@ fn exit_test_text(view: &ExitTestView) -> String {
         return format!("{}\n", (t.exit_busy)(&view.node.name));
     }
     let header = lang.paren(&format!("{} → {}", view.node.name, view.target), (codes.exit_via)(result.via));
-    // 节点报的是舍去零头的整毫秒：0 是不到 1 毫秒，不是什么都没做。JSON 里照旧是 0。
+    // 节点上报的是截断后的整毫秒值：0 表示不足 1 毫秒而非未执行。JSON 输出仍保持原值 0。
     let ms = |ms: u32| if ms == 0 { "<1 ms".to_owned() } else { format!("{ms} ms") };
     let outcome = |cause: Option<&ExitTestCause>, ok: String| cause.map_or(ok, codes.exit_test_cause);
     let mut fields = Fields::new(2);
@@ -360,8 +360,8 @@ pub fn nodes(nodes: &[Node]) {
     print_table(&table, t.no_nodes);
 }
 
-/// 启用了的 relay：在线的节点里几个连得上它（节点自己上报的，只是情况，不是毛病）、它的地址、带宽上限，
-/// 和最近一个统计时段里每秒转发多少。
+/// 展示已启用的中继列表：在线节点对其的可达性统计（由各节点上报，仅反映现状而非故障）、地址数量、带宽上限，
+/// 以及最近一个统计窗口的每秒转发速率。
 pub fn relays(nodes: &[Node]) {
     let (t, lang, _) = context();
     let mut table = Table::new(&t.relays_header);
@@ -383,7 +383,7 @@ pub fn relays(nodes: &[Node]) {
     print_table(&table, t.no_relays);
 }
 
-/// 在线的节点里连得上、连不上、没报的个数，写成 `3/1/0`。
+/// 将在线节点中可达、不可达与未上报的数量格式化为 `3/1/0`。
 fn reach_cell(reach: &RelayReach) -> String {
     format!("{}/{}/{}", reach.reached, reach.unreached, reach.unknown)
 }
@@ -618,7 +618,7 @@ pub fn routes(table: &RouteTable, names: &Names) {
     print_table(&rows, t.no_peers);
 }
 
-/// 一条路的细节：直连是怎么建立的，或者到第一个 relay 的那一段走 UDP 还是 TCP。节点没有说时是短横。
+/// 展示路径传输方式：直连的建立方式，或经中继时到首跳中继的传输协议（UDP 或 TCP）；节点未上报时显示短横。
 fn kind_cell(route: &Route, direct: Option<DirectKind>, relay_leg: Option<LegTransport>) -> String {
     let (_, _, codes) = context();
     match route {
@@ -698,7 +698,7 @@ fn path_switches(leg: &PathLeg, name: &dyn Fn(NodeId) -> String) {
     }
 }
 
-/// 一个方向上值得多说一句的事：为什么换到这条路，或者数据从哪里来。
+/// 生成单个方向的补充说明：路径切换原因或数据来源。
 fn path_note(leg: &PathLeg, name: &dyn Fn(NodeId) -> String) -> Option<String> {
     let (t, lang, codes) = context();
     match leg.source {
@@ -1045,7 +1045,7 @@ pub fn proxy(proxy: &Proxy, names: &Names) {
         };
         fields.add(&label, peer_lanes(lanes));
     }
-    // 写成网址：大多数程序的代理设置照抄就行。地址写 0.0.0.0 时换成节点上的某个地址，这里写不出来，照原样。
+    // 格式化为代理 URL，便于多数客户端直接复用；监听地址为 0.0.0.0 时需用户自行替换为节点实际地址，此处按原样输出。
     let login = if anonymous { String::new() } else { format!("{}:{}@", proxy.username, proxy.password) };
     let scheme = match proxy.protocol {
         ListenerProtocol::Http => "http",
@@ -1114,7 +1114,7 @@ pub fn pair(pair: &PairView) {
     fields.print();
 }
 
-/// 代理走不走 ice3proxy；走而起不了作用时带上"未生效"（原因在详情里）。
+/// 显示代理是否启用 ice3proxy；若已启用但当前未生效，则附注"未生效"（具体原因见详情）。
 fn proxy_lane_cell(proxy: &Proxy) -> String {
     let (t, lang, _) = context();
     match &proxy.lane_effect {

@@ -90,9 +90,9 @@ pub struct ErrorBody {
 pub struct ApiError {
     pub code: ErrorCode,
     pub message: String,
-    /// 比 `code` 更具体的一层：`not_found` 时是找不到的东西（`node`、`network` 等），`conflict` 时是挡着的东西，
-    /// `invalid_request` 时是哪里不对（`zero`、`too_long` 等），`cannot_self_update`、`no_update` 时是原因。
-    /// controller 说不出来时是 `null`。
+    /// 比 `code` 更具体的细分信息：`not_found` 时指明缺失对象（`node`、`network` 等），`conflict` 时指明冲突对象，
+    /// `invalid_request` 时指明具体错误（`zero`、`too_long` 等），`cannot_self_update` 与 `no_update` 时指明原因。
+    /// controller 无法提供时为 `null`。
     #[serde(default)]
     pub what: Option<String>,
     /// 请求里出问题的字段（请求体的字段名、查询参数名或路径参数名）；不是某一个字段的问题时是 `null`。
@@ -100,7 +100,7 @@ pub struct ApiError {
     pub field: Option<String>,
 }
 
-/// 给程序看的错误码。以后可能增加，不认识的值读成 [`ErrorCode::Unknown`]。
+/// 供程序识别的错误码。后续可能新增，未知值反序列化为 [`ErrorCode::Unknown`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -109,7 +109,7 @@ pub enum ErrorCode {
     Unauthorized,
     /// 路径里指的东西不存在，或者不属于路径里的那个网络。
     NotFound,
-    /// 请求本身不合法：JSON 解析不了、名字的写法不对、地址不合法、要改内置分组等。
+    /// 请求本身无效：JSON 无法解析、名称格式无效、地址无效、尝试修改内置分组等。
     InvalidRequest,
     /// 名字已经被同一个网络里的另一个东西占用。
     NameTaken,
@@ -131,7 +131,7 @@ pub enum ErrorCode {
     NetworkNotEmpty,
     /// 节点没有在本地声明可以承担这项能力（relay、出口）。
     NotDeclared,
-    /// 端口转发的目标节点没有打开管理员的开关（[`Node::forward_target`]），启用不了指向它的转发。
+    /// 端口转发的目标节点未开启管理员开关（[`Node::forward_target`]），无法启用指向它的转发。
     ForwardTargetOff,
     /// 要被继任的节点还在线。
     PredecessorOnline,
@@ -139,11 +139,11 @@ pub enum ErrorCode {
     Conflict,
     /// 要操作的节点不在线（让节点立即更新要它在线）。
     NodeOffline,
-    /// 节点不能自己更新：在容器里、是包管理器装的、程序所在的目录不可写，或者它的版本太旧不懂更新。
+    /// 节点无法自更新：运行在容器中、由包管理器安装、程序所在目录不可写，或版本过旧不支持更新。
     CannotSelfUpdate,
     /// 没有可以让这个节点更新到的版本：还没有查到发布、它已经是最新的、发布里没有它的平台的包，或者 controller 自己太旧。
     NoUpdate,
-    /// 同一对节点的上一次主动测试刚做过（或者一次全网矩阵刚开始过），要隔一会儿再测。
+    /// 同一对节点刚执行过主动测试（或全网矩阵测试刚启动），需间隔一段时间后再测。
     TooSoon,
     /// 这个网络正在跑一次全网矩阵，或者要取消的测试已经结束了。
     Busy,
@@ -233,7 +233,7 @@ pub struct Network {
     /// 比这个字段旧的 controller 不给，读成默认值。
     #[serde(default = "crate::netmap::default_vnet_mtu")]
     pub vnet_mtu: u16,
-    /// 各项设置的默认值。比这个字段旧的 controller 不给，是 `null`：这时说不出哪些设置改过。
+    /// 各项设置的默认值。较旧版本 controller 不会返回该字段，解析为 `null`（此时无法区分哪些设置已偏离默认值）。
     #[serde(default)]
     pub defaults: Option<NetworkDefaults>,
 }
@@ -388,9 +388,9 @@ pub struct Node {
     pub virtual_ip: Ipv4Addr,
     /// 它所在的分组，按名字排（不分大小写）。内置分组 `All` 每个节点都在，不在这里列出。
     pub groups: Vec<GroupRef>,
-    /// 节点在本地声明的"可以承担"（relay、出口）。没有声明的能力启用不了。
+    /// 节点在本地声明可承担的能力（relay、出口）。未声明的能力无法启用。
     pub declared: Declared,
-    /// 管理员的开关：可以作为端口转发的目标。新节点是关着的。关着时 controller 不给它下发转发，也启用不了指向它的转发；
+    /// 管理员开关：是否允许作为端口转发目标。新节点默认关闭。关闭时 controller 不向其下发转发，也无法启用指向它的转发；
     /// 节点自己不声明，也不拒绝：controller 能经转发碰到这台机器能碰到的一切（它的回环和局域网）。比这个字段旧的 controller 不给，读成 `false`。
     #[serde(default)]
     pub forward_target: bool,
@@ -446,9 +446,9 @@ pub struct Node {
     /// controller 发现的、值得提醒的情况，按节点最近一次报的东西算（离线时是它离线前报的）。没有时是空的。
     #[serde(default)]
     pub warnings: Vec<NodeWarning>,
-    /// controller 认定这个节点用不了 UDP：它报的连得上的 relay 里没有一个经 UDP，并且至少有一个别人经 UDP 连得上的 relay
-    /// 它只经 TCP 连上；这样持续了两分钟。它和别的节点之间的路上总有一段 TCP，没有设置的节点对（`udp_fallback`）
-    /// 因此用 ice3proxy。比这个字段旧的 controller 不报，读成 `false`。
+    /// controller 判定该节点无法使用 UDP：其上报的可达 relay 中没有任何一个经 UDP 连通，且至少有一个其他节点可经 UDP 连通的 relay
+    /// 它仅经 TCP 连通，并持续了两分钟。该节点与其他节点之间的路径必含一段 TCP，未单独配置的节点对（`udp_fallback`）
+    /// 因此启用 ice3proxy。较旧版本 controller 不会返回该字段，解析为 `false`。
     #[serde(default)]
     pub no_udp: bool,
 }
@@ -489,7 +489,7 @@ pub struct UpdateOrder {
 pub enum UpdateWait {
     /// 这个平台的包 controller 还没有从发布源取回来。
     Package,
-    /// 它是 relay：同一个网络里的 relay 一个一个更新，要等前一个更新完重新上线。
+    /// 该节点为 relay：同一网络中的 relay 逐个顺序更新，需等待前一个更新完成并重新上线。
     RelayTurn,
     #[serde(other)]
     Unknown,
@@ -534,13 +534,13 @@ pub struct UpdateOverview {
     pub nodes: UpdateCounts,
 }
 
-/// 查发布源、取更新包为什么没有成功：一个代码，加上把它写成一句话要用到的值。和它在一起的是中文原话。
+/// 查询发布源或下载更新包失败的原因码及格式化所需参数；同级 `check_error`/`error` 为原始中文说明。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ReleaseCause {
     /// 发布源的写法不对。
     InvalidSource,
-    /// 从这个地址取不到。`error` 是 HTTP 库的原话（连不上、HTTP 状态码等）。
+    /// 无法从该地址获取。`error` 为 HTTP 库返回的原始错误信息（连接失败、HTTP 状态码等）。
     FetchFailed { url: String, error: String },
     /// 发布源是本机的目录，读写里面的文件失败。`error` 是系统的原话。
     Io { path: String, error: String },
@@ -548,17 +548,17 @@ pub enum ReleaseCause {
     BadSignatureFile,
     /// 清单的签名不是任何一把受信任的发布公钥签的。
     BadSignature,
-    /// 签名正确，但清单的内容读不懂。
+    /// 签名有效，但无法解析清单内容。
     BadManifest,
     /// 发布源上最新的是预发布版，不取。
     Prerelease { version: Version },
     /// 清单里的文件名不是一个单纯的文件名。
     BadFileName { file: String },
-    /// 取回来的包和清单对不上。
+    /// 下载的安装包与清单校验不符。
     Mismatch { file: String, expected_size: u64, actual_size: u64 },
     /// controller 内部的原因（比如没有放包的缓存目录），细节在它的日志里。
     Internal,
-    /// 比这个程序新的 controller 给的、这里不认识的原因。
+    /// 较新版本 controller 返回的未知原因。
     #[serde(other)]
     Unknown,
 }
@@ -694,19 +694,19 @@ pub enum SkipCause {
     Offline,
     /// 节点的版本太旧，不懂更新。
     TooOld,
-    /// 节点说它不能自己更新；`blocker` 是它说的原因，说不出来时是 `null`。
+    /// 节点上报无法自更新；`blocker` 为具体原因，无法确定时为 `null`。
     CannotSelfUpdate { blocker: Option<SelfUpdateBlocker> },
     /// 还没有从发布源查到任何发布。
     NoRelease,
     /// 最新的发布 `version` 要求 controller 至少是 `min_controller`，现在的 controller 是 `controller`。
     ControllerTooOld { version: Version, min_controller: Version, controller: Version },
-    /// 节点报的版本号看不懂。
+    /// 无法解析节点上报的版本号。
     UnreadableVersion { version: String },
     /// 节点已经是最新的。
     UpToDate { running: Version, latest: Version },
     /// 发布里没有它的平台的包。
     NoPackage { version: Version, platform: String },
-    /// 比这个程序新的 controller 给的、这里不认识的原因。
+    /// 较新版本 controller 返回的未知原因。
     #[serde(other)]
     Unknown,
 }
@@ -727,7 +727,7 @@ pub struct NodeDetail {
     /// controller 看到的来源 IP 加上节点自报的 UDP 端口。
     pub observed_endpoint: Option<SocketAddr>,
     // 挂靠的 relay（`attached`）原来在这里，现在在 `Node` 里，JSON 里还是同一层的同一个字段。
-    /// 映射出来的端口是不是随对端变化。是的话这台机器所在的网络基本打不了洞。节点不在线或者还不知道时是 `null`。
+    /// 映射端口是否随对端变化。为 `true` 时该主机所在网络通常无法打洞。节点离线或尚未探测时为 `null`。
     pub mapping_varies: Option<bool>,
     /// 下面三项是节点本次连接期间最近一次上报的值，不在线时是 0。
     pub flows: u32,
@@ -777,7 +777,7 @@ pub struct UpdateNode {
     /// 管理员的开关：可以作为端口转发的目标（[`Node::forward_target`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_target: Option<bool>,
-    /// 管理员的开关：自动更新这个节点（[`Node::auto_update`]）。关掉时撤回给它的、还没换上去的自动更新。
+    /// 管理员开关：是否自动更新该节点（[`Node::auto_update`]）。关闭时会撤回已下发但尚未切换程序的自动更新。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_update: Option<bool>,
 }
@@ -790,7 +790,7 @@ fn nullable<'de, T: Deserialize<'de>, D: Deserializer<'de>>(deserializer: D) -> 
 /// relay 的设置：启用 relay 时的请求体（`PUT …/relay`），也是 controller 存着的那一份。
 ///
 /// 地址不在这里：controller 自己找出来，见 [`RelayView::addresses`]。
-/// 早先的请求体里的 `udp`、`tcp`、`region` 照收，没有作用（不认识的字段一律忽略）。
+/// 为兼容旧请求体，仍接受 `udp`、`tcp`、`region` 字段但不生效（未知字段一律忽略）。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RelaySettings {
     /// 转发的带宽上限；`null` 表示不限。
@@ -806,7 +806,7 @@ pub struct RelayView {
     pub addresses: Vec<RelayAddress>,
     /// 转发的带宽上限；`null` 表示不限。
     pub bandwidth_mbps: Option<u32>,
-    /// 在线的节点里有几个连得上它（节点自己上报的）。只是情况，不是毛病：只有一部分节点连得上的 relay 照样是那些节点的 relay。
+    /// 在线节点中可连通该 relay 的统计（由节点自行上报）。仅供参考而非故障：仅部分节点可达的 relay 仍正常服务于那些节点。
     #[serde(default)]
     pub reach: RelayReach,
     /// 谁在用它：最近一个统计时段里它替哪些节点对转发了多少，取自它最近一次上报。不在线、版本太旧不报时是 `null`。
@@ -817,9 +817,9 @@ pub struct RelayView {
 /// 在线的节点（不算 relay 自己）最近一次试一个 relay 的结果，数出来的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RelayReach {
-    /// 连得上的（UDP 或者 TCP）。
+    /// 可连通的节点数（经 UDP 或 TCP）。
     pub reached: u32,
-    /// 试过、连不上的。
+    /// 已探测但无法连通的节点数。
     pub unreached: u32,
     /// 还没有报过的（刚上线，或者版本太旧不报）。
     pub unknown: u32,
@@ -835,7 +835,7 @@ pub struct ReachEntry {
     pub at: Timestamp,
 }
 
-/// 一个 relay 最多有几个地址。多出来的（多半是网卡上的）不下发：节点每个都要试，试的都是同一台机器。
+/// 单个 relay 最多下发的地址数。超出部分（通常为本地网卡地址）不下发：节点会逐一探测，但指向的均为同一台主机。
 pub const MAX_RELAY_ADDRESSES: usize = 8;
 
 /// relay 的一个地址和它是从哪里来的。
@@ -855,19 +855,19 @@ pub enum AddressSource {
     Observed,
     /// 节点网卡上的地址，加上节点自报的端口。同一个局域网里的节点靠它连上。
     Local,
-    /// 比这个程序新的 controller 给的、这里不认识的来源。
+    /// 较新版本 controller 返回的未知来源。
     #[serde(other)]
     Unknown,
 }
 
-/// controller 发现的、值得提醒的情况。只是提醒，不挡着任何事。不认识的 `code` 读成 [`NodeWarning::Unknown`]。
+/// controller 检测到的提醒信息。仅作提示，不阻塞任何操作。未知 `code` 反序列化为 [`NodeWarning::Unknown`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum NodeWarning {
-    /// 节点的一个网卡地址落在网络的虚拟地址段里：在这台机器上，连这个地址段里的虚拟 IP 可能连到真实网络上去，
-    /// 虚拟网卡也装不上。`address` 是那个网卡地址（本节点自己的虚拟网卡上的虚拟 IP 不报，不算）。
+    /// 节点的某个网卡地址落入网络虚拟地址段内：在该主机上访问此地址段内的虚拟 IP 可能路由到真实网络，
+    /// 虚拟网卡也无法启用。`address` 为冲突的网卡地址（不含本节点自身虚拟网卡的虚拟 IP）。
     RangeOverlap { address: IpAddr },
-    /// 这个 relay 启用着，在线的节点里试过它的有 `tried` 个，一个也没有连上。只是如实说一句：哪天有节点连得上它，它就是那些节点的 relay。
+    /// 该 relay 已启用，在线节点中有 `tried` 个尝试连接但均未连通。仅客观提示：一旦有节点可连通，该 relay 即为其提供服务。
     RelayUnreached { tried: u32 },
     #[serde(other)]
     Unknown,
@@ -911,7 +911,7 @@ pub struct NodeRoute {
     /// 走直连时，这条直连是怎么建立起来的；节点没有说（版本太旧，或者它也不知道）时是 `null`。
     #[serde(default)]
     pub direct: Option<DirectKind>,
-    /// 经 relay 时，节点到第一个 relay 的那一段走的是 UDP 还是 TCP；节点没有说时是 `null`。
+    /// 经 relay 时，节点到首跳 relay 使用 UDP 还是 TCP；节点未上报时为 `null`。
     #[serde(default)]
     pub relay_leg: Option<LegTransport>,
     /// 和这个对端的共用连接上现在开着几条流、节点启动以来两个方向各走了多少字节，取自节点最近一次上报。
@@ -1012,7 +1012,7 @@ pub struct PathView {
 /// 一个方向的路径：发送方现在怎么把包送到对端。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathLeg {
-    /// 发送方：这一段是它说的。
+    /// 发送方：该方向路径信息由其提供。
     pub from: NodeRef,
     pub to: NodeRef,
     pub source: PathSource,
@@ -1026,7 +1026,7 @@ pub struct PathLeg {
     /// 走直连时，这条直连是怎么建立起来的。现问到的取自回答，否则取自上报；都没有时是 `null`。
     #[serde(default)]
     pub direct: Option<DirectKind>,
-    /// 经 relay 时，发送方到第一个 relay 的那一段走的是 UDP 还是 TCP；不知道时是 `null`。
+    /// 经 relay 时，发送方到首跳 relay 使用 UDP 还是 TCP；未知时为 `null`。
     #[serde(default)]
     pub relay_leg: Option<LegTransport>,
     /// 发送方用的选路模式。只有现问到、并且发送方的版本会说时才有。
@@ -1090,7 +1090,7 @@ pub struct BackboneRelay {
     pub reported_by: Option<NodeId>,
     /// 它到别的 relay 的链路。`to` 是 relay 的节点编号。
     pub links: Vec<BackboneLink>,
-    /// 在线的节点里有几个连得上它，同 [`RelayView::reach`]。
+    /// 在线节点中可连通该 relay 的统计，同 [`RelayView::reach`]。
     #[serde(default)]
     pub reach: RelayReach,
 }
@@ -1103,7 +1103,7 @@ pub enum PathSource {
     Query,
     /// 发送方最近一次上报的路由表。它现在不在线、版本太旧不会回答，或者没有按时回答。
     Report,
-    /// 没有数据：发送方没有上报过到这个对端的路，现在也问不到。
+    /// 无数据：发送方未上报过到该对端的路径，且当前无法实时查询。
     None,
     /// 发送方说对端不在它的 netmap 里：访问规则没有把这两个节点连通（或者配置还没有下发到）。
     NotPeers,
@@ -1176,7 +1176,7 @@ pub struct CreatedEnrollToken {
 
 /// 一条访问规则：分组 `src` 里的节点可以访问分组 `dst` 里的节点。
 ///
-/// 规则记的是分组的编号，名字只是给人看的：分组改名之后规则照常生效。
+/// 规则记录的是分组编号，名称仅用于展示：分组改名后规则依然生效。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     pub id: u32,
@@ -1237,9 +1237,9 @@ pub struct Proxy {
     pub node: NodeId,
     pub bind: SocketAddr,
     pub protocol: ListenerProtocol,
-    /// 出口节点。只有升级前就有、当时没有固定出口的代理是 `null`（状态是 `exit_missing`）：选好出口之前启用不了。
+    /// 出口节点。仅升级前已存在且未固定出口的代理为 `null`（状态为 `exit_missing`）：指定出口前无法启用。
     pub exit: Option<NodeId>,
-    /// 用户名和密码，原样存着，管理员可以再看、再复制。都是空的表示不认证，只有回环地址上的代理可以这样。
+    /// 用户名与密码原样存储，管理员可再次查看与复制。两者均为空表示不认证，仅回环地址上的代理允许不认证。
     pub username: String,
     pub password: String,
     pub enabled: bool,
@@ -1249,12 +1249,12 @@ pub struct Proxy {
     pub class: Option<Class>,
     /// 乐观回复；`null` 时看出口的设置，再按目标的种类。
     pub optimistic: Option<bool>,
-    /// 这个代理的 TCP 流走 ice3proxy：不管路上有没有 UDP，开得出时一律走，开不出时退回共用的连接。
+    /// 该代理的 TCP 流走 ice3proxy：无论路径是否支持 UDP，能够建立 lane 时一律走 lane，无法建立时回退至共用连接。
     /// 比这个字段旧的 controller 不写，读成 `false`。
     #[serde(default)]
     pub lane: bool,
     pub status: ProxyStatus,
-    /// `lane` 是 `true` 并且有出口时有：ice3proxy 在监听的节点和出口之间起不起作用，为什么。别的时候是 `null`。
+    /// 仅当 `lane` 为 `true` 且已指定出口时有值：说明 ice3proxy 在监听节点与出口之间是否生效及原因；其余情况为 `null`。
     #[serde(default)]
     pub lane_effect: Option<LaneEffect>,
     /// `lane` 是 `true` 时，监听的节点和出口各自报上来的、和对方之间的 ice3proxy。不在线、版本太旧、还没报过的节点不在里面；
@@ -1267,7 +1267,7 @@ pub struct Proxy {
     pub usage: ListenTraffic,
 }
 
-/// 一个代理现在能不能用，按 controller 知道的算。排在前面的先看：停用了的不看监听，监听不上的不看出口。
+/// 按 controller 掌握的状态判定代理当前是否可用。优先级自上而下：已停用时不检查监听，监听失败时不检查出口。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ProxyStatus {
@@ -1275,7 +1275,7 @@ pub enum ProxyStatus {
     ExitMissing,
     Disabled,
     NodeOffline,
-    /// 下发了，节点还没有报它的状态（刚改过，或者节点的版本太旧不懂代理）。
+    /// 已下发配置，节点尚未上报状态（刚修改配置，或节点版本过旧不支持代理）。
     Pending,
     /// 端口被别的程序占着，节点每 10 秒再试。
     PortInUse {
@@ -1303,7 +1303,7 @@ pub enum ProxyStatus {
     Listening {
         local: SocketAddr,
     },
-    /// 比这个程序新的 controller 给的、这里不认识的状态。
+    /// 较新版本 controller 返回的未知状态。
     #[serde(other)]
     Unknown,
 }
@@ -1431,11 +1431,11 @@ pub struct Forward {
     /// 这条转发上的流的服务等级；`null` 表示用网络的默认值。
     #[serde(default)]
     pub class: Option<Class>,
-    /// 监听节点最近一次报的这条转发的监听状态：在监听（端口写 0 时 `local` 是节点挑定的端口）、端口被占用、绑定失败等，
+    /// 监听节点最近一次上报的该转发监听状态：监听中（配置端口为 0 时 `local` 为系统分配的端口）、端口被占用、绑定失败等，
     /// 以及连接数和流量。节点不在线或者还没有报过时是 `null`。
     #[serde(default)]
     pub listen: Option<ListenStatus>,
-    /// 这条转发的流最近一次在目标那里失败（目标连不上）：原因和时间。之后有流成功了、从来没有失败过、
+    /// 该转发的流最近一次在目标端失败的原因与时间。后续有流成功、从未失败、
     /// 或者监听节点不在线（或者版本太旧不报）时是 `null`。
     #[serde(default)]
     pub target_failure: Option<ForwardFailure>,
@@ -1478,7 +1478,7 @@ pub struct ForwardInput {
 pub enum ForwardStatus {
     /// 被停用了。
     Disabled,
-    /// 目标节点的开关（[`Node::forward_target`]）关着：转发留着，没有下发，开关打开就回来。
+    /// 目标节点的转发开关（[`Node::forward_target`]）已关闭：转发配置保留但暂不下发，开启开关后恢复。
     ForwardTargetOff,
     /// 访问规则不允许监听节点访问目标节点，转发没有下发。
     AccessDenied,
@@ -1489,7 +1489,7 @@ pub enum ForwardStatus {
     TargetOffline,
     /// 已经下发，两端都在线。
     Active,
-    /// 比本程序新的 controller 说的、这里不认识的状态（以前的 `target_not_declared` 也读成它）。
+    /// 较新版本 controller 返回的未知状态（历史 `target_not_declared` 也反序列化为此值）。
     #[serde(other)]
     Unknown,
 }
@@ -1524,7 +1524,7 @@ impl PairSetting {
 
 /// 改一对节点的设置。没有写的项不变（这一对还没有设置时取默认值）。
 ///
-/// 旧的客户端还会写 `lane`：不认识的字段一律忽略，不报错，也不起任何作用。
+/// 旧客户端可能仍提交 `lane`：未知字段一律忽略，不报错且不生效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PairInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1549,7 +1549,7 @@ const fn stored_by_default() -> bool {
     true
 }
 
-/// 一个代理的 ice3proxy 起不起作用，为什么：看的是代理监听的节点和它的出口这一对。
+/// 代理的 ice3proxy 是否生效及原因：评估对象为监听节点与出口节点这一对。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneEffect {
     /// 至少一个节点能拨另一个节点的 TCP 端口，两个节点都懂 ice3proxy，访问规则让监听的节点访问出口。
@@ -1560,7 +1560,7 @@ pub struct LaneEffect {
     /// 拨号的节点：另一个节点启用了 relay、有已知的 TCP 地址。两个都能拨时各自用自己拨的 lane。
     #[serde(default)]
     pub dialers: Vec<NodeId>,
-    /// 给人看的一句说明（中文）。界面按 `effective`、`blocked`、`dialers` 用自己的话写，只在原因不认识时用它。
+    /// 中文说明文本。界面应依据 `effective`、`blocked`、`dialers` 本地化渲染，仅在遇到未知原因时回退使用该字段。
     pub summary: String,
 }
 
@@ -1574,7 +1574,7 @@ pub enum LaneBlock {
     NoTcpAddress { node: NodeId },
     /// 这个节点在线，但版本太旧，不懂 ice3proxy（节点协议 [`LANE_REVISION`](crate::control::LANE_REVISION) 起才懂）。
     NodeTooOld { node: NodeId },
-    /// 访问规则不让监听的节点访问出口：这时代理本身也用不了（它的状态是 `access_denied`）。
+    /// 访问规则不允许监听节点访问出口：此时代理本身也不可用（状态为 `access_denied`）。
     NotConnected,
 }
 
@@ -1689,7 +1689,7 @@ impl FromStr for LogRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("应该写成 <种类>:<编号>，例如 node:3；种类是 network、node、group、token、rule、proxy、forward 之一")]
+#[error("格式应为 <类型>:<编号>（例如 node:3）；类型须为 network、node、group、token、rule、proxy、forward 之一")]
 pub struct InvalidLogRef;
 
 /// 操作记录里提到的东西是哪一种。
@@ -1703,7 +1703,7 @@ pub enum RefKind {
     Rule,
     Proxy,
     Forward,
-    /// 不认识的种类，包括升级之前的记录里提到的接入凭据（`credential`）。
+    /// 未知类型，包括升级前历史记录中的接入凭据（`credential`）。
     #[serde(other)]
     Unknown,
 }
@@ -1762,7 +1762,7 @@ pub struct DeletedGroup {
 pub struct RelayEnabled {
     #[serde(flatten)]
     pub node: Node,
-    /// relay 的每个地址两项，先 UDP 后 TCP。只是参考：谁连得上它，它就是谁的 relay，controller 连不上不等于别人连不上。
+    /// 每个 relay 地址对应两项（先 UDP 后 TCP）。仅供参考：哪个节点能连通，该 relay 就服务于哪个节点；controller 无法连通不代表其他节点无法连通。
     pub reachability: Vec<Reachability>,
 }
 
@@ -1791,11 +1791,11 @@ pub enum ReachCause {
     Timeout,
     /// controller 到那个地址的网络不通。
     Unreachable,
-    /// controller 这边出的错（绑不出 UDP 端口、发不出去）。
+    /// controller 端本地错误（例如无法绑定 UDP 端口或发送失败）。
     Local,
     /// 别的原因，见 `error`。
     Other,
-    /// 比这个程序新的 controller 给的、这里不认识的原因。
+    /// 较新版本 controller 返回的未知原因。
     #[serde(other)]
     Unknown,
 }
@@ -1820,7 +1820,7 @@ pub struct ExitTestView {
     pub node: NodeRef,
     /// 测的目标，`主机:端口`。
     pub target: String,
-    /// 出口节点回答了没有。没有回答（版本太旧不懂这条消息，或者时限之内没有回答）时 `result` 是 `null`。
+    /// 出口节点是否返回响应。未响应（版本过旧不支持该消息，或超时未回复）时 `result` 为 `null`。
     pub answered: bool,
     #[serde(default)]
     pub result: Option<crate::control::ExitTestResult>,
@@ -1854,7 +1854,7 @@ pub enum ExitHealth {
     Ok,
     /// 最近 5 分钟里出口自己的失败至少 3 次，并且占请求的一成以上。
     Degraded,
-    /// 不在线，或者最近 5 分钟里没有请求，说不上来。
+    /// 节点离线，或最近 5 分钟内无请求，无法评估。
     Unknown,
 }
 

@@ -248,7 +248,7 @@ impl Session {
         }
     }
 
-    /// 隔一会儿问一次 `path`，直到 `done` 说做完了，返回最后那一次的应答。
+    /// 定期轮询 `path`，直到 `done` 判定完成，返回最终响应。
     async fn wait<T: DeserializeOwned>(&self, path: &str, done: impl Fn(&T) -> bool) -> anyhow::Result<Value> {
         let deadline = tokio::time::Instant::now() + WAIT_LIMIT;
         loop {
@@ -264,8 +264,7 @@ impl Session {
         }
     }
 
-    /// 把命令行上写的节点（编号、名字或虚拟 IP）找出来。
-    /// 把应答里的节点编号写成名字用的表。`--json` 时应答原样输出，用不着，不去取。
+    /// 构建将响应中的节点编号映射为名称的查找表。`--json` 模式下原样输出响应，无需拉取节点列表。
     async fn names(&self, network: NetworkId) -> anyhow::Result<render::Names> {
         if self.json {
             return Ok(render::Names::default());

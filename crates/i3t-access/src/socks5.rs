@@ -1,8 +1,8 @@
 //! SOCKS5（RFC 1928）和它的用户名密码认证（RFC 1929）的报文。只有解析和编码，不碰 socket。
 //!
 //! 每个 `parse` 接受从连接上读到的字节：报文完整时返回它和它占的长度，还不完整时返回 `None`，内容不对时返回错误。
-//! 每个报文的长度都由它自己的长度字节决定，最长的也只有五百多字节，所以"还不完整"时缓冲区一定比这个短，
-//! 客户端没办法让读的一方无限地攒数据。
+//! 每个报文的长度均由自身长度字段限定，最大仅五百余字节，因此处于“不完整”状态时缓冲区长度必然受限，
+//! 客户端无法迫使读取方无限缓存数据。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -97,7 +97,7 @@ impl Greeting {
 
     /// 选一种认证方法；没有可用的时返回 `None`。
     ///
-    /// 要用户名和密码时只能选它。不要时客户端肯"不认证"就选不认证，只提用户名密码的也接受（给了什么都不看）。
+    /// 需要用户名密码认证时只能选择该方式。不需要认证时，若客户端支持“无认证”则优先选择，仅提供用户名密码认证的客户端也允许通过（忽略凭据内容）。
     pub(crate) const fn choose(self, password_required: bool) -> Option<Method> {
         if password_required {
             if self.offers_password { Some(Method::Password) } else { None }

@@ -4,9 +4,9 @@
 //! 对端先按它的访问规则和每个对端的流数上限筛过，所以访问规则不允许时拿到的是明确的拒绝。到对端还没有连接时，
 //! 第一个往返先把连接建起来，它不算在结果里，可以等到连接层自己建连接的时限（[`FIRST`]）：慢的路上（只有 TCP、隔着
 //! 几百毫秒、经 relay）建连接要几秒。那时还没有建起来，说的是"没有及时建起来"，不是"不在线"。
-//! 连接建起来了（或者本来就有）、第一个往返却迟迟不回来时，说的不是连接，而是往返：它最多再等 [`EACH`]，
-//! 之后照常量，回不来的算丢了。
-//! 结果里有这一段时间开始和结束时这对节点的连接走的路，和路上的 relay 的名字。
+//! 连接建立后（或原本已存在），若首次探测未及时返回，则问题在往返而非建连：最多再等待 [`EACH`]，
+//! 随后继续常规测量，未返回的探测记为丢包。
+//! 结果包含测量开始与结束时该对节点连接所使用的路径，以及路径上各 relay 的名称。
 //!
 //! 只能由本机问（本机状态接口要令牌），一次只做一个，最多 [`MAX_COUNT`] 个往返、[`DEADLINE`] 之内做完；
 //! 只能问本节点配置里的节点，所以它不能拿来扫描别的地址。
@@ -35,7 +35,7 @@ pub const DEFAULT_COUNT: u32 = 5;
 pub const MAX_COUNT: u32 = 10;
 /// 两个往返之间隔多久。
 const INTERVAL: Duration = Duration::from_millis(200);
-/// 一个往返最多等多久，超过算丢了。
+/// 单次往返的最长等待时间，超时计为丢包。
 const EACH: Duration = Duration::from_secs(1);
 /// 第一个往返（可能要先建连接）最多等多久：连接层建一条连接的时限，加上建好之后的那一个往返。
 const FIRST: Duration = i3t_conn::DIAL_TIMEOUT.saturating_add(EACH);
@@ -53,15 +53,15 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PingReport {
-    /// 问的是哪个节点；认不出来时是 `None`。
+    /// 探测目标节点；无法识别时为 `None`。
     pub peer: Option<PingPeer>,
     pub outcome: PingOutcome,
-    /// 发出去的往返，和回来了的往返。没有回来的算丢了。
+    /// 已发送与已返回的往返次数，未返回计为丢包。
     pub sent: u32,
     pub received: u32,
-    /// 回来了的往返各用了多少微秒，按发出的顺序。
+    /// 已返回探测的往返耗时（微秒），按发送顺序排列。
     pub rtts_us: Vec<u64>,
-    /// 开始和结束时这对节点的连接走的路；不知道时是 `None`。两条不一样才算换了路：中间换过又换回来的不算，
+    /// 测量开始和结束时该对节点连接所使用的路径；未知时为 `None`。仅首尾不同视为切换路径：中途切换后又恢复的不计入，
     /// 那种来回只在流日志里记（`route_changed`）。
     pub route_start: Option<Route>,
     pub route_end: Option<Route>,
@@ -99,15 +99,15 @@ pub enum PingOutcome {
     NotAllowed,
     /// 对端拒绝了：它那边的访问规则不允许本节点访问它。
     Refused,
-    /// 到它开不出流：它不在线，或者没有路。
+    /// 无法向对端建立流：对端可能离线或无可用路径。
     Unreachable,
-    /// 到它的连接没有及时建起来（[`FIRST`] 之内）：不一定是它不在线，慢的路上建连接要几秒。
+    /// 未能在时限（[`FIRST`]）内建立连接：对端未必离线，慢速链路建连可能需要数秒。
     ConnectTimeout,
-    /// 它的版本太旧，不回答往返测量。
+    /// 对端版本过旧，不支持往返测量。
     Unsupported,
-    /// 本节点上另一个 ping 正在做。
+    /// 本节点上已有另一个 ping 正在执行。
     Busy,
-    /// 比这个程序新的节点答的、这里不认识的结论。
+    /// 来自较新版本节点、当前版本无法识别的结果状态。
     #[serde(other)]
     Unknown,
 }
@@ -164,15 +164,15 @@ pub(crate) async fn ping(runtime: &Runtime, target: &str, count: u32) -> PingRep
     let on_routes = [span.start.as_ref(), span.end.as_ref()].into_iter().flatten().flat_map(|route| route.relays().iter().copied());
     report.relays = relay_names(&netmap, on_routes);
     (report.route_start, report.route_end) = (span.start, span.end);
-    tracing::info!(peer = %id, outcome = ?report.outcome, sent = report.sent, received = report.received, "ping 做完了");
+    tracing::info!(peer = %id, outcome = ?report.outcome, sent = report.sent, received = report.received, "ping 测量完成");
     report
 }
 
-/// 第一个往返：把到 `peer` 的连接建起来，不算数。`connected` 说到 `peer` 现在有没有连接。
+/// 首次往返：用于建立到 `peer` 的连接，不计入测量结果。`connected` 表示当前是否已与 `peer` 建立连接。
 ///
-/// 连接建起来之前最多等 [`FIRST`]，等满了还没有连接，说的是连接没有及时建起来。连接建起来了（或者本来就有），这个往返
-/// 最多再等 [`EACH`]（也不超过 [`FIRST`]）：等不到它不能说连接没有建起来，也不能说对端不在线，所以不算失败，接着量，
-/// 回不来的往返算丢了。开流、读回答出错（被拒绝、没有路、连接断了、对端太旧）照旧是失败。
+/// 连接建立前最多等待 [`FIRST`]，超时仍未建立连接则判定为连接建立超时。连接已建立（或原本已存在）后，本次探测
+/// 最多再等待 [`EACH`]（且不超过 [`FIRST`]）：超时不能说明连接未建立或对端离线，因此不视为失败，继续后续测量，
+/// 未返回的探测计为丢包。建流或读取应答出错（被拒绝、无可用路径、连接断开、对端版本过旧）仍视为失败。
 async fn bring_up<C: Connector>(connector: &C, peer: NodeId, connected: impl Fn() -> bool) -> Result<(), PingOutcome> {
     let started = Instant::now();
     let warm_up = i3t_flow::ping(connector, peer);
@@ -187,7 +187,7 @@ async fn bring_up<C: Connector>(connector: &C, peer: NodeId, connected: impl Fn(
                     Ok(_) => return Ok(()),
                     Err(error) => outcome_of(&error),
                 };
-                tracing::info!(%peer, ?outcome, waited_ms = started.elapsed().as_millis(), "ping：第一个往返没有成");
+                tracing::info!(%peer, ?outcome, waited_ms = started.elapsed().as_millis(), "ping：首次往返测量失败");
                 return Err(outcome);
             }
             () = time::sleep_until(limit) => break,
@@ -202,17 +202,17 @@ async fn bring_up<C: Connector>(connector: &C, peer: NodeId, connected: impl Fn(
     match up_at {
         Some(at) => {
             let up_ms = at.saturating_duration_since(started).as_millis();
-            tracing::info!(%peer, up_ms, waited_ms, "ping：连接建起来了，第一个往返没有及时回来，接着量");
+            tracing::info!(%peer, up_ms, waited_ms, "ping：已建立连接，首次探测未在时限内返回，继续测量");
             Ok(())
         }
         None => {
-            tracing::info!(%peer, outcome = ?PingOutcome::ConnectTimeout, waited_ms, "ping：第一个往返没有成");
+            tracing::info!(%peer, outcome = ?PingOutcome::ConnectTimeout, waited_ms, "ping：首次往返测量失败");
             Err(PingOutcome::ConnectTimeout)
         }
     }
 }
 
-/// 连接建起来之后量 `count` 个往返（1 到 [`MAX_COUNT`]），到 `deadline` 为止，记进 `report`。
+/// 连接建立后，最多测量 `count` 次往返（次数限制在 1 至 [`MAX_COUNT`]）。仅在 `deadline` 前发起探测，结果写入 `report`。
 async fn measure<C: Connector>(connector: &C, peer: NodeId, count: u32, deadline: Instant, report: &mut PingReport) {
     for index in 0..count.clamp(1, MAX_COUNT) {
         if index > 0 {
@@ -247,8 +247,8 @@ fn find<'a>(netmap: &'a Netmap, target: &str) -> Result<&'a i3t_model::netmap::P
     found.ok_or(PingOutcome::UnknownNode)
 }
 
-/// 这些 relay 的名字，按出现的先后，不重复。名字按 [`Netmap::node_name`] 找（relay 列表、对端、本节点自己），
-/// 和 `i3t routes`、`i3t status`、流结束的日志是同一个办法；哪里都找不到的不给，显示时写编号。
+/// 这些 relay 的名称，按出现顺序去重。名称通过 [`Netmap::node_name`] 查找（relay 列表、对端、本节点自身），
+/// 与 `i3t routes`、`i3t status` 及流结束日志采用相同方式；均未找到时省略名称，展示时退回节点编号。
 pub(crate) fn relay_names(netmap: &Netmap, relays: impl IntoIterator<Item = NodeId>) -> Vec<RelayName> {
     let mut names: Vec<RelayName> = Vec::new();
     for id in relays {
@@ -262,8 +262,8 @@ pub(crate) fn relay_names(netmap: &Netmap, relays: impl IntoIterator<Item = Node
     names
 }
 
-/// 一个往返没有成，是哪一种。连接层自己建连接超时，和这里等满一样，说的是没有及时建起来；
-/// 没有路（等不到任何一条）、连接断了才是"不在线，或者没有路"。
+/// 将失败的往返探测映射为结果分类。连接层建连超时与此处等待超时语义一致，均表示未在时限内建立连接；
+/// 无可用路径或连接中断则归类为不可达（对端离线或无路径）。
 fn outcome_of(error: &FlowError) -> PingOutcome {
     match error {
         FlowError::Refused(_) => PingOutcome::Refused,

@@ -85,7 +85,7 @@ impl Mux {
     /// 挑一个到 `peer` 还没在用的上下文号并登记（发起方用）。
     pub(crate) fn allocate(self: &Arc<Self>, peer: NodeId) -> Registration {
         loop {
-            // 号是一路往上数的，绕回来撞上还开着的上下文时接着试下一个。
+            // 上下文号单调递增，回绕后若与活跃上下文冲突则继续尝试下一个。
             let context = self.next_context.fetch_add(1, Ordering::Relaxed);
             if let Some(registration) = self.register(peer, context) {
                 return registration;
@@ -100,20 +100,20 @@ impl Mux {
         }
     }
 
-    /// 处理对端发来的一帧。解析不了的、找不到上下文的、队列放不下的都直接丢掉：数据报本来就可以丢。
+    /// 处理对端发来的一帧。无法解析、找不到对应上下文或队列已满时直接丢弃（数据报允许丢包）。
     pub(crate) fn dispatch(&self, datagram: Datagram, now: Instant) {
         let Datagram { peer, payload } = datagram;
         let (header, rest) = match DatagramHeader::decode(&payload) {
             Ok((header, rest)) if header.recipient == self.side => (header, rest),
-            Ok(_) => return tracing::trace!(%peer, "丢掉一个数据报：它是给上下文的另一侧的"),
-            Err(error) => return tracing::trace!(%peer, %error, "丢掉一个数据报：帧不合格式"),
+            Ok(_) => return tracing::trace!(%peer, "丢弃数据报：目标侧与当前侧不匹配"),
+            Err(error) => return tracing::trace!(%peer, %error, "丢弃数据报：帧格式无效"),
         };
         let content = payload.slice(payload.len() - rest.len()..);
 
         let mut state = self.state();
         // 先看有没有这个上下文再拼片：不给不存在的上下文号占内存。
         let Some(queue) = state.contexts.get(&(peer, header.context)).cloned() else {
-            return tracing::trace!(%peer, context = header.context, "丢掉一个数据报：没有这个上下文");
+            return tracing::trace!(%peer, context = header.context, "丢弃数据报：找不到对应的上下文");
         };
         let body = match header.fragment {
             None => content,
@@ -129,7 +129,7 @@ impl Mux {
         };
         drop(state);
         if !queue.offer(body) {
-            tracing::trace!(%peer, context = header.context, "丢掉一个数据报：这个上下文的队列满了");
+            tracing::trace!(%peer, context = header.context, "丢弃数据报：上下文接收队列已满");
         }
     }
 

@@ -50,9 +50,9 @@ pub enum Source {
     Dir(PathBuf),
 }
 
-/// 发布源的写法不对。
+/// 发布源格式无效。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("发布源 {0:?} 的写法不对：要写成 https://… 或 http://… 的地址，或者 controller 所在机器上一个目录的绝对路径")]
+#[error("发布源 {0:?} 格式无效：必须为 https://… 或 http://… 地址，或 controller 所在主机的目录绝对路径")]
 pub struct InvalidSource(String);
 
 impl FromStr for Source {
@@ -60,7 +60,7 @@ impl FromStr for Source {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let text = s.trim();
-        // 地址和路径里都不该有控制字符（NUL、换行之类）：它会被存下来、写进操作记录、拿去拼请求。
+        // 地址与路径均不允许包含控制字符（如 NUL、换行等）：该值会被持久化存储、写入操作记录并用于拼接请求。
         if text.chars().any(char::is_control) {
             return Err(InvalidSource(s.to_owned()));
         }
@@ -82,11 +82,11 @@ impl std::fmt::Display for Source {
     }
 }
 
-/// 从发布源取东西没有成功。
+/// 从发布源获取清单或发布包失败。
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FetchError {
-    #[error("从 {url} 取不到")]
+    #[error("无法从 {url} 获取文件")]
     Http {
         url: String,
         #[source]
@@ -98,11 +98,11 @@ pub enum FetchError {
         #[source]
         source: io::Error,
     },
-    #[error("发布源给的签名文件不是一个签名")]
+    #[error("发布源返回的签名文件格式无效")]
     BadSignatureFile,
-    #[error("清单里的文件名 {0:?} 不是一个单纯的文件名")]
+    #[error("清单中的文件名 {0:?} 不是合法的纯文件名")]
     BadFileName(String),
-    #[error("取回来的 {file} 和清单对不上：{actual_size} 字节、SHA-256 {actual}，清单上是 {expected_size} 字节、{expected}")]
+    #[error("发布文件 {file} 校验失败：实际大小 {actual_size} 字节、SHA-256 {actual}，预期大小 {expected_size} 字节、SHA-256 {expected}")]
     Mismatch { file: String, expected_size: u64, expected: String, actual_size: u64, actual: String },
 }
 
@@ -127,7 +127,7 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// 连不上、文件不存在、太大，或者签名文件的内容不是一个签名。
+    /// 连接失败、文件不存在、文件超过大小上限，或签名文件内容无效。
     pub fn latest(&self) -> Result<SignedManifest, FetchError> {
         let manifest = self.read_text(&format!("{LATEST_DIR}/{MANIFEST_FILE}"), MAX_MANIFEST_LEN)?;
         let signature = self.read_text(&format!("{LATEST_DIR}/{SIGNATURE_FILE}"), MAX_SIGNATURE_LEN)?;
@@ -140,7 +140,7 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// 取不到、写不了缓存，或者取回来的内容和清单对不上（这时不留下任何文件）。
+    /// 获取失败、写入缓存失败，或下载内容与清单校验不一致（此时不会在缓存目录残留文件）。
     pub fn fetch(&self, version: &Version, artifact: &Artifact, cache_dir: &Path) -> Result<PathBuf, FetchError> {
         if Path::new(&artifact.file).file_name().and_then(|name| name.to_str()) != Some(artifact.file.as_str()) {
             return Err(FetchError::BadFileName(artifact.file.clone()));
@@ -166,7 +166,7 @@ impl Source {
             fs::rename(&partial, &path).map_err(io_error(&path))
         });
         if outcome.is_err() {
-            // 留着也没有用：下次是从头取。删不掉只是占地方。
+            // 保留临时文件无意义（下次会重新完整下载）；若删除失败仅占用磁盘空间。
             let _removed = fs::remove_file(&partial);
         }
         outcome.map(|()| path)
@@ -219,7 +219,7 @@ pub fn prune_cache(cache_dir: &Path, keep: &Version) {
     let Ok(entries) = fs::read_dir(cache_dir) else { return };
     for entry in entries.filter_map(Result::ok).filter(|entry| entry.file_name().to_str() != Some(keep.as_str())) {
         if let Err(error) = fs::remove_dir_all(entry.path()) {
-            tracing::warn!(path = %entry.path().display(), %error, "删不掉缓存里旧版本的包");
+            tracing::warn!(path = %entry.path().display(), %error, "删除缓存中的旧版本更新包失败");
         }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 两者到对端节点走的都是数据报上下文（[`i3t_flow::datagram`]）。上下文是用到的时候才开的，开的时候要等对端答应，
 //! 所以每个上下文有一个自己的任务：它去开上下文，开好之前到的报文在它的队列里等着，队列满了丢新来的。
-//! 收报文的那个循环因此从不等待，一个连不上的对端不会拖住发往别处的报文。
+//! 因此收包循环不会阻塞等待，单个不可达对端不会拖慢发往其他对端的报文。
 
 pub(crate) mod association;
 pub(crate) mod forward;
@@ -26,7 +26,7 @@ use crate::session::Shared;
 const OUTGOING_BACKLOG: usize = 64;
 
 /// 开上下文失败之后，多久之内发往那个对端的报文直接丢掉。
-/// 没有它的话，对端连不上（或者拒绝）时每个报文都会去开一次流。
+/// 若无该冷却时间，对端不可达（或拒绝）时每个报文都会反复尝试建立流。
 const RETRY_PAUSE: Duration = Duration::from_secs(5);
 
 /// 一个 UDP 报文最长这么多，收的缓冲区按它开。
@@ -46,7 +46,7 @@ async fn open_context<C: Connector + Datagrams, T>(
     match shared.opener.open(peer, class, origin).await {
         Ok(context) => Ok(context),
         Err(error) => {
-            tracing::info!(%peer, ?error, "到对端节点开数据报上下文失败，{RETRY_PAUSE:?} 之内发往它的 UDP 报文都被丢掉");
+            tracing::info!(%peer, ?error, "到对端节点建立数据报上下文失败，{RETRY_PAUSE:?} 内发往该节点的 UDP 报文将被丢弃");
             let discard = async { while queue.recv().await.is_some() {} };
             // 到时间了，或者发报文的一方已经不在了，都是不用再等。
             let _ = time::timeout(RETRY_PAUSE, discard).await;

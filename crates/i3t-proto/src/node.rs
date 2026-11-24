@@ -63,7 +63,7 @@ impl From<NodeId> for u32 {
 /// 把一个整数当作节点编号时出的错。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidNodeId {
-    #[error("节点编号不能是 0")]
+    #[error("节点编号不能为 0")]
     Zero,
     #[error("节点编号不是 1 到 4294967295 之间的整数：{0}")]
     NotANumber(#[from] ParseIntError),

@@ -1,9 +1,9 @@
-//! 装不进一个数据报的包：发的一方切成两片（`i3t_proto::flow::PacketPieces`），收的一方在这里拼回去。
+//! 数据报分片重组：当单个 IP 包超出连接数据报上限时，发送方将其拆分为两片（`i3t_proto::flow::PacketPieces`），接收方在此重组还原。
 //!
-//! 只在连接刚建立、路径 MTU 还没有探测上去的那一会儿，或者路上的包长一直上不去时才有（网卡的 MTU 见 [`crate::DEFAULT_MTU`]）。
-//! 片会丢、会乱序：先到的一片存着，等另一片；等不到就扔。内存有上限：同时最多 [`MAX_PENDING`] 个没拼完的包，每个最多等
-//! [`PIECE_WAIT`]，超出时扔最早的。一个对端最多占 [`MAX_PENDING_PER_PEER`] 个，超出时扔它自己最早的：一个对端发来一堆凑不成对的片，
-//! 挤不掉别的对端正在等的。
+//! 仅在连接刚建立、路径 MTU 探测尚未提升上限时，或路径最大包长持续受限时触发（虚拟网卡默认 MTU 见 [`crate::DEFAULT_MTU`]）。
+//! 分片可能丢失或乱序到达：先到的分片暂存等待配对，超时未齐则丢弃。内存占用严格有界：全局最多缓存 [`MAX_PENDING`] 个未完成包，
+//! 单包最长等待 [`PIECE_WAIT`]，超限时淘汰最早记录；单个对端最多占用 [`MAX_PENDING_PER_PEER`] 个槽位，超限时仅淘汰该对端最早记录，
+//! 避免单个对端发送大量孤立分片挤占其他对端的重组缓存。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -12,16 +12,16 @@ use bytes::{Bytes, BytesMut};
 use i3t_proto::NodeId;
 use i3t_proto::flow::{Fragment, MAX_PACKET_LEN};
 
-/// 同时最多攒多少个还没拼完的包（所有对端加起来）。每个至多一片，一千多字节：上限是几百 KB。
+/// 全局同时缓存的未完成分片包上限（所有对端合计）。每条仅存一片（约千余字节），总内存上限为数百 KB。
 pub const MAX_PENDING: usize = 256;
 
-/// 一个对端最多同时占多少个。
+/// 单个对端允许同时占用的最大缓存槽位数。
 pub const MAX_PENDING_PER_PEER: usize = MAX_PENDING / 4;
 
-/// 一片最多等另一片多久。两片是一前一后发出去的，正常时差不了一个往返；等不到多半是丢了，上面的协议自己重发。
+/// 单个分片等待另一片的最长时长。两片连续发出，正常情况下间隔不超过一次往返；超时未到通常意味着丢包，交由上层协议重传。
 pub const PIECE_WAIT: Duration = Duration::from_secs(2);
 
-/// 没拼完的包：（对端，包号）到已经到了的那一片。最多 [`MAX_PENDING`] 个，过期的和最早的都直接扫这张表找，不另外记先后。
+/// 未完成分片缓存表：以 `(对端, 消息序号)` 为键存储先到达的分片。容量上限为 [`MAX_PENDING`]，过期清理与淘汰直接线性扫描。
 #[derive(Debug, Default)]
 pub struct Reassembly {
     pending: HashMap<(NodeId, u16), Partial>,
@@ -35,19 +35,19 @@ struct Partial {
     bytes: Bytes,
 }
 
-/// 一片收下之后怎样了。
+/// 接收单个数据报分片后的处理结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Assembled {
-    /// 拼成了一个完整的包。
+    /// 已重组还原为完整 IP 数据包。
     Packet(Bytes),
-    /// 存着，等别的片。
+    /// 已暂存，等待配对分片到达。
     Waiting,
-    /// 这一片和先到的对不上（片数不同、同一片又来一次），或者拼出来太长：两片都扔了。
+    /// 当前分片与先到分片元数据冲突（总片数不一致或序号重复），或重组后超出长度上限：两片均予丢弃。
     Broken,
 }
 
 impl Reassembly {
-    /// 收下 `peer` 发来的一片。
+    /// 接收来自 `peer` 的一个数据报分片。
     pub fn accept(&mut self, peer: NodeId, fragment: Fragment, bytes: Bytes, now: Instant) -> Assembled {
         self.pending.retain(|_, partial| now.saturating_duration_since(partial.arrived) < PIECE_WAIT);
         let key = (peer, fragment.message);
@@ -61,7 +61,7 @@ impl Reassembly {
             self.pending.insert(key, Partial { arrived: now, count: fragment.count, index: fragment.index, bytes });
             return Assembled::Waiting;
         };
-        // 切片最多两片（`MAX_PACKET_PIECES`），所以另一片一到就齐了。
+        // 协议限定分片最多为 2 片（`MAX_PACKET_PIECES`），因此另一片到达即完成重组。
         if first.count != fragment.count || first.index == fragment.index || fragment.count != 2 {
             return Assembled::Broken;
         }
@@ -75,13 +75,13 @@ impl Reassembly {
         Assembled::Packet(packet.freeze())
     }
 
-    /// 还在等的片有几个。
+    /// 返回当前等待配对的分片数量。
     #[must_use]
     pub fn pending(&self) -> usize {
         self.pending.len()
     }
 
-    /// 扔掉最早到的那一片：`peer` 有值时只在它的里面挑。表最多 [`MAX_PENDING`] 个，直接扫。
+    /// 淘汰最早到达的分片：指定 `peer` 时仅在该对端条目内筛选。因总条目上限为 [`MAX_PENDING`]，直接线性扫描即可。
     fn drop_oldest(&mut self, peer: Option<NodeId>) {
         let oldest = self
             .pending

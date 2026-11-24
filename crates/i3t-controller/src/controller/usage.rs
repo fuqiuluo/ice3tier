@@ -33,7 +33,7 @@ const SAMPLE_GAP: Duration = Duration::from_secs(5);
 /// 归因于出口自己的失败至少这么多次、并且每这么多个请求里至少有一次（一成），才算不健康。偶尔一次解析器超时不算。
 const DEGRADED_MIN_FAILURES: u64 = 3;
 const DEGRADED_ONE_IN: u64 = 10;
-/// 一个节点最多报这么多个监听。乱报的节点占不了太多内存。
+/// 单个节点允许上报的最大监听数量，防止异常节点占用过多内存。
 const MAX_LISTENS: usize = 256;
 /// 一次上报里最多看这么多项出口的观测。观测是一次次报上来累积的，跨多次上报也替一个节点最多留这么多个出口的。
 const MAX_EXITS: usize = 256;
@@ -42,13 +42,13 @@ const MAX_EXITS: usize = 256;
 #[derive(Debug, Default)]
 pub(crate) struct Usage {
     exits: BTreeMap<NodeId, ExitSeen>,
-    /// （出口，发起节点）→ 发起节点看到的。按出口排，看一个出口的只扫它自己的那一段。
+    /// （出口节点，发起节点）→ 发起节点的观测记录。按出口节点排序，查询单个出口时仅扫描对应区间。
     observed: BTreeMap<(NodeId, NodeId), Observed>,
     /// 发起节点 → 它的观测留在 `observed` 里的那些出口。和 `observed` 的键一一对应。
     observers: BTreeMap<NodeId, BTreeSet<NodeId>>,
 }
 
-/// `observed` 里关于 `exit` 的那一段。
+/// `observed` 中属于 `exit` 的键区间。
 fn about(exit: NodeId) -> RangeInclusive<(NodeId, NodeId)> {
     const FIRST: NodeId = NodeId::new(1).unwrap();
     const LAST: NodeId = NodeId::new(u32::MAX).unwrap();
@@ -322,12 +322,12 @@ impl Inner {
 
     /// 记下一个节点上报里的用量和状态。
     ///
-    /// 出口自己的计数只收启用了出口的节点报的，和时间序列一样（见 [`Inner::stats_reported`]）：
-    /// 别的节点报了也用不着，留着只占地方。
+    /// 出口自身计数仅接收已启用出口的节点上报，与时间序列一致（见 [`Inner::stats_reported`]）：
+    /// 其余节点的上报无意义，避免占用内存。
     ///
-    /// 出口的观测只看前 [`MAX_EXITS`] 项，只收经它自己网络里启用了出口的别的节点出去的：别的编号报上来也用不着留，留着只占地方。
-    /// 节点不会经自己出去（代理不许把自己设成出口，netmap 里也没有它自己），报了也不收。
-    /// 读存储失败、说不清哪些是出口时，这次的观测不记，别的照记。
+    /// 出口观测仅处理前 [`MAX_EXITS`] 项，且仅接收本网络内其他已启用出口节点的记录：无效编号不予保留，避免占用内存。
+    /// 节点不会经自身出站（代理禁止将本节点设为出口，netmap 中也不包含自身），上报自身记录将忽略。
+    /// 若读取存储失败、无法确认已启用出口集合，则忽略本次出口观测，其余字段照常记录。
     pub(super) fn usage_reported(&mut self, node: &NodeRecord, report: UsageReport) {
         let UsageReport { run, exit, exits, proxies, listeners, forwards } = report;
         let now = Instant::now();
@@ -348,7 +348,7 @@ impl Inner {
         }
         match self.store.exits_among(node.network, exits.keys().copied()) {
             Ok(enabled) => self.usage.observed(node.id, exits.into_values().filter(|seen| enabled.contains(&seen.exit)), now),
-            Err(err) => tracing::warn!(node = %node.id, "读不出哪些节点是出口，这次报的出口观测不记：{}", error_chain(&err)),
+            Err(err) => tracing::warn!(node = %node.id, "无法查询已启用的出口节点列表，本次上报的出口观测已忽略：{}", error_chain(&err)),
         }
     }
 }

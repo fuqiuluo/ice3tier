@@ -29,44 +29,44 @@ pub enum Error {
     /// 分组的名字被占用（不分大小写）。和 [`Error::NameTaken`] 同一个代码，`what` 是 `group`。
     #[error("分组名 {0} 已经被占用（名字不分大小写）")]
     GroupNameTaken(String),
-    #[error("名字 {name} 属于一个刚删除的节点，还在冷却期（到 Unix 时间 {until} 为止），现在不能分给别的节点")]
+    #[error("名称 {name} 属于最近删除的节点，尚在冷却期（至 Unix 时间 {until}），暂不能分配给其他节点")]
     NameCoolingDown { name: String, until: Timestamp },
-    #[error("虚拟 IP {0} 已经分给了另一个节点")]
+    #[error("虚拟 IP {0} 已分配给其他节点")]
     AddressTaken(Ipv4Addr),
-    #[error("虚拟 IP {address} 属于一个刚删除的节点，还在冷却期（到 Unix 时间 {until} 为止），现在不能分给别的节点")]
+    #[error("虚拟 IP {address} 属于最近删除的节点，尚在冷却期（至 Unix 时间 {until}），暂不能分配给其他节点")]
     AddressCoolingDown { address: Ipv4Addr, until: Timestamp },
-    #[error("虚拟 IP {address} 不能用：它必须在地址段 {cidr} 里，并且不是网络地址和广播地址")]
+    #[error("虚拟 IP {address} 不可用：必须位于地址段 {cidr} 内，且不能是网络地址或广播地址")]
     AddressOutOfRange { address: Ipv4Addr, cidr: Ipv4Net },
     #[error("地址段 {cidr} 和网络 {other} 的地址段 {other_cidr} 重叠")]
     RangeOverlaps { cidr: Ipv4Net, other: String, other_cidr: Ipv4Net },
-    #[error("地址段 {0} 里没有空闲的地址了")]
+    #[error("地址段 {0} 中已无可用地址")]
     RangeExhausted(Ipv4Net),
     #[error("网络里已经有节点，地址段只能扩大：新的地址段必须包含原来的 {0}")]
     RangeNotSuperset(Ipv4Net),
-    #[error("网络 {0} 里还有节点，先删掉节点才能删网络")]
+    #[error("网络 {0} 中仍有节点，请先删除节点再删除网络")]
     NetworkNotEmpty(String),
     #[error("节点 {node} 没有声明{capability}。在节点上执行 `{command}` 之后才能启用", command = capability.command())]
     NotDeclared { node: String, capability: Capability },
-    #[error("节点 {0} 没有打开\"可以作为端口转发的目标\"。在 controller 上打开：`i3tctl node set {0} --forward-target on`")]
+    #[error("节点 {0} 未启用「允许作为端口转发目标」。在 controller 上启用：`i3tctl node set {0} --forward-target on`")]
     ForwardTargetOff(String),
     #[error("节点 {0} 还在线。只有已经下线的节点才能被继任")]
     PredecessorOnline(String),
     /// 代理的出口节点没有启用出口。
-    #[error("节点 {0} 没有启用出口：先把它启用成出口，或者选别的出口")]
+    #[error("节点 {0} 未启用出口功能：请先将其启用为出口，或选择其他出口")]
     ExitNotEnabled(String),
     /// 代理的出口是监听的节点自己。
-    #[error("出口要是另一个节点：不支持从监听的节点自己出去")]
+    #[error("出口必须为其他节点：不支持由监听节点自身作为出口")]
     ExitIsNode,
     /// 访问规则不让代理的监听节点访问它的出口。
-    #[error("访问规则不允许 {node} 访问 {exit}：先加一条让 {node} 能访问 {exit} 的规则")]
+    #[error("访问规则不允许 {node} 访问 {exit}：请先添加允许 {node} 访问 {exit} 的规则")]
     AccessDenied { node: String, exit: String },
     /// 代理的用户名和密码只写了一个。
-    #[error("用户名和密码要么都写，要么都不写（不在回环地址上的代理都不写时由 controller 生成一对）")]
+    #[error("用户名和密码必须同时提供或同时省略（非回环地址上的代理在两者均省略时由 controller 自动生成）")]
     CredentialsIncomplete,
     /// 和已有的配置冲突。`with` 是挡着的东西。
     #[error("{message}")]
     Conflict { with: Entity, message: String },
-    #[error("节点 {0} 不在线。让节点立即更新要它连着 controller")]
+    #[error("节点 {0} 不在线。触发节点立即更新要求该节点已连接到 controller")]
     NodeOffline(String),
     /// 节点不能自己更新（[`SkipCause::TooOld`] 或 [`SkipCause::CannotSelfUpdate`]）。
     #[error("节点 {node} 不能自己更新：{reason}")]
@@ -92,7 +92,7 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("controller 的密钥文件 {path} 读不出来")]
+    #[error("无法解析 controller 的密钥文件 {path}")]
     Key {
         path: PathBuf,
         #[source]
@@ -110,14 +110,14 @@ pub enum Error {
     },
     #[error("网络端口出错")]
     Socket(#[source] std::io::Error),
-    /// 数据目录里的密钥和数据库里记的不是同一把：数据目录和数据库不是同一个 controller 的。
-    #[error("{} 不是这个数据库的 controller 的密钥：数据目录和数据库对不上", path.display())]
+    /// 数据目录中的密钥与数据库记录的密钥不一致：数据目录和数据库不属于同一个 controller。
+    #[error("密钥文件 {} 与当前数据库的 controller 不匹配：数据目录与数据库不一致", path.display())]
     KeyMismatch { path: PathBuf },
-    /// 数据库里是一个已有的 controller 的数据，数据目录里却没有它的密钥。不生成新的：节点认的是原来那一把。
-    #[error("数据库里是一个已有的 controller 的数据，可是没有它的密钥 {}：把备份的密钥放回来", path.display())]
+    /// 数据库中已存在 controller 数据，但数据目录中缺少对应密钥。不自动生成新密钥：节点仅信任原有密钥。
+    #[error("数据库中已存在 controller 数据，但缺少对应的密钥文件 {}：请恢复备份的密钥文件", path.display())]
     KeyMissing { path: PathBuf },
-    /// 要重新生成管理令牌的目录不是 controller 的数据目录：缺了 `missing` 这个文件。
-    #[error("{} 里没有 {missing}，不是 controller 的数据目录", dir.display())]
+    /// 重新生成管理令牌所指定的目录不是有效的 controller 数据目录：缺少 `missing` 文件。
+    #[error("{} 中缺少 {missing}，不是有效的 controller 数据目录", dir.display())]
     NotDataDir { dir: PathBuf, missing: &'static str },
     /// 请求里的 `field` 这一项引起的错误。只是给 [`Error::field`] 带上字段名，别的都和 `error` 一样。
     /// 内部错误不会被这样包起来（见 [`Error::in_field`]），所以不用往下转来由。
@@ -126,7 +126,7 @@ pub enum Error {
 }
 
 impl Error {
-    /// 是不是整个数据库都读写不了（见 [`StoreError::is_database_wide`]）。这时别的节点、别的网络也是一样的结果，不用往下试。
+    /// 判断是否为整个数据库无法读写（见 [`StoreError::is_database_wide`]）。若是，其余节点和网络也会遭遇相同错误，无需继续尝试。
     pub(crate) fn is_database_wide(&self) -> bool {
         matches!(self, Self::Store(err) if err.is_database_wide())
     }
@@ -175,12 +175,12 @@ impl Error {
         }
     }
 
-    /// 比 [`code`](Self::code) 更具体的一层，管理 API 的错误里的 `what`。说不出来时是 `None`。
+    /// 比 [`code`](Self::code) 更具体的错误子分类，对应管理 API 错误响应中的 `what` 字段。无适用子分类时为 `None`。
     ///
-    /// - `not_found`：找不到的东西（[`Entity::code`]）；
-    /// - `invalid_request`：哪里不对；
-    /// - `conflict`：挡着的东西；
-    /// - `cannot_self_update`：节点说的原因（`container` 之类），或者 `too_old`、`unknown`；
+    /// - `not_found`：未找到的对象类型（[`Entity::code`]）；
+    /// - `invalid_request`：具体的校验失败原因；
+    /// - `conflict`：导致冲突的对象类型；
+    /// - `cannot_self_update`：节点上报的原因（如 `container`），或 `too_old`、`unknown`；
     /// - `no_update`：[`SkipCause`] 的代码；
     /// - `not_declared`：没有声明的能力（`relay`、`exit`）；
     /// - `internal`：出错的环节（`store`、`io` 之类）。日志里有细节，应答里只有这一个词。
@@ -291,7 +291,7 @@ fn cause_code(cause: &impl serde::Serialize) -> Option<String> {
     }
 }
 
-/// 找不到的是什么。
+/// 未找到的资源类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entity {
     Network,
@@ -392,26 +392,26 @@ impl fmt::Display for Capability {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Rejection {
-    #[error("注册令牌无效：它不存在、已经用过，或者已经过期")]
+    #[error("注册令牌无效：不存在、已使用或已过期")]
     BadToken,
-    #[error("这把公钥没有在 controller 上注册。节点可能已经被删除，要重新加入网络")]
+    #[error("该公钥没有在 controller 上注册。节点可能已被删除，需要重新加入网络")]
     UnknownKey,
-    #[error("这把公钥已经注册过了。要重新加入，先在 controller 上删掉原来的节点")]
+    #[error("该公钥已注册。如需重新加入，请先在 controller 上删除原节点")]
     KeyAlreadyEnrolled,
-    #[error("要继任的节点还在线。等它下线之后再用这个令牌加入")]
+    #[error("待继任的节点仍在线，请在其下线后再使用该令牌加入")]
     PredecessorOnline,
-    #[error("令牌预设的虚拟 IP 现在不能用：{0}")]
+    #[error("令牌预设的虚拟 IP 当前不可用：{0}")]
     AddressUnavailable(String),
-    #[error("网络的地址段里没有空闲的地址了")]
+    #[error("网络地址段中已无可用地址")]
     RangeExhausted,
-    #[error("连接上的第一条消息必须是 enroll 或者 hello")]
+    #[error("连接的首条消息必须为 enroll 或 hello")]
     UnexpectedFirstMessage,
-    #[error("controller 内部出错，稍后再试")]
+    #[error("controller 内部错误，请稍后再试")]
     Internal,
 }
 
 impl Rejection {
-    /// 发给节点的回答。controller 自己出的错不是"不认这个节点"：节点收到 `Rejected` 会就此停下、等人重新加入，
+    /// 构造发往节点的应答消息。controller 内部错误并非拒绝节点身份：节点收到 `Rejected` 后会停止重连并等待人工重新加入，
     /// 所以这时回 `TryLater`，让它按退避重连。
     #[must_use]
     pub fn reply(&self) -> ToNode {

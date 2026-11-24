@@ -784,7 +784,7 @@ pub fn command(lang: Lang) -> clap::Command {
     describe(Cli::command(), &texts.help, &texts.values)
 }
 
-/// 把文字目录里的说明装到命令行上。命令和参数的名字写错了 clap 会 panic，测试按两种语言都装一遍，所以写错过不了测试。
+/// 将文字目录中的帮助说明绑定到命令行定义。若命令或参数名拼写错误，clap 会在初始化时 panic；单元测试会按所有语言执行绑定，以确保名称一致。
 fn describe(command: clap::Command, h: &Help, v: &Values) -> clap::Command {
     let node = |arg: clap::Arg| arg.value_name(v.node);
     let group = |arg: clap::Arg| arg.value_name(v.group);

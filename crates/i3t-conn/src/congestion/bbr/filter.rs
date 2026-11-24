@@ -134,7 +134,7 @@ impl MinRtt {
     }
 
     /// 把下限换成 `sample`，不管它比原来的高还是低。在途量降下来之后量到的值、或者应用本来就发得很少时的样本，
-    /// 里面没有自己造成的排队。比原来高出四分之一以上时，新的下限是暂定的，返回 `true`：多半是换了一条更长的路。
+    /// 不含自身造成的排队延迟。若较原值升高超过四分之一，则将新下限标记为暂定并返回 `true`（通常意味着切换到了更长路径）。
     pub(super) fn replace(&mut self, now: Instant, sample: Duration) -> bool {
         self.provisional = self.value.is_some_and(|old| sample * 4 > old * 5);
         self.value = Some(sample);

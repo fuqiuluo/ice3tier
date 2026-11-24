@@ -3,43 +3,43 @@
 //! 一个 [`RelayLink`] 管到一个 relay 的全部事情。它不直接碰 socket：要发的东西交给 [`Wire`]，
 //! 所以整套"先试谁、什么时候换"的规则可以脱离网络来测。
 //!
-//! 一个 relay 可以有好几个地址（controller 找出来的），不一定每个都连得上。UDP 的握手把 INIT 同时发给每个地址，
-//! 谁先回答 CHALLENGE 就用谁，之后的握手和保活都只走它；会话断了，下一次又是每个地址一起试。所以连不上的地址不多花时间。
-//! 回答了 CHALLENGE、握手却走不完的地址（地址和别的 relay 撞了，回答的是另一台机器）这一轮里不再试，剩下的地址马上接着试。
-//! TCP 一个接一个地错开一点时间去连（见 [`crate::tcp`]），上一次握手成功的地址排在最前，失败的排在最后。
+//! 单个 relay 可能拥有多个候选地址（由 controller 收集），其中部分可能不可达。UDP 握手会同时向所有候选地址发送 INIT，
+//! 采用最先返回 CHALLENGE 的地址进行后续握手与保活；会话断开后下次重连仍会并发探测全部地址，避免在不可达地址上耗时。
+//! 对已返回 CHALLENGE 但未完成握手的地址（如地址冲突、实际应答者为其他节点），本轮不再重试，立即尝试其余候选地址。
+//! TCP 则按错峰策略依次并发连接（见 [`crate::tcp`]），上次握手成功的地址排在最前，失败的地址排在最后。
 //!
 //! # 骨干
 //!
-//! 本节点自己是 relay 时，到别的 relay 的联系也是骨干上的一段：两边互相都要有会话，并且在同一种传输上（[`crate::backbone`]）。
-//! UDP 通的时候和节点一样走 UDP（这时不像节点那样同时去连 TCP）。下面几种情况下这一段改走一条 TCP，两个会话都在上面：
+//! 当本节点自身作为 relay 时，与其他 relay 的连接同时构成骨干链路：双方需互相建立会话并采用相同的传输协议（[`crate::backbone`]）。
+//! UDP 可达时与普通节点一样使用 UDP（此时不并发尝试 TCP）。以下情况下该骨干链路切换为单条 TCP 连接，双向会话共用该连接：
 //!
-//! - 本节点到它的 UDP 握不上手；
-//! - 本节点到它的 UDP 会话通着，它却 [`ONE_SIDED_GRACE`] 都没有在本节点的 relay 上建会话：它连不上本节点；
-//! - 它拨进来了一条（本节点的 relay 接住，告诉路径层），本节点又没有通着的 UDP 会话，或者它的会话已经搬到了这条 TCP 上。
+//! - 本节点到对端 relay 的 UDP 握手未完成；
+//! - 本节点到对端 relay 的 UDP 会话已建立，但经过 [`ONE_SIDED_GRACE`] 仍未收到对方在本节点 relay 上建立的会话（表明对方无法通过 UDP 到达本节点）；
+//! - 对方主动拨入 TCP 连接（由本节点 relay 接受并通知路径层），且本节点尚无活跃 UDP 会话，或对方的会话已迁移至该 TCP 连接。
 //!
-//! 谁拨号：编号小的一方先拨；它连不上的话（对方连不进去），另一方等 [`DIAL_DEFER`] 没有等到它拨进来就自己拨。
-//! 第二种情况下本节点知道对方连不上自己，马上拨。两边都拨通了的话，编号小的一方留着自己拨的那条，另一方改用它，放下自己的。
+//! 拨号方协商规则：节点 ID 较小的一方优先主动拨号；若拨号失败（对方不可直连），另一方等待 [`DIAL_DEFER`] 后仍未收到入站连接则主动拨出。
+//! 在第二种单向可达场景下，本节点已知对方无法连入自身，因此立即主动拨号。若双方同时拨通，ID 较小的一方保留自建连接，另一方切换复用该连接并关闭自建连接。
 //!
-//! 改走 TCP 之后，这条 TCP 断了也照样用 TCP 重连（像节点的 TCP 退路一样）。一边的会话换回 UDP、另一边还在 TCP 上的那一阵，
-//! 两个会话不在同一处，骨干上什么都转不过去；只有一个方向的 UDP 通（防火墙、端口映射）时，自顾自换回去的一方每试一次就让这一段断上十几秒。
-//! 所以回到 UDP 要两个方向都有证据，两个证据在接受的一方碰头：
+//! 切换为 TCP 后，该连接断开时仍按 TCP 重连（与普通节点的 TCP 回退策略相同）。若一端单方面切回 UDP 而另一端仍停留在 TCP，
+//! 双向会话分处不同传输通道将导致骨干转发中断；在仅单向 UDP 可达（受防火墙或端口映射限制）的环境下，单方反复切回会导致链路周期性中断十余秒。
+//! 因此切回 UDP 需要双向可达证据，并在接收方汇聚确认：
 //!
-//! - 走着 TCP 时（TCP 通不通都一样）每隔 [`backbone_udp_retry`] 在后台经 UDP 握一次手，TCP 照常用着。没有握上手什么都不变：
-//!   不算一次失败的尝试，不动退避，也不改报上去的结果。
-//! - 后台的握手收到对方的 CHALLENGE，就记下"本节点的 UDP 到得了它"，[`udp_evidence_ttl`] 之内算数。
-//! - 对方经 UDP 发来的 AUTH 本身说明它的 UDP 到得了本节点。本节点的 relay 只在有上面那个证据、或者本节点到它的 UDP 会话通着时，
-//!   才让它把会话搬到 UDP 上；不然不建会话、不回答，告诉路径层它敲了门（[`crate::BackboneInbox`]），路径层马上自己试一次（[`KNOCK_GAP`]）。
-//!   对方是新版本、它那个方向通的证据就是这次敲门，所以敲门总是有回应，不管下面的退避。
-//! - 后台的握手成功了（对方让本节点搬了过去），本节点离开 TCP，又是一段普通的 UDP 骨干。对方跟过来之前它的会话还在这条 TCP 上：
-//!   自己拨的那条等它的会话离开了再关（关早了它在本节点上就没有会话，这一会儿经这一段的包会被拒绝），
-//!   借来的那条一阵之内不再借（不然看上去和"它搬到了自己拨的 TCP 上"一样，本节点会马上借回去）。
-//!   对方看到本节点的会话到了 UDP 上，照下一条跟过来；它的 AUTH 这边接受，因为本节点到它的 UDP 会话已经通了。
-//! - 对方经 UDP 在本节点上建了会话（它那边在 UDP 上、而且连得上本节点），本节点的 UDP 最近也到得了它时，本节点也回到 UDP 再试。
-//!   只有前一半不算：UDP 整个断掉之后，对方原来那个 UDP 的会话还要等到过期（三十秒）才从本节点上消失。
+//! - 使用 TCP 期间（无论当前 TCP 是否已连通），每隔 [`backbone_udp_retry`] 在后台尝试一次 UDP 握手，不影响现有 TCP 使用。握手未完成时不改变任何状态：
+//!   不计入失败次数，不触发退避，也不修改上报结果。
+//! - 后台握手收到对方的 CHALLENGE 时，记录“本节点 UDP 可达对方”，有效期为 [`udp_evidence_ttl`]。
+//! - 对方经 UDP 发来的 AUTH 本身可证明对方 UDP 可达本节点。本节点 relay 仅在持有上述双向证据或本节点到对方的 UDP 会话已建立时，
+//!   才允许对方将会话迁移至 UDP；否则不建立会话、不应答，并通知路径层对方发起试探（[`crate::BackboneInbox`]），路径层随即主动试探一次（受 [`KNOCK_GAP`] 限制）。
+//!   若对方为新版本，其此次请求即构成反向可达证据，因此不受下方退避间隔约束。
+//! - 后台握手成功后（对方允许本节点迁回 UDP），本节点退出 TCP 模式，恢复常规 UDP 骨干。在对方跟随切换前，其会话仍停留在该 TCP 连接上：
+//!   自建连接需等待对方会话离开后再关闭（过早关闭会导致对方在本节点无会话，进而使转发包被拒绝），
+//!   复用连接则在短时间内不再复用（避免被误判为“对方迁至自建 TCP”而再次切回）。
+//!   对方发现本节点会话已切至 UDP 后按下一条规则跟随；本端因已有活跃 UDP 会话而接受其 AUTH。
+//! - 当对方经 UDP 在本节点建立会话（表明对方处于 UDP 且可达本节点），且本节点近期亦验证 UDP 可达对方时，本节点切回 UDP 重试。
+//!   仅满足前半条件不足以触发切换：UDP 完全中断后，对方原有 UDP 会话需等待超时（30 秒）才会过期清除。
 //!
-//! 比这个改动旧的 relay 接受每一个 AUTH，又从不在 TCP 上试 UDP。本节点的 UDP 到得了它、它的到不了本节点时，本节点每一次回到 UDP
-//! 都要等既有的规则把两边带回 TCP（几秒到十几秒）。所以回到 UDP 之后 [`RETURN_PROBATION`] 之内又改走 TCP 的话，
-//! 下一次在后台试 UDP 的间隔加倍，最多 [`BACKBONE_RETRY_MAX`]；回去之后保持住了的，间隔复原。
+//! 早于本次改动的旧版 relay 会接受所有 AUTH 且不在 TCP 上探测 UDP。若仅本节点 UDP 可达对方而反向不可达，本节点每次切回 UDP
+//! 都需等待既有规则将双方带回 TCP（耗时数秒至十余秒）。因此，若切回 UDP 后在 [`RETURN_PROBATION`] 内再次退回 TCP，
+//! 下次后台尝试 UDP 的间隔将加倍，上限为 [`BACKBONE_RETRY_MAX`]；若切回后保持稳定，则恢复初始间隔。
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -61,9 +61,9 @@ use crate::timing::{
 
 /// 挂靠几个 relay。
 pub(crate) const ATTACH_COUNT: usize = 2;
-/// 挂靠的 relay 连不上超过这么久，就可以被别的顶替。
+/// 挂靠的 relay 持续无法连接超过该时长后，可被其他 relay 替换。
 const FAILING_AFTER: Duration = Duration::from_secs(10);
-/// TCP 多久连不上就算这次失败。
+/// TCP 连接超时阈值。
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 不保持会话的 relay 每分钟问一次延迟（INIT / CHALLENGE），这么久没有回答就算这一次没问到。
 const SURVEY_SILENCE: Duration = Duration::from_secs(3);
@@ -99,22 +99,22 @@ pub(crate) struct Backbone {
     pub(crate) offered: Option<u64>,
 }
 
-/// 骨干上的这一段走一条 TCP（见模块文档）。
+/// 骨干链路通过单条 TCP 连接承载（见模块文档）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpLink {
     since: Instant,
-    /// 本节点知道它连不上本节点：不等它拨进来，本节点拨。
+    /// 本节点已知对方无法连入，因此不等待对方拨入，由本节点主动拨号。
     must_dial: bool,
-    /// 下一次在后台经 UDP 试的时刻。
+    /// 下次在后台尝试 UDP 握手的时刻。
     next_try: Instant,
 }
 
-/// relay 没有照办，原因出在某条路上而不是会话本身。
+/// relay 拒绝转发请求，原因在于目标路径而非会话本身。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Complaint {
-    /// 这个对端没有挂在它上面。
+    /// 目标对端未挂靠于该 relay。
     PeerUnattached(NodeId),
-    /// 多级中转的路径走不下去：它和这个 relay 之间没有骨干连接；是它自己的编号时，表示路径比网络允许的长。
+    /// 多级中转路径不可达：该 relay 与指定下一跳之间无骨干连接；若为自身节点 ID，表示路径超出网络允许的最大跳数。
     RouteUnavailable(NodeId),
 }
 
@@ -163,11 +163,11 @@ pub(crate) struct RelayLink {
     /// 最近一次 TCP 上握手成功的地址，下一次先连它；握手失败的地址下一次排最后。
     tcp_good: Option<SocketAddr>,
     tcp_bad: Option<SocketAddr>,
-    /// TCP 那条腿上一个会话留下的测量值。断了重连还是同一段链路，新的会话接着用：不这样的话，
-    /// 一条隔一会儿就断的链路每次重连之后都像新的一样好，延迟优先的选路会一次次被它骗回去。
+    /// 上一个 TCP 会话保留的链路测量值。断线重连仍属于同一链路，新会话继续沿用：
+    /// 否则频繁中断的链路每次重连后都显得质量良好，会导致延迟优先选路反复切回。
     tcp_measured: Estimate,
-    /// 最近一次是因为 UDP 握不上手才用 TCP 连上的。这样的会话断了重连时只连 TCP，不再让 UDP 先试一秒：
-    /// 多半还是握不上，白等。连上之后照常定期试 UDP，通了就换回去。
+    /// 最近一次因 UDP 握手未完成而回退至 TCP 建立会话。此类会话断开重连时直接尝试 TCP，不再预留 1 秒 UDP 先行窗口，
+    /// 避免重复无效等待；连上后仍定期尝试切回 UDP。
     fell_back: bool,
     /// 会话断没断过，见 [`is_settled`](Self::is_settled)。
     steadiness: Steadiness,
@@ -193,16 +193,16 @@ pub(crate) struct RelayLink {
     seen: Option<(IpAddr, Instant)>,
     /// 本节点是 relay 时最近一次 [`poll`](Self::poll) 交进来的骨干上的情况；不是时是 `None`。
     backbone: Option<Backbone>,
-    /// 骨干上的这一段改走了 TCP。
+    /// 骨干链路已切换为 TCP 模式。
     tcp_link: Option<TcpLink>,
-    /// 到它的 UDP 会话通着、它在本节点的 relay 上却没有 UDP 的会话：从这个时刻起。
+    /// 到对端的 UDP 会话已建立、但对方尚未经 UDP 在本节点 relay 建立会话的起始时刻。
     one_sided_since: Option<Instant>,
-    /// 借来用、却没有用成的那条（握手没走完、会话断了），或者回到 UDP 时放下的那条，和那个时刻：[`OFFER_RETRY`] 之内不再借它。
+    /// 曾复用但失败的连接（握手未完成或会话中断），或切回 UDP 时释放的连接及对应时刻：[`OFFER_RETRY`] 内不再复用。
     spoiled_offer: Option<(u64, Instant)>,
-    /// 本节点经 UDP 发的 INIT 最近一次得到它的 CHALLENGE 的时刻：本节点的 UDP 到得了它，它的回答也回得来。
-    /// 改走 TCP 时清掉：那之前的证据不说明现在。
+    /// 本节点经 UDP 发送的 INIT 最近一次收到对方 CHALLENGE 的时刻（证明双向 UDP 可达）。
+    /// 切换为 TCP 模式时清除，避免使用过期证据。
     udp_reached: Option<Instant>,
-    /// 骨干上的这一段最近一次从 TCP 回到 UDP 的时刻；之后又改走 TCP 时用掉。
+    /// 骨干链路最近一次从 TCP 切回 UDP 的时刻；若短时间内再次退回 TCP，用于退避判断。
     returned: Option<Instant>,
     /// 走着 TCP 时多久在后台试一次 UDP（见模块文档的退避）。
     backbone_retry: Duration,
@@ -275,7 +275,7 @@ impl RelayLink {
         }
     }
 
-    /// netmap 更新了这个 relay 的信息。正在用的地址不在新的列表里也接着用：它还通着；会话断了之后才只试新的。
+    /// 根据 netmap 更新该 relay 的信息。当前活跃地址即使不在新列表中也继续沿用，待会话断开后再仅尝试新地址。
     pub(crate) fn update(&mut self, relay: &Relay) {
         self.key = relay.key;
         if self.udp_addrs != relay.udp || self.tcp_addrs != relay.tcp {
@@ -386,7 +386,7 @@ impl RelayLink {
         self.steadiness = Steadiness::Down;
     }
 
-    /// 会话建立了。从 TCP 换回 UDP 时会话没有断过，不算重新连上。
+    /// 会话已建立。从 TCP 切回 UDP 时会话未曾中断，不视为断线重连。
     fn session_up(&mut self, now: Instant) {
         if self.steadiness == Steadiness::Down {
             self.steadiness = Steadiness::Recovered(now);
@@ -411,10 +411,9 @@ impl RelayLink {
 
     /// 报给别的节点的延迟（挂靠表里的那个数）：它们拿它当"经这个 relay 到本节点"的最后一段。
     ///
-    /// 走 UDP 时是平滑延迟。走 TCP 时是本节点自己给这一段算代价用的同一个数（最近几分钟的平均，停顿和卡死都算在里面，
-    /// 见 `crate::estimate`）：不然同一条 TCP 两头用两把尺子，对端报来的平滑延迟总比这一头按平均算的便宜，
-    /// 经它的路就显得比实际好。真实链路上见过：一个节点连过来的 TCP 会话一会儿一断，报来的延迟却一直是最低的，
-    /// 选路每次按代价换过去，半分钟之后又因为会话断了换走。估计过期了（很久没有回答）时退回平滑延迟。
+    /// 使用 UDP 时上报平滑延迟；使用 TCP 时上报与本节点计算路径代价相同的指标（最近数分钟的均值，包含停顿与卡死时长，
+    /// 见 `crate::estimate`）：避免同一 TCP 链路两端衡量标准不一致，导致对端上报的平滑延迟偏低而使该路径显得优于实际质量。
+    /// 实际网络中曾出现频繁断连的 TCP 会话持续上报最低延迟，致使选路反复切换并在半分钟后再次因断连切走。估计过期时回退至平滑延迟。
     pub(crate) fn reported_rtt(&self, now: Instant) -> Option<Rtt> {
         match self.leg()? {
             Leg::Udp(_) => self.udp.rtt(),
@@ -443,7 +442,7 @@ impl RelayLink {
         self.reported_rtt(now).map(Rtt::get).or(surveyed)
     }
 
-    /// 要它却一直连不上。
+    /// 需要连接该 relay 但持续未建立会话。
     pub(crate) fn is_failing(&self, now: Instant) -> bool {
         self.leg().is_none() && self.wanted_since.is_some_and(|since| now.saturating_duration_since(since) > FAILING_AFTER)
     }
@@ -477,13 +476,13 @@ impl RelayLink {
         self.seen.filter(|(_, at)| now.saturating_duration_since(*at) < ESTIMATE_TTL).map(|(ip, _)| ip)
     }
 
-    /// 不保持会话时每分钟一次的 UDP 询问这一次没有回答：UDP 到不了它，TCP 还没试过。
+    /// 未保持会话时每分钟一次的 UDP 探测本次未收到响应（UDP 不可达，TCP 尚未尝试）。
     pub(crate) fn survey_silent(&self, now: Instant) -> bool {
         !self.wanted && self.survey.is_some_and(|(_, sent)| now.saturating_duration_since(sent) >= SURVEY_SILENCE)
     }
 
-    /// 推进定时器。`urgent`：有包正经它发出去，却有一阵没有从它收到任何东西了。
-    /// `survey`：不保持会话时要不要定期测一下延迟。`backbone`：本节点是 relay 时骨干上的情况（见模块文档），不是时是 `None`。
+    /// 推进定时器。`urgent` 表示当前有数据包经该 relay 发出，但已有一段时间未收到其任何响应。
+    /// `survey`：未保持会话时是否定期探测延迟。`backbone`：本节点作为 relay 时的骨干状态（见模块文档），非 relay 时为 `None`。
     pub(crate) fn poll(
         &mut self,
         now: Instant,
@@ -500,7 +499,7 @@ impl RelayLink {
             return;
         }
         if backbone.is_none() && self.tcp_link.take().is_some() {
-            // 本节点不再是 relay：这一段不再是骨干，照节点的规矩来（UDP 先试，TCP 是退路）。
+            // 本节点不再作为 relay：该链路不再属于骨干，恢复普通节点策略（优先尝试 UDP，TCP 作为回退）。
             self.one_sided_since = None;
         }
         if backbone.is_none() && self.lingering.take().is_some() && self.tcp.is_none() {
@@ -516,14 +515,14 @@ impl RelayLink {
 
         if self.udp.is_up() {
             if self.retire_tcp().is_some() {
-                tracing::info!(relay = %self.id, "到 relay 的 UDP 通了，不再用 TCP");
+                tracing::info!(relay = %self.id, "到 relay 的 UDP 会话已建立，关闭 TCP 回退连接");
                 wire.tcp_close();
             }
             return;
         }
         self.try_udp_beside_tcp(now, who, wire);
         if self.tcp.as_ref().is_some_and(|tcp| tcp.session.is_up()) {
-            // 走着 TCP：定期再试 UDP，通了就换回去。骨干改走了 TCP 时按骨干的规矩在后台试（上面那一步，见模块文档）。
+            // 当前使用 TCP：定期重试 UDP，成功则切回；骨干 TCP 模式则按骨干规则在后台试探（见上一步及模块文档）。
             if self.tcp_link.is_none() && self.udp.is_idle() && now >= self.udp_retry_at && self.has_udp() {
                 self.udp_retry_at = now + UDP_RETRY;
                 self.start_udp(now, who, wire);
@@ -534,8 +533,8 @@ impl RelayLink {
             None if now >= self.retry_at => self.begin_attempt(now, who, wire),
             None => {}
             Some(started) => {
-                // UDP 先走一步；它这么久还没握上手，就让等在 cookie 那一步的 TCP 继续。
-                // 上一轮已经试出 UDP 握不上手的话，这一轮不再让它先走。
+                // 先给 UDP 预留先行时间窗口；超时仍未完成握手时，放行暂停在 cookie 阶段的 TCP 握手继续执行。
+                // 若上一轮已确认 UDP 握手未完成，本轮不再预留先行窗口。
                 let head_start = if self.failures == 0 { UDP_HEAD_START } else { Duration::ZERO };
                 let head_start_over = now.saturating_duration_since(started) >= head_start || self.udp.is_idle();
                 if head_start_over
@@ -543,13 +542,13 @@ impl RelayLink {
                     && let Some(send) = tcp.session.release(now)
                 {
                     if self.fell_back {
-                        tracing::info!(relay = %self.id, "到 relay 的 UDP 上一次握不上手，这一次直接用 TCP");
+                        tracing::info!(relay = %self.id, "上一次与 relay 的 UDP 握手未完成，本次直接通过 TCP 建立会话");
                     } else {
-                        tracing::info!(relay = %self.id, "到 relay 的 UDP 握不上手，改用 TCP");
+                        tracing::info!(relay = %self.id, "与 relay 的 UDP 握手未完成，继续通过 TCP 建立会话");
                     }
                     self.send_tcp(send, who, wire);
                 }
-                // 骨干改走了 TCP 时这一轮只有 TCP：后台试着的 UDP 不归它管，不用等它。
+                // 骨干切换为 TCP 时本轮仅尝试 TCP：后台 UDP 试探独立运行，无需等待。
                 if self.tcp.is_none() && (self.tcp_link.is_some() || self.udp.is_idle()) {
                     self.attempt_failed(now);
                 }
@@ -571,13 +570,13 @@ impl RelayLink {
         self.apply_tcp(step, now, who, wire);
     }
 
-    /// 骨干上的这一段该不该、该怎样改走 TCP（见模块文档）。本节点是 relay 时每一轮都看。
+    /// 评估骨干链路是否及如何切换为 TCP（见模块文档）。本节点为 relay 时每轮调用。
     fn review_backbone(&mut self, now: Instant, who: Identity<'_>, backbone: Backbone, wire: &mut dyn Wire) {
         self.linger(now, backbone.theirs, wire);
         let offered =
             backbone.offered.filter(|offer| self.spoiled_offer.is_none_or(|(spoiled, at)| spoiled != *offer || now >= at + OFFER_RETRY));
         let using = self.tcp.as_ref().and_then(|tcp| tcp.adopted);
-        // 本节点到它的 UDP 会话通着也用：它的会话已经搬到这条 TCP 上了（它那边 UDP 不通），这一段只能都在 TCP 上。
+        // 即使本节点到对方的 UDP 会话仍通，只要对方的会话已迁至该 TCP 连接（其侧 UDP 不可达），双方均需统一使用该 TCP 连接。
         let moved = |offer: u64| backbone.theirs == Some(SessionLeg::Accepted(offer));
         if let Some(offer) = offered.filter(|offer| using != Some(*offer) && (!self.udp.is_up() || moved(*offer))) {
             // 自己拨的那条已经通了、按编号又该本节点拨的话留着它：对方看到本节点的会话从它接的那条上来，会放下它自己拨的。
@@ -588,17 +587,17 @@ impl RelayLink {
             }
         }
         if self.tcp_link.is_none() && !self.udp.is_up() && self.tcp.as_ref().is_some_and(|tcp| tcp.session.is_up()) {
-            // 本节点成为 relay 之前就照节点的规矩退到了 TCP：这一段已经在 TCP 上，照骨干的规矩接着用。
-            tracing::info!(relay = %self.id, "本节点成为 relay 之前就经 TCP 连着这个 relay：骨干上的这一段照骨干的规矩走这条 TCP");
+            // 本节点启用 relay 角色前已按普通节点策略回退至 TCP：该链路已在 TCP 上，转按骨干 TCP 规则沿用。
+            tracing::info!(relay = %self.id, "本节点启用 relay 角色前已通过 TCP 连接到该 relay，骨干链路沿用该 TCP 连接");
             self.enter_tcp_link(now, false);
         }
         if self.tcp_link.is_some() {
-            // 它经 UDP 连得上本节点、它那边也已经在 UDP 上，本节点的 UDP 最近也到得了它：回到 UDP 再试，不通的话这一轮失败之后又会改走 TCP。
-            // 没有后面这个证据时不算：UDP 整个断掉之后它在本节点上原来那个 UDP 的会话还要等到过期（三十秒）才消失，照它回去只会一次次握不上手，
-            // 这一段既不在 UDP 上也拨不起 TCP。本节点在后台试的 UDP 通了，证据就有了。
+            // 对方已通过 UDP 在本节点建立会话且本节点近期验证 UDP 可达对方：切回 UDP 重试，若失败则重新切回 TCP。
+            // 缺少后一项证据时不可切回：UDP 完全中断后，对方原有的 UDP 会话需等待 30 秒超时才会清除，
+            // 若据此切回会导致反复握手失败，既无法恢复 UDP 也无法建立 TCP。后台 UDP 试探收到回应后即产生该证据。
             if backbone.theirs == Some(SessionLeg::Udp) && self.udp_reaches(now) {
-                tracing::info!(relay = %self.id, "这个 relay 经 UDP 在本节点上建了会话，本节点的 UDP 也到得了它：骨干上的这一段回到 UDP 再试");
-                // 它的会话已经搬走了，这条 TCP 上没有谁了。
+                tracing::info!(relay = %self.id, "对端 relay 已通过 UDP 与本节点建立会话且本节点 UDP 可达，骨干链路切回 UDP 重试");
+                // 对方会话已迁离，该 TCP 连接不再需要。
                 if self.leave_tcp_link(now).is_some() {
                     wire.tcp_close();
                 }
@@ -611,21 +610,21 @@ impl RelayLink {
             (true, Some(SessionLeg::Accepted(_) | SessionLeg::Dialled(_)) | None) => {
                 let since = *self.one_sided_since.get_or_insert(now);
                 if now.saturating_duration_since(since) >= ONE_SIDED_GRACE {
-                    tracing::info!(relay = %self.id, "到这个 relay 的 UDP 会话通着，它却一直没有经 UDP 在本节点上建会话：它连不上本节点，骨干上的这一段改走本节点拨出去的 TCP");
+                    tracing::info!(relay = %self.id, "到该 relay 的 UDP 会话已建立，但对方持续未通过 UDP 与本节点建立会话，骨干链路改由本节点主动拨出 TCP");
                     self.enter_tcp_link(now, true);
                 }
             }
         }
     }
 
-    /// 骨干上的这一段改走 TCP：放下 UDP 的会话，马上按 TCP 的规矩重来。之前回到 UDP 没有回成的话，后台试 UDP 的间隔加倍（见模块文档）。
+    /// 骨干链路切换为 TCP 模式：停止 UDP 会话并立即按 TCP 规则重连。若上次切回 UDP 后短时间内再次退回，后台 UDP 重试间隔加倍（见模块文档）。
     fn enter_tcp_link(&mut self, now: Instant, must_dial: bool) {
         self.backbone_retry = Self::next_backbone_retry(self.backbone_retry, self.returned.take(), now);
         if self.backbone_retry > backbone_udp_retry() {
             tracing::info!(
                 relay = %self.id,
                 wait = self.backbone_retry.as_secs(),
-                "骨干上的这一段回到 UDP 没有多久又改走 TCP：下一次在后台试 UDP 多等一倍（秒）"
+                "骨干链路切回 UDP 后短时间内再次退回 TCP，后台 UDP 重试间隔已加倍（秒）"
             );
         }
         self.tcp_link = Some(TcpLink { since: now, must_dial, next_try: now + self.backbone_retry });
@@ -648,12 +647,12 @@ impl RelayLink {
         }
     }
 
-    /// 骨干上的这一段离开 TCP、回到 UDP：本节点的会话不再用这条 TCP。返回放下的那条，关不关由调用的一方定（借来的只是不再用，
-    /// 关它是 relay 的事）。
+    /// 骨干链路退出 TCP 模式、切回 UDP：本节点会话不再使用该 TCP 连接。返回释放的连接，是否关闭由调用方决定
+    /// （复用连接仅停止使用，关闭由 relay 侧管理）。
     ///
-    /// 借来的那条放下之后 [`OFFER_RETRY`] 之内不再借：对方还没有跟过来的那一会儿，它的会话还在这条 TCP 上，
-    /// 看上去和"它搬到了自己拨的 TCP 上"一样（[`review_backbone`](Self::review_backbone)），不这样的话本节点会马上又借回去。
-    /// 回到 UDP 真的不成时，对方拨的是新的一条，或者本节点照"它连不上本节点"自己拨。
+    /// 复用连接释放后在 [`OFFER_RETRY`] 内不再复用：在对方跟随切回前，其会话仍停留在该 TCP 连接上，
+    /// 若立即复用会被误判为“对方迁至自建 TCP”（[`review_backbone`](Self::review_backbone)）。
+    /// 若切回 UDP 确实失败，对方将拨入新连接，或由本节点按单向可达规则主动拨号。
     fn leave_tcp_link(&mut self, now: Instant) -> Option<TcpLeg> {
         self.tcp_link = None;
         self.returned = Some(now);
@@ -665,9 +664,9 @@ impl RelayLink {
         Some(tcp)
     }
 
-    /// 本节点先回到 UDP、放下的又是自己拨的那条 TCP 时，先不关它：对方还没有跟过来，它在本节点的 relay 上的会话还绑在这条 TCP 上，
-    /// 一关就没了，这一会儿经这一段的包会被拒绝，发包的节点据此十来秒不走这一段。留着它，这一会儿的包只是悄悄丢掉。
-    /// 对方的会话离开它（搬到了 UDP 上，或者没了）之后再关，最多留 [`ONE_SIDED_GRACE`]：到那时对方还不来，既有的规则会另拨一条。
+    /// 当本节点先行切回 UDP 且释放的是自建 TCP 连接时暂不立即关闭：对方尚未跟随切换，其在本节点 relay 上的会话仍绑定在该 TCP 连接上，
+    /// 立即关闭会导致该会话中断、期间转发的数据报被拒绝，使源节点避开该链路十余秒；暂缓关闭则仅静默丢包。
+    /// 待对方会话迁移离开（转至 UDP 或断开）后再关闭，最长等待 [`ONE_SIDED_GRACE`]，超时后按常规规则重建。
     fn linger(&mut self, now: Instant, theirs: Option<SessionLeg>, wire: &mut dyn Wire) {
         let Some(since) = self.lingering else { return };
         if matches!(theirs, Some(SessionLeg::Dialled(_))) && now.saturating_duration_since(since) < ONE_SIDED_GRACE {
@@ -679,36 +678,36 @@ impl RelayLink {
         }
     }
 
-    /// 骨干走着 TCP：到了时候就在后台经 UDP 试一次（见模块文档）。TCP 照常用着；没有握上手的话什么都不变（见 [`apply_udp`](Self::apply_udp)）。
+    /// 骨干链路使用 TCP 时，到期后在后台尝试一次 UDP 握手（见模块文档）。现有 TCP 正常使用；握手未完成时不改变状态（见 [`apply_udp`](Self::apply_udp)）。
     fn try_udp_beside_tcp(&mut self, now: Instant, who: Identity<'_>, wire: &mut dyn Wire) {
         let Some(link) = &mut self.tcp_link else { return };
         if now < link.next_try {
             return;
         }
         link.next_try = now + self.backbone_retry;
-        // 敲门引出的那一次还没有结束的话，它就是这一次。
+        // 若由对方请求触发的试探尚未结束，则复用该次尝试。
         if self.udp.is_idle() && self.has_udp() {
-            tracing::debug!(relay = %self.id, "骨干上的这一段走着 TCP：在后台经 UDP 试一次");
+            tracing::debug!(relay = %self.id, "骨干链路当前使用 TCP，开始在后台尝试 UDP 握手");
             self.start_udp(now, who, wire);
         }
     }
 
-    /// 这个 relay 经 UDP 敲了门：本节点的 relay 因为不知道自己的 UDP 到不到得了它，挡下了它的 AUTH（[`crate::BackboneInbox::knocked`]）。
+    /// 收到对端 relay 经 UDP 发来的试探请求：本节点 relay 因缺乏反向 UDP 可达证据而拦截了其 AUTH（[`crate::BackboneInbox::knocked`]）。
     ///
-    /// 骨干走着 TCP 的话马上自己经 UDP 试一次，不管后台试的间隔退到了多长：它是新版本、它那个方向通的证据就是这次敲门。
-    /// 正在试着的、或者 [`KNOCK_GAP`] 之内因为敲门试过的，不再试。没有走 TCP 时不理（本节点的 relay 手上那张表还没跟上）。
+    /// 若骨干链路当前使用 TCP，则立即发起一次 UDP 尝试，不受后台退避间隔限制（对方为新版本且已证明其方向可达）。
+    /// 若当前正在尝试或在 [`KNOCK_GAP`] 内已响应过，则忽略；未处于 TCP 模式时忽略（本节点 relay 的门控状态尚未同步）。
     pub(crate) fn on_knock(&mut self, now: Instant, who: Identity<'_>, wire: &mut dyn Wire) {
         let answered_lately = self.knock_answered.is_some_and(|at| now.saturating_duration_since(at) < KNOCK_GAP);
         if self.tcp_link.is_none() || answered_lately || !self.udp.is_idle() || !self.has_udp() {
             return;
         }
         self.knock_answered = Some(now);
-        tracing::debug!(relay = %self.id, "这个 relay 经 UDP 敲了门：骨干上的这一段走着 TCP，马上自己经 UDP 试一次");
+        tracing::debug!(relay = %self.id, "收到对端 relay 的 UDP 握手请求，当前骨干链路使用 TCP，立即发起 UDP 尝试");
         self.start_udp(now, who, wire);
     }
 
-    /// 本节点的 relay 让不让它经 UDP 把会话搬过来（[`crate::BackboneInbox::admits_udp`]）。骨干上的这一段没有走 TCP、
-    /// 或者本节点到它的 UDP 会话通着时是 `None`：都让，和以前一样。
+    /// 控制本节点 relay 是否允许该对端经 UDP 迁移会话（[`crate::BackboneInbox::admits_udp`]）。
+    /// 当骨干链路未使用 TCP 或本节点到对方的 UDP 会话已建立时返回 `None`（直接允许，沿用常规行为）。
     pub(crate) fn udp_gate(&self) -> Option<Gate> {
         if self.tcp_link.is_none() || self.udp.is_up() {
             return None;
@@ -716,7 +715,7 @@ impl RelayLink {
         Some(self.udp_reached.map_or(Gate::Closed, |at| Gate::OpenUntil(at + udp_evidence_ttl())))
     }
 
-    /// 本节点的 UDP 最近到得了它（`udp_reached`），证据还算数。
+    /// 本节点近期验证过 UDP 可达对方（`udp_reached`），且该证据仍在有效期内。
     fn udp_reaches(&self, now: Instant) -> bool {
         self.udp_reached.is_some_and(|at| now < at + udp_evidence_ttl())
     }
@@ -730,7 +729,7 @@ impl RelayLink {
             wire.tcp_close();
         }
         let Some((addr, accepted)) = wire.tcp_adopt() else { return };
-        tracing::info!(relay = %self.id, %addr, conn = accepted, "这个 relay 拨进来了一条 TCP：骨干上的这一段两个会话都走它");
+        tracing::info!(relay = %self.id, %addr, conn = accepted, "对端 relay 已拨入 TCP 连接，骨干链路两端会话复用该连接");
         let mut session = Session::over_tcp(self.tcp_measured.clone());
         session.set_training(self.training);
         let send = session.start(now, false);
@@ -740,7 +739,7 @@ impl RelayLink {
         self.send_tcp(send, who, wire);
     }
 
-    /// 骨干走 TCP 时本节点现在能不能自己拨：编号小的一方先拨，另一方等一会儿（见模块文档）。
+    /// 判断骨干走 TCP 时本节点当前是否应主动拨号：节点 ID 较小的一方先拨，另一方延迟后拨（见模块文档）。
     fn may_dial(&self, link: TcpLink, now: Instant, who: Identity<'_>) -> bool {
         link.must_dial || who.me < self.id || now.saturating_duration_since(link.since) >= DIAL_DEFER
     }
@@ -767,7 +766,7 @@ impl RelayLink {
             wire.tcp_connect(&tcp_addrs);
         }
         if !self.has_udp() && tcp_addrs.is_empty() {
-            tracing::warn!(relay = %self.id, "netmap 里这个 relay 没有任何地址，连不了");
+            tracing::warn!(relay = %self.id, "netmap 中该 relay 无可用地址，无法建立连接");
             self.attempt_failed(now);
         }
     }
@@ -791,12 +790,12 @@ impl RelayLink {
             return;
         }
         if tcp_addrs.is_empty() {
-            tracing::warn!(relay = %self.id, "这个 relay 的 UDP 不通，netmap 里又没有它的 TCP 地址：只能等它拨过来");
+            tracing::warn!(relay = %self.id, "到该 relay 的 UDP 不可达且 netmap 中无其 TCP 地址，等待对方主动拨入");
             self.attempt = Some(now);
             self.attempt_failed(now);
             return;
         }
-        tracing::info!(relay = %self.id, "骨干上到这个 relay 的这一段走 TCP：本节点拨号");
+        tracing::info!(relay = %self.id, "到该 relay 的骨干链路使用 TCP，由本节点主动拨号");
         self.attempt = Some(now);
         let mut session = Session::over_tcp(self.tcp_measured.clone());
         session.set_training(self.training);
@@ -812,14 +811,14 @@ impl RelayLink {
         self.failures = self.failures.saturating_add(1);
         self.udp_shunned.clear();
         if self.backbone.is_some() && self.tcp_link.is_none() {
-            // 骨干上 UDP 握不上手：这一段改走 TCP，不等退避。
-            tracing::info!(relay = %self.id, "到这个 relay 的 UDP 握不上手，骨干上的这一段改走 TCP");
+            // 骨干链路 UDP 握手未完成：立即切换为 TCP，不进入退避等待。
+            tracing::info!(relay = %self.id, "与该 relay 的 UDP 握手未完成，骨干链路切换为 TCP");
             self.enter_tcp_link(now, false);
             return;
         }
         let wait = retry_delay(self.failures);
         self.retry_at = now + wait;
-        tracing::info!(relay = %self.id, failures = self.failures, "连不上 relay，{} 秒后再试", wait.as_secs());
+        tracing::info!(relay = %self.id, failures = self.failures, "无法连接 relay，{} 秒后重试", wait.as_secs());
     }
 
     /// 在用的会话没了：马上重连。同一个 relay 掉线时挂靠它的节点会同时重连，所以带一点随机的延迟错开。
@@ -888,8 +887,8 @@ impl RelayLink {
                 let via = self.udp_target.map(|addr| addr.to_string()).unwrap_or_default();
                 tracing::info!(relay = %self.id, %observed, %via, "到 relay 的中转会话建立（UDP）");
                 if self.tcp_link.is_some() {
-                    // 对方让本节点搬了过来（它知道自己的 UDP 到得了本节点）：这一段回到 UDP，对方看到之后跟过来。
-                    tracing::info!(relay = %self.id, "骨干上的这一段走着 TCP，在后台试的 UDP 握上了手：回到 UDP");
+                    // 对方允许本节点迁回 UDP（表明其侧确认 UDP 可达）：该链路切回 UDP，对方观测到后随之切回。
+                    tracing::info!(relay = %self.id, "骨干链路后台 UDP 握手已完成，由 TCP 切回 UDP");
                     match self.leave_tcp_link(now) {
                         Some(TcpLeg { adopted: None, connected: true, .. }) => self.lingering = Some(now),
                         Some(_) => wire.tcp_close(),
@@ -902,19 +901,19 @@ impl RelayLink {
                 let established = std::mem::take(&mut self.udp_established);
                 self.set_target(None);
                 if self.tcp_link.is_some() && !established {
-                    // 骨干走着 TCP 时在后台试的 UDP 没有握上手：什么都不变。没有回答 AUTH 多半是对方还不知道它自己的 UDP 到不到得了本节点，
-                    // 它被敲了门会自己来试，所以这个地址也不记成握不完手的。
-                    tracing::debug!(relay = %self.id, reason, "骨干走着 TCP，在后台试的 UDP 没有握上手");
+                    // 骨干链路使用 TCP 时后台尝试的 UDP 握手未完成：保持现状。未收到 AUTH 应答通常是因为对方尚缺乏反向 UDP 可达证据，
+                    // 对方在被触发试探后会主动发起探测，因此不将该地址标记为握手异常。
+                    tracing::debug!(relay = %self.id, reason, "骨干链路后台 UDP 握手未完成，保持 TCP 连接");
                     return;
                 }
                 if !established
                     && self.wanted
                     && let Some(addr) = target
                 {
-                    // 回答了 CHALLENGE，握手却没有走完：这一轮不再试它，剩下的地址马上接着试，不等这一轮结束。
+                    // 已返回 CHALLENGE 但未完成握手：本轮不再重试该地址，立即尝试其余候选地址。
                     self.udp_shunned.push(addr);
                     if self.has_udp() {
-                        tracing::info!(relay = %self.id, %addr, reason, "relay 的这个地址握手没有走完，换别的地址试");
+                        tracing::info!(relay = %self.id, %addr, reason, "该 relay 地址握手未完成，切换至其他候选地址重试");
                         self.start_udp(now, who, wire);
                         return;
                     }
@@ -961,9 +960,9 @@ impl RelayLink {
             Some(Event::Down { reason }) => {
                 tracing::info!(relay = %self.id, reason, "到 relay 的 TCP 中转不可用");
                 match self.tcp {
-                    // 借来的那条没用成：一阵之内不再借它，本节点自己拨（对方也许是不会在上面回答的旧版本）。
+                    // 复用的入站 TCP 连接未能建立会话：短时间内不再复用，改由本节点主动拨号（对方可能是不支持反向复用的旧版本）。
                     Some(TcpLeg { adopted: Some(offer), .. }) => self.spoiled_offer = Some((offer, now)),
-                    // 连上了、握手却没有走完的地址，下一次排在最后：它多半是另一台机器。
+                    // 已建立 TCP 连接但握手未完成的地址，下次排在末尾（可能对应其他主机）。
                     Some(TcpLeg { addr: Some(addr), established: false, .. }) => self.tcp_bad = Some(addr),
                     Some(_) | None => {}
                 }
@@ -1017,7 +1016,7 @@ impl RelayLink {
         }
     }
 
-    /// relay 的 UDP 地址发来的错误帧，回显的是 `echo`。返回 relay 对某条路的抱怨（只有回显对得上会话时才算数）。
+    /// 处理来自 relay UDP 地址的错误帧，回显内容为 `echo`。返回 relay 报告的路径问题（仅当回显匹配当前会话时有效）。
     pub(crate) fn on_udp_refusal(
         &mut self,
         refused: &Refused,
@@ -1031,7 +1030,7 @@ impl RelayLink {
         complaint
     }
 
-    /// 一个会话收到的错误帧：说本节点没有会话的交给会话自己核对；说路走不通的，回显是这个会话握手的随机数才算数。
+    /// 处理会话收到的错误帧：涉及本节点无会话的错误交由会话自身校验；涉及路径不可达的错误仅在回显匹配本次握手随机数时采信。
     fn refusal(
         session: &mut Session,
         relay: NodeId,
@@ -1047,7 +1046,7 @@ impl RelayLink {
             RefusalReason::RouteUnavailable => Complaint::RouteUnavailable(refused.node),
         };
         if !session.is_session_echo(echo) {
-            tracing::debug!(%relay, reason = ?refused.reason, "relay 的错误帧回显的不是本节点的会话，不理");
+            tracing::debug!(%relay, reason = ?refused.reason, "relay 错误帧回显与当前会话不匹配，已忽略");
             return (Step::default(), None);
         }
         (Step::default(), Some(complaint))
@@ -1082,8 +1081,8 @@ impl RelayLink {
         self.apply_tcp(step, now, who, wire);
     }
 
-    /// 到这个 relay 的 TCP 里收到的错误帧。规则和 UDP 上的一样（[`on_udp_refusal`](Self::on_udp_refusal)）：
-    /// TCP 上的帧路径外的人伪造不了，但一样的规则让两边的行为一致，代价只是"没有会话"时多一个往返。
+    /// 处理经该 relay TCP 连接收到的错误帧。校验规则与 UDP 一致（[`on_udp_refusal`](Self::on_udp_refusal)）：
+    /// 尽管路径外攻击者难以伪造 TCP 帧，保持两端规则一致仅会在无会话时多一次往返探测。
     pub(crate) fn on_tcp_refusal(
         &mut self,
         refused: &Refused,
@@ -1098,16 +1097,16 @@ impl RelayLink {
         complaint
     }
 
-    /// 到这个 relay 的 TCP 断了，或者没连上。
+    /// 到该 relay 的 TCP 连接已断开或连接失败。
     pub(crate) fn on_tcp_closed(&mut self, now: Instant) {
         let Some(tcp) = self.retire_tcp() else { return };
         if tcp.session.is_up() {
-            tracing::info!(relay = %self.id, "到 relay 的 TCP 断开，中转会话没有了");
+            tracing::info!(relay = %self.id, "到 relay 的 TCP 连接已断开，中转会话终止");
             if !self.udp.is_up() {
                 self.reconnect_soon(now);
             }
         } else {
-            tracing::debug!(relay = %self.id, "到 relay 的 TCP 没有连上，或者握手时断开了");
+            tracing::debug!(relay = %self.id, "到 relay 的 TCP 连接失败或在握手阶段断开");
         }
     }
 
@@ -1115,7 +1114,7 @@ impl RelayLink {
         let message = Accepted::signed_message(self.id, who.me, &ok.nonce, ok.valid_for, ok.observed);
         let genuine = i3t_crypto::verify(&self.key, Accepted::PURPOSE, &message, &Signature::from_bytes(ok.signature)).is_ok();
         if !genuine {
-            tracing::warn!(relay = %self.id, "relay 的握手应答签名不对，忽略");
+            tracing::warn!(relay = %self.id, "relay 握手应答签名校验失败，已忽略");
         }
         genuine
     }
@@ -1128,11 +1127,11 @@ impl RelayLink {
         if candidates.is_empty() {
             return;
         }
-        // 没有回答的话过一会儿就再问，早点知道它能不能用；有回答的话下一次在一个完整的间隔之后。
+        // 未收到响应时较快重试以尽早确认可达性；收到响应后则按完整周期继续探测。
         self.next_survey = now + RELAY_SURVEY / 6;
         let nonce: Nonce = i3t_underlay::random_bytes();
         self.survey = Some((nonce, now));
-        // 每个地址都问，先回答的那个就是量到的延迟。
+        // 向所有候选地址并发发送探测，以最先返回的结果作为延迟样本。
         let init = Init { node: who.me, nonce }.to_bytes();
         for to in candidates {
             wire.udp(to, &init);
@@ -1151,7 +1150,7 @@ enum Steadiness {
     Recovered(Instant),
 }
 
-/// 连不上之后等多久再试：1 秒起每次加倍，封顶，再加上最多五分之一的随机量。
+/// 连接失败后的指数退避重试间隔：从 1 秒起逐次翻倍直至上限，并附加最多 20% 的随机抖动。
 fn retry_delay(failures: u32) -> Duration {
     let base = Duration::from_secs(1).saturating_mul(1u32.checked_shl(failures.saturating_sub(1)).unwrap_or(u32::MAX)).min(RELAY_RETRY_MAX);
     base + jitter(base / 5)
@@ -1169,7 +1168,7 @@ pub(crate) struct Standing {
     pub(crate) id: NodeId,
     /// 到它的延迟；不知道时是 `None`。
     pub(crate) rtt: Option<Duration>,
-    /// 正挂靠着它，却一直连不上。
+    /// 已选为挂靠目标但持续连接失败。
     pub(crate) failing: bool,
 }
 
@@ -1178,8 +1177,8 @@ pub(crate) struct Standing {
 /// - 管理员固定了的话就是固定的那几个。
 /// - 否则保留现在挂靠的，不足 [`ATTACH_COUNT`] 个时补上延迟最低的；延迟还不知道的按 netmap 里的顺序排在后面，
 ///   这样刚启动时不用等测量就有 relay 可用。
-/// - 外面有明显更好的（延迟低出 `max(10ms, 20%)`，或者现在挂靠的连不上）就换掉最差的一个。一次只换一个，
-///   有迟滞，免得两个延迟相近的 relay 之间来回换。
+/// - 若存在明显更优的外部候选（延迟降低超过 `max(10ms, 20%)`，或当前挂靠的 relay 持续连接失败），则替换最差的一个；
+///   每次仅替换一个并带迟滞，避免在延迟相近的 relay 之间频繁抖动。
 pub(crate) fn choose_attached(current: &[NodeId], relays: &[Standing], pinned: &[NodeId]) -> Vec<NodeId> {
     let known = |id: &NodeId| relays.iter().any(|relay| relay.id == *id);
     if !pinned.is_empty() {

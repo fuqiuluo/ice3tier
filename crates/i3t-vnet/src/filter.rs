@@ -1,19 +1,19 @@
-//! 按包执行访问规则。
+//! 逐包访问控制过滤。
 //!
-//! controller 的规则说的是"a 可以访问 b"，回程自然放行；同一个事实就是 netmap 里每个对端的 `inbound`（它可以访问本节点），
-//! 和建流时查的是同一个。对端不被允许访问本节点时，它发来的包里只有本节点发起的会话的回包能进来：
+//! controller 定义的访问规则为“a 可访问 b”，对应回程流量默认放行；在 netmap 中体现为每个对端的 `inbound` 标志
+//! （是否允许其访问本节点），与建立连接流时查询的权限一致。若不允许对端访问本节点，则仅放行本节点主动发起会话的回包：
 //!
-//! - TCP：第一个握手包（有 SYN 没有 ACK）丢掉，别的放行。别的 TCP 包开不了连接，内核对不存在的连接只回 RST。
-//!   被切开的、头不完整的 TCP 丢掉（看不准标志）；
-//! - ping：请求丢掉，回答和差错报文（不可达、超时、参数问题）放行。差错报文带回来的原包是 UDP 的话，要是下面那张表里的会话：
-//!   不然它可以随便编一个本机的端口，让那个套接字收到一个错误；
-//! - UDP：本节点最近往它的这个端口、从本机的这个端口发过包，才放行（[`Replies`]，一张有上限的小表）；
-//! - 被切开的包按第一片判断：对端发来的片先攒齐（[`crate::fragments`]），拿第一片来问这里。单独的后面几片丢掉；
-//! - 别的协议丢掉：看不出是不是回包。
+//! - TCP：丢弃新建连接的首个握手包（带 SYN 且不带 ACK），放行其余 TCP 包（其余包无法建立新连接，内核对不存在的连接仅回复 RST）。
+//!   同时丢弃被分片或头部不完整的 TCP 包（无法可靠判断标志位）；
+//! - ICMP：丢弃 Echo 请求（ping），放行应答与差错报文（不可达、超时、参数问题）。若差错报文引用的原始包为 UDP，
+//!   则该会话必须存在于下方回包跟踪表中，防止对端伪造端口向本机无关 UDP 套接字注入错误；
+//! - UDP：仅当本节点近期曾从对应本机端口向该对端地址和端口发送过数据包时才放行（由有界表 [`Replies`] 跟踪）；
+//! - IP 分片包：先收集齐所有分片（[`crate::fragments`]），再以首片调用本模块判定；单独的后续分片直接丢弃；
+//! - 其他协议：一律丢弃（无法区分是否为回包）。
 //!
-//! 差错报文说的是不是本节点发给这个对端的包，不管对端能不能访问本节点都要核对，在 [`crate::engine`] 里。
+//! ICMP 差错报文所引用原包的源/目的地址校验适用于所有对端（无论是否允许入站），在 [`crate::engine`] 中统一执行。
 //!
-//! 规则双向都允许时（新建的网络默认 `all <-> all`）什么都不记、什么都不查。
+//! 当规则双向均允许时（新建网络默认 `all <-> all`），不记录也不查询回包表。
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -21,22 +21,22 @@ use std::time::{Duration, Instant};
 
 use crate::ipv4::{Conversation, Ipv4, UDP};
 
-/// 表里最多记多少个 UDP 会话。满了先扔过期的，还满就扔最旧的：最多是更早的那个会话的回包进不来了。
-/// 每个几十字节，表最大一两百 KB。
+/// UDP 回包跟踪表的最大条目数。表满时先清理过期条目，仍满则淘汰最旧条目（最坏情况仅影响最早会话的回包）。
+/// 单条仅占数十字节，整表内存上限约 100–200 KB。
 pub const MAX_REPLIES: usize = 4096;
 
-/// 本节点往一个地址和端口发过包之后，多久之内那里来的包算回包。和 UDP 端口转发的会话空闲回收一样长。
+/// 本节点向某目标地址与端口发送 UDP 包后，允许接收其回包的有效窗口。与 UDP 端口转发的会话空闲超时保持一致。
 pub const REPLY_WINDOW: Duration = Duration::from_secs(60);
 
-/// 一个包让不让进来。
+/// 入站数据包的访问控制判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Pass,
-    /// 对端不被允许访问本节点，而这个包开的是一次新的会话（或者看不出它不是）。
+    /// 对端无权访问本节点，而该数据包用于发起新会话（或无法确认其属于已有会话的回包）。
     NewConversation,
 }
 
-/// 本节点最近往不能访问本节点的对端发过的 UDP：（对端的地址，对端的端口，本机的端口）。
+/// 本节点近期发往无入站权限对端的 UDP 会话标识：（对端 IP，对端端口，本机端口）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Flow {
     peer: Ipv4Addr,
@@ -44,14 +44,14 @@ struct Flow {
     local_port: u16,
 }
 
-/// 那张小表。
+/// UDP 回包会话跟踪表。
 #[derive(Debug, Default)]
 pub struct Replies {
     flows: HashMap<Flow, Instant>,
 }
 
 impl Replies {
-    /// 本机发往不能访问本节点的对端的一个包：是 UDP 的话记下来。
+    /// 记录本机发往无入站权限对端的出站数据包（仅跟踪 UDP）。
     pub fn sent(&mut self, packet: &Ipv4<'_>, now: Instant) {
         let Conversation::Udp { source, destination } = packet.conversation() else { return };
         let flow = Flow { peer: packet.destination(), peer_port: destination, local_port: source };
@@ -61,7 +61,7 @@ impl Replies {
         self.flows.insert(flow, now);
     }
 
-    /// 不能访问本节点的对端发来的一个包让不让进来。被切开的包问的是它的第一片。
+    /// 判定无入站权限对端发来的数据包是否允许放行。对于 IP 分片包，应传入其首片。
     #[must_use]
     pub fn admit(&self, packet: &Ipv4<'_>, now: Instant) -> Verdict {
         let pass = match packet.conversation() {
@@ -76,7 +76,7 @@ impl Replies {
         if pass { Verdict::Pass } else { Verdict::NewConversation }
     }
 
-    /// 差错报文带回来的本机发出的原包：UDP 的要是表里的会话（看不到端口的也不放），别的协议由内核自己对（TCP 核对序号）。
+    /// 检查 ICMP 差错报文引用的原始出站包：UDP 需命中回包跟踪表（无法读取端口的拒绝），其余协议交由内核校验（如 TCP 序号校验）。
     fn quotes_ours(&self, quoted: &Ipv4<'_>, now: Instant) -> bool {
         if quoted.protocol() != UDP {
             return true;
@@ -93,7 +93,7 @@ impl Replies {
         self.flows.get(&flow).is_some_and(|sent| now.saturating_duration_since(*sent) < REPLY_WINDOW)
     }
 
-    /// 表里现在有几条（含过期还没扔的）。
+    /// 返回当前表中的条目数（包含尚未清理的过期条目）。
     #[must_use]
     pub fn len(&self) -> usize {
         self.flows.len()

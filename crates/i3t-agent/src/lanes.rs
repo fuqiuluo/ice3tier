@@ -7,16 +7,16 @@
 //! - 跟着 netmap：用 [`Lanes::set_peers_with_identities`] 更新 lane 的对端和仍有效的节点公钥。controller 只给有选了 ice3proxy 的
 //!   代理的一对（代理监听的节点和它的出口）下发 `always`，别的是 `off`。本节点能拨的是 netmap 里启用了 relay、
 //!   有 TCP 地址的对端（relay 在节点端口上听 TCP）；本节点自己是 relay 时，relay 的 TCP 端口把以 TLS 握手开头的连接交给 lane。
-//!   两边都不能被拨的一对当作 `off`：开不出 lane 的流不该被记成"改走了共用的连接"。
+//!   双方均无法接受拨号的对端组合按 `off` 处理：无法建立 lane 的流不应计为“回退到共用连接”。
 //! - 两个节点都能拨对方时，各自用自己拨的 lane 开流：补 lane 是本地的事，不用经过对方的 POOL 往返，
 //!   每边的池跟着它自己开流的速率走；代价是两边各有一条控制 lane。
 //! - `always`：能拨的对端一直拨着（控制 lane 和几条空闲的）。
 //! - `udp_fallback`（controller 不再下发，旧的 controller 和静态的 netmap 还会写）：按需拨。到对端有路、并且路上没有 UDP 连续 [`SETTLE`] 才拨；
 //!   UDP 回来了（或者没有路了）满 [`HOLD`] 才放手，之后什么都不连。没有路不算没有 UDP：对端离线时不去拨它。
-//!   "路上没有 UDP"是：本节点自己这一段没有 UDP，或者经 relay 而 controller 说对端用不了 UDP（netmap 里它的 `no_udp`）。
-//!   后一样是因为经 relay 时节点只看得见自己这一段：经一个 UDP 的中继到一个没有 UDP 的中继时，自己这一段有 UDP，路上却有一段 TCP。
-//!   现在走的是直连时不看它：直连的整条路都是 UDP，照默认的做法走共用的连接。被认定用不了 UDP 的节点也可能和个别对端
-//!   打得通（它出去的 UDP 经运营商的地址转换到得了对方）；走不走直连由选路定（默认直连优先，延迟优先时比代价）。
+//!   “路径无 UDP”指：本节点侧无 UDP，或经 relay 且 controller 标记对端不支持 UDP（netmap 中的 `no_udp`）。
+//!   后者是因为经 relay 时节点仅能观测本节点侧：经 UDP 中继转发至无 UDP 能力的中继时，本节点侧虽为 UDP，整条路径仍包含 TCP 段。
+//!   当前走直连时不参考该标记：直连整条路径均为 UDP，默认走共用连接。被标记为不支持 UDP 的节点仍可能与个别对端
+//!   直连成功（其出站 UDP 经 NAT 可达对端）；是否走直连由路由选择决定（默认直连优先，延迟优先时比较路径代价）。
 //!   开流的一方按同样的判断：路上没有 UDP、并且和对端之间的 lane 建着（控制 lane 在）时新的 TCP 流走 lane；
 //!   lane 没建着（对方还没拨上来，或者本节点刚开始拨）就直接走共用的连接，不等，也不记作改走。
 //!   剩下看不见的：两边都有 UDP、只是这条路经过的某一段（比如两个中继之间）是 TCP。
@@ -46,19 +46,19 @@ pub(crate) type Acceptor = LaneAcceptor<Endpoint>;
 /// 多久看一次本节点的公网地址变了没有、到按需拨号的对端的路上有没有 UDP。
 const CHECK: Duration = Duration::from_secs(1);
 
-/// `udp_fallback` 下，本节点这一段要连续这么久没有 UDP（中间没看到过 UDP）才开始拨。
+/// `udp_fallback` 模式下，本节点侧须连续保持无 UDP 状态达到此时长后才开始拨号。
 ///
-/// 有 UDP 的节点也会一阵子没有 UDP 的路：到 relay 的会话让 UDP 先走一秒，没握上手就先用 TCP（丢包的线路上常有），
-/// 30 秒之后再试 UDP（路径层的 `UDP_RETRY`）；直连也要几秒才验证好。这时就拨，要白拨一整个保持时间（[`HOLD`]），
-/// 和"有 UDP 的一对什么都不花"不符。取比 30 秒多一截：UDP 重试过一次还不行才算真没有。真没有 UDP 的节点，
-/// 开头这一阵新的流走共用的连接。没有路不算有 UDP，也不让这段时间重新算：对端的会话断了又连上的那一下不耽误。
+/// 支持 UDP 的节点也可能短暂缺少 UDP 路径：到 relay 的会话先尝试 UDP 1 秒，握手未成功时会先使用 TCP（丢包线路上常见），
+/// 30 秒后再次尝试 UDP（路径层的 `UDP_RETRY`）；直连也需数秒完成验证。若此时立即拨号，将白白维持整个保持期（[`HOLD`]），
+/// 与“双方均支持 UDP 时不产生额外开销”的设计目标不符。取值略高于 30 秒：UDP 重试仍失败才视为无 UDP。确实无 UDP 的节点，
+/// 初期的新流走共用连接。无可用路径不计为有 UDP，也不重置计时：避免对端会话短暂重连打断等待。
 const SETTLE: Duration = Duration::from_secs(40);
 
-/// `udp_fallback` 下，UDP 回来（或者没有路）之后还拨多久才放手。
+/// `udp_fallback` 模式下，UDP 恢复（或无可用路径）后仍维持拨号的保持时长。
 ///
-/// 坏线路上路几分钟一换（路径层两条路来回换时停留期逐次加倍，最长 8 分钟），UDP 回来一阵又没了是常事：放手太早，
-/// 每换一次就要重拨一遍，换回 TCP 的头几秒新的流只能走共用的连接。拨着的代价是一条控制 lane 加几条空闲的 TCP（控制 lane 每 10 秒一个保活）。
-/// 取比路径层最长的停留期长一点的 10 分钟：一阵一阵来的 UDP 不会让 lane 反复拆了又拨，UDP 真的回来了也只多拨这么久。
+/// 弱网环境下路径可能每数分钟切换一次（路径层双向切换时停留期逐次翻倍，最长 8 分钟），UDP 间歇恢复很常见：释放过早
+/// 会导致每次切换都需重新拨号，且切回 TCP 初期的新流只能走共用连接。维持拨号的开销仅为一条控制 lane 加若干空闲 TCP（控制 lane 每 10 秒保活一次）。
+/// 取略高于路径层最长停留期的 10 分钟：间歇性 UDP 不会导致 lane 反复拆除与重拨，UDP 真正稳定恢复后也仅多维持此时长。
 const HOLD: Duration = Duration::from_secs(600);
 /// 测试用的开关：环境变量 `I3T_TEST_LANE_HOLD` 改上面这个时间（秒），实验环境里不用等 10 分钟。
 const HOLD_TEST_SWITCH: &str = "I3T_TEST_LANE_HOLD";
@@ -78,14 +78,14 @@ pub(crate) struct NodeLanes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Setting {
     mode: LaneMode,
-    /// controller 说对端用不了 UDP（[`i3t_model::netmap::Peer::no_udp`]）。
+    /// controller 标记对端不支持 UDP（[`i3t_model::netmap::Peer::no_udp`]）。
     no_udp: bool,
 }
 
 impl Setting {
-    /// 按 `udp_fallback` 的算法，到对端的路上有没有 UDP。`seen` 是本节点看得见的（[`Endpoint::udp_path`]）：
-    /// 直连时整条路都是 UDP，不管 controller 怎么说对端；经 relay 时要本节点这一段有 UDP、并且对端不是用不了 UDP 的节点。
-    /// 没有路时是 `None`，不管对端怎样：没有路不算没有 UDP。
+    /// 按 `udp_fallback` 策略判断到对端的路径是否存在 UDP。`seen` 是本节点观测到的状态（[`Endpoint::udp_path`]）：
+    /// 直连时整条路径均为 UDP，不受 controller 对端标记影响；经 relay 时须同时满足本节点侧有 UDP 且对端未被标记为不支持 UDP。
+    /// 无可用路径时返回 `None`，不视为无 UDP。
     fn udp_path(self, seen: Option<UdpSeen>) -> Option<bool> {
         seen.map(|seen| match seen {
             UdpSeen::WholePath => true,
@@ -195,22 +195,22 @@ impl NodeLanes {
             .iter()
             .map(|(peer, _)| LanePeer { dial: if wanted.contains(&peer.id) { peer.dial.clone() } else { Vec::new() }, ..peer.clone() });
         if let Err(error) = self.lanes.set_peers_with_identities(peers, identities.iter().copied()) {
-            // 签不了 TLS 配置是本机的问题，不会因为重试好起来；保留原来的设置，流照常走共用的连接。
-            tracing::error!(%error, "ice3proxy 的设置没能生效");
+            // 生成 TLS 配置失败属于本机错误，重试不会恢复；保留原有配置，流继续走共用连接。
+            tracing::error!(%error, "ice3proxy 配置未能生效");
             return false;
         }
         let on_demand = |id: &NodeId| plan.iter().find(|(peer, setting)| peer.id == *id && setting.mode == LaneMode::UdpFallback);
         for (peer, _) in wanted.difference(dialled).filter_map(&on_demand) {
-            // 本节点这一段有 UDP 还要拨，只能是因为对端。
+            // 本节点侧有 UDP 仍触发拨号，原因只可能来自对端。
             let why = if self.endpoint.udp_path(peer.id) == Some(UdpSeen::OwnLeg) {
-                "经中继，controller 说对端用不了 UDP"
+                "经中继转发，controller 标记对端不支持 UDP"
             } else {
-                "本节点这一段没有 UDP"
+                "本节点侧当前无 UDP 路径"
             };
-            tracing::info!(peer = %peer.id, settle = ?self.timing.settle, why, "到这个节点的路上已经这么久没有 UDP，开始拨 ice3proxy");
+            tracing::info!(peer = %peer.id, settle = ?self.timing.settle, why, "到该对端的路径持续无 UDP 已达阈值，开始拨号建立 ice3proxy");
         }
         for peer in dialled.difference(&wanted).filter(|id| on_demand(id).is_some()) {
-            tracing::info!(%peer, hold = ?self.timing.hold, "到这个节点的共用连接有 UDP 的路（或者没有路）已经这么久，不再拨 ice3proxy");
+            tracing::info!(%peer, hold = ?self.timing.hold, "到该对端的共用连接持续具备 UDP 路径（或无可用路径）已达保持期，停止拨号 ice3proxy");
         }
         *dialled = wanted;
         true
@@ -287,8 +287,8 @@ impl NodeLanes {
 /// 一条到对端的 TCP 流走不走 lane。`udp_path`（到对端的路上有没有 UDP，见 [`Setting::udp_path`]）和 `lanes_up`
 /// （和对端之间的控制 lane 在）只在 `udp_fallback` 时才问。
 ///
-/// `udp_fallback` 时 lane 没建着就不去试：拨号方按需才拨，对方还没拨上来是常有的事，不是失败，
-/// 试了也只是马上改走共用的连接，还要记一笔改走。`always` 照旧去试，取不到才改走并记下来。
+/// `udp_fallback` 模式下 lane 未建立时不尝试获取：拨号方按需拨号，对端尚未建立连接属于常态而非失败，
+/// 即使尝试也只会立即回退到共用连接，还会额外增加回退计数。`always` 模式仍会尝试，获取失败时再回退并计数。
 fn takes_lane(mode: Option<LaneMode>, udp_path: impl FnOnce() -> Option<bool>, lanes_up: impl FnOnce() -> bool) -> bool {
     match mode {
         Some(LaneMode::Always) => true,
@@ -297,11 +297,11 @@ fn takes_lane(mode: Option<LaneMode>, udp_path: impl FnOnce() -> Option<bool>, l
     }
 }
 
-/// 一个对端值不值得列出来（上报、`i3t status`、本机的 `/metrics`）。`always` 的都列；`udp_fallback` 的只列现在要用或者正在用的：
-/// 拨着、控制 lane 在、有空闲的、在用的或者在拨的 lane，或者到它的路上没有 UDP。
+/// 判断对端是否需要在上报、`i3t status` 和本机 `/metrics` 中展示。`always` 全部展示；`udp_fallback` 仅展示当前需要或正在使用的对端：
+/// 正在拨号、控制 lane 在线、存在空闲/使用中/拨号中的 lane，或到该对端的路径无 UDP。
 ///
-/// 以前的 controller 给没有设置的每一对下发 `udp_fallback`，网络里每个 relay 都和别的节点"打开"了 ice3proxy，两边都有 UDP 的一对
-/// 什么都没连，列出来只是一屏的零。累计的计数不让它留着：它们在全节点的合计里。
+/// 旧版 controller 会为未配置的对端组合默认下发 `udp_fallback`，导致每个 relay 都与其他节点开启了 ice3proxy；双方均支持 UDP 时
+/// 并未建立任何连接，展示出来全是零值。累计计数不因此保留单对端条目，均已计入全节点汇总。
 fn listed(peer: &PeerLaneStatus, mode: Option<LaneMode>, udp_path: impl FnOnce() -> Option<bool>) -> bool {
     let live = peer.dials
         || peer.control
@@ -330,12 +330,12 @@ struct OnDemand {
 struct Watch {
     /// 从什么时候起一直没有 UDP（中间没看到过 UDP）。
     since: Instant,
-    /// 最近一次看到有路、本节点这一段没有 UDP。
+    /// 最近一次观测到存在路径且本节点侧无 UDP 的时刻。
     last: Instant,
     dialling: bool,
 }
 
-/// 按需拨号的两个时间：开始拨之前等多久（[`SETTLE`]），UDP 回来之后还拨多久（[`HOLD`]）。
+/// 按需拨号的两个时长阈值：开始拨号前等待时长（[`SETTLE`]），UDP 恢复后维持拨号时长（[`HOLD`]）。
 #[derive(Debug, Clone, Copy)]
 struct Timing {
     settle: Duration,
@@ -343,11 +343,11 @@ struct Timing {
 }
 
 impl OnDemand {
-    /// 看一眼到 `peer` 的路（`udp_path`，见 [`Endpoint::udp_path`]），返回现在该不该拨它。
+    /// 根据到 `peer` 的路径状态（`udp_path`，见 [`Endpoint::udp_path`]），返回当前是否应拨号。
     ///
-    /// 没拨着时：有路、本节点这一段没有 UDP 已经连续 `settle`，开始拨；看到 UDP 就从头算。
-    /// 拨着时：从最后一次看到没有 UDP 算起满 `hold` 才放手，这中间 UDP 来了又走照旧拨着。
-    /// 没有路（`None`）不算没有 UDP，也不算有：不让它开始拨，也不让开始前的等待从头算。
+    /// 未拨号时：存在路径且本节点侧无 UDP 连续满 `settle` 后开始拨号；观测到 UDP 则重新计时。
+    /// 拨号中时：自最后一次观测到无 UDP 起满 `hold` 才停止，期间 UDP 短暂恢复仍保持拨号。
+    /// 无可用路径（`None`）既不视为无 UDP 也不视为有 UDP：既不触发拨号，也不重置等待计时。
     fn wants(&mut self, peer: NodeId, udp_path: Option<bool>, now: Instant, timing: Timing) -> bool {
         if udp_path == Some(false) {
             self.watched.entry(peer).or_insert(Watch { since: now, last: now, dialling: false }).last = now;

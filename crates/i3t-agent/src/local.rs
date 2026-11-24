@@ -5,10 +5,10 @@
 //! - **本机状态**：`i3t status` 和 `i3t routes` 向正在运行的节点问现在的状态，`i3t ping` 让它量到另一个节点的往返
 //!   （`/ping?peer=…&count=…`）。它在一个系统挑的回环端口上，每个请求都要带令牌。
 //!
-//! 本机状态接口为什么是"回环端口加令牌"：回环地址本机的任何用户都连得上，只靠它挡不住别的用户。
-//! 所以节点每次启动生成一个随机令牌，和端口一起写进状态目录里的 `local.json`。状态目录只有属主进得去
-//! （节点的私钥也在里面），于是能问状态的就是能读私钥的那些人：运行节点的用户，和 root。
-//! 没有用 Unix 域套接字，是因为这个办法在 Linux、Windows、macOS 上是同一份代码。
+//! 本机状态接口采用“回环端口 + 随机令牌”设计：本机任意用户均可连接回环地址，仅靠绑定回环无法隔离其他用户。
+//! 因此节点每次启动时生成随机令牌，与端口一并写入状态目录中的 `local.json`。状态目录仅属主可访问
+//! （节点私钥也存于此处），因此只有有权读取私钥的用户（运行节点的用户与 root）才能查询状态。
+//! 未使用 Unix 域套接字，是为了让 Linux、Windows、macOS 复用同一套实现。
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -37,19 +37,19 @@ pub(crate) struct LocalServers {
 }
 
 impl LocalServers {
-    /// 开出本机状态接口，和（配置里没有关掉的话）指标接口。
+    /// 启动本机状态接口，以及（若配置未关闭）指标接口。
     ///
-    /// 两个接口都不是节点工作所必需的：开不出来只记一条日志，节点照常运行。
+    /// 两个接口均非节点运行所必需：启动失败仅记录日志，节点继续运行。
     pub(crate) async fn start(runtime: &Arc<Runtime>, state: &StateDir, metrics_at: Option<SocketAddr>) -> Self {
         let mut tasks = Vec::new();
         match start_status(runtime, state).await {
             Ok(task) => tasks.push(task),
-            Err(error) => tracing::warn!("本机状态接口没有开出来，i3t status 和 i3t routes 看不到运行中的状态：{error:#}"),
+            Err(error) => tracing::warn!("本机状态接口启动失败，i3t status 和 i3t routes 将无法查询运行状态：{error:#}"),
         }
         if let Some(addr) = metrics_at {
             match TcpListener::bind(addr).await {
                 Ok(listener) => {
-                    tracing::info!(%addr, "指标接口开在 http://{addr}{METRICS_PATH}");
+                    tracing::info!(%addr, "指标接口已启动：http://{addr}{METRICS_PATH}");
                     let runtime = Arc::clone(runtime);
                     tasks.push(tokio::spawn(http::serve(listener, move |request| {
                         let response = respond_metrics(&runtime, &request);
@@ -57,7 +57,7 @@ impl LocalServers {
                     })));
                 }
                 Err(error) => {
-                    tracing::warn!(%addr, %error, "指标接口没有开出来（端口被占用的话，在 config.toml 的 [metrics] 里换一个，或者写 \"off\"）")
+                    tracing::warn!(%addr, %error, "指标接口启动失败（如端口已被占用，可在 config.toml 的 [metrics] 中更换地址或设为 \"off\"）")
                 }
             }
         }
@@ -71,7 +71,7 @@ impl Drop for LocalServers {
             task.abort();
         }
         if let Err(error) = self.state.remove_local() {
-            tracing::debug!("没能删掉本机状态接口的记录：{error:#}");
+            tracing::debug!("删除本机状态接口记录失败：{error:#}");
         }
     }
 }
@@ -91,22 +91,22 @@ async fn start_status(runtime: &Arc<Runtime>, state: &StateDir) -> anyhow::Resul
 
 async fn respond_status(runtime: &Runtime, token: &str, request: &Request) -> Response {
     if !request.bearer.as_deref().is_some_and(|presented| same(presented, token)) {
-        tracing::warn!(path = %request.path, "拒绝了本机状态接口上的一个请求：没有带令牌，或者令牌不对");
-        return Response::error(401, "要带状态目录里 local.json 记的令牌");
+        tracing::warn!(path = %request.path, "已拒绝本机状态接口请求：缺少令牌或令牌无效");
+        return Response::error(401, "需要提供状态目录中 local.json 记录的令牌");
     }
     let body = match request.path.as_str() {
         STATUS_PATH => serde_json::to_string(&LiveStatus::of(runtime)),
         PING_PATH => {
             let Some((peer, count)) = ping_query(&request.query) else {
-                return Response::error(400, "要写 peer=节点，可以加 count=次数");
+                return Response::error(400, "参数错误：需要 peer=<节点>，可选 count=<次数>");
             };
             serde_json::to_string(&ping::ping(runtime, &peer, count).await)
         }
-        _ => return Response::error(404, "没有这个路径"),
+        _ => return Response::error(404, "未找到请求的路径"),
     };
     match body {
         Ok(body) => Response::ok("application/json", body),
-        Err(error) => Response::error(500, &format!("回答写不成 JSON：{error}")),
+        Err(error) => Response::error(500, &format!("响应序列化为 JSON 失败：{error}")),
     }
 }
 
@@ -142,7 +142,7 @@ fn same(presented: &str, expected: &str) -> bool {
 ///
 /// # Errors
 ///
-/// `local.json` 读不了，节点给不出看得懂的回答，或者 `peer` 里有节点名和地址里不会有的字符。
+/// 无法读取 `local.json`、节点返回无法解析的应答，或 `peer` 包含节点名与地址中不允许的字符。
 pub async fn ping(state: &StateDir, peer: &str, count: u32) -> anyhow::Result<Option<PingReport>> {
     let Some(local) = state.local()? else { return Ok(None) };
     if peer.is_empty() || !peer.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)) {
@@ -157,16 +157,16 @@ pub async fn ping(state: &StateDir, peer: &str, count: u32) -> anyhow::Result<Op
     serde_json::from_str(&body).map(Some).context(crate::texts::texts().status_unreadable)
 }
 
-/// 记录还在、端口却连不上：节点是被杀掉的，没来得及删记录。
+/// 记录文件仍存在但端口无法连接：通常是节点被异常终止，未能清理记录。
 fn refused(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused))
 }
 
-/// 向正在运行的节点问它现在的状态。没有节点在运行时返回 `None`。
+/// 查询正在运行节点的状态。无节点运行时返回 `None`。
 ///
 /// # Errors
 ///
-/// `local.json` 读不了，或者节点在运行却没有给出看得懂的回答。
+/// 无法读取 `local.json`，或节点正在运行但返回了无法解析的应答。
 pub async fn query(state: &StateDir) -> anyhow::Result<Option<LiveStatus>> {
     let Some(local) = state.local()? else { return Ok(None) };
     let body = match http::get(local.addr, STATUS_PATH, Some(&local.token)).await {

@@ -303,7 +303,7 @@ async fn in_the_default_mode_a_pair_with_no_relay_both_can_use_takes_a_chain_and
     let report = o.paths.path_report(a.id).expect("A 是 O 的对端");
     assert_eq!(report.mode, RoutingMode::DirectFirst);
     assert_eq!(report.cause, Some(RouteCause::NoSharedRelay { hint: None }), "{}", report.reason);
-    assert!(report.reason.contains("没有一个 relay 两端都用得上"), "{}", report.reason);
+    assert!(report.reason.contains("无两端共同可达的单个 relay"), "{}", report.reason);
     let reasons = drain_reasons(&mut changes, &a);
     assert!(reasons.iter().any(|reason| reason.contains(&format!("经 relay {} → {}", p.id, h.id))), "{reasons:?}");
 
@@ -386,7 +386,7 @@ async fn a_multi_hop_route_that_silently_stops_delivering_is_abandoned_and_the_s
     a.wait_route(&d, "从 R3 出", |route| matches!(route, Route::Relay { relays } if relays.last() == Some(&r3.id))).await;
     assert!(noticed.elapsed() < 2 * SOON, "用了 {:?} 才换到还通的那条路", noticed.elapsed());
     let reasons = drain_reasons(&mut changes, &d);
-    assert!(reasons.iter().any(|reason| reason.contains("一直没有回音")), "{reasons:?}");
+    assert!(reasons.iter().any(|reason| reason.contains("持续无响应")), "{reasons:?}");
     transfer.expect_progress(400).await;
     transfer.finish().await;
 }

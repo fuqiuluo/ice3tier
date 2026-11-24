@@ -13,9 +13,9 @@
 //! 4. 挑"最低的"时，代价相差在 5% 以内的候选之间随机取两个，用路径上 relay 负载低的那个。
 //!    这样大家不会同时挤到同一个"最优"的 relay 上，又比纯随机更偏向空闲的。
 //!
-//! 下面两条设计里没有，是在真实链路上补的。一个只能走 TCP 的节点，到两个 relay 的链路都时好时坏：
-//! 坏的那一阵会话十来秒断一次，每次重连之后的头几个测量值都很漂亮。只按上面的规则，流量会每半分钟被换到
-//! 刚重连的那条路上，几秒之后它又断，再换回来。
+//! 以下两条规则基于真实链路问题补充：当仅支持 TCP 的节点到两个 relay 的链路均不稳定时，
+//! 劣化阶段会话每隔十余秒断开一次，但每次重连初期的几个延迟样本偏低。若仅按上述规则，流量会每半分钟切向刚重连的链路，
+//! 数秒后再次断开并切回，导致反复震荡。
 //!
 //! 5. 因为代价换路时，不换到入口 relay 的会话刚断过又连上的路上：要等它重新连上之后保持满一段时间
 //!    （[`SETTLE`](crate::timing::SETTLE)）。从没断过的会话不用等。原来的路断了要立刻换的时候不管这一条：有路总比没有强。
@@ -100,7 +100,7 @@ pub(crate) struct DirectLink {
     pub(crate) lan: bool,
 }
 
-/// 此刻的网络在本节点眼里的样子。只包含确实连得上的边。
+/// 本节点视角下的当前网络拓扑图，仅包含已确认可达的边。
 pub(crate) struct Graph<'a> {
     pub(crate) me: NodeId,
     /// 一条路径最多经过几个 relay。
@@ -109,23 +109,23 @@ pub(crate) struct Graph<'a> {
     pub(crate) entries: &'a [Entry],
     pub(crate) matrix: &'a Matrix,
     pub(crate) now: Instant,
-    /// 不能用的 relay：即将下线的、过载的。
+    /// 需避开的 relay（即将下线或过载）。
     pub(crate) avoid: &'a dyn Fn(NodeId) -> bool,
-    /// 刚被告知走不通的骨干连接（从前一个到后一个）。
+    /// 近期被报告不可达的骨干链路（前驱至后继节点）。
     pub(crate) broken: &'a dyn Fn(NodeId, NodeId) -> bool,
 }
 
-/// 要去的对端。
+/// 目标对端信息。
 pub(crate) struct Destination<'a> {
     pub(crate) id: NodeId,
-    /// 能把包交到对端手上的 relay，和对端到它的链路质量。对端自己就是 relay 时它自己也在这里，质量是 `None`（没有最后那一段）。
+    /// 可将数据包送达对端的出口 relay 及对端至该 relay 的链路质量；若对端自身为 relay 则亦包含在内且质量为 `None`（无末跳链路）。
     pub(crate) exits: &'a [(NodeId, Option<Segment>)],
     pub(crate) direct: Option<DirectLink>,
 }
 
-/// 列出到 `dest` 的全部候选路径：直连（如果有），以及经 1 到 `max_hops` 个 relay 的每一条走得通的路径。
+/// 枚举到 `dest` 的全部可达候选路径：直连（若可用），以及经 1 至 `max_hops` 个 relay 的每条可达路径。
 ///
-/// relay 的数量是个位数、级数不超过 4，所以直接穷举；代价里丢包那一项不是各段相加，没法用普通的最短路算法。
+/// 由于 relay 数量通常为个位数且最大跳数不超过 4，直接穷举即可；同时代价公式中的丢包项并非各段线性相加，无法直接使用常规最短路算法。
 pub(crate) fn candidates(graph: &Graph<'_>, dest: &Destination<'_>) -> Vec<Candidate> {
     let mut found = Vec::new();
     if let Some(direct) = dest.direct {
@@ -212,9 +212,9 @@ pub(crate) fn direct_first(
     })
 }
 
-/// 默认模式在直连和一个 relay 都走不了时用的一串 relay：`candidates`（此刻走得了的候选，按代价从低到高）里经两个以上 relay 的，
-/// 代价最低的一串；现在走着的一串（`current`）没有被便宜得够多的另一串比下去时还是它（[`lowest_cost_path`] 的规矩，
-/// 差距是选路器的 `max(5ms, 10%)`）。级数的上限在列候选的时候已经管了。没有这样的候选时是 `None`。
+/// 默认模式在直连与单跳 relay 均不可达时选用的多级 relay 路径：从 `candidates`（当前可达、按代价升序排列的候选集）中
+/// 筛选经两个及以上 relay 的路径并取最优者；若当前多级路径（`current`）未被其他路径超出阈值（`max(5ms, 10%)`，见 [`lowest_cost_path`]），
+/// 则维持不变。跳数上限已在候选枚举阶段约束；无符合条件候选时返回 `None`。
 pub(crate) fn fallback_chain(candidates: &[&Candidate], current: Option<PathId>) -> Option<PathId> {
     let chains: Vec<&Candidate> = candidates
         .iter()
@@ -224,9 +224,9 @@ pub(crate) fn fallback_chain(candidates: &[&Candidate], current: Option<PathId>)
     lowest_cost_path(&chains, current)
 }
 
-/// 延迟优先模式从 `current` 出发此刻会选的路径（`candidates` 按代价从低到高，都是此刻走得了的）：
-/// 局域网直连优先；代价最低的比现在的路便宜得够换过去（[`beats_by_margin`]）就是它，不够就还是现在的路。没有候选时是 `None`。
-/// 只看差距：连续几个评估窗口、换路之后的停留期是时间上的条件，一次快照里看不出来。
+/// 延迟优先模式基于当前路径 `current` 在可达候选集 `candidates`（按代价升序）中的即时选择：
+/// 局域网直连无条件优先；若最低代价候选优于当前路径且超出切换阈值（[`beats_by_margin`]）则选中之，否则保持当前路径；无候选时返回 `None`。
+/// 仅比较代价差距：连续评估窗口数与切换停留期属于时间维度条件，单次快照中无法体现。
 pub(crate) fn lowest_cost_path(candidates: &[&Candidate], current: Option<PathId>) -> Option<PathId> {
     if let Some(lan) = candidates.iter().find(|candidate| candidate.lan) {
         return Some(lan.path);
@@ -311,7 +311,7 @@ impl Selector {
             .filter(|candidate| candidate.settled && candidate.path != current.path && beats_by_margin(current.cost_ms, candidate.cost_ms))
             .collect();
         let near = near_best(&cheaper);
-        // 上一个窗口考察的那条路还在"明显更便宜"的一组里就接着数；不在了就从头数另一条。
+        // 若上一评估窗口考察的候选路径仍位于“显著更优”集合中则继续累加计数，否则重新挑选并从 1 计数。
         let (path, wins) = match self.challenger {
             Some((path, wins)) if near.iter().any(|candidate| candidate.path == path) => (path, wins.saturating_add(1)),
             Some(_) | None => match two_choice(&near, pick) {

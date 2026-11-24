@@ -1,8 +1,8 @@
 //! 共用的连接和 ice3proxy 装在一起：上层还是只看到一个 [`Connector`]、一个 [`Acceptor`]。
 //!
-//! - [`LaneConnector`]：[`Connector::open_tcp`]（承载一条 TCP 连接的流）在调用方的选择函数说"这个对端走 lane"
-//!   并且现在开得出 lane 时走 lane；开不出来（池空等满了、控制 lane 不在、对方要走了、拨不通）就悄悄改走共用的连接，
-//!   并且记一次。这时开流请求一个字节都还没有发出去，换一条路不会让它被执行两次。
+//! - [`LaneConnector`]：[`Connector::open_tcp`]（承载 TCP 连接的流）在调用方选择函数指示该对端使用 lane
+//!   且当前可成功获取 lane 时走 lane；获取失败（池耗尽超时、控制 lane 未建立、对端正在排空、拨号失败）时静默回退到共用连接
+//!   并计入一次回退。此时开流请求尚未发送任何字节，切换传输不会导致重复执行。
 //!   别的流（[`Connector::open`]，例如数据报上下文）和数据报一律走共用的连接。
 //! - [`LaneAcceptor`]：两边开过来的流排在同一个接受队列里，交给同一个 `serve`，接受方的筛选、
 //!   每个对端同时处理的流数、访问规则、排空对两种流一视同仁。
@@ -68,8 +68,8 @@ impl<C: Connector> Connector for LaneConnector<C> {
             match self.lanes.open_stream(peer).await {
                 Ok((send, recv)) => return Ok((EitherSend::Lane(send), EitherRecv::Lane(recv))),
                 Err(error) => {
-                    // 每条流一行，记 debug：池空的时候一阵就是几百行。次数在状况里有。
-                    tracing::debug!(%peer, %error, "开不出 lane，这条流改走共用的连接");
+                    // 每条回退流记录一条 debug 日志（池耗尽期间可能短时产生大量日志），累计次数可在状态中查看。
+                    tracing::debug!(%peer, %error, "开启 lane 失败，该流回退至共用连接");
                     self.lanes.note_fallback(peer);
                 }
             }

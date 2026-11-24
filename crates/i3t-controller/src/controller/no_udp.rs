@@ -1,17 +1,17 @@
-//! 认定哪些节点用不了 UDP：管理接口里节点的 `no_udp`，别的节点的 netmap 里它那一项的 `no_udp`。
+//! 判定不可用 UDP 的节点：对应管理接口中节点的 `no_udp` 字段以及其他节点 netmap 中该对端的 `no_udp` 标志。
 //!
-//! 用处：`udp_fallback` 只在路上没有 UDP 时用 ice3proxy，可节点只看得见自己到对端的那一段。
-//! 普通节点经一个 UDP 的中继到一个没有 UDP 的中继时，自己这一段有 UDP，看不出路上那一段 TCP；controller 看得出来，告诉它。
-//! 这个 controller 不再下发 `udp_fallback`（ice3proxy 是代理的选项，选了就一直走），netmap 里的 `no_udp` 只对还按它走的节点有用；
-//! 管理接口里节点的 `no_udp` 照旧给人看。
+//! 用途：`udp_fallback` 仅在路径上缺少 UDP 时启用 ice3proxy，但节点只能观测到自身到对端或首跳中继的传输方式。
+//! 当普通节点经支持 UDP 的中继转发至不可用 UDP 的中继时，节点自身这一段走 UDP，无法感知后半段为 TCP；由 controller 统一判定并通知对端。
+//! 当前 controller 不再下发 `udp_fallback`（ice3proxy 已作为代理选项按需常开），netmap 中的 `no_udp` 仅对仍按该模式运行的旧节点生效；
+//! 管理接口中的 `no_udp` 仍供管理员参考。
 //!
-//! - 证据是节点上报的、试过的 relay 连没连上、经什么连上的（[`relay_reach::without_udp`]）。只在有节点报的结果变了之后、
-//!   在后台的下一轮重新算那个网络。
-//! - 证据成立满 [`Timing::no_udp_settle`](super::Timing) 才算数：有 UDP 的节点也会一阵子只有 TCP（到 relay 的会话让 UDP
-//!   先走一秒，没握上手就先用 TCP，30 秒之后再试 UDP）。等的这段时间里不动任何 netmap，所以这样一阵一阵的变化不会让它的
-//!   对端的 netmap 来回重算。证据不成立了马上不算：节点上的按需拨号自己还会多拨一个保持时间，不会因此拆了重拨。
-//! - controller 启动时，存储里证据已经成立的节点直接算数：重启之前多半就是这样，不让它的对端的 netmap 先改掉再改回来。
-//! - 算数和不算数之间换了的时候，网络里知道它的节点（它的对端）的 netmap 重算，按上报引起的重算一样合并。
+//! - 判定依据来自节点上报的 relay 连通性及传输协议（[`relay_reach::without_udp`]）。仅在有节点上报变化后，
+//!   于后台任务下一轮重算该网络。
+//! - 依据持续成立满 [`Timing::no_udp_settle`](super::Timing) 才正式生效：支持 UDP 的节点也可能短暂退回 TCP（到 relay 的会话先尝试 UDP
+//!   1 秒，握手未成功则临时改用 TCP，30 秒后重试 UDP）。稳定期内不改动任何 netmap，避免短时波动导致
+//!   对端 netmap 反复重算。一旦依据不再成立则立即取消判定：节点侧的按需拨号自身带有保持时间，不会因此立即断开重拨。
+//! - controller 启动时，持久化记录中已满足依据的节点直接生效：重启前通常已处于该状态，避免对端 netmap 先移除后恢复。
+//! - 判定状态发生切换时，重算网络中与其存在访问关系的对端节点的 netmap，并与上报触发的重算合并节流。
 
 use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
@@ -32,7 +32,7 @@ pub(crate) struct NoUdp {
     network: NetworkId,
     /// 证据从什么时候起一直成立。
     since: Instant,
-    /// 已经算数（写进了它的对端的 netmap）。
+    /// 判定是否已生效（已写入其对端的 netmap）。
     settled: bool,
 }
 
@@ -43,12 +43,12 @@ impl NodeFacts for Inner {
 }
 
 impl Inner {
-    /// 认定 `node` 用不了 UDP。
+    /// 判断 `node` 是否已被判定为不可用 UDP。
     pub(crate) fn no_udp(&self, node: NodeId) -> bool {
         self.no_udp.get(&node).is_some_and(|entry| entry.settled)
     }
 
-    /// 启动时：一个网络里存储中证据已经成立的节点直接算数。
+    /// 启动初始化：对持久化记录中已满足依据的节点直接生效。
     pub(crate) fn load_no_udp<'a>(&mut self, nodes: impl IntoIterator<Item = &'a NodeRecord> + Clone, now: Instant) {
         let without = relay_reach::without_udp(nodes.clone());
         for node in nodes.into_iter().filter(|node| without.contains(&node.id)) {
@@ -56,21 +56,21 @@ impl Inner {
         }
     }
 
-    /// 后台的一轮：重新算报的结果变了的网络，证据成立满了等待时间的算数，换了的通知它的对端。返回下一个要算数的时刻。
+    /// 后台轮询：重算上报记录有变更的网络，使满稳定期的判定生效，并将状态变更通知对端。返回下一个待生效时刻。
     ///
-    /// 读存储出的错记进 `failures`。读不出来的网络留到下一轮，别的网络照常算，算出来的变化照常通知对端；
-    /// 读不出来的网络里的节点这一轮不算数，也不算它们的时刻：它们报的结果可能已经变了，读到之前不知道。
+    /// 存储读取错误记录到 `failures`。读取失败的网络留待下一轮重试，其余网络正常计算并通知对端；
+    /// 读取失败网络中的节点本轮不生效，也不计算其唤醒时刻，因为在成功读取前无法确认其上报状态是否已变化。
     pub(crate) fn no_udp_tick(&mut self, now: Instant, failures: &mut Failures) -> Option<Instant> {
         let mut changed: Vec<(NetworkId, NodeId)> = Vec::new();
         let mut unread = BTreeSet::new();
         while let Some(network) = self.no_udp_dirty.pop_first() {
             let nodes = match self.store.nodes(network) {
                 Ok(nodes) => nodes,
-                // 一个网络读不出来不耽误别的：不然前面的网络算出来的变化没人通知（它们已经不在 `no_udp_dirty` 里了），
-                // 一直读不出来的话排在它后面的网络也一直轮不到。
+                // 单个网络读取失败不阻塞其他网络：否则前面已计算出的变更无人通知（已移出 `no_udp_dirty`），
+                // 若该网络持续失败，排在后面的网络也将长期得不到处理。
                 //
-                // 整个数据库都读不了时剩下的网络不去试，留在 `no_udp_dirty` 里：连接没有回应时每读一次都要等满一次期限，
-                // 是拿着 controller 的锁等的。
+                // 若整个数据库不可读，则跳过剩余网络并保留在 `no_udp_dirty` 中：连接无响应时每次读取都会等待完整超时，
+                // 且此过程持有 controller 锁。
                 Err(error) => {
                     unread.insert(network);
                     let database_wide = error.is_database_wide();
@@ -85,12 +85,12 @@ impl Inner {
             for node in &nodes {
                 match self.no_udp.entry(node.id) {
                     Entry::Vacant(slot) if without.contains(&node.id) => {
-                        tracing::debug!(node = %node.id, "节点连得上的 relay 没有一个经 UDP，等一阵再认定它用不了 UDP");
+                        tracing::debug!(node = %node.id, "节点所有可达 relay 均未通过 UDP 连通，等待稳定期后再判定其不可用 UDP");
                         slot.insert(NoUdp { network, since: now, settled: false });
                     }
                     Entry::Occupied(slot) if !without.contains(&node.id) => {
                         if slot.remove().settled {
-                            tracing::info!(node = %node.id, "节点又经 UDP 连上了 relay，不再认定它用不了 UDP");
+                            tracing::info!(node = %node.id, "节点已恢复经 UDP 连通 relay，取消其不可用 UDP 的判定");
                             changed.push((network, node.id));
                         }
                     }
@@ -108,7 +108,7 @@ impl Inner {
         for (id, entry) in self.no_udp.iter_mut().filter(|(_, entry)| !unread.contains(&entry.network)) {
             if !entry.settled && now.saturating_duration_since(entry.since) >= settle {
                 entry.settled = true;
-                tracing::info!(node = %id, ?settle, "节点连得上的 relay 这么久都只经 TCP，认定它用不了 UDP");
+                tracing::info!(node = %id, ?settle, "节点在稳定期内所有可达 relay 均仅通过 TCP 连通，判定其不可用 UDP");
                 changed.push((entry.network, *id));
             }
         }
@@ -116,7 +116,7 @@ impl Inner {
             let holders = self.holders_of(node);
             self.defer_report(network, holders);
         }
-        // 没读成的网络等它读成了再说：出了错的一轮，后台本来就会过一会儿再来。
+        // 读取失败的网络留待后续读取成功后再计算：本轮已有错误记录，后台任务会自动安排重试。
         let unread = &self.no_udp_dirty;
         self.no_udp.values().filter(|entry| !entry.settled && !unread.contains(&entry.network)).map(|entry| entry.since + settle).min()
     }

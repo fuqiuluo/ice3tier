@@ -2,7 +2,7 @@
 //!
 //! 一次发布是一组文件加一份清单（[`Manifest`]）。清单写明版本号，以及每个平台的节点程序是哪个文件、多大、SHA-256 是多少。
 //! 清单的原文带着一个 Ed25519 签名一起传（[`SignedManifest`]），节点用编译在程序里的公钥验。
-//! 所以经手的 controller、发布源和镜像都不需要可信：它们改不了清单，也就换不了文件。
+//! 因此经手的 controller、发布源与镜像均无需受信任：它们无法篡改清单，也无法替换发布文件。
 //!
 //! 发布源的目录结构和 GitHub Release 的下载地址一样，镜像照着摆：
 //!
@@ -83,7 +83,7 @@ impl fmt::Display for Version {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} 不是合法的版本号，应该是 1.2.3 或者 1.2.3-rc.1 这样的写法")]
+#[error("{0:?} 不是有效的版本号，应形如 1.2.3 或 1.2.3-rc.1")]
 pub struct InvalidVersion(String);
 
 impl FromStr for Version {
@@ -184,7 +184,7 @@ impl fmt::Display for Platform {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} 不是合法的平台名，应该是 linux-x86_64 这样的写法")]
+#[error("{0:?} 不是有效的平台名，应形如 linux-x86_64")]
 pub struct InvalidPlatform(String);
 
 impl FromStr for Platform {
@@ -234,7 +234,7 @@ impl fmt::Debug for Sha256 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("不是一个 SHA-256：应该是 64 个十六进制字符")]
+#[error("无效的 SHA-256：应为 64 个十六进制字符")]
 pub struct InvalidSha256;
 
 impl FromStr for Sha256 {
@@ -267,27 +267,27 @@ pub struct Artifact {
 
 /// 发布清单。
 ///
-/// 清单是签过名的，改一个字节签名就不对了，所以收到的一方不能解析之后再重新生成，要把原文原样传下去
-/// （[`SignedManifest::manifest`]）。新版本的清单可以多出字段，旧程序忽略不认识的。
+/// 清单带有签名，修改任一字节都会导致验签失败，因此接收方不可反序列化后再重新生成，须原样转发原始文本
+/// （[`SignedManifest::manifest`]）。新版本清单可新增字段，旧版本程序会忽略未知字段。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: Version,
-    /// 这个版本的节点需要的 controller 最低版本。controller 比它旧时不下发这个版本，界面提示先更新 controller。
+    /// 该版本节点所需的 controller 最低版本。controller 版本低于此值时不下发更新，界面提示先升级 controller。
     pub min_controller: Version,
     /// 发布时间，Unix 秒。
     pub published: u64,
     /// 各个平台上的节点程序，键是平台名（[`Platform`] 的写法）。
-    /// 键留成字符串：以后出现写法不同的平台名时，旧程序只是用不上那一项，不至于整份清单都读不了。
+    /// 键保留为字符串：后续若出现新格式平台名，旧版本程序仅跳过该项，而不致无法解析整份清单。
     pub artifacts: BTreeMap<String, Artifact>,
     /// 最低的没有已知安全问题的版本：比它旧的版本有已知的安全问题。没有写是 `None`，清单里也就没有这个字段。
     ///
     /// 只是告诉人的，怎么下发更新不因它而变。发布的人从修了问题的那一版起每一版都带上它，跳过了几版的节点照样知道。
-    /// 比这个字段旧的程序照样认这份清单：签名盖的是原文的字节，解析时不认识的字段忽略。
+    /// 较旧版本程序仍可正常识别该清单：签名覆盖原始字节，解析时会忽略未知字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_floor: Option<Version>,
     /// 节点自更新清单之外的发布文件（`i3t-controller-*`、`i3tctl-*`、Windows 压缩包等），键是文件名。
     ///
-    /// 旧版本的节点和 controller 不认识这个字段会直接忽略；安装脚本用它核对下载的每个非自更新发布产物。
+    /// 旧版本节点与 controller 会忽略该未知字段；安装脚本用它校验所下载的各非自更新发布产物。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, Artifact>,
 }
@@ -349,7 +349,7 @@ impl fmt::Debug for ManifestSignature {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("不是一个清单签名：应该是 64 字节的 base64url")]
+#[error("无效的清单签名：应为 64 字节的 base64url")]
 pub struct InvalidManifestSignature;
 
 impl FromStr for ManifestSignature {
@@ -435,9 +435,9 @@ pub enum UpdateStatus {
     /// 没有更新在进行。
     #[default]
     Idle,
-    /// 正在从 controller 取包。链路断了会接着取，数字不会倒退。
+    /// 正在从 controller 下载安装包。链路断开后会断点续传，进度计数不会回退。
     Downloading { version: Version, received: u64, total: u64 },
-    /// 包取完了，正在核对大小和 SHA-256。
+    /// 安装包下载完成，正在校验大小和 SHA-256。
     Verifying { version: Version },
     /// 正在运行新程序的自检。
     SelfCheck { version: Version },
@@ -451,7 +451,7 @@ pub enum UpdateStatus {
     Restarting { version: Version },
     /// 新程序连上了 controller，更新完成。
     Confirmed { version: Version },
-    /// 更新没有成功。`version` 在连清单都没有验过时是 `null`。
+    /// 更新失败。若尚未通过清单校验，`version` 为 `null`。
     Failed {
         version: Option<Version>,
         kind: FailureKind,
@@ -460,30 +460,30 @@ pub enum UpdateStatus {
         #[serde(default)]
         cause: Option<UpdateCause>,
     },
-    /// 比本程序新的节点报上来的、本程序不认识的状态。节点可以比 controller 新。
+    /// 较新版本节点上报的未知状态。节点版本可以高于 controller。
     #[serde(other)]
     Unknown,
 }
 
-/// 更新没有成功的两种性质。controller 只在 [`FailureKind::VersionRejected`] 时暂停这个版本的自动更新并告警。
+/// 更新失败的两种类型。controller 仅在 [`FailureKind::VersionRejected`] 时暂停该版本的自动更新并告警。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
-    /// 没有装成，和这个版本好不好无关：清单被拒绝（签名不对、不比现在的新、没有这个平台的包）、包取不到或者内容不对、
-    /// 磁盘出错。以后可以再试。
+    /// 未完成安装，与目标版本本身质量无关：清单被拒（签名无效、版本不高于当前版本、缺少对应平台安装包）、无法获取安装包或校验不符、
+    /// 磁盘出错。后续可再次尝试。
     NotInstalled,
-    /// 这个版本在这台机器上不能用：自检不通过，或者装上之后没能连上 controller、已经换回旧程序。
+    /// 该版本在本机不可用：自检未通过，或安装后未能连接到 controller 并已回滚至旧版本。
     /// 节点记下了这次失败，不再自动重试这个版本。
     VersionRejected,
 }
 
-/// 节点上一次更新为什么没有成功：一个代码，加上把它写成一句话要用到的值。和它在一起的 `reason` 是中文原话。
+/// 节点最近一次更新失败的原因码及格式化所需参数；同级 `reason` 为原始中文说明。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum UpdateCause {
     /// 清单的签名不是任何一把受信任的发布公钥签的。
     BadSignature,
-    /// 签名正确，但清单的内容读不懂。
+    /// 签名有效，但无法解析清单内容。
     BadManifest,
     /// 节点不能自己更新。
     CannotSelfUpdate { blocker: SelfUpdateBlocker },
@@ -497,9 +497,9 @@ pub enum UpdateCause {
     NoPackage { version: Version, platform: Platform },
     /// 已经换上了另一个版本，在等进程重启。
     RestartPending { installed: Version },
-    /// 从 controller 取不到包。`detail` 是 controller 或者节点给的原话。
+    /// 无法从 controller 获取安装包。`detail` 为 controller 或节点返回的原始错误信息。
     Unavailable { detail: String },
-    /// 取回来的包和清单对不上。
+    /// 下载的安装包与清单校验不符。
     Corrupt { expected_size: u64, actual_size: u64 },
     /// 新程序的自检没有通过。`exit_code` 是它的退出码（被信号杀掉、没有运行起来或者超时时是 `null`），
     /// `output` 是它在标准错误上最后说的话，原样。
@@ -508,24 +508,24 @@ pub enum UpdateCause {
     Cancelled,
     /// 对一个文件的读写失败。`error` 是系统的原话。
     Io { path: String, error: String },
-    /// 节点上的更新状态文件读不懂。
+    /// 节点上的更新状态文件无法解析。
     StateUnreadable { path: String },
-    /// 新程序换上去 `minutes` 分钟还没有连上 controller，已经换回旧程序。
+    /// 新程序启动后 `minutes` 分钟内未能连接到 controller，已回滚至旧版本。
     NotConfirmed { minutes: u64 },
-    /// 新程序启动了 `starts` 次都没有连上 controller，已经换回旧程序。
+    /// 新程序启动 `starts` 次均未能连接到 controller，已回滚至旧版本。
     StartsUnconfirmed { starts: u32 },
-    /// 比这个程序新的节点报的、这里不认识的原因。
+    /// 较新版本节点上报的未知原因。
     #[serde(other)]
     Unknown,
 }
 
-/// 节点不能自己更新的原因。节点在连上 controller 时上报，WebUI 标出原因和手动更新的做法。
+/// 节点无法自更新的原因。节点连接 controller 时上报，WebUI 据此展示原因及手动更新方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelfUpdateBlocker {
-    /// 在容器里运行。换了程序文件，容器重建之后又回到镜像里的版本，所以要更新就换镜像。
+    /// 运行在容器中。替换程序文件在容器重建后会恢复为镜像版本，应通过更换镜像更新。
     Container,
-    /// 程序是系统的包管理器装的。自己换文件会和包管理器记的对不上，所以用包管理器更新。
+    /// 程序由系统包管理器安装。自行替换文件会导致与包管理器记录不一致，应通过包管理器更新。
     PackageManager,
     /// 程序文件所在的目录不可写。
     ReadOnlyDir,
@@ -534,9 +534,9 @@ pub enum SelfUpdateBlocker {
 impl fmt::Display for SelfUpdateBlocker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Container => "节点在容器里运行，更新要换镜像",
-            Self::PackageManager => "节点程序是系统的包管理器装的，要用包管理器更新",
-            Self::ReadOnlyDir => "节点程序所在的目录不可写",
+            Self::Container => "节点运行在容器中，请通过更换镜像更新",
+            Self::PackageManager => "节点程序由系统包管理器安装，请通过包管理器更新",
+            Self::ReadOnlyDir => "节点程序所在目录不可写",
         })
     }
 }

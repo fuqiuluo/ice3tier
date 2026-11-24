@@ -60,7 +60,7 @@ pub async fn run(transport: Transport, test: impl Future<Output = ()>) {
             }
         }
         assert!(carried > 0, "这个测试跑在 lane 上，但没有任何字节经过 lane");
-        assert_eq!(fallbacks, 0, "有流开不出 lane、改走了共用的连接");
+        assert_eq!(fallbacks, 0, "存在无法开启 lane 而回退至共用连接的流");
     }
 }
 
@@ -138,12 +138,12 @@ impl LaneMesh {
     ///
     /// # Panics
     ///
-    /// 回环上听不了，或者 10 秒之内控制 lane 没有建好。
+    /// 回环地址监听失败，或 10 秒内未能建立控制 lane。
     pub async fn join(&self, id: NodeId) -> Arc<Lanes> {
         let key = NodeKey::generate().expect("系统的随机数源可用");
         let config = LaneConfig { min_idle: 2, ..LaneConfig::default() };
-        let lanes = Arc::new(Lanes::new(&key, config).expect("节点密钥能签证书"));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("回环上听得了");
+        let lanes = Arc::new(Lanes::new(&key, config).expect("使用节点密钥签发证书成功"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("回环地址监听成功");
         let addr = listener.local_addr().expect("刚绑的监听有地址");
         let serving = Arc::clone(&lanes);
         let task = tokio::spawn(async move { serving.serve(listener).await });

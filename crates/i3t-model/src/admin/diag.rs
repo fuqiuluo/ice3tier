@@ -71,7 +71,7 @@ pub enum TestState {
     Running,
     /// 做完了（各项可能有成有败，看各项自己的状态）。
     Done,
-    /// 整个测试做不了，原因在 `error` 里。
+    /// 整个测试无法执行，原因见 `error`。
     Failed,
     /// 被管理员取消了。已经有的结果照样留着。
     Cancelled,
@@ -85,7 +85,7 @@ pub enum TestState {
 pub enum ItemState {
     /// 还没有结果。
     Pending,
-    /// 有结果了。直连能力"没有成功"也是一个结果（`ok` 是 `false`），不是失败。
+    /// 已得出结果。直连能力测试"未成功"同样属于正常结果（`ok` 为 `false`），并非测试失败。
     Done,
     /// 没有做：条件不满足（原因在 `problem` 里）。
     Skipped,
@@ -110,7 +110,7 @@ pub struct TestView {
     pub finished_at: Option<Timestamp>,
     /// 属于哪一次全网矩阵；单独发起的是 `null`。
     pub matrix: Option<u64>,
-    /// 整个测试做不了时的原因（`state` 是 `failed`）。
+    /// 整个测试无法执行时的原因（`state` 为 `failed`）。
     pub error: Option<TestProblem>,
     /// 直连能力；没有要这一项时是 `null`。
     pub direct: Option<DirectResult>,
@@ -130,7 +130,7 @@ pub struct TestView {
 /// 一端的主机和连接状况（测试项 `host`）。
 ///
 /// 那一端最后一次上报到了才有内容，之前是 `pending`、各项都是 `null`。`done` 而里面有的项是 `null` 是正常的：
-/// 那台机器读不到那一样。节点的版本没有这一项时是 `skipped`、`not_supported`。
+/// 该主机无法采集对应指标。节点版本不支持该项时状态为 `skipped`、原因为 `not_supported`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostResult {
     pub node: NodeId,
@@ -146,12 +146,12 @@ pub struct DirectResult {
     pub state: ItemState,
     /// 两边都有了验证过的直连。
     pub ok: bool,
-    /// 发起方看到的直连是怎么建立的：`lan`、`ipv6`、`reachable`（端口本来就连得上，包括端口映射）、`punched`（打洞）。
+    /// 发起方观测到的直连建立方式：`lan`、`ipv6`、`reachable`（端口直接可达，包括端口映射）、`punched`（NAT 打洞）。
     pub kind: Option<DirectKind>,
-    /// 建立用了多久，毫秒；开始时就已经有直连（`already`）或者没有成功时是 `null`。
+    /// 建立耗时（毫秒）；测试开始前已存在直连（`already`）或未成功时为 `null`。
     pub elapsed_ms: Option<u32>,
     pub already: bool,
-    /// 没有成功、或者没有做时的原因，说的是哪个节点。
+    /// 未成功或未执行时的原因，并指明相关节点。
     pub problem: Option<TestProblem>,
     /// 两端各自看到的，`a` 在前。没有上报的一端不在里面。
     pub sides: Vec<DirectSideView>,
@@ -180,7 +180,7 @@ pub struct PathResult {
     /// 各段的延迟、抖动、丢包，按经过的顺序：`a` 到第一个 relay 是 `a` 测的，relay 之间来自骨干矩阵，
     /// 最后一个 relay 到 `b` 是 `b` 上报的延迟（只有延迟）。
     pub hops: Vec<Hop>,
-    /// `a` 到第一个 relay 的那一段走的是 UDP 还是 TCP。
+    /// `a` 到第一个 relay 这一跳使用的传输协议（UDP 或 TCP）。
     pub relay_leg: Option<LegTransport>,
     /// 吞吐；没有要吞吐时是 `null`。
     pub throughput: Option<ThroughputResult>,

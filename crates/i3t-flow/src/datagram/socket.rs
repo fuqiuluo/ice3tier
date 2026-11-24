@@ -28,7 +28,7 @@ impl OutboundSocket {
         match Self::bind_dual_stack() {
             Ok(socket) => Ok(Self { socket, dual_stack: true }),
             Err(error) => {
-                tracing::debug!(%error, "绑不出同时收发 IPv4 的 IPv6 端口，改用只有 IPv4 的");
+                tracing::debug!(%error, "绑定双栈 IPv6 端口失败，回退为仅 IPv4 端口");
                 let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
                 socket.set_nonblocking(true)?;
                 Ok(Self { socket: UdpSocket::from_std(socket)?, dual_stack: false })
@@ -58,7 +58,7 @@ impl OutboundSocket {
     ///
     /// # Errors
     ///
-    /// 系统拒绝发送：地址族用不了、网络不可达、报文太长等。
+    /// 系统拒绝发送，如地址族不可用、网络不可达或报文过长等。
     pub async fn send_to(&self, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
         let addr = match addr.ip().to_canonical() {
             IpAddr::V4(ip) if self.dual_stack => SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), addr.port()),

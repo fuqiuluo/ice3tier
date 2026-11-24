@@ -53,7 +53,7 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// 有端口绑不上，或者准备 TLS 配置失败。
+    /// 端口绑定失败，或准备 TLS 配置失败。
     pub async fn bind(controller: Arc<Controller>, options: ServeOptions) -> Result<Self, Error> {
         let tls = Arc::new(controller.tls_config()?);
         let (node_tcp, node_udp) = bind_node(options.node_listen, UdpSocket::bind).await?;
@@ -66,7 +66,7 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// 系统查不出这个 socket 的地址。
+    /// 无法获取该 socket 的本地监听地址。
     pub fn node_addr(&self) -> Result<SocketAddr, Error> {
         self.node_tcp.local_addr().map_err(Error::Socket)
     }
@@ -75,7 +75,7 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// 系统查不出这个 socket 的地址。
+    /// 无法获取该 socket 的本地监听地址。
     pub fn admin_addr(&self) -> Result<SocketAddr, Error> {
         self.admin.local_addr().map_err(Error::Socket)
     }
@@ -85,7 +85,7 @@ impl Server {
     ///
     /// # Errors
     ///
-    /// 现在不会出错：接受连接失败只记日志、过一会儿再接。留着 `Result` 是为了以后启动时还要做的事。
+    /// 当前实现不会返回错误：接受连接失败时仅记录日志并延迟重试。保留 `Result` 返回类型以便后续扩展启动期检查。
     pub async fn run(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<(), Error> {
         let (stop, stopped) = watch::channel(false);
         tokio::spawn(async move {
@@ -125,7 +125,7 @@ impl Server {
     }
 }
 
-/// 端口写 0 时最多挑几次端口：系统挑的一次，加上它用不了之后自己挑的。
+/// 端口指定为 0 时的最大选口次数：包含首次由系统分配，以及不可用后的手动重试次数。
 const NODE_PORT_TRIES: usize = 16;
 
 /// 自己挑端口时用的范围：留给临时用途的动态端口，Windows 的系统也在这里面挑。
@@ -134,11 +134,10 @@ const DYNAMIC_PORTS: RangeInclusive<u16> = 49152..=65535;
 /// 绑节点协议的 TCP 和同一个端口号的 UDP（节点按"和节点协议同一个端口号"去找地址查询）。`bind_udp` 平时是
 /// `UdpSocket::bind`。
 ///
-/// 端口写 0 时先让系统给 TCP 挑一个。系统挑的时候不看 UDP，同号的 UDP 可能用不了：正被别的程序占着；或者落在 Windows
-/// 给 UDP 保留、不让绑的一段里（`netsh int ipv4 show excludedportrange protocol=udp`，绑它报"没有权限"）。这样的段
-/// Windows 会在运行中新划出来，见过挨着的两段、各 100 个，划在系统正要挑给 TCP 的那些端口号上；而系统是顺着往后一个个
-/// 挑的，之后挑给 TCP 的 200 个端口号全在段里，再让它挑多少次都一样。所以系统挑的用不了时不再让它挑，自己在动态端口的
-/// 范围里随便挑：每次挑的互不相干，不会卡在同一段上。端口写明了的不换，照实报错。
+/// 端口指定为 0 时先由系统为 TCP 分配一个端口。系统分配时不会检查 UDP，同号 UDP 端口可能不可用：可能正被其他进程占用，或落入 Windows
+/// 的 UDP 排除端口段（`netsh int ipv4 show excludedportrange protocol=udp`，绑定时报权限错误）。此类排除段
+/// 会由 Windows 在运行时动态划出，可能连续覆盖系统顺序分配给 TCP 的数百个端口，导致重复让系统分配持续命中同一排除段。
+/// 因此当系统分配的端口不可用时，改为在动态端口范围内随机挑选，避免连续碰撞同一排除段。若端口已显式指定则不更换，直接返回绑定错误。
 async fn bind_node<F, Fut>(listen: SocketAddr, mut bind_udp: F) -> Result<(TcpListener, UdpSocket), Error>
 where
     F: FnMut(SocketAddr) -> Fut,
@@ -158,13 +157,13 @@ where
         if listen.port() != 0 || !port_unusable(&source) || tries >= NODE_PORT_TRIES {
             return Err(Error::Bind { address: addr, source });
         }
-        tracing::debug!(%addr, error = %source, "这个端口号 TCP 和 UDP 不是都用得了，另挑一个");
+        tracing::debug!(%addr, error = %source, "该端口无法同时绑定 TCP 和 UDP，重新选择端口");
         wanted = SocketAddr::new(listen.ip(), any_dynamic_port()?);
     }
 }
 
-/// 绑不上是不是因为这个端口号用不了（换一个端口号就可能绑得上）。别的程序占着时报"地址已被占用"；Windows 上端口在
-/// 系统保留的一段里时，报的是"没有权限"（10013）。
+/// 判断绑定失败是否由当前端口不可用导致（更换端口可能成功）。端口被其他进程占用时报 `AddrInUse`；Windows 上端口落入
+/// 系统保留段时报 `PermissionDenied`（错误码 10013）。
 fn port_unusable(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied)
 }
@@ -205,8 +204,8 @@ async fn maintain(controller: Arc<Controller>, mut shutdown: watch::Receiver<boo
 /// 后台的一轮出的错，打进日志。一直出错的时候（比如数据库停了）后台每秒都要再试，每一轮都打的话日志很快就被刷满：
 /// 每 [`TICK_ERROR_LOG_EVERY`] 最多打一轮，说出这期间省掉了几轮，省掉的打在 debug 里。
 ///
-/// 中间有一轮没出错也照样限着：整个数据库读写不了时后台退避，退避期间的那几轮不碰数据库，也就不出错，
-/// 不能当作好了。
+/// 中间某轮未出错时仍保持限流：当整个数据库不可用时后台任务会进入退避，退避期间不访问数据库因此不会报错，
+/// 不能据此视为已恢复。
 fn log_failure(errors: &Throttle, failed: &TickFailed) {
     let suppressed = errors.allow();
     for err in &failed.errors {
@@ -226,14 +225,14 @@ async fn resolve_public_host(controller: Arc<Controller>) {
         let found = match tokio::net::lookup_host(address.as_str()).await {
             Ok(found) => found.map(|resolved| resolved.ip().to_canonical()).find(|ip| !ip.is_loopback() && !ip.is_unspecified()),
             Err(error) => {
-                tracing::debug!(%host, %error, "解析不了 controller 对外地址里的主机");
+                tracing::debug!(%host, %error, "无法解析 controller 对外地址中的主机名");
                 None
             }
         };
         if let Some(ip) = found
             && let Err(err) = blocking(&controller, move |controller| controller.set_public_host(Some(ip))).await
         {
-            tracing::error!("记下 controller 对外地址的 IP 时出错：{}", error_chain(&err));
+            tracing::error!("保存 controller 对外地址解析的 IP 失败：{}", error_chain(&err));
         }
         tokio::time::sleep(PUBLIC_HOST_REFRESH).await;
     }
@@ -245,14 +244,14 @@ const PUBLIC_HOST_REFRESH: Duration = Duration::from_secs(10 * 60);
 /// 后台任务：每小时查一次发布源，设置变了就提前查；有节点要用的包就去取。
 ///
 /// 查和取都要走网络，在阻塞线程上做，期间不拿 controller 的锁。失败了只记日志：原因在管理 API 里看得到，下一轮再试。
-/// 两件事各走各的：发布源连不上时一次查询要等到超时，不能因此耽误取别的包（管理员可能刚把发布源改到了连得上的地方）。
+/// 两项任务彼此独立：发布源不可达时单次检查需等待超时，不能因此阻塞更新包下载（管理员可能已将发布源修改为可达地址）。
 async fn follow_releases(controller: Arc<Controller>, mut shutdown: watch::Receiver<bool>) {
     let checks = async {
         let mut next_check = tokio::time::Instant::now();
         loop {
             if tokio::time::Instant::now() >= next_check || blocking(&controller, Controller::release_check_requested).await {
                 if let Err(err) = blocking(&controller, Controller::check_release).await {
-                    tracing::error!("记录查发布源的结果时出错：{}", error_chain(&err));
+                    tracing::error!("记录发布源检查结果失败：{}", error_chain(&err));
                 }
                 next_check = tokio::time::Instant::now() + RELEASE_CHECK_INTERVAL;
             }
@@ -265,7 +264,7 @@ async fn follow_releases(controller: Arc<Controller>, mut shutdown: watch::Recei
     let fetches = async {
         loop {
             if let Err(err) = blocking(&controller, Controller::fetch_packages).await {
-                tracing::error!("记录取包的结果时出错：{}", error_chain(&err));
+                tracing::error!("记录更新包获取结果失败：{}", error_chain(&err));
             }
             controller.wait_for_wanted_packages().await;
         }

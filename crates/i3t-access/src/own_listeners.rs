@@ -17,7 +17,7 @@ use i3t_model::netmap::ForwardProtocol;
 pub struct OwnListener {
     /// TCP 的监听还是 UDP 的端口。
     pub protocol: ForwardProtocol,
-    /// 绑定的地址：配置里端口写 0 的，这里是挑定的端口。
+    /// 实际绑定的地址：配置端口为 0 时，此处为系统分配的端口。
     pub local: SocketAddr,
     /// 是端口转发的监听时，它的编号。
     pub forward: Option<u32>,
@@ -49,7 +49,7 @@ pub struct OwnListeners {
 
 #[derive(Debug, Default)]
 struct Shared {
-    /// TCP 的监听每次登记、撤销之后加一：凭它知道以前查的结论还作不作数。
+    /// 每次登记或撤销 TCP 监听时递增：用于判断先前缓存的查询结果是否仍然有效。
     tcp_generation: AtomicU64,
     /// 同上，UDP 的。
     udp_generation: AtomicU64,
@@ -75,10 +75,10 @@ struct Held {
 impl OwnListeners {
     /// 登记一个监听，返回的凭据丢掉时撤销。
     ///
-    /// 要在这个监听收得到东西之前登记，这样不留"已经在听、出口还不知道"的空当：TCP 的在绑上之后、开始监听之前
-    /// （这中间连不进来）；UDP 的端口一绑上就在收，绑上马上登记。绑不上会隔一阵重试的监听只在绑上之后登记：
-    /// 每次重试都登记再撤销的话，别的程序占着的端口会被当成自己的，版本号也跟着白白地变。只开一次、不重试的，
-    /// 可以在绑之前就登记，绑不上就把凭据丢掉。撤销要等监听真的关掉之后。
+    /// 必须在监听器可接收流量前完成登记，避免出现“已开始接收但出口尚不知情”的时间窗口：TCP 监听在绑定之后、开始 listen 之前登记
+    /// （此间隙内不会接受连接）；UDP 端口一经绑定即可收包，需在绑定后立即登记。绑定失败后会定期重试的监听仅在绑定成功后登记：
+    /// 否则每次重试都登记再撤销，会将其他程序占用的端口误判为本程序监听，并导致版本号无谓递增。仅尝试绑定一次、不重试的监听，
+    /// 可在绑定前登记，绑定失败时释放凭据即可。撤销登记须在监听器彻底关闭之后进行。
     #[must_use = "凭据一丢掉，登记就撤销了"]
     pub fn claim(&self, listener: OwnListener) -> Claim {
         let claim = self.shared.next_claim.fetch_add(1, Ordering::Relaxed);

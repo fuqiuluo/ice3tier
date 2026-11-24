@@ -1,14 +1,14 @@
 //! 局域网发现：向本地网段的组播地址发信标，听同一个网络里的对端发的信标。信标的格式见 [`i3t_proto::beacon`]。
 //!
-//! 认出来的对端只是多了一个直连的候选地址（信标的来源 IP 加上信标里的端口），用之前照样要经过带签名的探测。
-//! 标签只说明发的人知道这把公钥，同一个网段上知道公钥的人造得出来，所以报上去的只是线索，上层不凭它做别的。
+//! 识别出的对端仅提供一个直连候选地址（信标来源 IP 与信标携带的端口），使用前仍需经签名探测验证。
+//! 认证标签仅表明发送方知晓该公钥，同一网段内知晓公钥的节点均可构造，因此上报的仅作为线索，上层不据此执行其他操作。
 //!
 //! 信标不走节点收包的那个端口：组播要求大家听同一个端口号，而节点的端口是可以配置的。这里另开的 socket
 //! 只收发信标，只在本地网段上（TTL 是 1），不需要在路由器上放行。
 //!
-//! 收哪些：socket 绑在未指定地址上，发到本机单播地址的这个端口上的东西也会进来，所以只认发往信标的组播地址的
-//! （路由器不转发它，只可能来自本地网段），并且来源要落在本机听信标的某块网卡的直连网段里、是会发信标的那一类地址。
-//! 这样认出来的候选只会是本地网段上的地址：公网上的人送不进信标，网段上的人也没法让本节点把别处的地址当成候选。
+//! 接收过滤：socket 绑定在未指定地址上，发往本机单播地址同端口的数据也会到达，因此仅接受目的地址为信标组播地址的数据报
+//! （路由器不转发该组播，来源必在本地网段），且要求来源地址落在本机监听信标的某块网卡直连网段内，并属于会发送信标的地址类型。
+//! 由此识别出的候选仅限于本地网段地址：公网主机无法注入信标，同网段主机也无法诱导本节点将外部地址记为候选。
 //!
 //! 从哪些地址发：每块网卡上的私有 IPv4 地址，以及不是链路本地的 IPv6 地址。公网 IPv4 地址所在的网段（机房里的
 //! 二层网络）不发，那里没有要找的对端。IPv6 的信标从全球地址或者唯一本地地址发出，收的一方直接拿来源地址当候选；
@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::ifaddr::{self, InterfaceAddr};
 
-/// 信标发往的组播地址。IPv4 的取自"管理范围内"的那一段（和 SSDP 一样），IPv6 的是链路本地范围，都不会被路由器转出本地网段。
+/// 信标使用的组播地址。IPv4 位于管理范围段（与 SSDP 一致），IPv6 为链路本地范围，均不会被路由器转发至本地网段之外。
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 105, 51);
 pub const GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0x69, 0x3374);
 /// 信标的端口。
@@ -108,12 +108,12 @@ pub struct LanDiscovery {
 impl LanDiscovery {
     /// 开始收发信标。要在 tokio 运行时里调用。
     ///
-    /// `key` 是本节点的公钥，`port` 是本节点收包的 UDP 端口。认出一个对端的信标时在后台任务里调用 `on_sighting`，
-    /// 它不能阻塞。一开始不认任何对端，要认谁用 [`set_peers`](Self::set_peers) 告诉它。
+    /// `key` 为本节点公钥，`port` 为本节点接收数据报的 UDP 端口。识别到对端信标时会在后台任务中调用 `on_sighting`，
+    /// 该回调不得阻塞。初始状态下不识别任何对端，需通过 [`set_peers`](Self::set_peers) 设置已知对端列表。
     ///
     /// # Errors
     ///
-    /// IPv4 和 IPv6 的组播 socket 一个都建不起来（端口被不肯共用的程序占着，或者系统不让用组播）。
+    /// IPv4 与 IPv6 组播 socket 均无法创建（例如端口被独占进程占用，或系统禁止组播）。
     pub fn start(config: LanConfig, key: PublicKey, port: u16, on_sighting: impl Fn(Sighting) + Send + Sync + 'static) -> io::Result<Self> {
         let v4 = Receiver::bind(SocketAddr::V4(config.v4));
         let v6 = config.v6.map(|group| Receiver::bind(SocketAddr::V6(group)));
@@ -143,7 +143,7 @@ impl LanDiscovery {
         *self.inner.peers.write().expect("lan peers lock poisoned") = peers;
     }
 
-    /// 本节点发不发信标。不建立直连的节点、只主动连接的节点不发，但照样听。
+    /// 控制本节点是否发送信标。不建立直连或仅主动发起连接的节点不发送信标，但仍保持监听。
     pub fn set_announcing(&self, announcing: bool) {
         self.inner.announcing.store(announcing, Ordering::Relaxed);
     }
@@ -237,8 +237,8 @@ impl Receiver {
     }
 }
 
-/// 收到的东西里可能是信标的那些数据报。不是发往信标的组播地址 `group` 的一个都不算：发到本机单播地址上的同样内容，
-/// 可以来自任何地方。系统不给目的地址时没法分辨，只好都算，后面还有来源地址那一关。
+/// 从已接收数据中筛选可能属于信标的数据报。目的地址不是组播地址 `group` 的一律忽略（发往本机单播地址的相同内容可能来自任意位置）；
+/// 若操作系统未提供目的地址则无法区分，暂时放行，后续由来源地址校验过滤。
 fn beacons<'a>(buf: &'a [u8], received: &Received, group: IpAddr) -> impl Iterator<Item = &'a [u8]> + use<'a> {
     let to_group = received.to.is_none_or(|to| to.to_canonical() == group);
     let datagrams = if to_group && received.stride == Beacon::LEN { &buf[..received.len.min(buf.len())] } else { &[] };
@@ -254,8 +254,8 @@ enum Segment {
 
 /// 本机听信标的一块网卡上的一个地址和它的前缀长度，也就是一个直连的网段。
 ///
-/// 只看网卡地址自己的前缀，不看路由表。IPv6 地址全由 DHCPv6 分配、没有自动配置的地址的网络里，网卡上的地址是 /128，
-/// 同一个链路上的邻居不在这样的"网段"里，那里的 IPv6 信标不认；IPv4 的信标照常。
+/// 仅检查网卡地址自身的前缀长度，不查询路由表。在仅通过 DHCPv6 分配地址且无自动配置地址的网络中，网卡地址前缀为 /128，
+/// 同链路邻居不在该网段范围内，此时不识别 IPv6 信标；IPv4 信标不受影响。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Subnet {
     addr: IpAddr,
@@ -330,7 +330,7 @@ impl Inner {
     fn recognise(&self, datagram: &[u8], from: SocketAddr, subnets: &[Subnet], budget: &mut Budget, now: Instant) -> Option<Sighting> {
         let beacon = Beacon::parse(datagram)?;
         let ip = from.ip().to_canonical();
-        // 链路本地的 IPv6 地址要带网卡编号才发得过去，这里不拿它当候选。
+        // 链路本地 IPv6 地址需指定接口索引才能发送，此处不作为候选地址。
         if !ifaddr::is_candidate(ip) && !ip.is_loopback() {
             return None;
         }
@@ -387,24 +387,24 @@ async fn run(inner: Arc<Inner>, v4: Option<Receiver>, v6: Option<Receiver>) {
                 let now = Instant::now();
                 for datagram in datagrams {
                     if let Some(sighting) = inner.recognise(datagram, from, &subnets, &mut budget, now) {
-                        tracing::trace!(addr = %sighting.addr, "在局域网里看到了一个对端的信标");
+                        tracing::trace!(addr = %sighting.addr, "收到局域网对端信标");
                         (inner.on_sighting)(sighting);
                     }
                 }
             }
             Err(error) => {
-                tracing::debug!(%error, "收局域网信标出错");
+                tracing::debug!(%error, "接收局域网信标失败");
                 tokio::time::sleep(RECEIVE_ERROR_PAUSE).await;
             }
         }
     }
 }
 
-/// 一轮：在新出现的网卡上加入组播组，然后从每个网段各发一个信标。返回本机现在听信标的那些网段。
+/// 执行一轮局域网发现：在新出现的网络接口上加入组播组，并在各网段发送信标，返回当前监听信标的网段列表。
 fn round(inner: &Inner, v4: Option<&Receiver>, v6: Option<&Receiver>, joined: &mut HashSet<Segment>) -> Vec<Subnet> {
     let chosen = inner.chosen();
     let segments = inner.segments(&chosen);
-    // 网卡没了之后内核自己会退组；从记录里去掉，它再出现时重新加入。
+    // 接口移除后内核会自动退出组播组；从记录中移除，待接口重新出现时再次加入。
     joined.retain(|segment| segments.contains(segment));
     for &segment in &segments {
         if !joined.contains(&segment) {
@@ -414,11 +414,11 @@ fn round(inner: &Inner, v4: Option<&Receiver>, v6: Option<&Receiver>, joined: &m
                 (Segment::V4(_), None, _, _) | (Segment::V6 { .. }, _, _, _) => continue,
             };
             match result {
-                Ok(()) => tracing::debug!(?segment, "开始在这个网段上听局域网信标"),
+                Ok(()) => tracing::debug!(?segment, "已加入网段组播组，开始监听局域网信标"),
                 // 同一块网卡上的另一个地址已经加入过了。
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
                 Err(error) => {
-                    tracing::debug!(?segment, %error, "在这个网段上加入不了组播组");
+                    tracing::debug!(?segment, %error, "无法在该网段加入组播组");
                     continue;
                 }
             }
@@ -427,7 +427,7 @@ fn round(inner: &Inner, v4: Option<&Receiver>, v6: Option<&Receiver>, joined: &m
         if inner.announcing.load(Ordering::Relaxed)
             && let Err(error) = inner.announce(segment)
         {
-            tracing::debug!(?segment, %error, "局域网信标没有发出去");
+            tracing::debug!(?segment, %error, "发送局域网信标失败");
         }
     }
     chosen.iter().map(|interface| Subnet { addr: interface.ip, prefix: interface.prefix }).collect()

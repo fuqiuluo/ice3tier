@@ -42,7 +42,7 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// 只知道延迟的一段：抖动和丢包当作 0。目的节点到它挂靠的 relay 的那一段是这样（netmap 里只有延迟）。
+    /// 仅已知延迟的链路段（抖动与丢包率按 0 处理），例如目的节点至其挂靠 relay 的末段（netmap 仅提供延迟）。
     #[must_use]
     pub const fn from_rtt_ms(rtt_ms: f64) -> Self {
         Self { rtt_ms, jitter_ms: 0.0, loss: 0.0 }

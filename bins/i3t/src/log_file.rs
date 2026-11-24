@@ -13,13 +13,13 @@ pub const DEFAULT_LIMIT: u64 = 16 * 1024 * 1024;
 #[cfg(windows)]
 pub const LIMIT_ENV: &str = "I3T_LOG_MAX_SIZE";
 
-/// 一个日志文件的上限。`setting` 是环境变量 `I3T_LOG_MAX_SIZE` 的值：没有设就是 [`DEFAULT_LIMIT`]，设了但读不懂是 `None`。
+/// 计算单个日志文件的大小上限。`setting` 为环境变量 `I3T_LOG_MAX_SIZE` 的值：未设置时返回 [`DEFAULT_LIMIT`]，无法解析时返回 `None`。
 pub fn limit(setting: Option<&str>) -> Option<u64> {
     setting.map_or(Some(DEFAULT_LIMIT), parse_size)
 }
 
-/// 读一个大小：字节数，后面可以带 `K`、`M`、`G`（不分大小写，按 1024 进位；写成 `MB`、`MiB` 也认），比如 `64M`。
-/// 零、放不进 `u64` 的和别的写法都读不懂。
+/// 解析大小字符串：字节数后可附带 `K`、`M`、`G` 单位（不区分大小写，按 1024 进位，兼容 `MB`、`MiB` 等写法），例如 `64M`。
+/// 零值、超出 `u64` 范围或格式不合法的输入均返回 `None`。
 fn parse_size(text: &str) -> Option<u64> {
     let text = text.trim();
     let (number, unit) = text.split_at(text.find(|digit: char| !digit.is_ascii_digit()).unwrap_or(text.len()));
@@ -33,7 +33,7 @@ fn parse_size(text: &str) -> Option<u64> {
     number.parse::<u64>().ok()?.checked_mul(1 << shift).filter(|&size| size > 0)
 }
 
-/// 日志文件打不开或者写不进去、过大的归档处理不了的时候，过这么久再试。
+/// 日志文件打开/写入失败或超大归档处理失败后的重试间隔。
 const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// 裁短文件时一次读写这么多。
@@ -41,11 +41,11 @@ const CHUNK: usize = 64 * 1024;
 
 /// 日志文件（`i3t.log`）和它的一份归档（`i3t.log.old`）。
 ///
-/// 每写一条之前先看文件里还装不装得下，装不下就轮转：文件改名成归档，顶掉上一份，再开一个空的接着写。
-/// 两个文件都不超过上限，合起来不超过两倍，服务运行多久都一样。
+/// 每次写入前检查当前文件剩余空间，超出上限时触发轮转：将活动文件重命名为归档覆盖旧归档，再新建空文件继续写入。
+/// 单个文件均不超过上限，总占用不超过两倍上限，与服务运行时长无关。
 ///
-/// Windows 上别的程序开着其中一个文件看的时候（`Get-Content -Wait`）改不了名。这时把内容抄进归档，清空日志文件接着写；
-/// 抄也抄不成，这一份就不留了：宁可丢掉旧日志，也不能写满状态目录所在的盘。
+/// Windows 上若有其他进程打开了任一文件（如 `Get-Content -Wait`），重命名会失败。此时退化为将内容复制到归档后清空活动文件继续写入；
+/// 若复制也失败，则直接放弃保留该份归档：宁可丢弃旧日志，也不允许耗尽状态目录所在磁盘空间。
 pub struct LogFile {
     path: PathBuf,
     archive: PathBuf,
@@ -55,7 +55,7 @@ pub struct LogFile {
 
 struct State {
     open: Option<Open>,
-    /// 日志文件打不开、轮转不了、写不进去之后，到这个时刻之前不再试：免得每条日志都把文件系统碰一遍。
+    /// 日志文件打开、轮转或写入失败后的退避截止时刻，在此之前不再重试，避免每条日志都触发文件系统调用。
     closed_until: Option<Instant>,
     /// 什么时候去看归档有没有超过上限。看过没有问题就不再看：之后只有这里往归档里放东西。
     check_archive_at: Option<Instant>,
@@ -79,13 +79,13 @@ impl LogFile {
         log
     }
 
-    /// 添一行。和别的日志一样受上限管着。这是报错的最后一条路，文件刚才打不开也再试一次。
+    /// 追加一行日志，受相同的单文件大小上限约束。作为最后的错误输出通道，即使此前打开文件失败也会立即重试一次。
     pub fn append_line(&self, line: &str) {
         // 拼成一条再写：分开写的话，轮转可能正好落在这一行和它的换行之间。
         self.write_record(format!("{line}\n").as_bytes(), true);
     }
 
-    /// 写一条，写不进去就丢掉。`insist`：文件刚才打不开、还没到再试的时候，这一条也去试。
+    /// 写入一条日志记录，写入失败时丢弃。`insist` 为 `true` 时忽略退避冷却时间，强制尝试重新打开并写入。
     fn write_record(&self, record: &[u8], insist: bool) {
         // 一条比整个文件还大的只留开头：断在字符的边界上，补上换行。
         let room = usize::try_from(self.limit).unwrap_or(usize::MAX);
@@ -114,17 +114,17 @@ impl LogFile {
                 state.open = Some(current);
                 state.closed_until = None;
             }
-            // 打不开、轮转不了、写不进去（盘满了）都一样：文件关上，过一会儿重新打开再试，里面有多少字节到时候重新看。
+            // 打开、轮转或写入失败（如磁盘满）统一处理：关闭句柄并进入退避期，稍后重新打开并重新读取文件长度。
             Err(_) => state.closed_until = Some(Instant::now() + RETRY_AFTER),
         }
     }
 
-    /// 打开着的、还装得下 `size` 字节的日志文件：没开着就打开，装不下就先轮转。
+    /// 获取已打开且剩余空间足以容纳 `size` 字节的日志文件：未打开时先打开，空间不足时先轮转。
     fn ready(&self, open: Option<Open>, size: u64) -> io::Result<Open> {
         let current = match open {
             Some(current) => current,
             None => {
-                // 比上限还大的是旧版本留下的：那时只在启动时轮转，一次运行写了多少就有多大。裁不了的，下面轮转时清空。
+                // 超过上限的文件来自旧版本（旧版仅在启动时轮转，单次运行无大小限制）。若无法截断，后续轮转时会直接清空。
                 let _oversized = shrink(&self.path, self.limit);
                 self.open_active()?
             }
@@ -146,15 +146,15 @@ impl LogFile {
 
     /// 日志文件（里面有 `len` 字节）留作归档，再开一个空的。
     fn rotate(&self, len: u64) -> io::Result<Open> {
-        // 比上限还大的（旧版本留下、又裁不了的）不留：归档也不能超过上限。
+        // 超过上限的旧活动文件（旧版遗留且截断失败）不保留为归档，确保归档同样不超过上限。
         if len <= self.limit {
             if fs::rename(&self.path, &self.archive).is_ok() {
                 return self.open_active();
             }
-            // 改不了名，多半是别的程序正开着其中一个文件。把内容抄进归档；抄不成这一份就不留了。
+            // 重命名失败通常是因为其他进程占用了文件，退化为复制内容到归档；复制失败则放弃保留。
             let _lost = self.copy_to_archive();
         }
-        // 清空之后用追加的方式重新打开：这样别人中途清空了文件，也不会接着往原来的位置写。
+        // 截断后以追加模式重新打开，避免其他进程中途清空文件后继续按旧偏移量写入产生空洞。
         open_unlinked(&self.path, OpenOptions::new().create(true).write(true))?.set_len(0)?;
         self.open_active()
     }
@@ -168,7 +168,7 @@ impl LogFile {
         Ok(())
     }
 
-    /// 旧版本留下的归档可能比上限大：裁短，裁不了就删掉。都不成（正被别的程序开着），或者连看都看不了，就是错误，过一会儿再试。
+    /// 处理旧版本遗留的超大归档：尝试截断至上限以内，截断失败则删除。若因文件被占用或无法查询元数据而失败，则返回错误等待稍后重试。
     fn fit_archive(&self) -> io::Result<()> {
         match fs::symlink_metadata(&self.archive) {
             Ok(archive) if archive.is_file() && archive.len() > self.limit => {
@@ -177,7 +177,7 @@ impl LogFile {
             // 没有超过上限，或者那里根本不是文件。
             Ok(_) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            // 一时看不了不等于没有问题：过一会儿再看。
+            // 暂时无法读取元数据不代表归档未超限，保留错误以便稍后重试检查。
             Err(err) => Err(err),
         }
     }
@@ -186,7 +186,7 @@ impl LogFile {
 /// 给 `tracing_subscriber` 当写入器用（`Arc<LogFile>`）。它每条日志调一次 `write_all`。
 impl Write for &LogFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // 写不进去就算了，不能让日志拖住节点。
+        // 忽略写入失败，避免日志异常阻塞节点运行。
         self.write_record(buf, false);
         Ok(buf.len())
     }
@@ -196,8 +196,8 @@ impl Write for &LogFile {
     }
 }
 
-/// 文件比 `limit` 大就裁到不超过 `limit`，只留最后那些完整的行。留不下来（盘满了，原地往前挪也写不进去）就清空，
-/// 先把地方让出来。没有这个文件不算错。
+/// 若文件超过 `limit`，则截断至不超过 `limit` 并仅保留末尾的完整行。若无法保留尾部（例如磁盘已满导致原地前移写入失败），
+/// 则直接清空文件以释放空间。文件不存在时不视为错误。
 fn shrink(path: &Path, limit: u64) -> io::Result<()> {
     let mut file = match open_unlinked(path, OpenOptions::new().read(true).write(true)) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),

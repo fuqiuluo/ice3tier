@@ -1,8 +1,8 @@
 //! 骨干矩阵的一行：一个 relay 到其他各个 relay 的延迟、抖动和丢包，加上它自己的状态。
 //!
-//! relay 之间连得上的两两保持中转会话并互测。每个 relay 把自己测到的这一行签上名，发给在它上面有会话的所有节点
-//! （其中也包括别的 relay）；relay 收到别人的行原样再发给自己的会话。所以矩阵不经过 controller 就能到达每个节点，
-//! 而且每一行只有它的主人签得出来，中间的 relay 改不了别人的行。
+//! 相互可达的 relay 两两保持中转会话并互测链路质量。每个 relay 对自身测得的行数据签名后发送给其上的全部会话节点
+//! （含其他 relay）；relay 收到其他 relay 的行后原样转发给自身会话。因此矩阵无需经由 controller 即可送达各节点，
+//! 且每一行仅能由其所属 relay 签发，中间 relay 无法篡改他人的行。
 //!
 //! 同一种帧也是 relay 的通知：relay 过载或者即将下线时，立刻发一行状态变了的。
 //!
@@ -13,17 +13,17 @@
 //! 整数都是大端。
 //!
 //! - **序号**：主人每发一行加大一次（用的是毫秒时间戳，重启之后也不会变小）。收的一方只留每个主人序号最大的那一行，
-//!   所以重放一行旧的换不掉新的。
+//!   因此重放旧行无法覆盖新行。
 //! - **状态**：见 [`RelayState`]。
 //! - **负载**：转发带宽占用了上限的百分之几，超过 255 记 255；没有设上限的 relay 填 0。
-//! - **延迟**：毫秒。`0xffff` 表示主人连不上这个 relay；行里没有列出的 relay 同样当作连不上。
+//! - **延迟**：毫秒。`0xffff` 表示发起方无法连通该 relay；行中未列出的 relay 同样视为不可达。
 //! - **抖动**：毫秒，超过 255 记 255。
 //! - **丢包**：单位是 0.5%，200 就是全丢。
 //!
 //! # 签的是什么
 //!
 //! 签名由调用方用 `i3t_crypto::NodeKey::sign(用途, 消息)` 来算：用途是 [`Row::PURPOSE`]，消息是帧里签名之前的全部字节
-//! （[`Row::signed_part`]）。里面有主人的编号和序号，所以一行拿不到别的 relay 名下，也改不了新旧。
+//! （[`Row::signed_part`]）。签名包含所属 relay 编号与序号，因此无法冒充其他 relay，也无法篡改新旧顺序。
 //!
 //! # 对没有认证过的来源
 //!
@@ -116,7 +116,7 @@ impl LinkQuality {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
     pub relay: NodeId,
-    /// `None` 表示主人连不上它。
+    /// `None` 表示所属 relay 无法连通该目标。
     pub quality: Option<LinkQuality>,
 }
 
@@ -178,7 +178,7 @@ impl Row {
         })
     }
 
-    /// 帧里要拿去验签名的那一段。帧不完整时返回 `None`。
+    /// 帧中参与验签的字节区间。帧不完整时返回 `None`。
     #[must_use]
     pub fn signed_part(datagram: &[u8]) -> Option<&[u8]> {
         Self::is_complete(datagram).then(|| &datagram[..datagram.len() - SIGNATURE_LEN])
@@ -195,7 +195,7 @@ impl Row {
 
     /// 解析一帧，返回行的内容和签名。只看格式，签名由收的一方去验。
     ///
-    /// 帧不完整、状态码不认识、有编号是 0、主人把自己或者同一个 relay 列了两次时返回 `None`。
+    /// 帧不完整、状态码未知、包含为 0 的节点编号、包含自身或重复列出同一 relay 时返回 `None`。
     #[must_use]
     pub fn parse(datagram: &[u8]) -> Option<(Self, [u8; SIGNATURE_LEN])> {
         if !Self::is_complete(datagram) {

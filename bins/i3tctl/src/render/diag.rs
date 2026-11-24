@@ -109,7 +109,7 @@ pub fn test(view: &TestView, names: &Names) {
     }
 }
 
-/// 两端的主机状况，和各自到对端的那条连接。读不到的写 `-`。
+/// 展示两端主机状态及各自到对端的连接信息；无法获取的字段以 `-` 表示。
 fn host_lines(hosts: &[HostResult], name: &dyn Fn(NodeId) -> String) {
     let (t, lang, codes) = context();
     let cpu =
@@ -127,7 +127,7 @@ fn host_lines(hosts: &[HostResult], name: &dyn Fn(NodeId) -> String) {
             let resident = report.memory.map_or_else(|| NONE.to_owned(), |memory| lang.bytes(memory.process_rss_bytes));
             (t.host_process)(&resident, process.threads, &lang.duration(process.uptime_secs))
         });
-        // 这一端没有内容时（还没报、版本太旧、没报上来），系统那一格写原因。
+        // 当该端尚无主机信息时（尚未上报、版本过旧或上报失败），在系统列显示原因。
         let state = match &host.problem {
             Some(problem) => lang.labelled((codes.item_state)(host.state), &problem_text(problem, name)),
             None => (codes.item_state)(host.state).to_owned(),

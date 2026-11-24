@@ -31,7 +31,7 @@ pub struct Duplex {
     pub wr: Pin<Box<dyn AsyncWrite + Send>>,
 }
 
-/// 一次 LLM 流式请求的形状：先上传请求体，等一会儿，再按节拍收一串小消息。
+/// 一次 LLM 流式请求的流量模型：先上传请求体，等待首 token 延迟后，按固定间隔接收一系列小消息。
 #[derive(Clone, Copy, Debug)]
 pub struct LlmShape {
     pub body_len: u64,
@@ -102,7 +102,7 @@ impl Request {
                 let ((ttft_ms, tokens), (interval_ms, token_size), (silent_after, silent_ms)) = (halves(1), halves(2), halves(3));
                 Self::Llm(LlmShape { body_len: word(0), ttft_ms, tokens, interval_ms, token_size, silent_after, silent_ms })
             }
-            other => bail!("不认识的请求类型 {other}"),
+            other => bail!("未知的请求类型 {other}"),
         })
     }
 }

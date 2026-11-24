@@ -41,13 +41,13 @@ const INTERFACES_TTL: Duration = Duration::from_secs(5);
 
 /// 同时在进行的域名解析最多多少个。
 ///
-/// 系统的解析器是阻塞的：每个解析占一个阻塞线程，直到解析器自己返回为止，调用者超时走了也停不下来（glibc 最长要三十秒左右）。
+/// 系统解析器为阻塞调用：每次解析占用一个阻塞线程直至其自行返回，即使调用方超时退出也无法中止（glibc 最长约 30 秒）。
 /// tokio 的阻塞线程池一共 512 个线程，别的阻塞操作也要用。没有上限的话，一个节点拿权威服务器不回应的随机子域名不停地发请求，
 /// 每秒几十个就能把线程池占满。正常的解析几十毫秒就回来，加上缓存，同时在解析的很少超过十几个。
 const MAX_LOOKUPS: usize = 64;
 
 /// 其中一个请求方（一个发起节点，或者本机的出口测试）最多同时占多少个。一个节点刷解析时只占满它自己的这一份，
-/// 别的节点和本机照常解析。浏览器一下子打开几十个域名时多出来的排一会儿队，每个只等几十毫秒。
+/// 其他节点与本机仍可正常解析。浏览器短时间并发解析数十个域名时，超出部分短暂排队，通常只需等待数十毫秒。
 const MAX_LOOKUPS_PER_ASKER: usize = 16;
 
 /// 出站的拨号器。出口处理别人的流和出口测试都用它，所以两者是同一份出站策略、同一个解析缓存。克隆出来的是同一个。
@@ -189,7 +189,7 @@ impl<S: System> Outbound<S> {
         &self.inner.own_listeners
     }
 
-    /// `addr` 是不是本机的地址、上面又正好是程序自己的监听（`protocol` 那一种）。读不到本机网卡的地址时按"是本机的"算。
+    /// 判断 `addr` 是否为本机地址且正被本程序自身监听（对应 `protocol`）。无法获取本机网卡地址时保守按“属于本机”处理。
     pub(crate) fn own_listener_holds(&self, protocol: ForwardProtocol, addr: SocketAddr) -> bool {
         let own = self.interfaces().map_or(true, |interfaces| is_own_address(&interfaces, addr.ip().to_canonical()));
         own && self.inner.own_listeners.receives(protocol, addr)
@@ -251,7 +251,7 @@ impl<S: System> Outbound<S> {
         if role.upstream_socks5.is_some() {
             return Err(Reply::new(Status::NotEnabled, "这个出口经上游代理出站，上游代理不承载 UDP"));
         }
-        targets.first().copied().ok_or_else(|| Reply::new(Status::Unreachable, "没有可以发的地址"))
+        targets.first().copied().ok_or_else(|| Reply::new(Status::Unreachable, "没有可用的目标地址"))
     }
 
     /// 局域网目标：本节点必须是出口并且打开了局域网开关，地址必须在本机某块网卡直连的网段里。端口不受限制。
@@ -362,7 +362,7 @@ impl<S: System> Outbound<S> {
                 Ok(Err(reply)) => connect_cause(reply.status, via),
                 Err(_) => ExitTestCause::Timeout,
             };
-            // 几个地址都连不上时报最说明问题的那个，和替别人连时一样。
+            // 所有候选地址均连接失败时，上报最具诊断价值的失败原因，与正常代理连接一致。
             if last.is_none_or(|kept| cause_rank(cause) > cause_rank(kept)) {
                 last = Some(cause);
             }
@@ -374,7 +374,7 @@ impl<S: System> Outbound<S> {
 
     /// 本节点自己的服务：只用本机的非回环地址去连。
     ///
-    /// 所以只监听 127.0.0.1 的服务连不上，不会因为装了这个程序就对组网可见；要暴露这样的服务得显式配端口转发。
+    /// 因此仅监听在 127.0.0.1 的服务无法被直接访问，不会因安装本程序而暴露给组网；如需暴露此类服务，须显式配置端口转发。
     /// 本机有几个地址就挨个试：服务可能只监听在其中一个上。
     pub(crate) async fn node_port(&self, port: u16) -> Result<TcpStream, Reply> {
         let targets = self.node_targets(port, ForwardProtocol::Tcp)?;
@@ -405,7 +405,7 @@ impl<S: System> Outbound<S> {
 
     /// 本节点自己的服务的 UDP 报文该发到哪个地址：本机的第一个非回环地址。
     ///
-    /// TCP 可以挨个地址去试哪个连得上，UDP 没有"连上"这回事，试不了；只监听在别的地址上的服务要配端口转发。
+    /// TCP 可依次尝试多个地址判断是否连通，UDP 无连接建立过程，无法逐一探测；仅监听在其他地址上的服务须配置端口转发。
     pub(crate) fn udp_node(&self, port: u16) -> Result<SocketAddr, Reply> {
         let targets = self.node_targets(port, ForwardProtocol::Udp)?;
         targets.first().copied().ok_or_else(|| Reply::new(Status::Unreachable, "这个节点没有非回环的地址"))
@@ -480,8 +480,8 @@ impl<S: System> Outbound<S> {
 
     /// 占到名额之后在系统的解析器上解析 `name`。
     ///
-    /// 解析在自己的任务里做，名额跟着它走：调用者等不及（超时）走了，系统的解析器还要过一阵才返回，这期间名额不能还回去，
-    /// 不然一个不停地解析不存在的名字的节点能让阻塞线程越积越多。
+    /// 解析在独立任务中执行，配额随任务生命周期持有：即使调用方超时退出，系统解析器仍需等待一段时间才返回，期间不能提前归还配额，
+    /// 否则持续解析不存在域名的节点会导致阻塞线程不断堆积。
     async fn lookup(&self, name: String, asker: Asker) -> Result<Vec<IpAddr>, ResolveError> {
         let permits = self.inner.lookups.acquire(asker).await;
         let inner = Arc::clone(&self.inner);
@@ -489,10 +489,10 @@ impl<S: System> Outbound<S> {
             let _permits = permits;
             inner.system.resolve(&name).await
         });
-        task.await.unwrap_or_else(|error| Err(ResolveError::Failed(format!("解析的任务没有正常结束：{error}"))))
+        task.await.unwrap_or_else(|error| Err(ResolveError::Failed(format!("域名解析任务异常结束：{error}"))))
     }
 
-    /// 本机网卡上的地址和网段。读不到时拒绝请求：没有它就判断不了目标是不是在本机的内网里。
+    /// 获取本机网卡的地址与网段。获取失败时拒绝请求，否则无法判断目标是否位于本机内网。
     fn interfaces(&self) -> Result<Arc<[IpNet]>, Stop> {
         let mut cached = self.inner.interfaces.lock().expect("interfaces mutex poisoned");
         if let Some(interfaces) = cached.as_ref().filter(|interfaces| interfaces.read_at.elapsed() < INTERFACES_TTL) {
@@ -503,13 +503,13 @@ impl<S: System> Outbound<S> {
         Ok(nets)
     }
 
-    /// 挨个尝试 `targets`，返回第一条连上的连接。都连不上时返回其中最说明问题的那个失败。
+    /// 依次尝试连接 `targets`，返回首条成功的连接。全部失败时返回最具诊断价值的错误。
     async fn connect_first(&self, targets: impl IntoIterator<Item = SocketAddr>, timeout: Duration, via: Via) -> Result<TcpStream, Reply> {
         let mut failure: Option<Reply> = None;
         for target in targets {
             let attempt = match time::timeout(timeout, self.connect_one(target, via)).await {
                 Ok(attempt) => attempt,
-                Err(_) => Err(Reply::new(Status::TimedOut, format!("{timeout:?} 之内没有连上"))),
+                Err(_) => Err(Reply::new(Status::TimedOut, format!("连接超时（超过 {timeout:?}）"))),
             };
             match attempt {
                 Ok(stream) => {
@@ -523,7 +523,7 @@ impl<S: System> Outbound<S> {
                 }
             }
         }
-        Err(failure.unwrap_or_else(|| Reply::new(Status::Unreachable, "没有可以连的地址")))
+        Err(failure.unwrap_or_else(|| Reply::new(Status::Unreachable, "没有可连接的目标地址")))
     }
 
     async fn connect_one(&self, target: SocketAddr, via: Via) -> Result<TcpStream, Reply> {
@@ -538,7 +538,7 @@ impl<S: System> Outbound<S> {
             .system
             .connect(proxy)
             .await
-            .map_err(|error| Reply::new(Status::InternalError, format!("连不上上游代理：{error}")))?;
+            .map_err(|error| Reply::new(Status::InternalError, format!("连接上游代理失败：{error}")))?;
         upstream::connect(&mut stream, target).await?;
         Ok(stream)
     }
@@ -565,7 +565,7 @@ pub(crate) enum Stop {
     NameNotFound(&'static str),
     ResolverFailed(String),
     ResolveTimeout(Duration),
-    /// 读不到本机网卡的地址。
+    /// 获取本机网卡地址失败。
     Interfaces(String),
 }
 
@@ -602,16 +602,16 @@ impl From<Stop> for Reply {
                 let wanted = match family {
                     IpFamily::Ipv4 => "IPv4",
                     IpFamily::Ipv6 => "IPv6",
-                    IpFamily::Any => "可以连",
+                    IpFamily::Any => "可用",
                 };
-                Self::new(Status::PolicyDenied, format!("出口只连 {wanted} 地址，这个目标没有这种地址"))
+                Self::new(Status::PolicyDenied, format!("出口仅允许连接 {wanted} 地址，目标无匹配地址"))
             }
             Stop::Forbidden { what, .. } => Self::new(Status::PolicyDenied, format!("目标地址是{what}，出口不替别人连这类地址")),
             Stop::NotOnLan { why, .. } => Self::new(Status::PolicyDenied, why),
             Stop::NameNotFound(detail) => Self::new(Status::NameNotFound, detail),
             Stop::ResolverFailed(reason) => Self::new(Status::ResolverFailure, reason),
-            Stop::ResolveTimeout(timeout) => Self::new(Status::ResolverFailure, format!("{timeout:?} 之内没有解析出来")),
-            Stop::Interfaces(error) => Self::new(Status::InternalError, format!("读不到本机网卡的地址：{error}")),
+            Stop::ResolveTimeout(timeout) => Self::new(Status::ResolverFailure, format!("域名解析超时（超过 {timeout:?}）")),
+            Stop::Interfaces(error) => Self::new(Status::InternalError, format!("获取本机网卡地址失败：{error}")),
         }
     }
 }
@@ -705,11 +705,11 @@ fn subnet_contains(interface: &IpNet, ip: IpAddr) -> bool {
 }
 
 /// 给到目标的连接设置选项：关掉 Nagle，打开内核保活（[`i3t_flow::keep_alive`]：流没有空闲时限，目标的死活靠它判断）。
-/// 设不上不影响这条连接能用，只记一行。
+/// 设置失败不影响该连接的正常使用，仅记录日志。
 fn tune(stream: &TcpStream) {
     let tuned = stream.set_nodelay(true).and_then(|()| i3t_flow::keep_alive(stream));
     if let Err(error) = tuned {
-        tracing::warn!(%error, "到目标的连接设置不了 NODELAY 或者保活，静默久了可能被中间的路由器回收");
+        tracing::warn!(%error, "为目标连接设置 TCP_NODELAY 或内核保活失败，长时间空闲时可能被中间网络设备断开");
     }
 }
 
@@ -727,7 +727,7 @@ fn connect_status(error: &io::Error) -> Status {
     }
 }
 
-/// 几个地址都连不上时报哪一个失败：越具体的越优先。"拒绝连接"说明主机在、端口没开，比"不可达"有用。
+/// 全部候选地址均连接失败时的错误优先级：越具体的错误优先级越高。“连接被拒绝”表明主机可达但端口未监听，比“不可达”更具诊断价值。
 const fn rank(status: Status) -> u8 {
     match status {
         Status::ConnectionRefused => 4,

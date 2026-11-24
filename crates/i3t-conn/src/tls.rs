@@ -5,7 +5,7 @@
 //!
 //! - 发起方（[`crate::Payload::for_first_data`]）：首批数据里的 ClientHello 要提供 TLS 1.3（§4.1.2）。
 //! - 接受方（[`ServerHelloWatch`]）：目标回的 ServerHello 要选定 TLS 1.3 和一个加密的套件，而且不是 HelloRetryRequest（§4.1.3）。
-//!   只有这样，它后面的握手（证书等）才是加密的。目标选了 TLS 1.2、或者只校验不加密的套件（RFC 9150）时证书接着就明文回来；
+//!   只有满足该条件，后续握手消息（证书等）才处于加密保护之下。若目标选用 TLS 1.2 或仅校验不加密的套件（RFC 9150），证书将以明文返回；
 //!   回了 HelloRetryRequest 时，在 ServerHello 之前切换会让路上的人能冒充目标再要一次 ClientHello。
 
 /// 明文的 TLS 记录最长 2^14 字节（RFC 8446 §5.1）。
@@ -31,7 +31,7 @@ fn supported_versions(first: &[u8]) -> Option<&[u8]> {
     if handshake.0.len() > MAX_RECORD_LEN {
         return None;
     }
-    // 记录里正好一条握手消息，是 ClientHello。拆在几条记录里的（超过 16 KB）不认，宁可加密。
+    // 记录中必须恰好包含一条 ClientHello 握手消息；跨多条记录分片的（超过 16 KB）不予识别，保持加密。
     let [HANDSHAKE_CLIENT_HELLO] = handshake.array()? else { return None };
     let mut hello = Reader(handshake.vec24()?);
     handshake.end()?;
@@ -77,7 +77,7 @@ const HELLO_RETRY_REQUEST: [u8; 32] = [
 
 /// 接受方的方向什么时候可以不再加密（发起方的方向随后跟着它）：看目标回的头几条 TLS 记录。
 ///
-/// 发起方选了 passthrough 只说明它的首批数据是一个提供 TLS 1.3 的 ClientHello，目标会怎么回还不知道。所以接受方先照常加密，
+/// 发起方选择 passthrough 仅表明首批数据为提供 TLS 1.3 的 ClientHello，目标响应尚未可知。因此接受方先保持加密，
 /// 把目标发来的字节按顺序喂给 [`feed`](Self::feed)，直到看出结果：
 ///
 /// - 第一条记录是一个选定 TLS 1.3 的 ServerHello：它之后的握手和数据都由用户自己的 TLS 加密了，这条记录一结束就可以不再加密；
@@ -100,9 +100,9 @@ pub struct ServerHelloWatch {
 /// [`ServerHelloWatch::feed`] 看出了什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerHelloVerdict {
-    /// 还看不出来，接着喂。
+    /// 尚未得出结论，需继续输入数据。
     Undecided,
-    /// 刚喂进去的这一段里，前这么多字节（一个 TLS 1.3 的 ServerHello 的结尾）还要加密，之后的可以不再加密。
+    /// 本次输入数据中，前 `usize` 字节（TLS 1.3 ServerHello 结尾部分）仍需加密，其后字节可切换为透传。
     PassthroughAfter(usize),
     /// 这个方向一直加密。
     Sealed,
@@ -206,7 +206,7 @@ fn server_hello(record: &[u8]) -> Option<ServerHello> {
     let random: [u8; 32] = hello.array()?;
     let session_id = hello.vec8()?;
     // cipher_suite：只认 TLS 1.3 里加密的套件（RFC 8446 §B.4，AES-GCM、ChaCha20-Poly1305、AES-CCM）。只校验不加密的
-    // （RFC 9150 的 TLS_SHA256_SHA256、TLS_SHA384_SHA384）选了之后证书还是明文；不认识的也一样当作不加密，宁可一直加密。
+    // （RFC 9150 的 TLS_SHA256_SHA256、TLS_SHA384_SHA384）选用后证书仍为明文；未知套件一律按不加密处理，保持加密传输。
     let [0x13, 0x01..=0x05] = hello.array()? else { return None };
     let [0] = hello.array()? else { return None }; // legacy_compression_method
     let mut extensions = Reader(hello.vec16()?);

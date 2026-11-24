@@ -1,12 +1,11 @@
-//! 网络的地址段是不是和这台机器所在的真实网络重叠。
+//! 检测虚拟网络网段是否与本机当前所处的真实网络重叠。
 //!
-//! 虚拟网卡装上之后，地址段经它走，从真网卡进来、自称来自地址段的包一律丢掉（防冒充的那条规则）。
-//! 这台机器要是本来就在一个和地址段重叠的真实网络里（家里的局域网、云上的私有网络、容器的网桥、另一个组网程序），装上就等于
-//! 把它从那个网络上切下来，远程的服务器连自己的 SSH 会话都可能断掉。所以装之前先看一遍：本机网卡上的地址、`main` 表里的路由，
-//! 和地址段有没有重叠。默认路由不算：它只是"别的都往这里走"，包括 VPN 拆成两半的那种（`0.0.0.0/1` 加 `128.0.0.0/1`）；
-//! 自己的那块虚拟网卡上的不算。
+//! 启用虚拟网卡后，网络网段路由将指向该网卡，且防伪造规则会丢弃从物理网卡进入、源地址属于该网段的数据包。
+//! 若本机原本位于与虚拟网段重叠的真实网络（如局域网、云 VPC、容器网桥或其他组网工具），启用后可能导致本机失联甚至中断 SSH 会话。
+//! 因此启用前会先检查本机网卡地址及 `main` 路由表是否与虚拟网段冲突。默认路由（包括 VPN 常用的对半拆分写法 `0.0.0.0/1`
+//! 与 `128.0.0.0/1`）以及本节点自身虚拟网卡上的地址和路由不计为重叠。
 //!
-//! 这是一道保险，所以读不懂系统的回答时按"不能装"处理，不按"没有重叠"处理。
+//! 作为安全保护机制，若无法读取或解析系统网络信息，按检查失败拒绝安装处理，而不默认视为无重叠。
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -17,17 +16,17 @@ use serde_json::Value;
 use crate::device::Platform;
 use crate::machine::{CommandError, Machine, Program};
 
-/// `cidr` 和本机的哪个地址或者路由重叠；不重叠时是 `None`。说出来的写法像 `ip` 的：`192.168.1.5/24 dev eth0`。
-/// `own` 是本节点自己的虚拟网卡（装着的时候），它上面的地址和经它的路由不算。
+/// 检查 `cidr` 是否与本机已有地址或路由重叠；无冲突时返回 `None`，冲突时返回类似 `ip` 风格的描述（如 `192.168.1.5/24 dev eth0`）。
+/// `own` 为本节点当前已创建的虚拟网卡名称，其上的地址与路由会被排除。
 ///
-/// 地址每个平台都看（网卡的地址和前缀）；路由只在 Linux 上看（`ip -j route`，没有 `ip` 时不看）。
+/// 所有平台均检查本机接口地址与前缀；Linux 额外通过 `ip -j route` 检查主路由表（若无 `ip` 命令则跳过路由检查）。
 ///
 /// # Errors
 ///
-/// 读不了本机的地址，或者读不懂 `ip` 的回答。
+/// 无法获取本机接口地址，或无法执行/解析 `ip` 命令输出时返回错误。
 pub fn find(machine: &mut impl Machine, platform: Platform, cidr: Ipv4Net, own: Option<&str>) -> Result<Option<String>, CommandError> {
     let interfaces = interfaces()
-        .map_err(|error| CommandError::Io { program: Program::Ip, detail: format!("读不了本机网卡的地址：{error}") })?;
+        .map_err(|error| CommandError::Io { program: Program::Ip, detail: format!("无法读取本机网卡地址：{error}") })?;
     if let Some(found) = addresses_overlapping(&interfaces, cidr, own) {
         return Ok(Some(found));
     }
@@ -41,7 +40,7 @@ pub fn find(machine: &mut impl Machine, platform: Platform, cidr: Ipv4Net, own: 
     }
 }
 
-/// 本机每块网卡上的 IPv4 地址和前缀。
+/// 读取本机各网络接口的 IPv4 地址及网段前缀。
 fn interfaces() -> io::Result<Vec<(String, Ipv4Net)>> {
     let found = if_addrs::get_if_addrs()?.into_iter().filter_map(|interface| match interface.addr {
         if_addrs::IfAddr::V4(v4) => Ipv4Net::new(v4.ip, v4.prefixlen).ok().map(|net| (interface.name, net)),
@@ -50,28 +49,28 @@ fn interfaces() -> io::Result<Vec<(String, Ipv4Net)>> {
     Ok(found.collect())
 }
 
-/// `ip -j` 的输出：一个 JSON 数组。不是的话当作命令失败：查不清有没有重叠就不装。
+/// 解析 `ip -j` 输出的 JSON 数组；解析失败时按命令失败处理，确保无法确认安全时不继续启用网卡。
 fn listing(json: &str) -> Result<Vec<Value>, CommandError> {
     serde_json::from_str(json).map_err(|error| CommandError::Failed {
         program: Program::Ip,
         status: None,
-        detail: format!("读不懂它的输出：{error}"),
+        detail: format!("无法解析 ip 命令输出：{error}"),
     })
 }
 
-/// 路由宽到算不上"某个网络"：默认路由，以及把它拆成两半的写法。
+/// 视为全网默认路由而非特定子网的最大前缀长度：涵盖默认路由及其对半拆分写法（`/1`）。
 const CATCH_ALL_PREFIX: u8 = 1;
 
 fn args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
 
-/// 两个地址段有没有共同的地址。
+/// 判断两个 IPv4 网段是否存在地址交集。
 fn overlaps(a: Ipv4Net, b: Ipv4Net) -> bool {
     a.contains(&b.network()) || b.contains(&a.network())
 }
 
-/// 网卡的地址里和 `cidr` 重叠的第一个（`own` 上的除外）。回环的不算（`127.0.0.0/8` 本来就不会被用作地址段）。
+/// 返回首个与 `cidr` 重叠的非回环接口地址描述（排除 `own`）。
 fn addresses_overlapping(interfaces: &[(String, Ipv4Net)], cidr: Ipv4Net, own: Option<&str>) -> Option<String> {
     interfaces
         .iter()
@@ -80,7 +79,7 @@ fn addresses_overlapping(interfaces: &[(String, Ipv4Net)], cidr: Ipv4Net, own: O
         .map(|(name, net)| format!("{net} dev {name}"))
 }
 
-/// `ip -j -4 route show table main` 的输出里，和 `cidr` 重叠的第一条路由（默认路由和经 `own` 的除外）。
+/// 返回 `ip -j -4 route show table main` 输出中首条与 `cidr` 重叠的路由（排除默认路由及经由 `own` 的路由）。
 fn routes_overlapping(routes: &[Value], cidr: Ipv4Net, own: Option<&str>) -> Option<String> {
     routes.iter().find_map(|route| {
         let dev = route.get("dev").and_then(Value::as_str);
@@ -88,7 +87,7 @@ fn routes_overlapping(routes: &[Value], cidr: Ipv4Net, own: Option<&str>) -> Opt
         if dst == "default" || (own.is_some() && dev == own) {
             return None;
         }
-        // 只有一个地址的路由不带前缀长度。
+        // 主机路由不带前缀长度，解析为 `/32`。
         let net: Ipv4Net = dst.parse().or_else(|_| dst.parse::<Ipv4Addr>().map(Ipv4Net::from)).ok()?;
         if net.prefix_len() <= CATCH_ALL_PREFIX || !overlaps(net, cidr) {
             return None;

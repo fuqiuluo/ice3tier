@@ -1,12 +1,12 @@
 //! 主动测试在 controller 这一侧：管理员发起测试，controller 检查、给两端下发同一个编号和参数，
-//! 两端各自上报，controller 合成结果、存下来（每对节点留最近的 [`crate::store::KEEP_PER_PAIR`] 个），以及全网矩阵（`matrix`）。
+//! 两端各自上报，controller 汇总并持久化结果（每对节点保留最近的 [`crate::store::KEEP_PER_PAIR`] 条），以及全网矩阵（`matrix`）。
 //!
 //! 规矩：
 //!
 //! - 同一对节点两次测试至少隔 [`MIN_INTERVAL`]，带吞吐的至少隔 [`THROUGHPUT_INTERVAL`]；同一对节点同时只有一个测试。
 //!   节点自己也守着差不多的间隔，controller 被攻破时节点照样守得住。
-//! - 指令发出之前就知道做不了的不发：节点不在线、版本太旧（[`TEST_REVISION`] 之前）、访问规则没有连通，整个测试直接失败，
-//!   原因里说是哪个节点；只经 relay 的节点不参加直连的两项，只用直连的节点不参加 relay 的那项，在本地关掉了吞吐测试的不量吞吐，
+//! - 下发指令前即可确定无法执行的测试不予下发：若节点离线、版本过旧（低于 [`TEST_REVISION`]）或访问规则未放行，整个测试直接失败，
+//!   原因中注明具体节点；仅经 relay 的节点跳过直连两项，仅直连的节点跳过 relay 项，本地禁用吞吐测试的节点跳过吞吐测量，
 //!   这些项标成"没有做"并说明原因。
 //! - 发起方报完最后的结果之后，controller 告诉两端测试结束（`TestEnd`），接受方随即报它最后的那一份（它那个方向上两种模式的选择）。
 //!   接受方 [`RESPONDER_GRACE`] 之内没有报，或者整个测试过了时间窗还没有报完，就按手上有的结束，缺的那一端在结果里写明。
@@ -48,7 +48,7 @@ const DEFAULT_LIST: u32 = 20;
 const MAX_LIST: u32 = 200;
 /// 一个测试最多指定几条 relay 路径：和默认测的条数一样，加上直连，一个带吞吐的测试最多量三条路径、六条测量流。
 const MAX_VIA: usize = 2;
-/// 测试的结果、矩阵的下一对写不进存储时，隔多久再试。节点的每条消息都会叫醒后台任务，
+/// 测试结果或矩阵下一对写入存储失败后的重试间隔。节点的每条消息都会唤醒后台任务，
 /// 不隔开的话数据库出错期间每来一条消息就试一次、记一遍日志。
 const STORE_RETRY: Duration = Duration::from_secs(5);
 
@@ -71,16 +71,16 @@ impl Diag {
 
 /// 一个进行中的测试。
 struct Running {
-    /// 结果的骨架：请求、两个节点、指令发出前就知道做不了的项。
+    /// 结果骨架：包含请求参数、两个参与节点及下发前即可确定无法执行的测试项。
     base: TestView,
     skips: Skips,
     initiator: Option<TestReport>,
     responder: Option<TestReport>,
-    /// 到这个时刻还没报完就按手上有的结束。结果定下了、还没存下来时，是下一次再存的时刻。
+    /// 截止时刻：超时未上报完毕时按已有结果结束；结果已确定但尚未持久化时，表示下次重试持久化的时刻。
     deadline: Instant,
     /// 发起方报完、controller 发出结束的时刻。
     ended: Option<Instant>,
-    /// 第一次结束时定下的结果，连同结束的时刻。存不下来时它还留在进行中，后台任务原样再存，这期间来的上报不算数。
+    /// 首次结束时确定的最终结果及其结束时刻。持久化失败时该测试保留在运行集合中，由后台任务原样重试，期间收到的上报一律忽略。
     outcome: Option<TestView>,
 }
 
@@ -95,7 +95,7 @@ impl Running {
         })
     }
 
-    /// 给人看的样子：结束了的是定下的结果（还没存下来也一样），没结束的是到现在为止的。
+    /// 对外展示的当前视图：已结束的返回最终结果（即使尚未持久化），未结束的返回截至当前的汇总结果。
     fn current(&self) -> TestView {
         self.outcome.clone().unwrap_or_else(|| self.view(false))
     }
@@ -114,7 +114,7 @@ fn pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
 }
 
 impl Controller {
-    /// 发起一个测试。做不了的测试也会建起来（状态是失败，原因里说是哪个节点），这样历史里看得到。
+    /// 发起一次主动测试。无法执行的测试也会创建记录（状态为失败，原因中注明具体节点），以便在历史记录中查询。
     ///
     /// # Errors
     ///
@@ -130,7 +130,7 @@ impl Controller {
         Ok(view)
     }
 
-    /// 一个测试：进行中的现在的样子，结束了的存下来的结果。
+    /// 查询单条测试记录：进行中的返回当前视图，已结束的返回持久化结果。
     ///
     /// # Errors
     ///
@@ -155,8 +155,8 @@ impl Controller {
         let pair = match (query.a, query.b) {
             (Some(a), Some(b)) => Some((a, b)),
             (None, None) => None,
-            (Some(_), None) => return Err(Error::invalid_field("b", "missing", "要看一对节点的测试时 a 和 b 都要写")),
-            (None, Some(_)) => return Err(Error::invalid_field("a", "missing", "要看一对节点的测试时 a 和 b 都要写")),
+            (Some(_), None) => return Err(Error::invalid_field("b", "missing", "查询节点对的测试记录时必须同时指定 a 和 b")),
+            (None, Some(_)) => return Err(Error::invalid_field("a", "missing", "查询节点对的测试记录时必须同时指定 a 和 b")),
         };
         let limit = query.limit.unwrap_or(DEFAULT_LIST).clamp(1, MAX_LIST);
         let stored = inner.store.tests(network, pair, limit)?;
@@ -171,8 +171,8 @@ impl Controller {
 
     /// 取消一个进行中的测试。已经有的结果照样留着。
     ///
-    /// 操作记录和取消的结果在一个事务里存下来，存不下来时什么都没有变，可以再试。
-    /// 随矩阵一起取消了、结果还没存下来的，再取消一次就是接着存。
+    /// 操作记录与取消结果在同一事务中持久化；若持久化失败则状态不变，可安全重试。
+    /// 对随矩阵取消但结果尚未持久化的测试，再次调用取消将继续尝试持久化。
     ///
     /// # Errors
     ///
@@ -187,9 +187,9 @@ impl Controller {
             };
         };
         let finished = match running.outcome.as_ref().map(|outcome| outcome.state) {
-            // 随矩阵一起取消了，结果还没存下来：接着存。
+            // 随矩阵取消但结果尚未持久化：继续尝试持久化。
             Some(TestState::Cancelled) => inner.finish_test(id, true),
-            // 已经因为别的原因结束了，只是结果还没存下来。
+            // 已因其他原因结束，仅结果尚未持久化。
             Some(_) => return Err(Error::Busy(format!("测试 #{id} 已经结束了"))),
             None => {
                 let (a, b) = (running.base.a.clone(), running.base.b.clone());
@@ -215,7 +215,7 @@ impl Inner {
     /// 把请求规整一遍：测试项去重排好，指定的路径要是这个网络里启用了的 relay、不超过最大中转级数。
     fn test_request(&self, network: &NetworkRecord, input: &CreateTest) -> Result<TestRequest, Error> {
         if input.a == input.b {
-            return Err(Error::invalid_field("b", "same_node", "要测的是两个不同的节点"));
+            return Err(Error::invalid_field("b", "same_node", "测试的两端必须为不同的节点"));
         }
         let mut items: Vec<TestItem> = input.items.clone().unwrap_or_else(|| TestItem::ALL.to_vec());
         if !input.via.is_empty() && !items.contains(&TestItem::RelayQuality) {
@@ -224,10 +224,10 @@ impl Inner {
         items.sort_unstable();
         items.dedup();
         if items.is_empty() {
-            return Err(Error::invalid_field("items", "empty", "至少要做一项测试"));
+            return Err(Error::invalid_field("items", "empty", "至少需指定一项测试"));
         }
         if input.throughput && !items.iter().any(|item| matches!(item, TestItem::DirectQuality | TestItem::RelayQuality)) {
-            return Err(Error::invalid_field("throughput", "needs_quality", "吞吐是在测质量的路径上量的：要同时测直连质量或者中继质量"));
+            return Err(Error::invalid_field("throughput", "needs_quality", "吞吐测试依赖质量测量路径，需同时启用直连质量或中继质量测试"));
         }
         if input.via.len() > MAX_VIA {
             return Err(Error::invalid_field("via", "too_many", format!("最多指定 {MAX_VIA} 条路径")));
@@ -257,7 +257,7 @@ impl Inner {
     fn check_interval(&self, a: NodeId, b: NodeId, throughput: bool) -> Result<(), Error> {
         let key = pair(a, b);
         if self.diag.running.values().any(|running| pair(running.base.a.id, running.base.b.id) == key) {
-            return Err(Error::Busy("这一对节点正在测试，等它结束或者取消它".to_owned()));
+            return Err(Error::Busy("该节点对正在测试中，请等待其完成或先取消".to_owned()));
         }
         let now = Instant::now();
         let Some(&(started, with_throughput)) = self.diag.last.get(&key) else { return Ok(()) };
@@ -269,10 +269,10 @@ impl Inner {
         if wait.is_zero() {
             return Ok(());
         }
-        Err(Error::TooSoon(format!("这一对节点刚测过，{} 秒之后再试", wait.as_secs().max(1))))
+        Err(Error::TooSoon(format!("该节点对刚刚执行过测试，请 {} 秒后再试", wait.as_secs().max(1))))
     }
 
-    /// 整个测试做不了的原因：有一端不在线、版本太旧，或者访问规则没有把它们连通。
+    /// 整个测试无法执行的原因：任一端离线、版本过旧，或访问规则未放行互通。
     fn test_blocker(&self, a: &NodeRecord, b: &NodeRecord) -> Option<TestProblem> {
         for node in [a, b] {
             match self.live.get(&node.id) {
@@ -285,7 +285,7 @@ impl Inner {
         (!knows(a, b) || !knows(b, a)).then(|| TestProblem::new(TestCode::NotConnected, None))
     }
 
-    /// 指令发出前就知道做不了的项。
+    /// 下发指令前即可确定无法执行的测试项。
     fn test_skips(&self, network: &NetworkRecord, a: &NodeRecord, b: &NodeRecord, request: &TestRequest) -> Result<Skips, Error> {
         let reach = |node: &NodeRecord| node.reach.unwrap_or(network.reach);
         let blamed = |wanted: Reach, code: TestCode| {
@@ -303,7 +303,7 @@ impl Inner {
 
     /// 建起一个测试并下发指令。调用前已经查过间隔。
     ///
-    /// 出错时什么都没有变：存储里没有这个测试，没有指令发出去，可以原样再试。
+    /// 出错时不产生任何副作用：存储中无此测试记录，也未向节点下发指令，可原样重试。
     pub(super) fn begin_test(
         &mut self,
         network: &NetworkRecord,
@@ -348,11 +348,11 @@ impl Inner {
         let blocker = self.test_blocker(a, b);
         let nothing_to_do = !(items.direct || items.direct_quality || items.relay_quality || items.route || items.host);
         if blocker.is_some() || nothing_to_do {
-            // 指令不用发：要么做不了，要么每一项都事先知道做不了。
+            // 无需下发指令：整个测试无法执行，或所有测试项均已预先跳过。
             view.state = if blocker.is_some() { TestState::Failed } else { TestState::Done };
             view.error.clone_from(&blocker);
             view.finished_at = Some(started_at);
-            // 整个测试做不了时，每一项都是"没有做"，原因就是那一条。
+            // 整个测试无法执行时，各项均标记为已跳过，原因同整体错误。
             let skips = match &blocker {
                 Some(problem) => Skips { direct: Some(problem.clone()), relay: Some(problem.clone()), throughput: Some(problem.clone()) },
                 None => skips,
@@ -375,7 +375,7 @@ impl Inner {
                 host.state = ItemState::Skipped;
                 host.problem.clone_from(&blocker);
             }
-            // 编号要等插进去才有，所以插完再改一次。几笔写在一个事务里，出错时什么都没有留下。
+            // 测试编号在插入后由数据库生成，因此插入后再更新写入完整视图；全部操作在同一事务内执行，失败时不会残留记录。
             self.store.atomically(|store| {
                 view.id = store.insert_test(&view)?;
                 store.update_test(&view)?;
@@ -408,9 +408,9 @@ impl Inner {
         }
         match self.finish_test(id, false) {
             Ok(view) => Ok(view),
-            // 测试已经建起来了，不算开始失败：结果定下了，后台任务接着存。
+            // 测试记录已创建，不视为发起失败：最终结果已确定，由后台任务继续持久化。
             Err(error) => {
-                tracing::warn!(test = id, "存发不出去的主动测试的结果时出错，{} 秒后再试：{error}", STORE_RETRY.as_secs());
+                tracing::warn!(test = id, "指令发送失败，持久化该主动测试结果出错，{} 秒后重试：{error}", STORE_RETRY.as_secs());
                 Ok(self.diag.running.get(&id).map_or(started, Running::current))
             }
         }
@@ -446,15 +446,15 @@ impl Inner {
         Ok(())
     }
 
-    /// 节点报来一个测试的结果。不是这个测试的两端、或者角色不对的不算数。
+    /// 处理节点上报的测试结果。非该测试参与节点或角色不匹配的上报将被忽略。
     pub(super) fn test_reported(&mut self, node: NodeId, report: TestReport) -> Result<(), Error> {
         let id = report.test;
         let Some(running) = self.diag.running.get_mut(&id) else {
-            tracing::debug!(%node, test = id, "丢掉一份测试结果：没有在进行这个测试（多半已经结束了）");
+            tracing::debug!(%node, test = id, "忽略测试上报：该测试未在进行中（可能已结束）");
             return Ok(());
         };
         if running.outcome.is_some() {
-            tracing::debug!(%node, test = id, "丢掉一份测试结果：这个测试已经结束了，结果在等着存下来");
+            tracing::debug!(%node, test = id, "忽略测试上报：该测试已结束，结果正在等待持久化");
             return Ok(());
         }
         let role = if node == running.base.a.id {
@@ -462,11 +462,11 @@ impl Inner {
         } else if node == running.base.b.id {
             TestRole::Responder
         } else {
-            tracing::debug!(%node, test = id, "丢掉一份测试结果：报的节点不是这个测试的两端");
+            tracing::debug!(%node, test = id, "忽略测试上报：上报节点并非该测试的参与端");
             return Ok(());
         };
         if report.role.is_some_and(|reported| reported != role) {
-            tracing::debug!(%node, test = id, "丢掉一份测试结果：角色对不上");
+            tracing::debug!(%node, test = id, "忽略测试上报：上报角色与预期不符");
             return Ok(());
         }
         let refused = report.refused.is_some();
@@ -501,10 +501,10 @@ impl Inner {
         Ok(())
     }
 
-    /// 结束一个测试：合成最后的结果、存下来、告诉两端结束。`cancelled` 是管理员取消的。
+    /// 结束一次测试：汇总最终结果、写入存储并通知两端结束。`cancelled` 表示是否由管理员取消。
     ///
-    /// 结果在第一次结束时定下来，连同结束的时刻；之后再调用只是把它再存一次，`cancelled` 不再起作用。
-    /// 存不下来时别的都没有变：它还在进行中，过 [`STORE_RETRY`] 后台任务再存，这期间来的上报不算数。
+    /// 结果与结束时刻在首次结束时确定；后续重试仅重新写入该结果，`cancelled` 不再生效。
+    /// 若持久化失败，其余状态不变：测试仍留在进行中集合，间隔 [`STORE_RETRY`] 后由后台任务重试，期间收到的上报一律忽略。
     pub(super) fn finish_test(&mut self, id: u64, cancelled: bool) -> Result<TestView, Error> {
         let view = self.fix_outcome(id, cancelled).ok_or(Error::NotFound(Entity::Test))?;
         if let Err(error) = self.store.update_test(&view) {
@@ -535,7 +535,7 @@ impl Inner {
         Some(outcome)
     }
 
-    /// 测试的结果存下来了：从进行中拿掉，告诉两端结束，记进矩阵。
+    /// 测试结果持久化完成后：将其移出进行中集合、通知两端结束，并更新所属矩阵。
     fn test_stored(&mut self, view: &TestView) {
         let id = view.id;
         self.diag.running.remove(&id);
@@ -556,15 +556,15 @@ impl Inner {
             return view;
         }
         let problem =
-            TestProblem { code: TestCode::Internal, node: None, message: "controller 重启过，这个测试没有做完".to_owned() };
+            TestProblem { code: TestCode::Internal, node: None, message: "controller 已重启，该测试未能完成".to_owned() };
         TestView { state: TestState::Failed, error: Some(problem), ..view }
     }
 
-    /// 到点了的：过了时间窗还没报完的测试按手上有的结束；接受方迟迟不报最后一份的也结束；结果没存下来的再存；
-    /// 矩阵里排着的接着开始。返回下一次最晚什么时候再来看。
+    /// 处理到期任务：结束超过时间窗或接受方宽限期未完成的测试、重试持久化失败的结果，
+    /// 并继续调度矩阵中排队的节点对。返回下一次最晚唤醒时刻。
     ///
-    /// 存储出错不算这里出错：记下日志，存不下来的测试、开始不了的矩阵各自隔 [`STORE_RETRY`] 再试，
-    /// 一个出错不耽误别的，也不让后台任务丢掉别的工作要它回来的时刻。
+    /// 存储错误不向上传播：仅记录日志，持久化失败的测试与启动失败的矩阵各自间隔 [`STORE_RETRY`] 后重试，
+    /// 互不阻塞，也不影响后台任务其他工作的调度时刻。
     pub(super) fn tests_tick(&mut self, now: Instant) -> Option<Instant> {
         for id in self.time_out_tests(now) {
             // 前面结束的测试给节点发结束时，节点可能掉线，连带结束了这一个。
@@ -572,7 +572,7 @@ impl Inner {
                 continue;
             }
             if let Err(error) = self.finish_test(id, false) {
-                tracing::warn!(test = id, "存主动测试的结果时出错，{} 秒后再试：{error}", STORE_RETRY.as_secs());
+                tracing::warn!(test = id, "持久化主动测试结果失败，{} 秒后重试：{error}", STORE_RETRY.as_secs());
             }
         }
         self.schedule_matrices(now);
@@ -581,14 +581,14 @@ impl Inner {
         [next, cooling].into_iter().flatten().min()
     }
 
-    /// 到点了的测试里还没结束的，按手上的结果定下来，返回到点了的测试。只改内存、不碰存储：
-    /// 整个数据库都读写不了、后台任务这一轮不存测试结果时也要做，定下之后来的上报就不算数了（见 [`Inner::test_reported`]），
-    /// 不然一个已经超时、本该算失败的测试，会被迟到的上报记成做完了。结果等能存了再存。
+    /// 将已到期但尚未结束的测试按当前已有结果定稿，并返回全部到期测试编号。此步骤仅修改内存、不访问存储：
+    /// 即使整个数据库不可读写、本轮后台任务跳过持久化时也必须执行，确保定稿后的迟到上报被忽略（见 [`Inner::test_reported`]），
+    /// 避免本应超时的测试被迟到上报误判为完成。最终结果待存储恢复后再持久化。
     pub(super) fn time_out_tests(&mut self, now: Instant) -> Vec<u64> {
         let due: Vec<u64> = self.diag.running.iter().filter(|(_, running)| now >= running.due_at()).map(|(id, _)| *id).collect();
         for &id in &due {
             if self.diag.running.get(&id).is_some_and(|running| running.outcome.is_none()) {
-                tracing::info!(test = id, "主动测试到时间了，按手上的结果结束");
+                tracing::info!(test = id, "主动测试已超时，按已有结果结束");
                 self.fix_outcome(id, false);
                 // 定下之后它只看 `deadline`（见 `Running::due_at`）。因为接受方过了宽限期才结束的，原来的时间窗可能还早：
                 // 收到现在，能存了马上就存，不用等到时间窗结束才放开这一对节点。
@@ -614,9 +614,9 @@ impl Inner {
             if !self.diag.running.contains_key(&id) {
                 continue;
             }
-            tracing::info!(test = id, %node, "节点掉线，主动测试按手上的结果结束");
+            tracing::info!(test = id, %node, "节点离线，主动测试按已有结果结束");
             if let Err(error) = self.finish_test(id, false) {
-                tracing::warn!(test = id, "存主动测试的结果时出错，{} 秒后再试：{error}", STORE_RETRY.as_secs());
+                tracing::warn!(test = id, "持久化主动测试结果失败，{} 秒后重试：{error}", STORE_RETRY.as_secs());
             }
         }
     }

@@ -20,7 +20,7 @@ const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 /// 一条连接从接受到回完最多这么久。回环上正常只要几毫秒；这个时限只是不让不说话的连接一直占着。
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 收到的一个请求里服务端用得上的部分。
+/// 已接收请求中服务端所需的字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Request {
     pub(crate) method: String,
@@ -148,7 +148,7 @@ fn parse_request(head: &str) -> Option<Request> {
 ///
 /// # Errors
 ///
-/// 连不上、应答不是 HTTP，或者状态码不是 200（这时错误里有应答体，它就是对方给的原因）。
+/// 连接失败、应答不是有效的 HTTP 响应，或状态码非 200（此时错误中包含应答体作为对端返回的原因）。
 pub(crate) async fn get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> anyhow::Result<String> {
     let exchange = async {
         let mut stream = TcpStream::connect(addr).await.with_context(|| format!("连接 {addr}"))?;
@@ -159,7 +159,7 @@ pub(crate) async fn get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> a
         stream.take(MAX_RESPONSE).read_to_end(&mut response).await.context("读应答")?;
         anyhow::Ok(response)
     };
-    let response = tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await.with_context(|| format!("{addr} 迟迟没有回答"))??;
+    let response = tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await.with_context(|| format!("等待 {addr} 应答超时"))??;
     let text = String::from_utf8(response).context("应答不是文本")?;
     let (head, body) = text.split_once("\r\n\r\n").context("应答不是 HTTP")?;
     let status = head.split(' ').nth(1).and_then(|code| code.parse::<u16>().ok()).context("应答不是 HTTP")?;

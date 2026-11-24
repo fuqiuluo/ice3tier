@@ -1,12 +1,12 @@
-//! 网卡本身：建、读写，丢掉就拆。三个平台都经 `tun-rs`：Linux 的 TUN、Windows 的 Wintun、macOS 的 utun。
+//! 虚拟网卡设备抽象：创建、读写及析构清理。各平台均通过 `tun-rs` 封装（Linux TUN、Windows Wintun、macOS utun）。
 //!
-//! 要建成什么样先写成数据（[`DeviceSpec`]：名字、地址、前缀、MTU，Windows 上另有驱动文件的位置），三个平台的都能在任何一台机器上
-//! 单元测试；真的去建的只有 [`Tun::create`]。地址和前缀给了，系统就有一条"网络的地址段走这块网卡"的路由：Linux 和 Windows 由内核
-//! 按前缀自己加，macOS 的 utun 不会，由 `tun-rs` 加（它的 `associate_route`）。网卡不是持久的：进程退出（包括被杀掉）时 Linux 和 macOS
-//! 的内核把它连同地址和路由一起删掉；Windows 上 Wintun 的适配器随句柄关掉而删掉，崩溃留下的同名适配器下次按名字认出来、接着用。
+//! 网卡参数先构建为声明式配置（[`DeviceSpec`]：名称、地址、前缀长度、MTU 及 Windows 驱动路径），以便所有平台的配置逻辑均可在任意主机上
+//! 单元测试；仅 [`Tun::create`] 会实际调用系统接口创建设备。配置地址与前缀后，系统会自动生成指向该网卡的网段路由（Linux 与 Windows 由内核自动添加，
+//! macOS utun 由 `tun-rs` 通过 `associate_route` 添加）。虚拟网卡均为非持久化设备：进程退出（含异常终止）时，Linux 与 macOS 内核会自动移除设备及关联地址和路由；
+//! Windows Wintun 适配器随句柄关闭销毁，若异常崩溃遗留同名适配器，下次启动将按名称重新打开并复用。
 //!
-//! 引擎只看 [`Device`]：读一个包，写一个包或者一批。测试里换成一对内存里的队列。Linux 上网卡和内核之间一次可以交接一大块
-//! （[`Offload`]），那是 [`Tun`] 里面的事：引擎读到、写下的还是一个个不超过 MTU 的包。
+//! 转发引擎仅面向 [`Device`] 抽象（单包读取、单包或批量写入），测试中可替换为内存队列。Linux 平台网卡与内核间的分段卸载（[`Offload`]）
+//! 完全封装在 [`Tun`] 内部，引擎侧收发的仍为不超过 MTU 的独立 IP 包。
 
 use std::fmt;
 use std::future::Future;
@@ -22,50 +22,50 @@ use crate::{DEFAULT_MTU, DEVICE_PATTERN};
 #[cfg(target_os = "linux")]
 mod offload;
 
-/// 引擎和网卡之间的接缝：一次读一个包，一次写一个包或者一批。
+/// 转发引擎与虚拟网卡之间的抽象接口：支持单包读取以及单包或批量写入。
 pub trait Device: Send + Sync + 'static {
-    /// 读下一个本机发出、经这块网卡走的包，放进 `buf`，返回长度。
+    /// 读取下一个由本机发出并经该虚拟网卡路由的数据包，写入 `buf` 并返回字节长度。
     ///
-    /// `InvalidData` 的错误是说读到的东西不成一个包、已经丢掉了，网卡还在，接着读就是；别的错误是网卡读不了了。
+    /// 返回 `InvalidData` 错误表示读出的数据无法组成合法数据包并已丢弃，网卡本身仍正常，应继续读取；其余错误表示网卡读取失败。
     fn recv(&self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
 
-    /// 网卡上现在就有包的话读一个，没有就是 `None`，不等。
+    /// 非阻塞尝试读取当前已就绪的数据包；无数据时立即返回 `None`。
     ///
-    /// 引擎读到一个包之后用它把紧跟着的也取出来。"把 [`recv`](Self::recv) 试一下、还要等就丢掉"代替不了它：
-    /// Windows 上 `recv` 每等一次都要建一个内核事件、往阻塞线程池里派一个任务，丢掉时再取消掉，每一阵包的末尾白做一遍。
+    /// 引擎在读到首个数据包后调用该方法排空后续已就绪数据包。不能以“轮询一次 [`recv`](Self::recv) 未就绪即丢弃”替代：
+    /// 在 Windows 平台上每次异步等待 `recv` 都会创建内核事件并向阻塞线程池派发任务，取消时会产生明显额外开销。
     fn try_recv(&self, buf: &mut [u8]) -> Option<io::Result<usize>>;
 
-    /// 把一个包交给本机的内核，像是从这块网卡进来的。
+    /// 向本机内核注入单个入站数据包（视同从该虚拟网卡收到）。
     fn send(&self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
 
-    /// 把一批包按顺序交给本机的内核。默认一个一个地写；写得了一大块的网卡把首尾相接的先合起来。
+    /// 按顺序向本机内核注入一批入站数据包。默认逐包写入；支持分段卸载的网卡会先聚合连续分段再写入。
     ///
     /// # Errors
     ///
-    /// 有写不进去的：几个、多少字节、为什么。别的都写进去了。
+    /// 若部分数据包写入失败，返回失败包数、字节数与最后一个错误；其余数据包已写入成功。
     fn send_many(&self, packets: &[Bytes]) -> impl Future<Output = Result<(), Unwritten>> + Send {
         send_singly(self, packets)
     }
 }
 
-/// 一批里没写进网卡的包。
+/// 批量写入虚拟网卡时未能成功写入的数据包统计。
 #[derive(Debug)]
 pub struct Unwritten {
     pub packets: usize,
     pub bytes: usize,
-    /// 最后一个写不进去的原因。
+    /// 最后一次写入失败的底层错误。
     pub error: io::Error,
 }
 
 impl Unwritten {
-    /// 一批里又有 `packets` 个、一共 `bytes` 字节没写进去。
+    /// 累加本次批量写入中新增的失败包数、字节数及错误。
     fn add(lost: &mut Option<Self>, packets: usize, bytes: usize, error: io::Error) {
         let (earlier_packets, earlier_bytes) = lost.as_ref().map_or((0, 0), |lost| (lost.packets, lost.bytes));
         *lost = Some(Self { packets: earlier_packets + packets, bytes: earlier_bytes + bytes, error });
     }
 }
 
-/// 一个一个地写，写不进去的记下来接着写后面的。
+/// 逐包写入虚拟网卡，记录失败项并继续处理后续数据包。
 pub(crate) async fn send_singly<D: Device + ?Sized>(device: &D, packets: &[Bytes]) -> Result<(), Unwritten> {
     let mut lost = None;
     for packet in packets {
@@ -76,17 +76,17 @@ pub(crate) async fn send_singly<D: Device + ?Sized>(device: &D, packets: &[Bytes
     lost.map_or(Ok(()), Err)
 }
 
-/// 网卡和内核之间一次交接多少（Linux）。
+/// 虚拟网卡与内核之间的分段卸载模式（仅限 Linux）。
 ///
-/// 不是 [`Off`](Self::Off) 时内核把本机发出的数据一大块（最长 64 KB）地交过来，程序自己切成不超过 MTU 的包；
-/// 对端来的包合成大块再交给内核。每个包一次系统调用变成几十个包一次。
+/// 非 [`Off`](Self::Off) 时，内核可将本机发出的连续数据合并为最大 64 KB 的大块交付用户态拆分；
+/// 入站方向则将连续数据包聚合后一次性提交内核，大幅减少系统调用次数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offload {
-    /// 一次一个包。别的平台上，本机设了不要，或者内核不给的时候。
+    /// 逐包收发模式（非 Linux 平台、本机禁用分段卸载或内核不支持时使用）。
     Off,
-    /// TCP 的数据成块地交接。
+    /// 仅启用 TCP 分段卸载。
     Tcp,
-    /// UDP 的也是（Linux 6.2 起）。
+    /// 同时启用 TCP 与 UDP 分段卸载（需 Linux 6.2 及以上内核）。
     TcpUdp,
 }
 
@@ -100,18 +100,18 @@ impl fmt::Display for Offload {
     }
 }
 
-/// 建网卡的平台。
+/// 虚拟网卡目标平台。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Linux,
     Windows,
     MacOs,
-    /// 别的平台：没有网卡（状态是"这个平台上还没有"）。
+    /// 暂不支持虚拟网卡的其他平台。
     Other,
 }
 
 impl Platform {
-    /// 这个程序编译给的平台。
+    /// 当前二进制编译目标平台。
     pub const CURRENT: Self = if cfg!(target_os = "linux") {
         Self::Linux
     } else if cfg!(windows) {
@@ -123,36 +123,35 @@ impl Platform {
     };
 }
 
-/// Windows 上 Wintun 的驱动文件名：和 `i3t` 的程序放在同一个目录里，运行时加载（不随仓库提交，发布时打进 Windows 的包里）。
+/// Windows 平台 Wintun 驱动文件名：与 `i3t` 可执行文件置于同一目录并在运行时动态加载（不提交至源码仓库，发布时随安装包分发）。
 pub const WINTUN_DLL: &str = "wintun.dll";
 
-/// Windows 上网卡的名字。Wintun 的适配器按名字认：上次崩溃留下的同名适配器被打开接着用，不会多出一块。
+/// Windows 平台虚拟网卡名称。Wintun 适配器按名称识别，异常崩溃后遗留的同名适配器会在下次启动时自动重新打开并复用。
 pub const WINDOWS_NAME: &str = "i3t0";
 
-/// 网卡的描述（Windows 的"网络连接"里显示的那一行）。
+/// 虚拟网卡描述信息（显示于 Windows “网络连接”列表）。
 pub const DESCRIPTION: &str = "ice3tier";
 
-/// 要建成什么样的网卡。
+/// 创建虚拟网卡所需的规格参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceSpec {
     pub platform: Platform,
-    /// 建的时候给的名字：Linux 是 [`DEVICE_PATTERN`]（内核挑编号），Windows 是 [`WINDOWS_NAME`]，macOS 不给（系统挑一个 `utunN`）。
+    /// 创建设备时指定的名称：Linux 为 [`DEVICE_PATTERN`]（由内核分配编号），Windows 为 [`WINDOWS_NAME`]，macOS 为 `None`（由系统分配 `utunN`）。
     pub name: Option<String>,
-    /// 本节点的虚拟 IP。
+    /// 本节点虚拟 IP。
     pub address: Ipv4Addr,
-    /// 网络地址段的前缀长度：地址带着它，系统就有一条地址段走这块网卡的路由。
+    /// 网络网段前缀长度：配置地址后系统据此生成网段路由。
     pub prefix: u8,
-    /// 默认是 [`DEFAULT_MTU`]，本机另外设了时是设的值（[`DeviceSpec::with_mtu`]）。
+    /// 网卡 MTU，默认为 [`DEFAULT_MTU`]，可通过 [`DeviceSpec::with_mtu`] 覆盖。
     pub mtu: u16,
-    /// Windows：Wintun 的驱动文件在哪里（程序旁边）。
+    /// Windows 平台 Wintun 驱动文件路径（位于主程序同目录）。
     pub driver: Option<PathBuf>,
-    /// 要不要和内核一大块一大块地交接（[`Offload`]）。只有 Linux 上有；内核不给时照一次一个包的办法建。
+    /// 是否尝试启用分段卸载（[`Offload`]）。仅 Linux 平台有效；若内核不支持则自动回退为逐包模式。
     pub offload: bool,
 }
 
 impl DeviceSpec {
-    /// 本节点的虚拟 IP 是 `own`、网络的地址段是 `cidr` 时，在 `platform` 上要建的网卡。`program` 是这个程序自己的路径，
-    /// Windows 上驱动文件在它旁边。
+    /// 根据目标平台、本节点虚拟 IP `own`、网络网段 `cidr` 及主程序路径 `program`（Windows 用于定位同目录驱动）构造网卡规格。
     #[must_use]
     pub fn new(platform: Platform, own: Ipv4Addr, cidr: Ipv4Net, program: Option<&std::path::Path>) -> Self {
         let name = match platform {
@@ -168,46 +167,46 @@ impl DeviceSpec {
         Self { platform, name, address: own, prefix: cidr.prefix_len(), mtu: DEFAULT_MTU, driver, offload }
     }
 
-    /// 换一个 MTU（本机配置里设的）。调用方保证它在 [`crate::MTU_RANGE`] 里：配置文件读进来时查过。
+    /// 设置自定义 MTU。调用方需保证其处于 [`crate::MTU_RANGE`] 范围内（加载配置时已校验）。
     #[must_use]
     pub const fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = mtu;
         self
     }
 
-    /// 本机设了要不要一大块一大块地交接（`[network] offload`）。没有这回事的平台上怎么设都是不要。
+    /// 配置是否启用分段卸载（`[network] offload`）。非 Linux 平台始终保持关闭。
     #[must_use]
     pub const fn with_offload(mut self, wanted: bool) -> Self {
         self.offload = wanted && matches!(self.platform, Platform::Linux);
         self
     }
 
-    /// 装上之后系统里那条路由：地址段走这块网卡。
+    /// 返回该网卡启用后对应的系统网段路由。
     #[must_use]
     pub fn route(&self) -> Ipv4Net {
-        Ipv4Net::new(self.address, self.prefix).expect("前缀长度来自一个合法的地址段").trunc()
+        Ipv4Net::new(self.address, self.prefix).expect("前缀长度来自合法网段").trunc()
     }
 }
 
-/// 网卡建不起来的原因。
+/// 创建或配置虚拟网卡时的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceError {
-    /// 没有权限：Linux 上缺 `CAP_NET_ADMIN`，Windows 上不是以管理员运行，macOS 上不是 root。`missing` 是缺的东西的写法。
-    #[error("没有建网卡的权限（缺 {missing}）：{source}")]
+    /// 权限不足：Linux 缺少 `CAP_NET_ADMIN`，Windows 未以管理员身份运行，macOS 非 root 用户。`missing` 为缺失权限的名称。
+    #[error("缺少创建虚拟网卡所需的权限（缺少 {missing}）：{source}")]
     NoPermission { missing: String, source: io::Error },
-    /// 建网卡用的设备或者驱动没有：Linux 上打不开 `/dev/net/tun`，Windows 上程序旁边没有 `wintun.dll`。
-    #[error("没有建网卡用的设备或驱动：{detail}")]
+    /// 缺少创建虚拟网卡所需的设备节点或驱动：Linux 无法打开 `/dev/net/tun`，Windows 同目录下缺少 `wintun.dll`。
+    #[error("缺少创建虚拟网卡所需的设备或驱动：{detail}")]
     NoDevice { detail: String },
-    #[error("Windows 上程序旁边没有 {}", .path.display())]
+    #[error("Windows 程序同目录下缺少 Wintun 驱动文件 {}", .path.display())]
     DriverMissing { path: PathBuf },
-    #[error("建不起网卡：{0}")]
+    #[error("创建虚拟网卡失败：{0}")]
     Failed(io::Error),
-    #[error("这个平台上还没有虚拟网卡")]
+    #[error("当前平台暂不支持虚拟网卡功能")]
     Unsupported,
 }
 
 impl DeviceError {
-    /// 按系统给的错误分类：没有权限、没有设备，或者别的。
+    /// 将系统 I/O 错误归类为权限不足、设备缺失或其他失败。
     fn classify(platform: Platform, error: io::Error) -> Self {
         let missing = match platform {
             Platform::Linux => "CAP_NET_ADMIN",
@@ -216,7 +215,7 @@ impl DeviceError {
         };
         match error.kind() {
             io::ErrorKind::PermissionDenied => Self::NoPermission { missing: missing.to_owned(), source: error },
-            // Linux：没有 /dev/net/tun（ENOENT），或者内核没有 tun 模块（ENODEV、ENXIO）。
+            // Linux：`/dev/net/tun` 不存在（ENOENT），或内核未加载 tun 模块（ENODEV、ENXIO）。
             io::ErrorKind::NotFound => Self::NoDevice { detail: error.to_string() },
             _ if matches!(error.raw_os_error(), Some(code) if no_device_code(platform, code)) => {
                 Self::NoDevice { detail: error.to_string() }
@@ -226,10 +225,10 @@ impl DeviceError {
     }
 }
 
-/// Linux：先自己打开一次 `/dev/net/tun`，把"设备不在"和"不让用这个设备"说清楚。
+/// Linux 平台预检：先直接打开 `/dev/net/tun`，以明确区分“设备缺失或未授权挂载”与“缺少网络管理权限”。
 ///
-/// 不在的时候 `tun-rs` 会试着自己建这个设备文件；容器里它多半建得出来（Docker 默认给 `CAP_MKNOD`），打开时却被容器的
-/// 设备白名单拒绝，那样的"没有权限"看起来像是缺 `CAP_NET_ADMIN`，其实是容器没有把这个设备给它。
+/// 若设备节点不存在，`tun-rs` 会尝试自行通过 `mknod` 创建；在容器中通常因默认拥有 `CAP_MKNOD` 而创建成功，
+/// 但打开时会被容器设备白名单拒绝并返回 `PermissionDenied`，容易误判为缺少 `CAP_NET_ADMIN`，实际原因是容器未挂载 TUN 设备。
 fn open_tun_node() -> Result<(), DeviceError> {
     const NODE: &str = "/dev/net/tun";
     match std::fs::OpenOptions::new().read(true).write(true).open(NODE) {
@@ -241,18 +240,18 @@ fn open_tun_node() -> Result<(), DeviceError> {
     }
 }
 
-/// 说明"没有这个设备"的系统错误码（Linux 的 ENODEV 和 ENXIO）。
+/// 判断系统错误码是否表示设备不可用（Linux 的 `ENODEV` 与 `ENXIO`）。
 fn no_device_code(platform: Platform, code: i32) -> bool {
     const ENXIO: i32 = 6;
     const ENODEV: i32 = 19;
     platform == Platform::Linux && matches!(code, ENODEV | ENXIO)
 }
 
-/// 建好了的网卡。丢掉它，网卡就拆了（Linux 和 macOS 上连同地址和路由）。
+/// 已创建的虚拟网卡句柄。丢弃该实例后设备自动销毁（Linux 与 macOS 同时移除地址与路由）。
 pub struct Tun {
     device: tun_rs::AsyncDevice,
     name: String,
-    /// 和内核一大块一大块地交接时有。
+    /// 启用分段卸载时持有分片拆解与聚合状态。
     #[cfg(target_os = "linux")]
     segmented: Option<offload::Segmented>,
 }
@@ -264,11 +263,11 @@ impl std::fmt::Debug for Tun {
 }
 
 impl Tun {
-    /// 按 `spec` 建网卡、配上地址和 MTU、打开。要在 tokio 运行时里调用。
+    /// 按 `spec` 创建、配置并启用虚拟网卡。必须在 tokio 运行时上下文中调用。
     ///
     /// # Errors
     ///
-    /// 没有权限、没有设备或驱动、系统不给（原话在错误里），或者这个平台上没有。
+    /// 权限不足、缺少设备或驱动、系统调用失败，或当前平台不支持时返回对应错误。
     pub fn create(spec: &DeviceSpec) -> Result<Self, DeviceError> {
         if spec.platform != Platform::CURRENT || spec.platform == Platform::Other {
             return Err(DeviceError::Unsupported);
@@ -280,10 +279,9 @@ impl Tun {
             open_tun_node()?;
         }
         match Self::build(spec, spec.offload) {
-            // 内核不收分段卸载的设置（很老的内核，或者不完整的 TUN 实现）：没建成的那一块已经随着关掉没了，
-            // 照一次一个包的办法再建。
+            // 若内核不支持分段卸载（如较老内核或受限 TUN 实现），未建成的设备句柄已自动关闭，回退为逐包模式重试。
             Err(DeviceError::Failed(error)) if spec.offload => {
-                tracing::info!(%error, "带着分段卸载建不起虚拟网卡，照一次一个包的办法再建");
+                tracing::info!(%error, "启用分段卸载创建虚拟网卡失败，回退为逐包模式重试");
                 Self::build(spec, false)
             }
             built => built,
@@ -304,7 +302,7 @@ impl Tun {
         }
         #[cfg(target_os = "macos")]
         {
-            // utun 配上地址不会自己有到网段的路由：要 tun-rs 加，网卡拆的时候路由跟着没了。
+            // macOS utun 配置地址后不会自动生成网段路由，需启用 associate_route 由 tun-rs 关联添加并在销毁时清理。
             builder = builder.with(|options| {
                 options.associate_route(true);
             });
@@ -327,13 +325,13 @@ impl Tun {
         })
     }
 
-    /// 网卡实际的名字：`i3t0`（Linux、Windows）、`utun7`（macOS）。
+    /// 返回操作系统实际分配的虚拟网卡名称（如 Linux/Windows 的 `i3t0`、macOS 的 `utun7`）。
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// 这块网卡和内核之间谈下来的交接办法。
+    /// 返回当前虚拟网卡实际生效的分段卸载模式。
     #[must_use]
     pub fn offload(&self) -> Offload {
         #[cfg(target_os = "linux")]

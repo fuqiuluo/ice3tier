@@ -1,14 +1,14 @@
-//! 节点上报的"连得上哪些 relay"在 controller 这一侧（谁连得上，它就是谁的 relay）。
+//! controller 侧对节点上报的 relay 连通性记录的处理。
 //!
 //! # Responsibilities
-//! - 把节点每次上报的结果并进存着的那一份（每个节点对每个 relay 只留最近一次）。
-//! - 数出每个 relay 有几个在线的节点连得上；一个也没有时给一条如实的提醒。
-//! - 两个节点之间缺一个两边都连得上的 relay 时，挑一个让它们都挂上去（[`shared_relays`]）。
+//! - 将节点每次上报的结果合并到持久化记录中（每个节点对每个 relay 仅保留最近一次结果）。
+//! - 统计每个 relay 当前可被多少在线节点连通；若没有任何已探测的在线节点可连通，则生成相应提醒。
+//! - 当两个节点之间缺少共同可达的 relay 时，选定一个共同 relay 要求双方同时挂靠（[`shared_relays`]）。
 //! - 定节点的出口地址（[`egress_ip`]）。
 //!
 //! # Invariants
 //! - 每个节点存的结果不超过 [`MAX_RELAY_TRIES`] 项，只有它所在网络里启用着的 relay。
-//! - 一个只有部分节点连得上的 relay 不是毛病，不提醒；只有试过的在线节点一个也没连上时才说一句。
+//! - 仅对部分节点可达的 relay 属于正常情况，不触发告警；仅当已探测该 relay 的在线节点均无法连通时才生成提醒。
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,13 +28,13 @@ const AT_RESOLUTION: Timestamp = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Merged {
     pub(crate) records: Vec<ReachRecord>,
-    /// 有 relay 从连得上变成连不上（或者反过来），或者多了一个结果：两个节点之间缺不缺共同的 relay 可能跟着变，要重算 netmap。
+    /// 存在 relay 的可达状态变化（可达与不可达互转）或新增记录：节点间是否缺少共同可达 relay 可能随之变化，需要重算 netmap。
     pub(crate) reach_changed: bool,
 }
 
 /// 把节点 `node` 这一次上报的结果并进存着的那一份。没有任何要记的变化时返回 `None`。
 ///
-/// 只收 `relays`（它所在网络里启用着的 relay）里、不是它自己的；不认识的结果不收。结果和看到的 IP 都没变时，
+/// 仅接受属于 `relays`（所在网络已启用的 relay）且非节点自身的条目；忽略未知结果。若连通结果和观测到的 IP 均未变化，
 /// 时刻最多每 [`AT_RESOLUTION`] 秒更新一次。不再是 relay 的项去掉；超过 [`MAX_RELAY_TRIES`] 项时留最近试的那些。
 pub(crate) fn merge(
     stored: &[ReachRecord],
@@ -122,12 +122,12 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// 按上报的结果看用不了 UDP 的节点：它连得上的 relay 里没有一个经 UDP，并且至少有一个它只经 TCP 连上的 relay，
-/// 别的节点经 UDP 连得上。`nodes` 是一个网络里的全部节点（在线的和离线的：离线的报过的照样是证据）。
+/// 根据上报记录筛选疑似不可用 UDP 的节点：在其所有可达 relay 中没有任何一个经 UDP 连通，且至少存在一个它仅经 TCP 连通、
+/// 而其他节点可经 UDP 连通的 relay。`nodes` 为网络内的全部节点（包括在线与离线节点：离线节点此前上报的记录仍可作为依据）。
 ///
-/// 只经 TCP 连上一个本来就没有 UDP 的 relay，说明不了这个节点自己：那个 relay 谁都只能经 TCP 连。所以要有一个别人经 UDP
-/// 连得上的 relay 作对照。只有一个 relay、或者 relay 都没有 UDP 的网络里谁都认定不了，那里的路本来就绕不开 TCP 的那一段，
-/// 节点自己这一段就看得出来。结果只是这一刻的证据，什么时候算数见 `controller::no_udp`。
+/// 仅经 TCP 连上一个本身不支持 UDP 的 relay 并不能证明该节点不可用 UDP，因为所有节点都只能经 TCP 连接该 relay；因此必须以其他节点经 UDP
+/// 可达的 relay 作为对照。若网络中只有一个 relay，或所有 relay 均不支持 UDP，则无法做出此判定（此类路径本身必然经过 TCP，
+/// 节点在自身这一段即可感知）。返回值仅表示当前时刻的依据，何时生效见 `controller::no_udp`。
 pub(crate) fn without_udp<'a>(nodes: impl IntoIterator<Item = &'a NodeRecord>) -> BTreeSet<NodeId> {
     let nodes: Vec<&NodeRecord> = nodes.into_iter().collect();
     let udp_relays: BTreeSet<NodeId> = nodes
@@ -186,7 +186,7 @@ impl ReachIndex {
         self.counts.get(&relay).copied().unwrap_or_default()
     }
 
-    /// 启用着的 relay，在线的节点里试过它的一个也没有连上时，如实说一句。有一个连得上就不说：它就是那些节点的 relay。
+    /// 对已启用的 relay，若探测过它的在线节点均无法连通，则返回不可达提醒；只要有至少一个在线节点可连通即不告警。
     pub(crate) fn warning(&self, relay: NodeId) -> Option<NodeWarning> {
         let count = self.counts.get(&relay)?;
         (count.reached == 0 && count.unreached > 0).then_some(NodeWarning::RelayUnreached { tried: count.unreached })
@@ -219,7 +219,7 @@ pub(crate) struct Side {
     pub(crate) is_relay: bool,
     /// 它自己挑的挂靠对象（不算 controller 要它另外挂的）。
     pub(crate) own: BTreeSet<NodeId>,
-    /// 它上报的、连得上的 relay。
+    /// 节点上报的可达 relay 集合。
     pub(crate) reached: BTreeSet<NodeId>,
 }
 
@@ -241,12 +241,12 @@ impl Side {
 
 /// `a` 和 `b` 之间要不要另找一个共同的 relay，要的话是哪一个。
 ///
-/// 默认模式下，`a` 经 relay 到 `b` 用的是：`b` 自己（它是 relay、`a` 连得上它），`a` 自己（它是 relay、`b` 连得上它），
-/// 或者 `b` 挂靠的某个 relay（`a` 要连得上它）。反方向一样。两个方向都有路时不用找。
+/// 默认模式下，`a` 经 relay 到 `b` 可通过：`b` 自身（`b` 是 relay 且 `a` 可达），`a` 自身（`a` 是 relay 且 `b` 可达），
+/// 或 `b` 挂靠的某个 `a` 可达的 relay；反方向同理。当双向均已有可达路径时无需额外指定。
 ///
-/// 要找时，在两边都连得上的 relay 里挑：两边已经挂着的优先（少挂一个是一个），一样时取编号小的。两个节点算出来的是同一个，
-/// 所以各自挂上去之后正好碰头。只看各自自己挑的挂靠对象（不看 controller 要它另外挂的），所以结果不会因为挂上去了又变回去。
-/// 两边没有共同连得上的 relay 时返回 `None`：延迟优先模式下也许还有经几个 relay 的路，这里不管。
+/// 需要指定时，在双方共同可达的 relay 中选择：优先选择双方已挂靠的（尽量减少新增挂靠），相同时取节点编号较小者。双方计算结果一致，
+/// 因此各自挂靠后可在同一 relay 会合。计算时仅考虑节点自主选择的挂靠（不计 controller 分配的共享挂靠），避免挂靠生效后结果抖动。
+/// 若双方无共同可达的 relay 则返回 `None`：延迟优先模式下可能仍存在多跳 relay 路径，此处不处理。
 pub(crate) fn meeting_relay(a: &Side, b: &Side, relays: &BTreeSet<NodeId>) -> Option<NodeId> {
     let through_each_other = (b.is_relay && a.reached.contains(&b.id)) || (a.is_relay && b.reached.contains(&a.id));
     let a_to_b = b.own.iter().any(|relay| a.reached.contains(relay));

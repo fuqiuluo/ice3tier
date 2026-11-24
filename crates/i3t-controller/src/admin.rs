@@ -160,7 +160,7 @@ impl From<Error> for Failure {
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!("管理请求失败：{}", error_chain(&error));
             // 内部错误的细节只进日志，不发给调用方；只说是哪个环节。
-            let message = "controller 内部出错，详情见它的日志".to_owned();
+            let message = "controller 内部错误，详情请查看 controller 日志".to_owned();
             return Self::new(status, ErrorCode::Internal, error.what().as_deref(), message);
         }
         tracing::info!(?code, reason = %error, "拒绝管理请求");
@@ -185,8 +185,8 @@ async fn require_admin(State(controller): State<App>, request: Request, next: Ne
         request.headers().get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()).and_then(|value| value.strip_prefix("Bearer "));
     let (what, reason) = match presented {
         Some(token) if controller.is_admin_token(token.trim()) => return next.run(request).await,
-        Some(_) => ("wrong", "管理令牌不对"),
-        None => ("missing", "请求没有带管理令牌（Authorization: Bearer <令牌>）"),
+        Some(_) => ("wrong", "管理令牌不正确"),
+        None => ("missing", "请求未携带管理令牌（Authorization: Bearer <令牌>）"),
     };
     let remote = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0);
     tracing::warn!(?remote, path = %request.uri().path(), reason, "拒绝管理请求");
@@ -194,14 +194,14 @@ async fn require_admin(State(controller): State<App>, request: Request, next: Ne
 }
 
 async fn no_such_endpoint() -> Failure {
-    Failure::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, Some("endpoint"), "没有这个接口".to_owned())
+    Failure::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, Some("endpoint"), "接口不存在".to_owned())
 }
 
 async fn method_not_allowed() -> Failure {
-    Failure::new(StatusCode::METHOD_NOT_ALLOWED, ErrorCode::InvalidRequest, Some("method"), "这个接口不支持这种请求方法".to_owned())
+    Failure::new(StatusCode::METHOD_NOT_ALLOWED, ErrorCode::InvalidRequest, Some("method"), "该接口不支持当前请求方法".to_owned())
 }
 
-/// 路径里的参数。解析不了时按统一的格式报错。
+/// 路径参数。解析失败时按统一格式返回错误。
 struct Path<T>(T);
 
 impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Path<T> {
@@ -220,7 +220,7 @@ impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Path<T>
                     ErrorKind::ParseError { .. } if names.as_ref().is_some_and(|names| names.iter().count() == 1) => nth(0),
                     _ => None,
                 };
-                Err(Failure::bad_request("path", field, format!("路径里的编号不对：{}", error.body_text())))
+                Err(Failure::bad_request("path", field, format!("路径中的编号无效：{}", error.body_text())))
             }
             Err(rejection) => Err(Failure::bad_request("path", None, rejection.body_text())),
         }
@@ -238,7 +238,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for Query<T> {
             Ok(axum::extract::Query(value)) => Ok(Self(value)),
             Err(rejection @ QueryRejection::FailedToDeserializeQueryString(_)) => {
                 let text = rejection.body_text();
-                Err(Failure::bad_request("query", named_field(&text), format!("查询参数不对：{text}")))
+                Err(Failure::bad_request("query", named_field(&text), format!("查询参数无效：{text}")))
             }
             Err(rejection) => Err(Failure::bad_request("query", None, rejection.body_text())),
         }
@@ -257,10 +257,12 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
             Err(rejection) => {
                 let text = rejection.body_text();
                 let (what, field, said) = match &rejection {
-                    JsonRejection::MissingJsonContentType(_) => ("content_type", None, "请求体要是 JSON（Content-Type: application/json）"),
+                    JsonRejection::MissingJsonContentType(_) => {
+                        ("content_type", None, "请求体必须为 JSON（Content-Type: application/json）")
+                    }
                     JsonRejection::JsonSyntaxError(_) => ("syntax", None, "请求体不是合法的 JSON"),
-                    JsonRejection::JsonDataError(_) => ("data", data_field(&text), "请求体里的字段不对"),
-                    _ => ("body", None, "请求体读不出来"),
+                    JsonRejection::JsonDataError(_) => ("data", data_field(&text), "请求体字段无效"),
+                    _ => ("body", None, "无法读取请求体"),
                 };
                 Err(Failure::bad_request(what, field, format!("{said}：{text}")))
             }
@@ -430,7 +432,7 @@ async fn status(State(app): State<App>) -> Reply {
 async fn log(State(app): State<App>, Query(query): Query<LogQuery>) -> Reply {
     let reference = match query.reference.as_deref().map(str::parse::<LogRef>).transpose() {
         Ok(reference) => reference,
-        Err(error) => return Err(Failure::bad_request("query", Some("ref".to_owned()), format!("查询参数 ref 不对：{error}"))),
+        Err(error) => return Err(Failure::bad_request("query", Some("ref".to_owned()), format!("查询参数 ref 无效：{error}"))),
     };
     let filter = LogFilter {
         limit: query.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT),
@@ -540,7 +542,7 @@ async fn delete_node(State(app): State<App>, Path((network, node)): Path<(Networ
     deleted(&app, move |controller| controller.delete_node(network, node)).await
 }
 
-/// 启用之后从 controller 这边试连 relay 的地址，结果和节点一起回给调用方。试连只是参考：谁连得上它，它就是谁的 relay。
+/// 启用后从 controller 侧探测 relay 地址的连通性，并将结果与节点信息一并返回给调用方。探测结果仅供参考，仅反映 controller 到该地址的连通性。
 async fn enable_relay(
     State(app): State<App>,
     Path((network, node)): Path<(NetworkId, NodeId)>,

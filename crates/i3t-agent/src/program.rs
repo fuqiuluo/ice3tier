@@ -25,7 +25,7 @@ impl Program {
     ///
     /// # Errors
     ///
-    /// 系统给不出当前程序的路径。
+    /// 无法获取当前可执行文件路径。
     pub fn detect(version: Version) -> anyhow::Result<Self> {
         let path = i3t_update::current_program().context(crate::texts::texts().find_program)?;
         let blocker = i3t_update::self_update_blocker(&path);

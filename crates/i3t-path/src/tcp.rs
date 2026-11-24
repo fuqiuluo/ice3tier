@@ -1,8 +1,8 @@
-//! 节点一侧到 relay 的那条 TCP（UDP 用不了时的退路）。握手的规则在 [`crate::relays`]，这里只管连接和搬运。
+//! 节点侧到 relay 的 TCP 连接（UDP 不可用时的回退通道）。握手规则见 [`crate::relays`]，本模块仅负责连接建立与帧收发。
 //!
-//! 本节点自己是 relay、拨的是另一个 relay 时，这条 TCP 是骨干上的一段（[`crate::backbone`]）：对方在上面反过来和本节点的
-//! relay 建会话、送要往下转的包，这些交给本节点的 relay。另一种是别的 relay 拨进来、由本节点的 relay 接住的，
-//! 路径层只是借来用（[`TcpLegHandle::adopted`]），读写都在 relay 那边。
+//! 当本节点为 relay 且拨号目标为另一个 relay 时，该 TCP 连接作为骨干链路（[`crate::backbone`]）：对方在该连接上反向与本节点
+//! relay 建立会话并转发数据报，相关帧交给本节点 relay 处理。另一种情况是由其他 relay 拨入、本节点 relay 接受的连接，
+//! 路径层直接复用该连接（[`TcpLegHandle::adopted`]），读写仍由 relay 侧负责。
 
 use std::io;
 use std::net::SocketAddr;
@@ -24,31 +24,31 @@ use crate::control::Ctrl;
 use crate::table::{RelaySlot, Shared};
 use crate::timing::TCP_LEG_GIVE_UP;
 
-/// 每个地址连多久算连不上。
+/// 单个地址的连接超时时间。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-/// 一个 relay 有几个地址时，前一个还没连上，隔这么久就同时去连下一个（前一个失败了就马上连下一个）。
-/// 连不上的地址多半是根本不回答，挨个等满 [`CONNECT_TIMEOUT`] 的话，排在后面的好地址要等好几秒。
+/// relay 存在多个地址时，若前一个地址尚未连上，每隔该时间并发尝试下一个地址（前一个失败时立即尝试下一个）。
+/// 不可达地址通常会静默丢包，若顺序等待完整的 [`CONNECT_TIMEOUT`]，排在后面的可用地址将被延迟数秒。
 const CONNECT_STAGGER: Duration = Duration::from_millis(250);
 
-/// 这条 TCP 上发生的事，报给控制任务。
+/// 该 TCP 连接上产生并上报给控制任务的事件。
 #[derive(Debug)]
 pub(crate) enum TcpEvent {
-    /// 连上了这个地址。
+    /// 已连接到该地址。
     Connected(SocketAddr),
-    /// relay 发来的会话帧，错误帧除外。
+    /// relay 发来的会话帧（错误帧除外）。
     Frame(Frame),
-    /// relay 发来的错误帧和它回显的字节。
+    /// relay 发来的错误帧及其回显字节。
     Refusal(Refused, Echo),
-    /// relay 发来的骨干矩阵的一行，整帧。
+    /// relay 发来的骨干矩阵行（完整帧）。
     Row(Bytes),
-    /// 没连上，或者断了。
+    /// 连接失败或已断开。
     Closed,
 }
 
-/// 一条到 relay 的 TCP。丢弃它就关掉连接（借来用的那种除外：它归本节点的 relay）。
+/// 到 relay 的 TCP 连接句柄。丢弃该句柄将关闭连接（复用的外部拨入连接除外，其所有权属于本节点 relay）。
 #[derive(Debug)]
 pub(crate) struct TcpLegHandle {
-    /// 控制任务给这条 TCP 编的号。同一个 relay 先后连过几次时，靠它认出迟到的事件属于哪一次。
+    /// 控制任务为该 TCP 连接分配的编号。同一 relay 多次重连时，用于识别迟到事件所属的连接。
     pub(crate) conn: u64,
     pub(crate) sender: FrameSender,
     origin: Origin,
@@ -56,19 +56,19 @@ pub(crate) struct TcpLegHandle {
 
 #[derive(Debug)]
 enum Origin {
-    /// 本节点拨出去的：读写它的任务。
+    /// 本节点主动拨出的连接及其读写任务。
     Dialled { task: JoinHandle<()>, shared: Arc<Shared> },
-    /// 别的 relay 拨进来、本节点的 relay 接住的第 `accepted` 条（relay 编的号）。
+    /// 其他 relay 拨入、由本节点 relay 接受的第 `accepted` 条连接（relay 侧编号）。
     Adopted { accepted: u64 },
 }
 
 impl TcpLegHandle {
-    /// 借用别的 relay 拨进来的第 `accepted` 条 TCP（[`crate::backbone`]）：路径层在上面建自己的会话，写进 `sender`。
+    /// 复用其他 relay 拨入的第 `accepted` 条 TCP 连接（[`crate::backbone`]）：路径层在其上建立会话，通过 `sender` 写入帧。
     pub(crate) const fn adopted(conn: u64, accepted: u64, sender: FrameSender) -> Self {
         Self { conn, sender, origin: Origin::Adopted { accepted } }
     }
 
-    /// 借来的那条 TCP 在 relay 那边的编号；本节点拨出去的是 `None`。
+    /// 复用连接在 relay 侧的编号；本节点主动拨出时为 `None`。
     pub(crate) const fn accepted(&self) -> Option<u64> {
         match self.origin {
             Origin::Adopted { accepted } => Some(accepted),
@@ -76,7 +76,7 @@ impl TcpLegHandle {
         }
     }
 
-    /// 对方 relay 在本节点 relay 上的会话（`theirs`）是不是就在这条 TCP 上：骨干上的这一段两个会话都在同一条 TCP 上才通。
+    /// 检查对方 relay 在本节点 relay 上的会话（`theirs`）是否位于该 TCP 连接上：骨干链路需两端会话共用同一条 TCP 连接方可互通。
     pub(crate) fn carries(&self, theirs: SessionLeg) -> bool {
         match self.origin {
             Origin::Adopted { accepted } => theirs == SessionLeg::Accepted(accepted),
@@ -89,7 +89,7 @@ impl Drop for TcpLegHandle {
     fn drop(&mut self) {
         if let Origin::Dialled { task, shared } = &self.origin {
             task.abort();
-            // 对方反过来绑在这条 TCP 上的会话（骨干）也跟着没了。
+            // 对方反向绑定在该 TCP 连接上的骨干会话随之失效。
             if let Some(local) = shared.local_relay.get() {
                 local.leg_closed(self.conn);
             }
@@ -97,7 +97,7 @@ impl Drop for TcpLegHandle {
     }
 }
 
-/// 去连 `addrs` 里的地址（按顺序错开一点时间一个个开始，先连上的那个为准），之后在这条 TCP 上收发帧。
+/// 尝试连接 `addrs` 中的地址（按顺序错峰并发连接，取最先建立的一条），随后在该 TCP 连接上收发帧。
 pub(crate) fn spawn(shared: Arc<Shared>, relay: Arc<RelaySlot>, conn: u64, addrs: Vec<SocketAddr>) -> TcpLegHandle {
     let (sender, queue) = tcp_leg::frame_queue();
     let leg = sender.clone();
@@ -105,8 +105,8 @@ pub(crate) fn spawn(shared: Arc<Shared>, relay: Arc<RelaySlot>, conn: u64, addrs
         let shared = Arc::clone(&shared);
         async move {
             let reason = run(&shared, &relay, conn, &addrs, (leg, queue)).await;
-            tracing::debug!(relay = %relay.id, conn, reason, "到 relay 的 TCP 结束");
-            // 控制任务已经没了的话，这个事件也没有人要了。
+            tracing::debug!(relay = %relay.id, conn, reason, "到 relay 的 TCP 连接结束");
+            // 控制任务已停止时无需处理该关闭事件。
             let _closed = shared.ctrl.send(Ctrl::Tcp { relay: relay.id, conn, event: TcpEvent::Closed }).await;
         }
     });
@@ -120,46 +120,46 @@ async fn run(
     addrs: &[SocketAddr],
     (sender, queue): (FrameSender, FrameQueue),
 ) -> &'static str {
-    let Ok((stream, addr)) = connect_first(addrs).await else { return "连不上" };
+    let Ok((stream, addr)) = connect_first(addrs).await else { return "TCP 连接失败" };
     if tcp_leg::configure(&stream).is_err() {
-        return "设置不了 socket 选项";
+        return "socket选项无法修改";
     }
     if !Recovery::giving_up_after(TCP_LEG_GIVE_UP).apply(&stream) {
-        tracing::debug!(relay = %relay.id, "到 relay 的 TCP 没有设重传上限（内核不支持），断网之后恢复得慢一些");
+        tracing::debug!(relay = %relay.id, "到 relay 的 TCP 连接未设置重传超时上限（内核不支持），断网后恢复会较慢");
     }
     if shared.ctrl.send(Ctrl::Tcp { relay: relay.id, conn, event: TcpEvent::Connected(addr) }).await.is_err() {
-        return "路径层已经停了";
+        return "路径层已停止";
     }
     let (read_half, write_half) = stream.into_split();
     let leg = Leg { conn, addr, sender };
     tokio::select! {
-        _ = tcp_leg::write_frames(write_half, queue) => "写不进去了",
+        _ = tcp_leg::write_frames(write_half, queue) => "TCP 写入任务结束",
         reason = read(shared, relay, &leg, FrameReader::new(read_half)) => reason,
     }
 }
 
-/// 读这条 TCP 时要知道的：编号，对端地址，往里写的一头（本节点的 relay 回话用）。
+/// 读取该 TCP 连接所需的上下文：连接编号、对端地址及写入端（供本节点 relay 应答使用）。
 struct Leg {
     conn: u64,
     addr: SocketAddr,
     sender: FrameSender,
 }
 
-/// 按顺序去连 `addrs`：每隔 250 毫秒（或者前一个失败时马上）开始连下一个，几个同时在连，先连上的那个为准，
-/// 别的放下。每个地址最多等 4 秒。所以排在前面的地址连不上（不回答）时，后面的好地址不用等它超时。
-/// 握手里通告压低的 MSS（[`tcp_mss`]）。
+/// 按顺序尝试连接 `addrs`：每隔 250 毫秒（或前一个地址失败后立即）并发连接下一个地址，取最先成功的一条，
+/// 取消其余尝试。单个地址最多等待 4 秒，避免排在前面的不可达地址阻塞后续可用地址。
+/// 握手阶段会通告下调后的 MSS（[`tcp_mss`]）。
 ///
-/// relay 的几个地址（controller 找出来的）不一定都连得上：到 relay 的 TCP 中转和 ice3proxy（`i3t-lane`）
-/// 都这样连。调用方按"上一次连上的排最前"排好 `addrs`。
+/// controller 发现的 relay 地址并非全部可达，到 relay 的 TCP 中继连接与 ice3proxy（`i3t-lane`）
+/// 均采用该策略。调用方应将上次成功连接的地址排在 `addrs` 最前。
 ///
 /// # Errors
 ///
-/// 全都连不上：最后一个失败的原因；全都超时（或者 `addrs` 是空的）时是 [`io::ErrorKind::TimedOut`]。
+/// 所有地址均连接失败时返回最后一个错误；全部超时（或 `addrs` 为空）时返回 [`io::ErrorKind::TimedOut`]。
 pub async fn connect_first(addrs: &[SocketAddr]) -> io::Result<(TcpStream, SocketAddr)> {
     let mut pending = addrs.iter().copied();
     let mut attempts = JoinSet::new();
     let mut next_start = tokio::time::Instant::now();
-    let mut last_error = io::Error::new(io::ErrorKind::TimedOut, "没有连得上的地址");
+    let mut last_error = io::Error::new(io::ErrorKind::TimedOut, "无可达地址");
     loop {
         let more = pending.len() > 0;
         tokio::select! {
@@ -172,12 +172,12 @@ pub async fn connect_first(addrs: &[SocketAddr]) -> io::Result<(TcpStream, Socke
             Some(done) = attempts.join_next() => match done {
                 Ok((addr, Ok(Ok(stream)))) => return Ok((stream, addr)),
                 Ok((addr, Ok(Err(error)))) => {
-                    tracing::debug!(%addr, %error, "连 TCP 失败");
+                    tracing::debug!(%addr, %error, "TCP 连接失败");
                     last_error = error;
                     next_start = tokio::time::Instant::now();
                 }
-                Ok((addr, Err(_))) => tracing::debug!(%addr, "连 TCP 超时"),
-                // 连接的任务不会 panic，也只在这里被放下。
+                Ok((addr, Err(_))) => tracing::debug!(%addr, "TCP 连接超时"),
+                // 连接任务不会 panic，仅在此处取消丢弃。
                 Err(_) => {}
             },
             else => return Err(last_error),
@@ -185,8 +185,8 @@ pub async fn connect_first(addrs: &[SocketAddr]) -> io::Result<(TcpStream, Socke
     }
 }
 
-/// 读这条 TCP：发给本节点的中转帧去掉头交给连接层，会话的应答和矩阵行交给控制任务；对方 relay 的会话请求和要往下转的包
-/// 交给本节点的 relay（本节点不是 relay 时它丢掉）。别的丢掉。
+/// 读取该 TCP 连接：将发往本节点的中转帧去除头部后交给连接层，会话应答与矩阵行交给控制任务；
+/// 对方 relay 的会话请求与待转发数据包交给本节点 relay（非 relay 节点丢弃）；其余帧丢弃。
 async fn read(shared: &Shared, relay: &RelaySlot, leg: &Leg, mut reader: FrameReader) -> &'static str {
     let conn = leg.conn;
     let to_relay = |frame: &[u8]| {
@@ -197,15 +197,15 @@ async fn read(shared: &Shared, relay: &RelaySlot, leg: &Leg, mut reader: FrameRe
     loop {
         let frame = match reader.next().await {
             Ok(Some(frame)) => frame,
-            Ok(None) => return "relay 关闭了连接",
-            Err(_) => return "读出错",
+            Ok(None) => return "relay 已关闭连接",
+            Err(_) => return "TCP 读取失败",
         };
         relay.last_rx.touch(&shared.clock);
         match Datagram::parse(&frame) {
             Ok(Datagram::Relayed { header, .. }) if header.dst == shared.me => {
-                // 连接层来不及收的时候在这里等，压力传回这条 TCP，relay 那头的队列会开始丢包。
+                // 连接层来不及接收时在此阻塞，背压传递回该 TCP 连接，relay 端队列将开始丢包。
                 if shared.inbound.send((header.src, frame.slice(RelayHeader::LEN..))).await.is_err() {
-                    return "路径层已经停了";
+                    return "路径层已停止";
                 }
             }
             // 多级中转的包：这条 TCP 通向的 relay 必须就是路径上的最后一个。
@@ -213,7 +213,7 @@ async fn read(shared: &Shared, relay: &RelaySlot, leg: &Leg, mut reader: FrameRe
                 if header.dst == shared.me && header.relays.last() == relay.id && header.relays.around(shared.me).is_none() =>
             {
                 if shared.inbound.send((header.src, frame.slice(header.encoded_len()..))).await.is_err() {
-                    return "路径层已经停了";
+                    return "路径层已停止";
                 }
             }
             // 骨干：对方在这条 TCP 上反过来和本节点的 relay 建会话、保活，或者把要本节点往下转的包交过来。
@@ -226,12 +226,12 @@ async fn read(shared: &Shared, relay: &RelaySlot, leg: &Leg, mut reader: FrameRe
                     (session, _) => TcpEvent::Frame(session),
                 };
                 if shared.ctrl.send(Ctrl::Tcp { relay: relay.id, conn, event }).await.is_err() {
-                    return "路径层已经停了";
+                    return "路径层已停止";
                 }
             }
             Ok(Datagram::Row(_)) => {
                 if shared.ctrl.send(Ctrl::Tcp { relay: relay.id, conn, event: TcpEvent::Row(frame) }).await.is_err() {
-                    return "路径层已经停了";
+                    return "路径层已停止";
                 }
             }
             Ok(_) | Err(_) => {}

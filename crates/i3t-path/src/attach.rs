@@ -3,9 +3,9 @@
 //! 一台不做 I/O 的状态机，UDP 和 TCP 上各用一份：外面告诉它时间和 relay 发来了什么，它回答该发什么、会话还在不在。
 //! 签名在外面做：它只说"该发 AUTH 了"，OK 的签名由外面验过才交进来。
 //!
-//! relay 的 ERROR 没有签名，伪造来源地址的人也能冒充 relay 发。所以它只在回显对得上时才算数（格式见
-//! [`i3t_proto::session`]）：说本节点没有会话的，要回显一个还在等回答的保活 PING 的随机数；说别的路走不通的，
-//! 要回显这个会话握手时的随机数。说没有会话、回显又对不上的（relay 回答中转帧时只能这样）只是个提示：马上发一个 PING 去问。
+//! relay 的 ERROR 帧不带签名，伪造来源地址的一方也可冒充发送。因此仅在回显内容匹配时采信（格式见
+//! [`i3t_proto::session`]）：指示无会话的错误帧须回显待响应保活 PING 的随机数；指示路径不可达的错误帧
+//! 须回显本次会话握手的随机数。若指示无会话但回显无法核对（relay 响应中继帧时只能如此），仅作提示：立即发送 PING 核实。
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -15,8 +15,8 @@ use i3t_proto::session::{Accepted, Challenge, Cookie, Echo, Nonce, Pong};
 use crate::estimate::{Estimate, Quality, Train};
 use crate::timing::{HANDSHAKE_RETRY, HANDSHAKE_TRIES, MAX_TIMEOUTS, PROBE_INTERVAL, Rtt, SILENCE, TCP_HANDSHAKE_STEP};
 
-/// 回显对不上的"没有会话"最多这么频繁地引出一个核实用的 PING。真的 relay 给中转帧回错误帧本来就是一秒一个；
-/// 伪造的再多，本节点也只是每秒多发一个 PING。
+/// 回显无法匹配的“无会话”错误帧触发核实 PING 的最小间隔。真实 relay 对中继帧返回错误帧的频率本就为每秒一次；
+/// 即使收到大量伪造帧，本节点也至多每秒多发送一次 PING。
 const NO_SESSION_CHECK_GAP: Duration = Duration::from_secs(1);
 
 /// 要外面去发的帧。节点编号和签名由外面填。
@@ -77,14 +77,14 @@ enum State {
 #[derive(Debug)]
 pub(crate) struct Session {
     state: State,
-    /// 这一段链路的延迟、抖动和丢包。保活和探测包列的结果都记在这里。
+    /// 该段链路的延迟、抖动与丢包统计，汇总保活探测与探测包列的测量结果。
     estimate: Estimate,
     train: Train,
     /// 这段链路是不是在正在评估的候选路径上：是的话定期发探测包列。
     training: bool,
     /// 保活的间隔。挂靠的 relay 是 5 秒，relay 和 relay 之间是 2 秒。
     interval: Duration,
-    /// 上一次因为一个核对不了的"没有会话"提前发 PING 的时刻。
+    /// 上一次因无法核对回显的“无会话”提示而提前发送 PING 的时刻。
     checked: Option<Instant>,
     /// 这个会话走在 TCP 里：帧不会丢，只会迟到，所以握手不重发、每一步等得更久。
     reliable: bool,
@@ -104,12 +104,12 @@ impl Session {
         }
     }
 
-    /// 走在 TCP 里的会话。`estimate` 是同一段链路上一个会话留下的测量值，接着用（见 [`measured`](Self::measured)）。
+    /// 运行在 TCP 上的会话。`estimate` 沿用同一链路前一会话保留的测量数据（见 [`measured`](Self::measured)）。
     pub(crate) const fn over_tcp(estimate: Estimate) -> Self {
         Self { state: State::Idle, estimate, train: Train::new(), training: false, interval: PROBE_INTERVAL, checked: None, reliable: true }
     }
 
-    /// 这段链路上测到的全部结果。会话没了之后链路还是那一段，留给下一个会话接着用。
+    /// 该段链路的累计测量数据。会话断开后链路物理条件未变，可保留供下一会话继续使用。
     pub(crate) const fn measured(&self) -> &Estimate {
         &self.estimate
     }
@@ -147,8 +147,8 @@ impl Session {
 
     /// 开始握手，返回要发的 INIT。
     ///
-    /// `hold` 为真时拿到 cookie 就停下，等 [`release`](Self::release)：TCP 和 UDP 同时试的时候，TCP 这边先走到这一步
-    /// 证明连得上，但不发 AUTH。因为 relay 上一个节点只有一个会话，后握手的顶掉先握手的，TCP 抢先的话包就会走 TCP。
+    /// `hold` 为真时在获取 cookie 后暂停，等待 [`release`](Self::release)：并行尝试 TCP 与 UDP 时，TCP 先完成至此
+    /// 以验证连通性，但暂不发送 AUTH。因为 relay 对每个节点仅保留一个会话，后完成的握手会覆盖前者，防止 TCP 抢先导致流量走 TCP。
     pub(crate) fn start(&mut self, now: Instant, hold: bool) -> Send {
         let nonce: Nonce = i3t_underlay::random_bytes();
         self.state = State::AwaitChallenge { nonce, sent: now, tries: 1, hold };
@@ -206,7 +206,7 @@ impl Session {
         Step { send: None, event: Some(Event::Up { observed: ok.observed }) }
     }
 
-    /// PONG。返回 relay 看到的本节点地址；随机数对不上时返回 `None`。
+    /// 处理 PONG 帧。返回 relay 观察到的本节点地址；随机数不匹配时返回 `None`。
     pub(crate) fn on_pong(&mut self, pong: &Pong, now: Instant) -> Option<SocketAddr> {
         let State::Up { nonce: session, last_ping, awaiting, .. } = self.state else { return None };
         match awaiting {
@@ -227,12 +227,12 @@ impl Session {
 
     /// relay 说本节点在它那里没有会话，错误帧回显的是 `echo`。
     ///
-    /// 回显的是一个还在等回答（或者刚超时）的保活 PING 的随机数：这是 relay 对那个 PING 的回答，会话确实没了。
-    /// 别的回显核对不了，只当作提示：马上发一个 PING 去问，relay 怎么回答它才算数。
+    /// 若回显匹配待响应（或刚超时）的保活 PING 随机数，则确认 relay 已无对应会话。
+    /// 其余无法核对的回显仅作为提示：立即发送 PING 向 relay 核实，以 relay 的实际响应为准。
     pub(crate) fn on_no_session(&mut self, echo: &Echo, now: Instant) -> Step {
         let State::Up { nonce, last_ping, awaiting, missed } = self.state else { return Step::default() };
         if awaiting.is_some_and(|(pinged, _)| pinged == *echo) || self.train.expects(echo) {
-            return self.fail("relay 说本节点没有会话");
+            return self.fail("relay 报告本节点无会话");
         }
         if awaiting.is_some() || self.checked.is_some_and(|at| now.saturating_duration_since(at) < NO_SESSION_CHECK_GAP) {
             return Step::default();
@@ -243,7 +243,7 @@ impl Session {
         Step { send: Some(Send::Ping { nonce: ping }), event: None }
     }
 
-    /// 推进定时器。`urgent`：有包正经这个 relay 发出去，却有一阵没有从它收到任何东西了。
+    /// 推进定时器。`urgent` 表示近期持续经该 relay 发包但一段时间内未收到任何回包。
     pub(crate) fn poll(&mut self, now: Instant, urgent: bool) -> Step {
         match self.state {
             State::Idle | State::Held { .. } => Step::default(),
@@ -253,7 +253,7 @@ impl Session {
                     self.state = State::AwaitChallenge { nonce, sent: now, tries: tries + 1, hold };
                     Step { send: Some(Send::Init { nonce }), event: None }
                 }
-                Retry::GiveUp => self.fail("握手没有回应"),
+                Retry::GiveUp => self.fail("握手无响应"),
             },
             State::AwaitOk { nonce, cookie, sent, tries } => match self.retry(sent, tries, now) {
                 Retry::Wait => Step::default(),
@@ -261,7 +261,7 @@ impl Session {
                     self.state = State::AwaitOk { nonce, cookie, sent: now, tries: tries + 1 };
                     Step { send: Some(Send::Auth { nonce, cookie }), event: None }
                 }
-                Retry::GiveUp => self.fail("握手的最后一步没有回应"),
+                Retry::GiveUp => self.fail("握手确认阶段无响应"),
             },
             State::Up { nonce, last_ping, awaiting, missed } => self.keep_alive(now, urgent, nonce, last_ping, awaiting, missed),
         }
@@ -293,7 +293,7 @@ impl Session {
             if let Some(sent) = self.train.oldest_overdue().filter(|_| self.reliable) {
                 self.estimate.stalled(now.saturating_duration_since(sent), now);
             }
-            return self.fail("保活连续没有回应");
+            return self.fail("保活连续无响应");
         }
         if !due {
             // 不到发保活的时候：探测包列该发的话发一个。它的回答只用来估丢包，不影响会话还在不在的判断。
@@ -305,7 +305,7 @@ impl Session {
         Step { send: Some(Send::Ping { nonce }), event: None }
     }
 
-    /// 握手的一步发出去之后该怎么办。走 UDP 的隔一会儿重发，发够了次数放弃；走 TCP 的只等，等得更久。
+    /// 决定当前握手步骤发送后的等待与重试策略：UDP 按间隔重发直至达到上限后放弃；TCP 不重发，仅延长等待超时。
     fn retry(&self, sent: Instant, tries: u8, now: Instant) -> Retry {
         let waited = now.saturating_duration_since(sent);
         if self.reliable {
@@ -398,7 +398,7 @@ mod tests {
             assert_eq!(session.poll(now, false).send, Some(Send::Init { nonce }), "重发用同一个随机数，哪个 CHALLENGE 回来都对得上");
         }
         now += HANDSHAKE_RETRY;
-        assert_eq!(session.poll(now, false).event, Some(Event::Down { reason: "握手没有回应" }));
+        assert_eq!(session.poll(now, false).event, Some(Event::Down { reason: "握手无响应" }));
         assert!(session.is_idle());
 
         // 第二步同样。
@@ -474,7 +474,7 @@ mod tests {
             assert!(session.in_doubt());
         }
         now += timeout;
-        assert_eq!(session.poll(now, false).event, Some(Event::Down { reason: "保活连续没有回应" }));
+        assert_eq!(session.poll(now, false).event, Some(Event::Down { reason: "保活连续无响应" }));
         assert!(session.is_idle());
     }
 
@@ -502,7 +502,7 @@ mod tests {
         let Some(Send::Ping { nonce }) = session.poll(up + PROBE_INTERVAL, false).send else { panic!("该发保活了") };
         assert_eq!(
             session.on_no_session(&nonce, up + PROBE_INTERVAL + 10 * MS).event,
-            Some(Event::Down { reason: "relay 说本节点没有会话" })
+            Some(Event::Down { reason: "relay 报告本节点无会话" })
         );
         assert!(session.is_idle());
         assert_eq!(session.on_no_session(&nonce, up + PROBE_INTERVAL + 20 * MS), Step::default(), "没有会话时这种帧没有意义");
@@ -633,7 +633,7 @@ mod tests {
                 break reason;
             }
         };
-        assert_eq!(reason, "保活连续没有回应");
+        assert_eq!(reason, "保活连续无响应");
         let stall = now.saturating_duration_since(first_ping.unwrap());
         assert!(stall >= Duration::from_secs(3), "三次超时，每次 1 秒（延迟的 4 倍）：{stall:?}");
         // 这一次停顿按它至少有多长算进平均：重连之后这条 TCP 不会只剩握手那两个漂亮的样本。

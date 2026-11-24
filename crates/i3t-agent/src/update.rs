@@ -5,7 +5,7 @@
 //! - controller 的指示从长连接来（[`UpdateCommand`]）。新的一条顶替正在做的那一条：更新库保证做到一半丢下是安全的，
 //!   取过的包也不会重新取。撤回就是丢下正在做的，把状态改回"没有更新在进行"。
 //!   和正在做的一模一样的指示不算新的：controller 每次重新连上都会把指示再发一遍，不能因此把做到一半的更新从头来过。
-//! - 包经长连接取（[`Packages`](crate::control::Packages)），链路断了算"被打断"，更新库自己会接着取。
+//! - 更新包经长连接拉取（[`Packages`](crate::control::Packages)），链路中断视为“已中断”，更新库会自动重试续传。
 //! - 更新库的状态每变一次就转出去（[`Driver::run`] 的 `reported`），装配层据此马上上报，并据此决定要不要排空。
 //! - 程序文件换好之后 [`Driver::run`] 返回，装配层让进程以"请重启我"的退出码退出。
 
@@ -51,7 +51,7 @@ impl<S: i3t_update::PackageSource + Clone + 'static> Driver<S> {
     /// 一直处理 controller 的指示，直到程序文件换好了、需要重启进程时才返回。
     pub(crate) async fn run(mut self) -> RestartRequired {
         let mut status = self.updater.status();
-        // 启动时更新库可能已经有话要说（上次更新失败换回来了）。
+        // 启动时更新库可能已有状态需要上报（如上次更新失败已回退）。
         self.publish(status.borrow_and_update().clone());
         let mut running: Option<Running> = None;
         loop {
@@ -65,7 +65,7 @@ impl<S: i3t_update::PackageSource + Clone + 'static> Driver<S> {
                         };
                     };
                     if running.as_ref().is_some_and(|current| current.was_ordered_by(&command)) {
-                        tracing::debug!("controller 重发了正在做的那条更新指示，接着做");
+                        tracing::debug!("controller 重发了当前正在执行的更新指令，继续执行");
                         continue;
                     }
                     // 先停下正在做的。它要是恰好已经把程序换好了，那就不能再做别的，只能重启。
@@ -115,7 +115,7 @@ impl<S: i3t_update::PackageSource + Clone + 'static> Driver<S> {
         restart
     }
 
-    /// 等一个正在做的更新做完。没有成功的话就没有什么可等的了。
+    /// 等待正在执行的更新任务完成。若未成功则不再返回。
     async fn finish(&self, task: JoinHandle<Result<RestartRequired, UpdateError>>) -> RestartRequired {
         match settled(task.await) {
             Some(restart) => self.restart(restart),

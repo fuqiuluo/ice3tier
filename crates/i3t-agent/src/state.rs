@@ -5,10 +5,10 @@
 //! | `node.key` | 节点私钥，PKCS#8 的 PEM，只有属主可读 |
 //! | `controller.json` | controller 的地址和公钥，注册时从令牌里得到 |
 //! | `config.toml` | 使用者手改的配置，见 [`crate::config`] |
-//! | `netmap.json` | 最后一份成功应用的 netmap。controller 不在线时节点靠它照常工作 |
+//! | `netmap.json` | 最后一份成功应用的 netmap。controller 离线时节点按该配置继续运行 |
 //! | `local.json` | 正在运行的节点的本机状态接口在哪里、凭什么问它。节点启动时写，退出时删 |
-//! | `ports.json` | 端口写 0 的端口转发挑定的端口，按转发的编号记。重启之后还用同一个端口 |
-//! | `quota.json` | 本节点作为出口时本账期的流量用量。重启之后接着记 |
+//! | `ports.json` | 配置端口为 0 的端口转发所分配的监听端口，按转发编号记录，重启后继续使用 |
+//! | `quota.json` | 本节点作为出口时本账期的流量用量，重启后继续累计 |
 //! | `update/` | 归 `i3t-update` 管：取了一半的更新包、待确认的版本、失败过的版本 |
 //!
 //! 所有文件都是先写临时文件再改名，所以断电不会留下写了一半的文件。
@@ -38,7 +38,7 @@ const QUOTA_FILE: &str = "quota.json";
 /// 节点默认绑定的端口。
 pub const DEFAULT_PORT: u16 = 20330;
 
-/// 出口本账期的流量用量，存下来跨重启用。
+/// 出口本账期的流量用量，持久化保存以供重启后继续统计。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct QuotaRecord {
     /// 这份用量属于哪个账期：账期开始的时刻，Unix 秒。
@@ -77,11 +77,11 @@ pub struct StateDir {
 }
 
 impl StateDir {
-    /// 打开状态目录，不存在就创建（只有属主可以进入）。
+    /// 打开状态目录，不存在则创建（仅属主可访问）。
     ///
     /// # Errors
     ///
-    /// 目录建不出来。
+    /// 状态目录创建或权限设置失败。
     pub fn open(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let root = root.into();
         ensure_not_reparse_or_symlink(&root).with_context(|| (texts().create_state_dir)(&root))?;
@@ -96,11 +96,11 @@ impl StateDir {
         &self.root
     }
 
-    /// 读出节点私钥；还没有时返回 `None`。
+    /// 读取节点私钥；尚不存在时返回 `None`。
     ///
     /// # Errors
     ///
-    /// 文件读不了，或者内容不是一把私钥。
+    /// 文件读取失败，或内容不是有效的节点私钥。
     pub fn key(&self) -> anyhow::Result<Option<NodeKey>> {
         let path = self.root.join(KEY_FILE);
         ensure_not_reparse_or_symlink(&path).with_context(|| (texts().read_key)(&path))?;
@@ -111,7 +111,7 @@ impl StateDir {
         }
     }
 
-    /// 读出节点私钥；还没有就生成一把并存下来。
+    /// 读取节点私钥；尚不存在时生成新私钥并保存。
     ///
     /// # Errors
     ///
@@ -127,7 +127,7 @@ impl StateDir {
 
     /// # Errors
     ///
-    /// 文件读不了或者解析不了。
+    /// 文件读取或解析失败。
     pub fn controller(&self) -> anyhow::Result<Option<ControllerInfo>> {
         self.read_json(CONTROLLER_FILE)
     }
@@ -147,7 +147,7 @@ impl StateDir {
 
     /// # Errors
     ///
-    /// 文件读不了或者解析不了。
+    /// 文件读取或解析失败。
     pub fn netmap(&self) -> anyhow::Result<Option<Netmap>> {
         self.read_json(NETMAP_FILE)
     }
@@ -159,11 +159,11 @@ impl StateDir {
         self.write_json(NETMAP_FILE, netmap)
     }
 
-    /// 正在运行的节点留下的本机状态接口；没有节点在运行（或者它没能开出这个接口）时是 `None`。
+    /// 正在运行的节点留下的本机状态接口；无节点运行（或启动状态接口失败）时返回 `None`。
     ///
     /// # Errors
     ///
-    /// 文件读不了或者解析不了。
+    /// 文件读取或解析失败。
     pub fn local(&self) -> anyhow::Result<Option<LocalEndpoint>> {
         self.read_json(LOCAL_FILE)
     }
@@ -175,11 +175,11 @@ impl StateDir {
         self.write_json(LOCAL_FILE, local)
     }
 
-    /// 节点退出时删掉本机状态接口的记录。本来就没有的话什么都不做。
+    /// 节点退出时删除本机状态接口记录。文件不存在时不执行任何操作。
     ///
     /// # Errors
     ///
-    /// 文件在但是删不掉。
+    /// 文件存在但删除失败。
     pub fn remove_local(&self) -> anyhow::Result<()> {
         let path = self.root.join(LOCAL_FILE);
         ensure_not_reparse_or_symlink(&path).with_context(|| format!("删除 {}", path.display()))?;
@@ -189,11 +189,11 @@ impl StateDir {
         }
     }
 
-    /// 端口写 0 的端口转发挑定的端口：转发的编号 → 端口。
+    /// 配置端口为 0 的端口转发所分配的监听端口：转发编号 → 端口号。
     ///
     /// # Errors
     ///
-    /// 文件读不了或者解析不了。
+    /// 文件读取或解析失败。
     pub fn forward_ports(&self) -> anyhow::Result<BTreeMap<u32, u16>> {
         Ok(self.read_json(PORTS_FILE)?.unwrap_or_default())
     }
@@ -205,11 +205,11 @@ impl StateDir {
         self.write_json(PORTS_FILE, ports)
     }
 
-    /// 上次存下的出口配额用量；从来没有存过时是 `None`。
+    /// 上次保存的出口配额用量；从未保存过时返回 `None`。
     ///
     /// # Errors
     ///
-    /// 文件读不了或者解析不了。
+    /// 文件读取或解析失败。
     pub fn exit_quota(&self) -> anyhow::Result<Option<QuotaRecord>> {
         self.read_json(QUOTA_FILE)
     }

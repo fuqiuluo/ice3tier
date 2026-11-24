@@ -51,7 +51,7 @@ pub async fn run(run: &Run, group: usize, spec: &GroupSpec, stream_no: u64, id: 
     };
     let accept = derive_accept_key(key.as_bytes());
     if head.status != 101 || head.header("sec-websocket-accept") != Some(accept.as_str()) {
-        return StreamEnd::new(Outcome::HttpError, format!("升级没有成功：HTTP {} {}", head.status, head.reason));
+        return StreamEnd::new(Outcome::HttpError, format!("WebSocket 升级失败：HTTP {} {}", head.status, head.reason));
     }
     let leftover = buf.split_off(head_len);
     let ws = WebSocketStream::from_partially_read(conn, leftover, Role::Client, None).await;
@@ -203,7 +203,7 @@ impl<'a> ClientSession<'a> {
         self.tally.bytes_down += u64::try_from(message.len()).unwrap_or(u64::MAX);
         match message {
             Message::Text(text) => {
-                let parsed: WsText = serde_json::from_str(&text).map_err(|err| self.corrupt(format!("上游的消息解析不了：{err}")))?;
+                let parsed: WsText = serde_json::from_str(&text).map_err(|err| self.corrupt(format!("无法解析上游消息：{err}")))?;
                 self.on_text(ws, parsed).await?;
             }
             Message::Binary(frame) => {

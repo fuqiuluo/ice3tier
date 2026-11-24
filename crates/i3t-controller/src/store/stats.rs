@@ -16,7 +16,7 @@ pub struct StatPoint {
     pub series: Series,
     /// 节点的序列是这个节点；网络的序列是 `None`。
     pub node: Option<NodeId>,
-    /// 这一段的开始，按步长对齐。
+    /// 该时间分段的起始时间戳，按步长对齐。
     pub at: Timestamp,
     pub value: f64,
 }
@@ -48,8 +48,8 @@ impl Store {
     ///
     /// 写数据库失败。
     pub fn insert_stats(&self, step: u32, points: &[StatPoint]) -> Result<(), StoreError> {
-        // 一批点一条语句、一次往返。同一段在这一批里出现两次时留后一个，和一个一个写一样：
-        // 一条 `INSERT … ON CONFLICT` 不能两次碰同一行。
+        // 单条语句一次往返批量写入。若同一分段在批次中重复出现则保留后者，与逐条写入行为一致：
+        // 单条 `INSERT … ON CONFLICT` 不能两次更新同一行。
         let mut latest = BTreeMap::new();
         for point in points {
             latest.insert((point.network, code(point.series), node_column(point.node), point.at), point.value);
@@ -76,8 +76,8 @@ impl Store {
         Ok(())
     }
 
-    /// 把 `[start, start + to_step)` 里步长是 `from_step` 的点按序列平均成一个步长是 `to_step` 的点。
-    /// 这一段里一个点都没有的序列不写：图上是断开的。返回写了几个点。
+    /// 将 `[start, start + to_step)` 内步长为 `from_step` 的数据点按序列聚合为步长为 `to_step` 的均值点。
+    /// 若某序列在该时段内无任何数据点则不写入（图表中表现为断开）。返回写入的数据点数。
     ///
     /// # Errors
     ///

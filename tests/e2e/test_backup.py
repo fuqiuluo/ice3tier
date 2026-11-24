@@ -104,7 +104,7 @@ def backup_and_restore(lab: Lab, work: Path, t: Checks) -> None:
     t.check("备份之后建的分组不在，之前的在", "later" not in groups and "laptop" in groups, str(groups))
     stopped = waited(lambda: c.proc.poll() is not None, 90, "c 退出")
     t.check("c 被当成不认识的节点拒绝，不再重连，进程退出并说明要重新加入",
-            stopped and "不认这个节点" in c.read_log() and "i3t join" in c.read_log(), tail(c.read_log(), 5))
+            stopped and "被 controller 拒绝" in c.read_log() and "i3t join" in c.read_log(), tail(c.read_log(), 5))
     t.check("controller 的日志里有拒绝的原因", "这把公钥没有注册" in restored.log.read_text(errors="replace"))
     if t.failures:
         print(tail(a.read_log()), tail(c.read_log()), tail(restored.log.read_text(errors="replace")), sep="\n  ---\n")

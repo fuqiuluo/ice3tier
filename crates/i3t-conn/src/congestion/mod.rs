@@ -19,7 +19,7 @@ use self::meter::Metered;
 /// 默认用 [`bbr`]，依据是 `bench/congestion` 在本机实验环境里的对比（起真实的节点经出口下载）：往返 50ms、
 /// 随机丢包 1% 的 100 Mbit/s 链路上 Cubic 只有 2～3 Mbit/s，BBR 是 83～90；没有丢包时两者的吞吐只差 3%，
 /// Cubic 却把瓶颈处的缓冲排满（往返多出 80～100ms，自己丢 1.8%），BBR 不丢包、只多几毫秒；带宽骤降、换路、
-/// 经 TCP 中转的那一段丢包时，BBR 几秒之内跟上，小消息的往返都在一秒之内。不如 Cubic 的地方：和 Cubic 共用一个
+/// 经 TCP 中转链路发生丢包时，BBR 可在数秒内适应，小消息往返延迟保持在 1 秒以内。相较 Cubic 的劣势在于：与 Cubic 共享同一
 /// 缓冲很深的瓶颈时只拿到约四分之一。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Algorithm {
@@ -35,17 +35,17 @@ impl Algorithm {
     /// （`i3tctl pair set … --congestion`），它盖过这里。
     pub(crate) const ENV: &str = "I3T_CONGESTION";
 
-    /// 环境变量 [`Self::ENV`] 指定的那一种（写法同 [`Congestion`]）；没有设置或者值看不懂时用默认的。
+    /// 返回环境变量 [`Self::ENV`] 指定的拥塞控制算法（取值同 [`Congestion`]）；未设置或取值无效时使用默认值。
     pub(crate) fn from_env() -> Self {
         let Ok(value) = std::env::var(Self::ENV) else { return Self::default() };
         Self::from_env_value(&value)
     }
 
-    /// 环境变量 [`Self::ENV`] 的值是 `value` 时用哪一种：看不懂时用默认的，记一行日志。
+    /// 解析环境变量 [`Self::ENV`] 的值 `value`：取值无效时回退至默认值并记录警告日志。
     fn from_env_value(value: &str) -> Self {
         value.parse::<Congestion>().map(Self::from).unwrap_or_else(|_| {
             let fallback = Self::default();
-            tracing::warn!(%value, fallback = %Congestion::from(fallback), "环境变量 {} 的值不是 cubic 或 bbr，改用默认的拥塞控制", Self::ENV);
+            tracing::warn!(%value, fallback = %Congestion::from(fallback), "环境变量 {} 的值无效（仅支持 cubic 或 bbr），使用默认拥塞控制算法", Self::ENV);
             fallback
         })
     }

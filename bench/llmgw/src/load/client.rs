@@ -280,7 +280,7 @@ pub async fn open(run: &Run, tally: &mut Tally) -> Result<Conn, StreamEnd> {
     let begin = Instant::now();
     let tcp = run.proxy.connect(&run.target.host, run.target.port).await.map_err(|err| match err {
         ProxyError::Refused(detail) => StreamEnd::new(Outcome::ProxyRefused, detail),
-        ProxyError::Connect(err) => StreamEnd::new(Outcome::ConnectFailed, format!("连不上：{err}")),
+        ProxyError::Connect(err) => StreamEnd::new(Outcome::ConnectFailed, format!("连接失败：{err}")),
         ProxyError::Io(err) => StreamEnd::new(Outcome::ConnectFailed, format!("和代理握手时出错：{err}")),
     })?;
     tally.connect = Some(begin.elapsed());

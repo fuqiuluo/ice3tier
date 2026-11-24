@@ -24,16 +24,16 @@ impl Control {
 
     pub(super) fn on_signal(&mut self, from: NodeId, signal: &Signal, now: Instant) {
         if !self.allow_direct {
-            tracing::debug!(peer = %from, "本节点不建立直连，忽略打洞信令");
+            tracing::debug!(peer = %from, "本节点未启用直连，已忽略打洞信令");
             return;
         }
         let Some(peer) = self.peers.get_mut(&from) else {
-            tracing::debug!(peer = %from, "信令来自不在 netmap 里的节点，忽略");
+            tracing::debug!(peer = %from, "收到非 netmap 节点的信令，已忽略");
             return;
         };
         let policy = direct_policy(&self.shared, self.allow_direct, self.dial_out_only, self.mode, &self.endpoints, peer, now);
         if !policy.signal {
-            tracing::debug!(peer = %from, "本节点或者对端是只主动连接的，不参与打洞，忽略信令");
+            tracing::debug!(peer = %from, "本节点或对端仅允许主动外连，不参与打洞，已忽略信令");
             return;
         }
         // 信令是经 controller 或者已经认证的连接送来的，对端确实想和本端建立直连：记下来，后面几轮探测才会跟上。
@@ -50,7 +50,7 @@ impl Control {
             return;
         }
         let Some(peer) = self.peers.get_mut(&ping.src) else {
-            tracing::trace!(%from, src = %ping.src, "PING 自称来自不在 netmap 里的节点，丢弃");
+            tracing::trace!(%from, src = %ping.src, "收到来源节点不在 netmap 中的 PING，已丢弃");
             return;
         };
         if self.dial_out_only && !peer.slot.is_active(&self.shared.clock) {
@@ -64,12 +64,12 @@ impl Control {
             None => peer.stranger_budget.take(now) && self.verify_budget.take(now),
         };
         if !budgeted {
-            tracing::debug!(%from, src = %ping.src, "这个地址来的 PING 太多，这一个不验了");
+            tracing::debug!(%from, src = %ping.src, "该地址发送的 PING 速率超限，跳过验签并丢弃");
             return;
         }
         let message = probe::Ping::signed_message(ping.src, ping.dst, &ping.nonce);
         if i3t_crypto::verify(&peer.key, probe::Ping::PURPOSE, &message, &Signature::from_bytes(ping.signature)).is_err() {
-            tracing::debug!(%from, src = %ping.src, "PING 的签名不对，丢弃");
+            tracing::debug!(%from, src = %ping.src, "PING 签名校验失败，已丢弃");
             return;
         }
         if peer.direct.active().is_some_and(|(addr, _)| addr == from) {
@@ -99,12 +99,12 @@ impl Control {
         }
         let message = probe::Pong::signed_message(pong.src, pong.dst, &pong.nonce, pong.observed);
         if i3t_crypto::verify(&peer.key, probe::Pong::PURPOSE, &message, &Signature::from_bytes(pong.signature)).is_err() {
-            tracing::debug!(%from, src = %pong.src, "PONG 的签名不对，丢弃");
+            tracing::debug!(%from, src = %pong.src, "PONG 签名校验失败，已丢弃");
             return;
         }
         let local_network = peer.direct.is_local_network(from);
         if !observed_is_mine(pong.observed, local_network, &self.local_candidates, &self.endpoints) {
-            tracing::debug!(%from, src = %pong.src, observed = %pong.observed, "对端看到的本节点地址不是本节点的，可能有人在中间来回转发探测，不认");
+            tracing::debug!(%from, src = %pong.src, observed = %pong.observed, "对端上报的观测地址不属于本节点，可能存在中间转发，已忽略该 PONG");
             return;
         }
         if peer.direct.active().is_some_and(|(addr, _)| addr == from) {
@@ -131,7 +131,7 @@ impl Control {
         peer.probe.answered = Some(now);
         let message = probe::Ping::signed_message(ping.src, ping.dst, &ping.nonce);
         if i3t_crypto::verify(&peer.key, probe::Ping::PURPOSE, &message, &Signature::from_bytes(ping.signature)).is_err() {
-            tracing::debug!(peer = %from, "路径探测的签名不对，丢弃");
+            tracing::debug!(peer = %from, "路径探测签名校验失败，已丢弃");
             return;
         }
         // 探测是经 relay 来的，没有"看到的来源地址"可报。
@@ -142,7 +142,7 @@ impl Control {
         peer.slot.send_frame(&self.shared, &pong.to_bytes());
     }
 
-    /// 对端回答了本端的路径探测：现在这条路径确实送得到；或者是经本节点 relay 量那一段的探测（`View::local_leg`），记下往返用了多久。
+    /// 处理对端返回的路径探测应答：确认当前多级路径可达；若属于测量“本节点 relay → 对端”链路的探测（`View::local_leg`），则记录往返耗时。
     pub(super) fn on_path_pong(&mut self, from: NodeId, pong: &probe::Pong, now: Instant) {
         let Some(peer) = self.peers.get_mut(&from) else { return };
         let path_probe = peer.probe.pending.is_some_and(|(nonce, _)| nonce == pong.nonce);
@@ -151,14 +151,13 @@ impl Control {
         }
         let message = probe::Pong::signed_message(pong.src, pong.dst, &pong.nonce, pong.observed);
         if i3t_crypto::verify(&peer.key, probe::Pong::PURPOSE, &message, &Signature::from_bytes(pong.signature)).is_err() {
-            tracing::debug!(peer = %from, "路径探测的回答签名不对，丢弃");
+            tracing::debug!(peer = %from, "路径探测应答签名校验失败，已丢弃");
             return;
         }
         if path_probe {
             peer.probe.pending = None;
             peer.probe.missed = 0;
-            // 这条路径又送得到了。之前探测没有回音、又没有别的路可换时记下的起因已经过时，留着的话，
-            // 下一次换路（哪怕是因为有了少绕路的 relay）会被说成"探测一直没有回音"。
+            // 路径已恢复可达：清除此前因探测持续无响应且无备选路径时遗留的起因，避免后续常规切换误报为探测超时。
             if peer.hint == Some(RouteHint::PathProbeSilent) {
                 peer.hint = None;
             }

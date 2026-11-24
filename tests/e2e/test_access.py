@@ -133,7 +133,7 @@ def forward_switch(lab: Lab, work: Path, t: Checks) -> None:
     t.check("关掉开关：a 不再监听转发的端口", ":9000 " not in gone)
     t.check("关掉开关：连不上了", local().returncode != 0)
     text = controller.host.run(binary("i3tctl"), "--token", controller.token, "forward", "list", check=False).stdout
-    t.check("命令行的列表里写成一句话", "目标的转发开关关着" in text, text)
+    t.check("命令行的列表里写成一句话", "目标节点未开启转发" in text, text)
 
     controller.forward_target(c)
     back = eventually(local, lambda r: r.returncode == 0)
@@ -508,7 +508,7 @@ def ping(lab: Lab, work: Path, t: Checks) -> None:
     b.stop()
     gone = run(b.name)
     t.check("b 停了：说连不上，或者连接没有及时建起来", gone.returncode != 0
-            and ("连不上 b" in gone.stderr or "没有及时建起来" in gone.stderr or "都没有回来" in gone.stdout),
+            and ("无法连接节点 b" in gone.stderr or "建立连接超时" in gone.stderr or "都没有回来" in gone.stdout),
             f"{gone.stdout!r} {gone.stderr.strip()}")
     if t.failures:
         print(tail(a.read_log()), tail(b.read_log()), sep="\n  ---\n")

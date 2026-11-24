@@ -120,7 +120,7 @@ pub(crate) struct Finding {
 ///
 /// - 关着：不提它。
 /// - 开着，并且是以前的版本的 `--apply` 打开的：改回 0。那时只在原来是 0 时才改成 1 并记下来，
-///   所以记着 1、现在也是 1 就是本程序自己的改动，撤掉它不碰管理员的设置。
+///   因此记录值为 1 且当前值也为 1 时可确认属于本程序之前的修改，回退为 0 不会影响管理员配置。
 /// - 开着，别的情形（管理员自己开的，或者设成了 2）：留着，只要求分段的下限不低于 [`MTU_PROBE_FLOOR_BYTES`]。
 pub(crate) fn survey(sysctl: &impl Sysctl, port: u16, recorded: &Recorded) -> Vec<Finding> {
     let t = &texts().linux;
@@ -169,7 +169,7 @@ pub(crate) fn survey(sysctl: &impl Sysctl, port: u16, recorded: &Recorded) -> Ve
 /// 把建议的值写进内核。返回改了哪些参数、改成了什么。
 ///
 /// # Errors
-/// 有一项写不进去就停下返回错误（通常是没有 root 权限）；在它之前的已经生效。
+/// 写入内核参数失败时停止处理并返回错误，已生效的修改不会回滚。常见原因是缺少 root 权限。
 pub(crate) fn apply(sysctl: &mut impl Sysctl, findings: &[Finding]) -> anyhow::Result<Vec<(&'static str, String)>> {
     let mut changed = Vec::new();
     for finding in findings {
@@ -207,7 +207,7 @@ fn persisted(existing: &str, changed: &[(&'static str, String)]) -> String {
 /// 记着改过的参数的那个文件现在的内容。还没有这个文件时是空的。
 ///
 /// # Errors
-/// 文件在但读不了（没有权限、不是文本、是个目录）。这时不能当它是空的：接下来写进去的会盖掉以前记下的参数。
+/// 文件存在但无法读取（如权限不足、非 UTF-8 文本或路径为目录）。此时不能视为空文件，否则后续写入会覆盖先前记录的参数。
 fn read_persisted(path: &Path) -> anyhow::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
@@ -222,7 +222,7 @@ pub(crate) fn run(port: u16, apply_changes: bool) -> anyhow::Result<()> {
     let mut sysctl = ProcSys;
     let kernel = sysctl.read("kernel.osrelease").unwrap_or_else(|| i3t_lang::NONE.to_owned());
     println!("{}", (t.tune_title)(&kernel));
-    // 记参数的文件读不了时按没记过来检查（最多少一条"改回去"的建议）；真要改的时候才报这个错。
+    // 持久化记录文件无法读取时，检查阶段按无历史记录处理（最多遗漏一条回退建议）；真正执行写入时再返回该错误。
     let existing = read_persisted(Path::new(PERSIST_FILE));
     let findings = survey(&sysctl, port, &existing.as_deref().map(recorded).unwrap_or_default());
     let mut table = i3t_lang::table::Table::new(&t.tune_header).indented(2);
@@ -248,7 +248,7 @@ pub(crate) fn run(port: u16, apply_changes: bool) -> anyhow::Result<()> {
         println!("\n{}", (t.tune_wanted)(wanted, PERSIST_FILE));
         return Ok(());
     }
-    // 原来记下的读不了时什么都不改，免得改了内核之后再把以前记下的参数整个覆盖掉。
+    // 若无法读取既有持久化记录，则中止修改，避免修改内核参数后覆盖丢失先前记录。
     let existing = existing?;
     let changed = apply(&mut sysctl, &findings)?;
     std::fs::write(PERSIST_FILE, persisted(&existing, &changed)).with_context(|| (t.tune_persist_failed)(PERSIST_FILE))?;

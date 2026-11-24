@@ -15,12 +15,12 @@ use super::session::Session;
 /// 测试用的 PostgreSQL 的连接串放在这个环境变量里。
 pub const TEST_DATABASE_ENV: &str = "I3T_TEST_DATABASE_URL";
 
-const HOW_TO: &str = "这些测试要一个 PostgreSQL。起一个用完就扔的，再把连接串放进环境变量，比如：\n\n    \
+const HOW_TO: &str = "这些测试需要一个 PostgreSQL 实例。可启动一个临时实例，并将连接串写入环境变量，例如：\n\n    \
     docker run -d --rm -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:5432:5432 postgres:17\n    \
     export I3T_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres\n";
 
-/// 连测试服务器肯等多久。几百个测试同时来连的时候它答得慢（Windows 上每条连接要起一个进程，CI 的机器上排得过
-/// 平时的十秒），那不是连不上；真连不上的时候多等这一会儿也无妨。
+/// 连接测试服务器的超时上限。大量测试并发建连时响应较慢（Windows 上每条连接需启动独立进程，在 CI 环境中排队时间可能超过
+/// 默认的 10 秒），但这并非连接失败；真正无法连接时多等待一段时间也无妨。
 const CONNECT_PATIENCE: Duration = Duration::from_secs(60);
 
 /// 同一个进程里的第几个。
@@ -36,18 +36,18 @@ pub struct Scratch {
 impl Scratch {
     /// # Panics
     ///
-    /// 环境变量 [`TEST_DATABASE_ENV`] 没有设、写得不对，或者连不上、建不了 schema。
+    /// 环境变量 [`TEST_DATABASE_ENV`] 未设置或格式无效，或无法连接数据库及创建 schema。
     #[must_use]
     pub fn new() -> Self {
-        let url = std::env::var(TEST_DATABASE_ENV).unwrap_or_else(|_| panic!("没有设 {TEST_DATABASE_ENV}。{HOW_TO}"));
-        let Database(mut server) = url.parse().unwrap_or_else(|error| panic!("{TEST_DATABASE_ENV} 写得不对：{error:?}"));
+        let url = std::env::var(TEST_DATABASE_ENV).unwrap_or_else(|_| panic!("未设置环境变量 {TEST_DATABASE_ENV}。{HOW_TO}"));
+        let Database(mut server) = url.parse().unwrap_or_else(|error| panic!("环境变量 {TEST_DATABASE_ENV} 格式无效：{error:?}"));
         server.connect_timeout(CONNECT_PATIENCE);
-        // 进程号加序号在一台机器上不重样；再加上时刻，几台机器共用一个测试服务器时也不撞。
+        // 进程号加序号在单机上不会重复；再附加纳秒时间戳，多机共用同一测试服务器时也不会冲突。
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.subsec_nanos());
         let schema = format!("i3t_test_{}_{}_{nanos:08x}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         let session =
-            Session::connect(&server).unwrap_or_else(|error| panic!("连不上 {TEST_DATABASE_ENV} 说的数据库：{error:?}\n{HOW_TO}"));
-        session.batch(&format!("CREATE SCHEMA {schema}")).unwrap_or_else(|error| panic!("建不了测试用的 schema：{error:?}"));
+            Session::connect(&server).unwrap_or_else(|error| panic!("无法连接 {TEST_DATABASE_ENV} 指定的数据库：{error:?}\n{HOW_TO}"));
+        session.batch(&format!("CREATE SCHEMA {schema}")).unwrap_or_else(|error| panic!("无法创建测试用 schema：{error:?}"));
         Self { server, schema }
     }
 
@@ -85,7 +85,7 @@ impl Default for Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // 删不掉（服务器已经没了）也不要紧：那是个用完就扔的服务器。
+        // 清理失败（例如测试服务器已关闭）可忽略：该服务器仅用于临时测试。
         if let Ok(session) = Session::connect(&self.server) {
             let _ = session.batch(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema));
         }

@@ -116,8 +116,8 @@ impl Inner {
         NetworkView::load(&self.store, network)?.ok_or(Error::NotFound(Entity::Network))
     }
 
-    /// 节点是不是已经确认了它该有的 netmap：确认到了当前的版本号，没有欠着的确认，也没有做不成、还在重试的重算。
-    /// 后两样在新的版本号一时记不进存储时才会和第一样不一致：版本号没加，它确认过的"当前版本"其实是旧的内容。
+    /// 判断节点是否已确认最新的目标 netmap：已确认当前版本号、无待处理的顺序确认，且不在重算重试队列中。
+    /// 后两项仅在新版本号暂时无法写入存储时与首项出现偏差：此时版本号尚未递增，节点确认的「当前版本」实为旧内容。
     fn has_acknowledged(&self, id: NodeId) -> bool {
         self.sync.get(&id).is_none_or(|sync| sync.state.acked >= sync.state.version && !sync.is_waiting() && !sync.retrying)
     }

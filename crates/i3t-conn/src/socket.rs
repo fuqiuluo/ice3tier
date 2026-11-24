@@ -125,7 +125,7 @@ impl AsyncUdpSocket for PathSocket {
 
 type Writable = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
 
-/// QUIC 库在 `try_send` 返回"现在发不了"之后用它等端口重新可写。每条连接各有一个，所以要能同时等。
+/// QUIC 库在 `try_send` 返回 `WouldBlock` 后通过它等待端口恢复可写。每条连接各自持有一个实例，需支持并发等待。
 struct WritablePoller {
     paths: Arc<Paths>,
     waiting: Option<Writable>,

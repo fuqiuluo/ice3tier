@@ -209,7 +209,7 @@ fn collect_release_files(dir: &Path) -> anyhow::Result<(BTreeMap<String, Artifac
 
 /// 一个文件名是不是某个平台的节点程序；是的话是哪个平台。
 ///
-/// 反过来核对一遍名字，所以 `i3t-linux-x86_64.exe`、`i3t-windows-x86_64` 这种和平台对不上的写法不算。
+/// 反向校验文件名，以排除 `i3t-linux-x86_64.exe`、`i3t-windows-x86_64` 等与目标平台命名规范不符的名称。
 fn node_program_platform(file: &str) -> Option<Platform> {
     let rest = file.strip_prefix(NODE_PROGRAM)?.strip_prefix('-')?;
     let platform: Platform = rest.strip_suffix(".exe").unwrap_or(rest).parse().ok()?;

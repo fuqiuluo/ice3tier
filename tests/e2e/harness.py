@@ -1201,7 +1201,7 @@ def vnet_ready(node: Node, timeout: float = 15) -> str:
         log = node.read_log()
         if "虚拟网卡装好了" in log:
             return "installed"
-        if "虚拟网卡装不上" in log:
+        if "虚拟网卡初始化失败" in log:
             return "failed"
         return None
     wait_until(lambda: outcome() is not None, timeout=timeout, what=f"{node.name} 的虚拟网卡有了结果")

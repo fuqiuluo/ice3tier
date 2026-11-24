@@ -9,12 +9,12 @@
 //! | 1 小时 | 7 天 | 168 |
 //!
 //! 序列是固定的一小组（[`Series`]）：每个网络 4 条，每个节点 3 条，每个 relay 1 条，每个出口 2 条。1000 个节点
-//! （其中 100 个 relay、100 个出口）大约 3300 条序列，最多 150 万行，数据库里约 46 MB（按这个表结构量过）。点都存在同一个数据库里，
-//! controller 重启之后还在，备份数据库时也带着它们；过了保留期的整点时删掉。数据库暂时写不进去时，过完了的段留在内存里
-//! 隔一会儿再写，最多留到 5 分钟的点的保留期；能写了之后一次写一个小时的。
+//! （其中 100 个 relay、100 个出口）大约 3300 条序列，最多 150 万行，数据库里约 46 MB（按这个表结构量过）。所有数据点均持久化在同一数据库中，
+//! controller 重启后仍保留，并随数据库备份一并保存；超出保留期的数据在整点清理。当数据库暂时不可写时，已完成的分段暂存于内存中
+//! 定期重试写入，最长保留至 5 分钟粒度的保留期；数据库恢复可写后每次批量写入一个小时的数据。
 //!
-//! 速率从累计的计数算：两次上报之间涨了多少除以隔了多久。节点重启（[`Report::run`] 变了）或者计数变小了，
-//! 这一段不算：算出来不是负数就是一个从零开始的大数。两次上报隔得太久（节点断开过）也不算，增量不知道落在哪一段里。
+//! 速率基于累计计数计算：两次上报间的增量除以间隔时间。若节点重启（[`Report::run`] 变更）或计数值回退，
+//! 则跳过本段速率计算，避免算出负值或异常跳变。若两次上报间隔过长（如节点曾断开连接），同样跳过，因为无法确定增量归属的时间段。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -37,7 +37,7 @@ pub(crate) const COARSE_STEP: u32 = 3600;
 const COARSE_KEEP: u64 = 7 * 24 * 60 * 60;
 /// 一次最多读多少个点：7 天的 5 分钟的点。
 const MAX_POINTS: u64 = 2016;
-/// 在线的节点数、挂靠在 relay 上的节点数多久数一次。一段 5 分钟里数 5 次，平均下来就是这一段的值。
+/// 在线节点数与各 relay 挂靠节点数的采样间隔。每个 5 分钟分段内采样 5 次，取平均值作为该分段的值。
 const SAMPLE_EVERY: Duration = Duration::from_secs(60);
 /// 同一个计数两次上报隔了超过这么久，中间的增量不算（节点每 10 秒报一次）。
 const MAX_GAP: Duration = Duration::from_secs(60);
@@ -62,7 +62,7 @@ impl Acc {
     }
 }
 
-/// 字节数换成浮点数。一段里的增量超过 2^53（8 PB）才会差一点，画图用不着那么准；标准库没有不丢精度的转换。
+/// 将字节数转换为浮点数。仅当单分段增量超过 2^53（约 8 PB）时才会产生微小精度损失，监控绘图无需更高精度；标准库无无损转换。
 fn precise(bytes: u64) -> f64 {
     bytes as f64
 }
@@ -80,15 +80,15 @@ type Key = (NetworkId, Series, Option<NodeId>);
 /// 攒着还没写进存储的数。
 #[derive(Debug, Default)]
 pub(crate) struct Collector {
-    /// 正在攒的那一段的开始；还没开始攒时是 `None`。
+    /// 当前正在累计的分段起始时间戳；尚未开始累计时为 `None`。
     bucket: Option<Timestamp>,
     acc: BTreeMap<Key, Acc>,
-    /// 过完了、还没写下的段：每段的开始和它的点。写成功了才清掉；写不进去（数据库暂时出错）就留着下次再写。
+    /// 已结束但尚未持久化的分段：映射分段起始时间至数据点列表。写入成功后清除；写入失败（数据库暂时异常）时保留以便后续重试。
     unwritten: BTreeMap<Timestamp, Vec<StatPoint>>,
     /// 上次没写成功：这个时刻之前不再试，免得数据库出错时每次叫都试一遍、报一遍错。过完了的段都写下了（或者丢了）时是 `None`。
     write_after: Option<Instant>,
     counters: BTreeMap<(NodeId, Series), Counter>,
-    /// 每个节点最近一次报的挂靠的 relay，和存下来的是同一份（核对过、去掉了重复的）。数 relay 上挂着几个在线节点要用。
+    /// 每个节点最近一次上报的挂靠 relay 列表，与持久化数据一致（已校验并去重），用于统计各 relay 的在线挂靠数。
     attached: BTreeMap<NodeId, (NetworkId, Vec<NodeId>)>,
     next_sample: Option<Instant>,
 }
@@ -102,13 +102,13 @@ impl Collector {
         }
     }
 
-    /// 一个累计的计数报上来了：和上一次比，涨了多少记进这一段的速率。
+    /// 处理上报的累计计数值：与上次上报对比，将增量计入本分段的速率统计。
     fn counter(&mut self, key: Key, run: u64, value: u64, now: Instant) {
         let (_, series, Some(node)) = key else { return };
         let previous = self.counters.insert((node, series), Counter { run, value, at: now });
         let Some(previous) = previous else { return };
         if previous.run != run || value < previous.value {
-            tracing::debug!(%node, series = %series, "计数从头开始了（节点重启过），这一段不算速率");
+            tracing::debug!(%node, series = %series, "累计计数发生重置或回退，跳过本段速率计算");
             return;
         }
         let gap = now.saturating_duration_since(previous.at);
@@ -122,7 +122,7 @@ impl Collector {
         }
     }
 
-    /// 这一段攒下的点，加上从节点的点算出来的网络的合计。之后从空的开始攒下一段。
+    /// 导出当前分段累计的数据点，并汇总生成网络级合计数据点；随后清空累计器以开始下一分段。
     fn take_points(&mut self, at: Timestamp) -> Vec<StatPoint> {
         let acc = std::mem::take(&mut self.acc);
         let mut totals: BTreeMap<(NetworkId, Series), f64> = BTreeMap::new();
@@ -140,7 +140,7 @@ impl Collector {
             }
             points.push(StatPoint { network, series, node, at, value });
         }
-        // 正好留出合计的地方：数据库写不进去时这些点要在内存里留很久，不让它翻倍长出空位。
+        // 精确预留合计点所需容量：数据库不可写时这些数据点可能长期驻留内存，避免翻倍扩容造成内存浪费。
         points.reserve_exact(totals.len());
         points.extend(totals.into_iter().map(|((network, series), value)| StatPoint { network, series, node: None, at, value }));
         points
@@ -151,14 +151,14 @@ impl Collector {
         self.attached.remove(&node);
     }
 
-    /// 写不进去时，早于 5 分钟的点的保留期的段不再留着：写下去也马上会被清掉。数据库一直写不进去时，内存里最多留这么久的。
-    /// 只在写失败之后丢：写得进去的话照样写下、汇总它所在的小时，再清掉（主机睡了一天多、时钟往前跳了，刚过完的那一段就是这样）。
+    /// 写入失败时丢弃早于 5 分钟粒度保留期的积压分段（即使写入也会立即被清理），从而限制数据库长期故障时的内存占用。
+    /// 仅在写入失败后执行丢弃：若数据库正常可写，仍先写入并汇总其所属小时后再清理（例如主机长时间休眠或时钟前跳后的刚结束分段）。
     fn let_go_of_expired(&mut self) {
         let Some(now_bucket) = self.bucket else { return };
         let kept = self.unwritten.split_off(&now_bucket.saturating_sub(FINE_KEEP));
         let expired = std::mem::replace(&mut self.unwritten, kept);
         if let Some(first) = expired.keys().next() {
-            tracing::warn!(from = first, segments = expired.len(), "时间序列有几段一直没能写下，过了保留期，不要了");
+            tracing::warn!(from = first, segments = expired.len(), "部分时间序列分段因长期写入失败已超出保留期，已丢弃");
         }
         if self.unwritten.is_empty() {
             self.write_after = None;
@@ -177,15 +177,17 @@ impl Controller {
         let network = inner.require_network(network)?;
         let node = match (query.series.per_node(), query.node) {
             (true, Some(id)) => Some(inner.require_node(network.id, id).in_field("node")?.to_ref()),
-            (true, None) => return Err(Error::invalid_field("node", "required", format!("序列 {} 要写是哪个节点", query.series))),
-            (false, Some(_)) => return Err(Error::invalid_field("node", "not_allowed", format!("序列 {} 是整个网络的", query.series))),
+            (true, None) => return Err(Error::invalid_field("node", "required", format!("查询序列 {} 必须指定节点", query.series))),
+            (false, Some(_)) => {
+                return Err(Error::invalid_field("node", "not_allowed", format!("序列 {} 为网络级指标，不能指定节点", query.series)));
+            }
             (false, None) => None,
         };
         let now = inner.clock.now();
         let to = query.to.unwrap_or(now);
         let from = query.from.unwrap_or_else(|| to.saturating_sub(FINE_KEEP));
         if from > to {
-            return Err(Error::invalid_field("from", "out_of_range", "开始的时间不能晚于结束的时间"));
+            return Err(Error::invalid_field("from", "out_of_range", "开始时间不能晚于结束时间"));
         }
         let step = match query.step {
             Some(step @ (FINE_STEP | COARSE_STEP)) => step,
@@ -198,15 +200,11 @@ impl Controller {
         };
         let span = u64::from(step);
         let first = from - from % span;
-        // 只到最后一段过完了的：正在攒的那一段还没有点，画出来会是一个假的断口。
+        // 截止到最后一个已完成的分段：正在累计的分段尚无落盘数据，包含它会导致图表末端出现虚假断口。
         let last_complete = (now - now % span).saturating_sub(span);
         let last = (to - to % span).min(last_complete);
         if last >= first && (last - first) / span >= MAX_POINTS {
-            return Err(Error::invalid_field(
-                "from",
-                "too_many",
-                format!("一次最多读 {MAX_POINTS} 个点，把时间范围缩短或者用大一些的步长"),
-            ));
+            return Err(Error::invalid_field("from", "too_many", format!("单次最多查询 {MAX_POINTS} 个数据点，请缩短时间范围或增大步长")));
         }
         let stored: BTreeMap<Timestamp, f64> =
             inner.store.stats(network.id, query.series, query.node, step, (first, last))?.into_iter().collect();
@@ -234,7 +232,7 @@ impl Inner {
         }
     }
 
-    /// 一个节点最近一次报的挂靠的 relay。`attached` 是核对过、去掉了重复的那一份，和存下来的是同一份。
+    /// 记录节点最近一次上报的挂靠 relay 列表。`attached` 为已校验并去重的列表，与持久化数据一致。
     pub(super) fn stats_attached(&mut self, node: &NodeRecord, attached: &[Attachment]) {
         self.stats.attached.insert(node.id, (node.network, attached.iter().map(|attachment| attachment.relay).collect()));
     }
@@ -248,7 +246,7 @@ impl Inner {
     pub(super) fn stats_tick(&mut self, now: Instant, wall: Timestamp) -> Result<Instant, Error> {
         let span = u64::from(FINE_STEP);
         let bucket = wall - wall % span;
-        // 先把过完了的那一段收起来，再数、再写。收起来不碰存储，存储出错也不会让新的数混进上一段。
+        // 先封闭已完成的分段，再执行采样与写入。封闭分段仅操作内存、不访问存储，确保存储异常时新采样不会混入上一分段。
         match self.stats.bucket {
             Some(current) if current < bucket => {
                 self.stats.bucket = Some(bucket);
@@ -341,7 +339,7 @@ impl Inner {
             Ok::<_, Error>(points.len())
         })?;
         let segments = unwritten.range(..next_hour).count();
-        tracing::debug!(hour = this_hour, segments, points = written, hour_over, prune, "写下了时间序列过完了的段");
+        tracing::debug!(hour = this_hour, segments, points = written, hour_over, prune, "已持久化已完成的时间序列分段");
         self.stats.unwritten = self.stats.unwritten.split_off(&next_hour);
         Ok(())
     }

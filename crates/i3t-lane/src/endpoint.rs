@@ -188,7 +188,7 @@ impl Lanes {
     ///
     /// # Errors
     ///
-    /// 给某个对端做 TLS 配置失败。这时什么都没有改。
+    /// 为某个对端构建 TLS 配置失败；调用失败时现有状态保持不变。
     pub fn set_peers(&self, peers: impl IntoIterator<Item = LanePeer>) -> Result<(), TlsError> {
         let peers: Vec<_> = peers.into_iter().collect();
         let identities: Vec<_> = peers.iter().map(|peer| (peer.id, peer.key)).collect();
@@ -200,7 +200,7 @@ impl Lanes {
     ///
     /// # Errors
     ///
-    /// 给某个对端做 TLS 配置失败。这时什么都没有改。
+    /// 为某个对端构建 TLS 配置失败；调用失败时现有状态保持不变。
     pub fn set_peers_with_identities(
         &self,
         peers: impl IntoIterator<Item = LanePeer>,
@@ -228,7 +228,7 @@ impl Lanes {
             let keep = wanted.get(id).is_some_and(|peer| peer.key == entry.key);
             if !keep {
                 entry.holder.close();
-                tracing::info!(peer = %id, "不再为这个节点开 ice3proxy");
+                tracing::info!(peer = %id, "停止为该节点启用 ice3proxy");
             }
             keep
         });
@@ -252,7 +252,7 @@ impl Lanes {
             entry.dial = configs.get(&peer.id).map(|config| {
                 let wake = Arc::new(Notify::new());
                 let task = tokio::spawn(dialler::run(Arc::clone(inner), peer.id, Arc::clone(&wake))).abort_handle();
-                tracing::info!(peer = %peer.id, addrs = ?peer.dial, "开始为这个节点拨 ice3proxy");
+                tracing::info!(peer = %peer.id, addrs = ?peer.dial, "开始向该节点拨号建立 ice3proxy");
                 DialSide {
                     addrs: peer.dial.clone(),
                     config: Arc::clone(config),
@@ -286,7 +286,7 @@ impl Lanes {
         let (ticket, evicted) = inner.admission.admit(from.ip());
         if evicted > 0 {
             inner.counters.handshake_busy.add(evicted);
-            inner.log_refusal(format_args!("还没握手完的 lane 太多，挤掉了 {evicted} 条最老的（来自 {from} 的新连接进来了）"));
+            inner.log_refusal(format_args!("未完成握手的 lane 数量超出上限，已驱逐 {evicted} 条最早的连接（因收到来自 {from} 的新连接）"));
         }
         let id = ticket.id();
         let started = Instant::now();
@@ -320,7 +320,7 @@ impl Lanes {
             match accepted {
                 Ok((stream, from)) => self.accept_tcp(stream, from, &[]),
                 Err(error) => {
-                    tracing::warn!(%error, "接受 lane 的连接失败");
+                    tracing::warn!(%error, "接受 lane 连接失败");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -336,7 +336,7 @@ impl Lanes {
     ///
     /// # Errors
     ///
-    /// 取不到 lane。这时开流请求还没有发出去，调用方可以放心地改走共用的连接。
+    /// 获取可用 lane 失败。此时开流请求尚未发出，调用方可安全回退到共用连接。
     pub async fn open_stream(&self, peer: NodeId) -> Result<(LaneSend, LaneRecv), OpenLaneError> {
         let inner = &self.inner;
         if inner.is_going_away() {
@@ -374,8 +374,8 @@ impl Lanes {
         })
     }
 
-    /// 本节点要走了（排空）：告诉所有对端，不再拨新的 lane；对端随之不再在和本节点之间的 lane 上开新的流。
-    /// 手上的流照常结束。
+    /// 标记本节点进入排空状态：通知所有对端不再拨建新 lane；对端随之不再在现有 lane 上新建流。
+    /// 存量流保持运行直至自然结束。
     pub fn go_away(&self) {
         let inner = &self.inner;
         inner.going_away.store(true, Ordering::Relaxed);
@@ -388,7 +388,7 @@ impl Lanes {
             }
         }
         drop(peers);
-        tracing::info!("ice3proxy 进入排空：通知对端，不再拨新的 lane");
+        tracing::info!("ice3proxy 进入排空状态：已通知对端，停止拨号新建 lane");
     }
 
     /// 排空撤销了（更新没有继续下去）：重新在 lane 上接新的流。
@@ -408,10 +408,10 @@ impl Lanes {
             }
         }
         drop(peers);
-        tracing::info!("ice3proxy 撤销排空：控制 lane 重新建立之后照常开流");
+        tracing::info!("ice3proxy 已撤销排空：控制 lane 重建后恢复正常开流");
     }
 
-    /// 本节点的地址变了（家宽重拨等）：拨出去的 lane 多半已经死了而且不会收到重置。全部换一个新的 epoch 重拨。
+    /// 本节点地址变更（如宽带重拨等）：已拨出的 lane 大多已失效且不会收到重置，全部切换新 epoch 重新拨号。
     pub fn address_changed(&self) {
         let inner = &self.inner;
         let mut peers = inner.lock_peers();
@@ -421,7 +421,7 @@ impl Lanes {
             }
         }
         drop(peers);
-        tracing::info!("本节点的地址变了，拨出去的 lane 换新的 epoch 重拨");
+        tracing::info!("本节点地址发生变化，已切换新 epoch 重新拨号所有出站 lane");
     }
 
     #[must_use]
@@ -490,11 +490,11 @@ impl Inner {
             let mut peers = self.lock_peers();
             let Some(entry) = peers.get_mut(&peer).filter(|entry| entry.matches(&lane.membership)) else {
                 drop(peers);
-                return self.refuse(peer, &lane.membership, "对端的 lane 授权已经失效");
+                return self.refuse(peer, &lane.membership, "对端 lane 授权已失效");
             };
             if entry.own_waiting >= MAX_OWN_WAITING_PER_PEER {
                 drop(peers);
-                return self.refuse(peer, &lane.membership, "它等着开流的 lane 到了上限");
+                return self.refuse(peer, &lane.membership, "对端等待开流的 lane 数量已达上限");
             }
             entry.own_waiting += 1;
         }
@@ -511,7 +511,7 @@ impl Inner {
             match opening {
                 Ok(Some(opening)) => inner.deliver(lane, &opening, None),
                 Ok(None) => {}
-                Err(error) => tracing::debug!(%peer, %error, "对方的一条 lane 没有开流就结束了"),
+                Err(error) => tracing::debug!(%peer, %error, "对端 lane 未开启流即关闭"),
             }
         });
     }
@@ -576,7 +576,7 @@ impl Inner {
         if let Some(entry) = self.lock_peers().get(&peer).filter(|entry| entry.matches(membership)) {
             entry.tally.refused.bump();
         }
-        tracing::debug!(%peer, reason, "关掉了对方拨来的一条 lane");
+        tracing::debug!(%peer, reason, "已关闭对端拨入的 lane");
     }
 
     fn handshake_failed(&self, from: SocketAddr, error: &LaneError) {
@@ -590,7 +590,7 @@ impl Inner {
         };
         counter.bump();
         // 外人能造成的失败，每次都记 info 就能刷屏。
-        tracing::debug!(%from, %error, "拨来的 lane 没有握手成功");
+        tracing::debug!(%from, %error, "拨入 lane 握手失败");
     }
 
     fn log_refusal(&self, message: std::fmt::Arguments<'_>) {
@@ -603,7 +603,7 @@ impl Inner {
     pub(crate) fn log_dry_pool(&self, peer: NodeId, waited: Duration) {
         let mut log = self.refusal_log.lock().expect("refusal log mutex poisoned");
         if let Some(skipped) = log.due(Instant::now()) {
-            tracing::info!(%peer, ?waited, skipped, "对方停在这里的 lane 用完了，等不到补拨，新的流改走共用的连接");
+            tracing::info!(%peer, ?waited, skipped, "对端驻留 lane 已耗尽且等待补充超时，新流回退至共用连接");
         }
     }
 
@@ -615,7 +615,7 @@ impl Inner {
         if dial.peer_going_away {
             return Err(OpenLaneError::GoingAway(peer));
         }
-        // 对方还没认本节点（或者已经不认了）：当场拨的 lane 会在开流的帧发出去之后才被拒绝，那时已经不能改走别的路。
+        // 对端尚未信任（或已撤销信任）本节点：现拨的 lane 会在开流帧发出后才被拒绝，届时已无法安全回退到共用连接。
         if !dial.control_up {
             return Err(OpenLaneError::NoControl(peer));
         }
@@ -732,7 +732,7 @@ impl Inner {
         if let Some(dial) = Self::dial_mut(&mut self.lock_peers(), peer, generation) {
             dial.control_up = up;
             if up {
-                // "要走"只对说它的那条控制 lane 算数：新的控制 lane 被接受了，说明对方（重启过的，或者撤销了排空的）又在接新的流。
+                // 排空状态仅对发送它的那条控制 lane 有效：新控制 lane 被接受，说明对端（重启或撤销排空后）已重新接受新流。
                 // 它还在排空的话会在新的控制 lane 上再说一次。
                 dial.peer_going_away = false;
             } else {
@@ -747,7 +747,7 @@ impl Inner {
         dial.peer_going_away = true;
         dial.warm.clear();
         drop(peers);
-        tracing::info!(%peer, "对方说它要走了，不再拨新的 lane，也不再在 lane 上往它开流");
+        tracing::info!(%peer, "对端已通知进入排空状态，停止向其拨号新建 lane 且不再在其 lane 上开流");
     }
 }
 
@@ -803,7 +803,7 @@ impl Acceptor for Lanes {
 }
 
 /// lane 不传数据报：UDP 应用的数据始终走共用的连接。实现它只是为了让 `i3t_flow::serve` 能直接跑在 lane 上；
-/// 收数据报的一方立刻结束，`serve` 照常只接流。
+/// 数据报接收端立即结束，`serve` 仅正常接受流。
 impl Datagrams for Lanes {
     type Sender = NoDatagrams;
 
@@ -816,7 +816,7 @@ impl Datagrams for Lanes {
     }
 }
 
-/// lane 上发不了数据报。
+/// lane 不支持发送数据报。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoDatagrams;
 

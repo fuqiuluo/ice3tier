@@ -56,7 +56,7 @@ pub(crate) struct Shared<C: Datagrams> {
     pub local: Vec<LocalEntry>,
     /// 按出口的用量。
     pub usage: Usage,
-    /// 端口写 0 的端口转发挑定的端口记在哪里。
+    /// 端口为 0 的端口转发所分配端口的持久化存储。
     pub ports: Arc<dyn PortBook>,
     /// 节点正在排空时有值：为什么排空，写进拒绝的日志。
     pub draining: Mutex<Option<String>>,
@@ -64,7 +64,7 @@ pub(crate) struct Shared<C: Datagrams> {
     pub drained: AtomicU64,
     /// UDP 端口转发的会话没有报文往来多久之后回收。
     pub udp_idle_timeout: Duration,
-    /// 端口转发的目标最近连不上的记录。
+    /// 端口转发目标近期连接失败的记录。
     pub forward_health: ForwardHealth,
     /// 本节点的程序自己在监听的地址，每个监听绑定时登记在里面。
     pub own_listeners: OwnListeners,
@@ -117,13 +117,13 @@ impl Client {
         }
     }
 
-    /// 看客户端发来的第一个字节分出它说的是哪种协议：`0x05` 是 SOCKS5，别的是 HTTP。这个字节留在缓冲区里，握手照常从它读起。
+    /// 根据客户端发送的首字节识别协议类型：`0x05` 为 SOCKS5，其余视为 HTTP。该字节保留在缓冲区中，后续握手从该字节继续读取。
     async fn sniff(&mut self) -> Result<Front, Broken<Infallible>> {
         let first = self.read(first_byte).await?;
         Ok(if first == SOCKS5_VERSION { Front::Socks5 } else { Front::Http })
     }
 
-    /// 告诉客户端请求失败了，然后关闭连接。写不出去说明客户端已经走了，没有人需要这个应答。
+    /// 向客户端返回失败应答并关闭连接。若写入失败则说明客户端已断开，无需重试。
     async fn fail(mut self, front: Front, failure: Failure) {
         let _ = self.stream.write_all(&front.failure(failure)).await;
         self.close().await;
@@ -151,7 +151,7 @@ impl Client {
 }
 
 /// 用 RST 关掉一条连接，客户端是 macOS 上的程序时也让它认（见 `i3t_underlay::tcp_reset`）。
-/// 设不上 SO_LINGER 时退化成普通的关闭，没有更好的办法。
+/// 若设置 `SO_LINGER` 失败，则退化为普通关闭。
 pub(crate) fn reset(stream: TcpStream) {
     i3t_underlay::tcp_reset::close(stream);
 }
@@ -219,7 +219,7 @@ async fn socks5_handshake(client: &mut Client, gate: Gate) -> Option<Ask> {
     let method = greeting.choose(gate.needs_password());
     client.stream.write_all(&socks5::method_selection(method)).await.ok()?;
     let Some(method) = method else {
-        tracing::info!("拒绝了一条 SOCKS5 连接：客户端没有提供可用的认证方法（这个代理要用户名和密码）");
+        tracing::info!("已拒绝 SOCKS5 连接：客户端未提供可用的认证方法（该代理需要用户名和密码认证）");
         return None;
     };
 
@@ -235,7 +235,7 @@ async fn socks5_handshake(client: &mut Client, gate: Gate) -> Option<Ask> {
         client.stream.write_all(&socks5::auth_status(admitted)).await.ok()?;
     }
     if !admitted {
-        tracing::info!("拒绝了一条 SOCKS5 连接：用户名或者密码不对");
+        tracing::info!("已拒绝 SOCKS5 连接：用户名或密码错误");
         return None;
     }
 
@@ -249,7 +249,7 @@ async fn socks5_handshake(client: &mut Client, gate: Gate) -> Option<Ask> {
         }
         Err(Broken::Malformed(error)) => {
             tracing::info!(%error, "拒绝了一个 SOCKS5 请求");
-            // 写不出去说明客户端已经走了。
+            // 写入失败说明客户端已断开。
             let _ = client.stream.write_all(&socks5::reply(error.reply())).await;
             None
         }
@@ -263,7 +263,7 @@ async fn http_handshake(client: &mut Client, gate: Gate) -> Option<Ask> {
         Ok(request) => request,
         Err(Broken::Malformed(error)) => {
             tracing::info!(%error, "拒绝了一个 HTTP 代理请求");
-            // 写不出去说明客户端已经走了。
+            // 写入失败说明客户端已断开。
             let _ = client.stream.write_all(error.response().as_bytes()).await;
             return None;
         }
@@ -276,8 +276,8 @@ async fn http_handshake(client: &mut Client, gate: Gate) -> Option<Ask> {
             let mut body = body.framing();
             let buffered = std::mem::take(&mut client.buffer);
             let Ok(taken) = body.take(&buffered) else {
-                tracing::info!("拒绝了一个明文 HTTP 请求：chunked 的请求体写得不对");
-                // 写不出去说明客户端已经走了。
+                tracing::info!("已拒绝明文 HTTP 请求：chunked 请求体格式无效");
+                // 写入失败说明客户端已断开。
                 let _ = client.stream.write_all(http::Response::BadRequest.as_bytes()).await;
                 return None;
             };
@@ -286,19 +286,19 @@ async fn http_handshake(client: &mut Client, gate: Gate) -> Option<Ask> {
         }
     };
     if !gate.admits(auth.as_ref()) {
-        tracing::info!(presented = auth.is_some(), "拒绝了一个 HTTP 代理请求：没有带用户名和密码，或者不对");
-        // 写不出去说明客户端已经走了。
+        tracing::info!(presented = auth.is_some(), "已拒绝 HTTP 代理请求：缺少凭据或用户名、密码错误");
+        // 写入失败说明客户端已断开。
         let _ = client.stream.write_all(http::Response::ProxyAuthenticationRequired.as_bytes()).await;
         return None;
     }
     Some(Ask { command, host, port })
 }
 
-/// 握手读到一半读不下去了：连接出错、客户端走了，或者发来的根本不是这种协议。没有什么可回的，记一行就放弃。
+/// 握手过程中无法继续读取：可能为连接错误、客户端断开或协议格式非法。无需回复，记录日志后放弃连接。
 fn give_up<E: std::fmt::Display>(stage: &str, broken: &Broken<E>) -> Option<Ask> {
     match broken {
         Broken::Io(error) => tracing::debug!(stage, %error, "握手时连接出错"),
-        Broken::Closed => tracing::debug!(stage, "客户端在握手完成之前关掉了连接"),
+        Broken::Closed => tracing::debug!(stage, "客户端在握手完成前关闭了连接"),
         Broken::Malformed(error) => tracing::info!(stage, %error, "拒绝了一条连接：握手报文不合法"),
     }
     None
@@ -335,14 +335,14 @@ pub(crate) async fn proxy<C: Connector + Datagrams>(
         Ok(Some(done)) => done,
         Ok(None) => return client.close().await,
         Err(_) => {
-            tracing::info!("关掉了一条连接：{HANDSHAKE_TIMEOUT:?} 之内没有完成代理握手");
+            tracing::info!("已关闭连接：在 {HANDSHAKE_TIMEOUT:?} 内未完成代理握手");
             return;
         }
     };
     // 握手完成了：认证已经过了，之后的连接不再占握手的名额。
     drop(pass);
-    // 排空时也先把握手做完：客户端要拿到一个看得懂的拒绝，而不是连接莫名其妙地断了。认证在拒绝之前，
-    // 没有用户名和密码的人看不出节点在排空。
+    // 排空期间仍先完成握手，以便客户端收到明确的拒绝应答，而非连接意外断开。认证先于排空拒绝执行，
+    // 未提供有效凭据的客户端不会获知节点处于排空状态。
     if shared.refuse_while_draining("代理请求") {
         return client.fail(front, Failure::Draining).await;
     }
@@ -412,12 +412,12 @@ async fn peer_revoked(mut netmap: watch::Receiver<Arc<Netmap>>, peer: NodeId, ke
 async fn without_waiting<C: Connector + Datagrams>(shared: &Shared<C>, mut client: Client, front: Front, flow: Outbound<'_>) {
     let Outbound { peer, key, request, meter, exit, carriage } = flow;
     if let Err(error) = client.stream.write_all(&front.established()).await {
-        return tracing::debug!(%error, "客户端在应答写出去之前断开了");
+        return tracing::debug!(%error, "客户端在写入应答前已断开");
     }
     let buffered = std::mem::take(&mut client.buffer);
     let first_data = match first_data::read(&mut client.stream, buffered, FIRST_BYTE_WAIT).await {
         Ok(first_data) => first_data,
-        Err(error) => return tracing::debug!(%error, "客户端在发出数据之前断开了"),
+        Err(error) => return tracing::debug!(%error, "客户端在发送数据前已断开"),
     };
     // 首批数据随 OPEN 一起发出，不经过搬运时的关卡，在这里补记。
     meter.record(true, first_data.len());
@@ -459,7 +459,7 @@ async fn after_reply<C: Connector + Datagrams>(
     plain: Option<Plain>,
 ) {
     let Outbound { peer, key, request, meter, exit, carriage } = flow;
-    // 客户端这时还没有收到应答，通常什么都没有发；万一握手时多读进来了一点，就当作首批数据。
+    // 客户端此时尚未收到应答，通常不会提前发送数据；若握手阶段已多读出部分字节，则将其作为首批数据。
     let (first_data, mut body) = match plain {
         Some(Plain { first, body }) => (first, Some(body)),
         None => (std::mem::take(&mut client.buffer), None),
@@ -503,7 +503,7 @@ async fn after_reply<C: Connector + Datagrams>(
         Some(body) => flow.relay_framed(client.stream, revoked, &meter, body).await,
         None => {
             if let Err(error) = client.stream.write_all(&front.established()).await {
-                tracing::debug!(%error, "客户端在应答写出去之前断开了");
+                tracing::debug!(%error, "客户端在写入应答前已断开");
                 return flow.abort(Reason::ClientReset);
             }
             flow.relay_metered(client.stream, revoked, &meter).await
@@ -536,7 +536,7 @@ pub(crate) async fn forward<C: Connector + Datagrams>(
     }
     let first_data = match first_data::read(&mut stream, Vec::new(), FIRST_BYTE_WAIT).await {
         Ok(first_data) => first_data,
-        Err(error) => return tracing::debug!(%error, "客户端在发出数据之前断开了"),
+        Err(error) => return tracing::debug!(%error, "客户端在发送数据前已断开"),
     };
     let meter = IngressMeter { listen: &connection.traffic, exit: None };
     meter.record(true, first_data.len());
@@ -553,7 +553,7 @@ pub(crate) async fn forward<C: Connector + Datagrams>(
             log_summary(forward.target, &request, &summary, &route.ended(&*shared.routes), &shared.netmap.borrow());
         }
         Err(error) => {
-            tracing::info!(target = %forward.target, ?error, "到目标节点建流失败，重置了端口转发的连接");
+            tracing::info!(target = %forward.target, ?error, "到目标节点建流失败，将尝试重置端口转发连接");
             shared.forward_health.record(forward.id, Err(TargetCause::NodeUnreachable));
             reset(stream);
         }
@@ -599,7 +599,7 @@ async fn forward_here<C: Connector + Datagrams>(
     let mut target = match i3t_underlay::tcp_mss::connect(entry.addr).await {
         Ok(target) => target,
         Err(error) => {
-            tracing::info!(forward = forward.id, target = %entry.addr, %error, "端口转发的目标连不上，重置了监听上的连接");
+            tracing::info!(forward = forward.id, target = %entry.addr, %error, "连接端口转发目标失败，将尝试重置监听上的连接");
             let cause = match error.kind() {
                 io::ErrorKind::ConnectionRefused => TargetCause::Refused,
                 io::ErrorKind::TimedOut => TargetCause::Timeout,
@@ -615,13 +615,13 @@ async fn forward_here<C: Connector + Datagrams>(
     if let Some(version) = entry.proxy_protocol {
         let header = crate::proxy_header::encode(version, from, target.peer_addr().unwrap_or(entry.addr));
         if let Err(error) = target.write_all(&header).await {
-            tracing::info!(forward = forward.id, %error, "目标在收到 PROXY protocol 的头之前断开了，重置了监听上的连接");
+            tracing::info!(forward = forward.id, %error, "目标在接收 PROXY protocol 头前断开，将尝试重置监听上的连接");
             return reset(stream);
         }
     }
     for side in [&stream, &target] {
         if let Err(error) = i3t_flow::keep_alive(side) {
-            tracing::debug!(%error, "打不开内核保活");
+            tracing::debug!(%error, "启用内核保活失败");
         }
     }
     let copied = tokio::select! {
@@ -648,7 +648,7 @@ async fn forward_here<C: Connector + Datagrams>(
     }
 }
 
-/// 等到 netmap 不再让 `from` 的这条连接接着用 `forward`（监听和目标都在本节点上、指向 `target` 的那一条），返回原因。
+/// 等待 netmap 不再允许来自 `from` 的连接继续使用 `forward`（监听与目标均在本节点且指向 `target`），并返回撤销原因。
 ///
 /// 一上来先按现在的 netmap 查一遍：接受连接之后、连上目标之前的变化也算。
 async fn withdrawn_here(mut netmap: watch::Receiver<Arc<Netmap>>, forward: &Forward, target: SocketAddr, from: SocketAddr) -> &'static str {
@@ -666,7 +666,7 @@ async fn withdrawn_here(mut netmap: watch::Receiver<Arc<Netmap>>, forward: &Forw
     }
 }
 
-/// 按 `netmap`，`from` 的连接还能不能接着用 `forward`（监听和目标都在本节点上、指向 `target` 的那一条）；不能时返回给人看的原因。
+/// 根据 `netmap` 判断来自 `from` 的连接是否仍可继续使用 `forward`（监听与目标均在本节点且指向 `target`）；若不再允许则返回原因说明。
 ///
 /// 和接受连接时查的是同样几项：这条转发还在、监听的地址和目标节点没有变，来源过得了虚拟 IP 的限制和白名单，指向的地址没有变。
 fn withdrawn_by(netmap: &Netmap, forward: &Forward, target: SocketAddr, from: SocketAddr) -> Option<&'static str> {
@@ -674,13 +674,13 @@ fn withdrawn_by(netmap: &Netmap, forward: &Forward, target: SocketAddr, from: So
         current.id == forward.id && current.protocol == forward.protocol && current.bind == forward.bind && current.target == netmap.me.id
     };
     let Some(current) = netmap.me.forwards.iter().find(same) else {
-        return Some("这条端口转发被删掉或者改了");
+        return Some("该端口转发已删除或已变更");
     };
     if !virtual_ip_admits(netmap, current.bind, from) {
-        return Some("来源不再是可以访问本节点的节点");
+        return Some("来源节点不再具备访问本节点的权限");
     }
     if !allowed(&current.allow_from, from) {
-        return Some("来源不再在这条端口转发的白名单里");
+        return Some("来源地址已不在该端口转发的白名单中");
     }
     let points_to = netmap
         .me
@@ -688,7 +688,7 @@ fn withdrawn_by(netmap: &Netmap, forward: &Forward, target: SocketAddr, from: So
         .iter()
         .find(|entry| entry.id == forward.id && entry.listener == netmap.me.id && entry.protocol == forward.protocol)
         .map(|entry| entry.addr);
-    (points_to != Some(target)).then_some("这条端口转发指向的地址被删掉或者改了")
+    (points_to != Some(target)).then_some("该端口转发指向的目标地址已删除或已变更")
 }
 
 /// 写进 OPEN 的客户端地址。本机的程序连过来时不带：回环地址对另一头没有意义。

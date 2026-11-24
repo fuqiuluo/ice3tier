@@ -3,7 +3,7 @@
 //! 这里只做装配：读参数，打开数据目录和数据库，绑端口，等退出信号。逻辑都在 `i3t-controller` 这个库里。
 //! 终端上的文字（帮助、管理令牌、启动时的错误）跟着系统的语言，日志不翻译。
 //!
-//! 除了运行，还有一种做完就退出的用法：`--reset-admin-token`。它不需要 `--public-addr`，也不起运行时。
+//! 除常驻运行外，还支持一次性执行的 `--reset-admin-token` 模式，无需 `--public-addr`，也不启动异步运行时。
 
 mod texts;
 
@@ -115,8 +115,8 @@ fn init_logging(default: &str) {
     tracing_subscriber::fmt().with_env_filter(filter).with_ansi(std::io::stderr().is_terminal()).with_writer(std::io::stderr).init();
 }
 
-/// 连到哪个数据库：`--database-url`（或者环境变量）给的，没有给就读数据目录里的 [`DATABASE_URL_FILE`]。
-/// 读不懂时只说哪里不对，不把连接串打出来：里面有密码。
+/// 解析数据库连接配置：优先使用 `--database-url`（或对应环境变量），未提供时读取数据目录中的 [`DATABASE_URL_FILE`]。
+/// 解析失败时仅报告错误原因而不输出连接串，避免泄露密码。
 fn database(data_dir: &Path, given: Option<&str>) -> anyhow::Result<Database> {
     let t = texts::texts();
     // 空的环境变量当作没有给。
@@ -233,7 +233,7 @@ async fn shutdown_signal() {
     tracing::info!("收到退出信号，正在停止");
 }
 
-/// 注册令牌里的地址写错了，节点拿着令牌也连不上，而且要到那时才发现。所以启动时先看一眼它的样子对不对。
+/// 若注册令牌中的对外地址格式有误，节点将无法连接且需到注册时才会暴露，因此启动时先做基本格式校验。
 fn check_public_addr(address: &str) -> anyhow::Result<()> {
     let well_formed =
         address.rsplit_once(':').is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0));
@@ -245,8 +245,8 @@ fn check_public_addr(address: &str) -> anyhow::Result<()> {
 
 /// 任何线程 panic 都让整个进程退出。
 ///
-/// controller 的状态在一把锁后面，持锁的线程 panic 之后这把锁就中毒了，之后每个请求都会失败，
-/// 进程却还活着、端口还开着。让它直接退出，由 systemd 之类的拉起来，比留着一个什么都做不了的进程好。
+/// controller 的共享状态由互斥锁保护，若持锁线程发生 panic 会导致锁中毒，后续请求均会失败，
+/// 但进程仍存活且继续占用端口。直接中止进程交由 systemd 等服务管理器拉起，优于保留无法提供服务的进程。
 fn abort_on_panic() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

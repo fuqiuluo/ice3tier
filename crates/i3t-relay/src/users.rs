@@ -1,7 +1,7 @@
 //! 谁在用这个 relay：按"从哪个节点、发往哪个节点"数转发的字节，每 [`WINDOW`] 一个时段。
 //!
 //! # Invariants
-//! - 一个时段里最多数 [`MAX_PAIRS`] 对，再来的节点对算进"其余"：转发路径上占的内存有上限，伪造不了无限多的节点对
+//! - 单个统计窗口内最多追踪 [`MAX_PAIRS`] 个节点对，超出的归入“其余”，以限制转发路径内存占用并防止伪造无限节点对
 //!   （来源节点要有会话，节点对本来也只在网络里的节点之间）。
 //! - 给出去的是上一个完整的时段里最多的 [`MAX_RELAY_USERS`] 对，其余的合成一个数。
 //!
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use i3t_model::control::{MAX_RELAY_USERS, RelayPairUse, RelayUse};
 use i3t_proto::NodeId;
 
-/// 一个统计时段多长。和节点上报的间隔一样：每次上报带着的是刚过去的那一段。
+/// 单个统计窗口的时长，与节点上报周期一致：每次上报携带刚结束的完整窗口数据。
 pub(crate) const WINDOW: Duration = Duration::from_secs(10);
 /// 一个时段里最多单独数多少个节点对。
 pub(crate) const MAX_PAIRS: usize = 1024;
@@ -69,7 +69,7 @@ fn empty() -> RelayUse {
 }
 
 fn window_secs() -> u32 {
-    u32::try_from(WINDOW.as_secs()).expect("统计时段是几秒，装得进 u32")
+    u32::try_from(WINDOW.as_secs()).expect("统计窗口秒数应可转换为 u32")
 }
 
 /// 一个时段数完了：最多的几对，其余的合成一个数。

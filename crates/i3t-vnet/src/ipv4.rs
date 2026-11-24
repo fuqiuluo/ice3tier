@@ -1,15 +1,15 @@
-//! 读 IPv4 包的头，和写"不可达"的 ICMP 包：核对来源和目的、按包判断访问规则、本机的程序发往到不了的地方时回一句话，都只要这么多。
+//! IPv4 头部解析与 ICMP 不可达报文构造：用于源/目的地址校验、逐包访问控制判定，以及在本机应用访问不可达目标时返回 ICMP 差错应答。
 //!
-//! 不校验头的校验和：从网卡读出来的是本机内核刚写的；写进网卡的，收的内核自己会校验，坏的它丢掉。
+//! 本模块默认不校验 IP 头校验和：出站包由本机内核刚生成，入站包在写入虚拟网卡后由接收端内核校验并丢弃损坏包。
 
 use std::net::Ipv4Addr;
 
-/// IP 头里的协议号。
+/// IP 头部协议号常量。
 pub const ICMP: u8 = 1;
 pub const TCP: u8 = 6;
 pub const UDP: u8 = 17;
 
-/// ICMP 的类型和"不可达"的几个代码。
+/// ICMP 报文类型常量。
 const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP_UNREACHABLE: u8 = 3;
 const ICMP_REDIRECT: u8 = 5;
@@ -17,47 +17,47 @@ const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_TIME_EXCEEDED: u8 = 11;
 const ICMP_PARAMETER_PROBLEM: u8 = 12;
 
-/// TCP 的标志位。
+/// TCP 标志位常量。
 const TCP_SYN: u8 = 0x02;
 const TCP_ACK: u8 = 0x10;
 
-/// TCP 头最短多少字节。
+/// TCP 头部最小长度（字节）。
 const TCP_HEADER_MIN: usize = 20;
 
-/// IP 头里的保留位、"不许分片"（DF）、"后面还有片"（MF），和片偏移占的那 13 位。
+/// IP 头部标志位（保留位、禁止分片 DF、更多分片 MF）及 13 位分片偏移掩码。
 const RESERVED_FLAG: u16 = 0x8000;
 const DONT_FRAGMENT: u16 = 0x4000;
 const MORE_FRAGMENTS: u16 = 0x2000;
 const FRAGMENT_OFFSET: u16 = 0x1fff;
 
-/// "不可达"的 ICMP 包里带回原来那个包的多少字节：IP 头加上它后面的一段，整个 ICMP 包不超过 576 字节（RFC 1812）。
-/// 收的内核靠带回来的 IP 头和端口（TCP 的还有序号）找到是哪个套接字的包。
+/// ICMP 不可达报文中引用的原始数据包最大字节数：确保含外层 IP/ICMP 头在内的总长不超过 576 字节（RFC 1812）。
+/// 接收端内核依据引用的 IP 头与传输层端口（TCP 还包含序号）定位对应的本地套接字。
 const QUOTED_MAX: usize = 576 - 20 - 8;
 
-/// 一个 IPv4 包，只看头。
+/// 已解析的 IPv4 报文视图（零拷贝切片）。
 #[derive(Debug, Clone, Copy)]
 pub struct Ipv4<'a> {
     bytes: &'a [u8],
     header_len: usize,
 }
 
-/// 读不懂的包。
+/// IPv4 数据包格式解析错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Malformed {
-    #[error("不是 IPv4（版本 {0}）")]
+    #[error("非 IPv4 数据包（版本号 {0}）")]
     NotIpv4(u8),
-    #[error("包只有 {0} 字节，装不下 IPv4 的头")]
+    #[error("数据包仅 {0} 字节，不足 IPv4 头部最小长度")]
     Truncated(usize),
-    #[error("头长 {header_len} 字节、总长 {total_len} 字节，和包的 {len} 字节对不上")]
+    #[error("IPv4 长度字段不一致：头长 {header_len} 字节、总长 {total_len} 字节，实际包长 {len} 字节")]
     Lengths { header_len: usize, total_len: usize, len: usize },
 }
 
 impl<'a> Ipv4<'a> {
-    /// 读一个完整的包：总长度要正好是 `bytes` 的长度。
+    /// 解析完整的 IPv4 数据包，要求头部声明的总长度严格等于 `bytes.len()`。
     ///
     /// # Errors
     ///
-    /// 不是 IPv4，或者头里的长度和包对不上。
+    /// 数据包不是 IPv4、长度不足最小头部，或头部长度字段与实际字节长度不一致时返回错误。
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Malformed> {
         let &first = bytes.first().ok_or(Malformed::Truncated(0))?;
         if first >> 4 != 4 {
@@ -74,7 +74,7 @@ impl<'a> Ipv4<'a> {
         Ok(Self { bytes, header_len })
     }
 
-    /// IP 版本：首字节的高 4 位。空的包是 0。
+    /// 读取 IP 版本号（首字节高 4 位）；空切片返回 0。
     #[must_use]
     pub fn version_of(bytes: &[u8]) -> u8 {
         bytes.first().map_or(0, |first| first >> 4)
@@ -95,7 +95,7 @@ impl<'a> Ipv4<'a> {
         self.bytes[9]
     }
 
-    /// 头有多长（字节）：20，带 IP 选项时更长。
+    /// 返回 IP 头部长度（字节）：标准头部为 20，含 IP 选项时更长。
     #[must_use]
     pub fn header_len(&self) -> usize {
         self.header_len
@@ -106,13 +106,13 @@ impl<'a> Ipv4<'a> {
         self.bytes[8]
     }
 
-    /// 头的校验和对不对。读包时不核对它（见模块的说明），只有要先替内核把关的地方（[`crate::fragments`]）问。
+    /// 校验 IPv4 头部校验和。常规解析不执行此检查（见模块文档），仅在用户态分片重组前预检时调用（[`crate::fragments`]）。
     #[must_use]
     pub fn header_checksum_ok(&self) -> bool {
         checksum(&self.bytes[..self.header_len]) == 0
     }
 
-    /// 标志里有没有置"不许分片"（DF）或者保留位。
+    /// 判断标志位中是否设置了禁止分片（DF）或保留位。
     #[must_use]
     pub fn dont_fragment_or_reserved(&self) -> bool {
         self.flags_and_offset() & (DONT_FRAGMENT | RESERVED_FLAG) != 0
@@ -128,7 +128,7 @@ impl<'a> Ipv4<'a> {
         self.bytes.is_empty()
     }
 
-    /// 标识：同一个包切出来的片标识相同（加上来源、目的和协议，内核按这几样把片拼回去）。
+    /// 返回 IP 标识字段（配合源地址、目的地址与协议号用于分片重组）。
     #[must_use]
     pub fn identification(&self) -> u16 {
         u16::from_be_bytes([self.bytes[4], self.bytes[5]])
@@ -138,37 +138,37 @@ impl<'a> Ipv4<'a> {
         u16::from_be_bytes([self.bytes[6], self.bytes[7]])
     }
 
-    /// 后面还有片（MF）：这是一个被切开的包的一片，不是最后一片。
+    /// 返回 MF（More Fragments）标志：为 `true` 表示该包为非末片的分片包。
     #[must_use]
     pub fn more_fragments(&self) -> bool {
         self.flags_and_offset() & MORE_FRAGMENTS != 0
     }
 
-    /// 这一片的内容在原来那个包里从第几个字节开始（头后面的部分算起；片偏移乘 8）。没切开的包是 0。
+    /// 返回当前分片负载在原数据包负载中的起始字节偏移（13 位分片偏移乘 8）；未分片包为 0。
     #[must_use]
     pub fn fragment_offset(&self) -> usize {
         usize::from(self.flags_and_offset() & FRAGMENT_OFFSET) * 8
     }
 
-    /// 片偏移不是 0：这是一个被切开的包的后面几片，里面没有端口。
+    /// 分片偏移非 0：表示该包为分片包的后续分片，不包含传输层端口信息。
     #[must_use]
     pub fn is_later_fragment(&self) -> bool {
         self.flags_and_offset() & FRAGMENT_OFFSET != 0
     }
 
-    /// 这是一个被切开的包的一片（第一片、中间的或者最后一片）。
+    /// 判断该包是否属于 IPv4 分片（首片、中间片或末片）。
     #[must_use]
     pub fn is_fragment(&self) -> bool {
         self.more_fragments() || self.is_later_fragment()
     }
 
-    /// 头后面的部分。
+    /// 返回 IP 头部之后的负载切片。
     #[must_use]
     pub fn payload(&self) -> &'a [u8] {
         &self.bytes[self.header_len..]
     }
 
-    /// 这个包在会话里是什么，按包判断访问规则用。
+    /// 识别该数据包在会话中的角色，供逐包访问控制使用。
     #[must_use]
     pub fn conversation(&self) -> Conversation {
         if self.is_later_fragment() {
@@ -176,8 +176,8 @@ impl<'a> Ipv4<'a> {
         }
         let payload = self.payload();
         match self.protocol() {
-            // 被切开的 TCP 不认：两端按网卡的 MTU 定段长，节点之间的 TCP 不会被切；切开的第一片可以短得连完整的头都没有，
-            // 标志还能被后面重叠的片改写（RFC 1858）。头不完整的也不认。
+            // 拒绝分片 TCP 及头部不完整的 TCP：两端按虚拟网卡 MTU 协商 MSS，正常节点间 TCP 不会分片；
+            // 分片首片可能截断 TCP 头，且标志位存在被重叠分片篡改的风险（RFC 1858）。
             TCP if self.more_fragments() || payload.len() < TCP_HEADER_MIN => Conversation::Other,
             TCP => match payload[13] {
                 flags if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 => Conversation::TcpOpen,
@@ -192,35 +192,35 @@ impl<'a> Ipv4<'a> {
             ICMP => match payload.first() {
                 Some(&ICMP_ECHO_REQUEST) => Conversation::IcmpRequest,
                 Some(&(ICMP_ECHO_REPLY | ICMP_UNREACHABLE | ICMP_TIME_EXCEEDED | ICMP_PARAMETER_PROBLEM)) => Conversation::IcmpAnswer,
-                // 别的 ICMP（时间戳请求、路由器通告……）当作新的会话：不确定是不是回答，就不放。
+                // 其他类型 ICMP（如时间戳请求、路由器通告等）按非回包处理，避免误放行。
                 _ => Conversation::Other,
             },
             _ => Conversation::Other,
         }
     }
 
-    /// 是不是一个 ICMP 的差错报文（不可达、超时、参数问题）。对差错报文不再回差错报文（RFC 1122 3.2.2）。
-    /// 被切开的包的后面几片看不出来（头后面是原包中间的任意字节），不算。
+    /// 判断是否为 ICMP 差错报文（目的不可达、超时、参数问题）。差错报文不得再触发差错回复（RFC 1122 3.2.2）。
+    /// 后续 IP 分片的负载为原包中间字节，无法判断 ICMP 类型，因此返回 `false`。
     #[must_use]
     pub fn is_icmp_error(&self) -> bool {
         matches!(self.icmp_type(), Some(ICMP_UNREACHABLE | ICMP_TIME_EXCEEDED | ICMP_PARAMETER_PROBLEM))
     }
 
-    /// 是不是一个 ICMP 重定向：路由器告诉主机去某个地址换一个下一跳。后面几片同上，不算。
+    /// 判断是否为 ICMP 重定向报文（通知主机更换下一跳）。后续 IP 分片同上返回 `false`。
     #[must_use]
     pub fn is_icmp_redirect(&self) -> bool {
         self.icmp_type() == Some(ICMP_REDIRECT)
     }
 
-    /// ICMP 的类型：协议是 ICMP、不是被切开的包的后面几片、读得到类型时才有。
+    /// 提取 ICMP 报文类型：仅当协议为 ICMP、非后续分片且负载非空时返回 `Some`。
     fn icmp_type(&self) -> Option<u8> {
         (self.protocol() == ICMP && !self.is_later_fragment()).then(|| self.payload().first().copied()).flatten()
     }
 
-    /// ICMP 差错报文里带回来的原包：只有它开头的一段，至少要有完整的 IP 头。读它的来源、目的、协议，和头后面的端口
-    /// （带回来的够长的话：RFC 792 要求至少带回头后面的 8 个字节）。不是差错报文，或者带回来的连头都不完整，是 `None`。
+    /// 解析 ICMP 差错报文中引用的原始数据包：需至少包含完整 IPv4 头部，可用于读取原包的源/目的地址、协议及传输层端口
+    /// （若引用长度足够；RFC 792 要求至少包含 IP 头后 8 字节）。非差错报文或引用头部不完整时返回 `None`。
     ///
-    /// 返回的包只有带回来的那一段：头里写的总长度说的是原来那个包，比它长。
+    /// 返回视图仅覆盖被引用截取的部分，其 IP 头中的总长度字段仍为原始数据包的长度，可能大于当前切片长度。
     #[must_use]
     pub fn quoted(&self) -> Option<Ipv4<'a>> {
         if !self.is_icmp_error() {
@@ -233,43 +233,43 @@ impl<'a> Ipv4<'a> {
     }
 }
 
-/// 一个包在它的会话里是什么：开头（发起一次新的会话），还是之后的、回答的。
+/// 数据包在会话中的分类（用于区分新会话发起包与回包）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conversation {
-    /// TCP 的第一个握手包：有 SYN 没有 ACK。
+    /// TCP 首次握手包（置 SYN 且未置 ACK）。
     TcpOpen,
-    /// 别的 TCP 包。它们开不了新的连接：对一个不存在的连接，内核只回 RST。
+    /// 非首个 SYN 的 TCP 包。此类数据包无法建立新连接，内核对不存在的连接仅回复 RST。
     TcpOngoing,
-    /// ping 的请求。
+    /// ICMP Echo 请求（ping 请求）。
     IcmpRequest,
-    /// ping 的回答和差错报文（不可达、超时、参数问题），都是对本机发出的包的回答。
+    /// ICMP Echo 应答及差错报文（不可达、超时、参数问题），均属对本机发出报文的响应。
     IcmpAnswer,
     Udp {
         source: u16,
         destination: u16,
     },
-    /// 被切开的包的后面几片：没有端口可看，单看它判断不了。对端发来的片在 [`crate::fragments`] 里攒齐了、按第一片判断。
+    /// IP 分片包的后续分片：不含传输层端口，无法单独判定。对端分片会在 [`crate::fragments`] 重组齐后按首片判定。
     LaterFragment,
-    /// 别的协议，或者看不出来的包（包括被切开的 TCP、头不完整的 TCP）。
+    /// 其他协议或无法可靠识别的数据包（含分片 TCP 及头部不完整的 TCP）。
     Other,
 }
 
-/// "不可达"的代码。
+/// ICMP 目的不可达子代码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Unreachable {
-    /// 主机不可达：地址段里没有这个节点、它没有网卡、连不上它。内核告诉程序 `EHOSTUNREACH`（"No route to host"），
-    /// 正在连的 TCP 当场失败。
+    /// 主机不可达（Code 1）：网段内无此节点、对端未启用虚拟网卡或无法建立连接。内核会向应用返回 `EHOSTUNREACH`（"No route to host"），
+    /// 使正在建立的 TCP 连接立即失败。
     Host = 1,
-    /// 被管理员禁止：访问规则不允许本节点访问它。内核告诉程序的也是 `EHOSTUNREACH`。
+    /// 被管理员禁止（Code 13）：访问规则不允许本节点访问目标节点。内核同样向应用返回 `EHOSTUNREACH`。
     Prohibited = 13,
 }
 
-/// 给本机发出的包 `original` 写一个"不可达"的 ICMP 包，写回网卡交给本机的内核。不该回答的包返回 `None`：
-/// 差错报文本身、被切开的包的后面几片、发往组播或者广播地址的（RFC 1122 3.2.2）。
+/// 针对本机出站包 `original` 构造 ICMP 目的不可达报文，用于写回虚拟网卡通知本机内核。
+/// 对不应回复差错报文的包返回 `None`：包括 ICMP 差错报文本身、后续 IP 分片以及组播/广播包（RFC 1122 3.2.2）。
 ///
-/// 来源写成原来那个包要去的地址，像是那台主机说的：写成本节点自己的地址的话，内核会把它当作伪造的包丢掉
-/// （从外面的网卡进来、来源却是本机的地址）；原来的目的地址在地址段里，经这块网卡走，这样写内核认。
+/// 报文源地址设为原包目的地址以模拟目标主机响应：若设为本节点自身地址，内核会因“从外部接口收到本机源地址”将其当作伪造包丢弃；
+/// 原目的地址位于经该网卡路由的网段内，内核会正常受理。
 #[must_use]
 pub fn unreachable(original: &Ipv4<'_>, code: Unreachable) -> Option<Vec<u8>> {
     let destination = original.destination();
@@ -279,10 +279,10 @@ pub fn unreachable(original: &Ipv4<'_>, code: Unreachable) -> Option<Vec<u8>> {
     let quoted = &original.bytes[..original.bytes.len().min(QUOTED_MAX)];
     let total = 20 + 8 + quoted.len();
     let mut packet = Vec::with_capacity(total);
-    let total_len = u16::try_from(total).expect("ICMP 包不超过 576 字节");
+    let total_len = u16::try_from(total).expect("ICMP 报文长度不超过 576 字节");
     packet.extend_from_slice(&[0x45, 0xc0]);
     packet.extend_from_slice(&total_len.to_be_bytes());
-    // 标识 0，不分片，TTL 64，协议 ICMP，校验和先写 0。
+    // IP 标识 0、不分片、TTL 64、协议 ICMP，校验和字段先置零。
     packet.extend_from_slice(&[0, 0, 0, 0, 64, ICMP, 0, 0]);
     packet.extend_from_slice(&destination.octets());
     packet.extend_from_slice(&original.source().octets());
@@ -295,13 +295,13 @@ pub fn unreachable(original: &Ipv4<'_>, code: Unreachable) -> Option<Vec<u8>> {
     Some(packet)
 }
 
-/// 互联网校验和（RFC 1071）。
+/// 计算互联网校验和（RFC 1071）。
 fn checksum(bytes: &[u8]) -> u16 {
     let mut sum: u32 = bytes.chunks(2).map(|pair| u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]))).sum();
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !u16::try_from(sum).expect("折叠之后不超过 16 位")
+    !u16::try_from(sum).expect("校验和折叠后不超过 16 位")
 }
 
 #[cfg(test)]

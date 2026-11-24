@@ -23,7 +23,7 @@
 //! - 搬运之前用 [`SendStream::take_raw`]、[`RecvStream::wait_raw`] 问一下这个方向是不是已经是一条原始的 TCP，
 //!   是的话直接在两条 TCP 之间搬（Linux 上用 splice），同时监听流的吊销信号。发起方的发送方向是在读的那一侧看到对端切换之后
 //!   才变成原始的，所以搬运时每一段之前都可以再问一次 [`SendStream::take_raw`]；
-//! - 开一条承载 TCP 连接的流用 [`Connector::open_tcp`]：实现可以为它挑独占的 TCP，别的流（数据报上下文等）照常用 [`Connector::open`]。
+//! - 开启承载 TCP 连接的流应使用 [`Connector::open_tcp`]，以便实现为其选用独占 TCP 通道；其余流（数据报上下文等）仍使用 [`Connector::open`]。
 //!
 //! 流之外，一对节点之间还可以互相发数据报（[`Datagrams`]）：一份一份的，每份有长度上限。
 //! 走 [`DatagramSender::send_datagram`] 的可能丢、可能乱序、不重传；走 [`DatagramSender::send_reliable`] 的不丢，
@@ -31,7 +31,7 @@
 //!
 //! 虚拟网卡上的 IP 包（[`Packets`]）也是不保证送达的数据报，首字节标着它是网络包（`i3t_proto::flow::PacketHeader`），
 //! 收的一方交给第三个人。它们和流不一样，没有一条流替它们撑着连接，所以：第一个包之前要先把连接建起来（[`PacketSender::connect`]）；
-//! 包在走的时候连接不因为没有流而被当作空闲回收，包停了照常回收。
+//! 有网络包传输时连接不会因无活跃流而被空闲回收，流量停止后恢复正常回收。
 
 use std::future::Future;
 use std::io;
@@ -90,7 +90,7 @@ pub trait SendStream: AsyncWrite + Unpin + Send + 'static {
 
     /// 这个方向底下是不是已经是一条只属于这条流、不再加密的 TCP。是的话交出来（见 [`RawWrite`]），之后这个 [`SendStream`] 不再能写。
     ///
-    /// 默认 `None`：照常用 `AsyncWrite` 写。
+    /// 默认返回 `None`，继续通过 `AsyncWrite` 写入。
     fn take_raw(&mut self) -> Option<RawWrite> {
         None
     }
@@ -109,14 +109,14 @@ pub trait RecvStream: AsyncRead + Unpin + Send + 'static {
     /// 对端的头读完了：接受方读完 OPEN、发起方读完 REPLY 时调。
     ///
     /// 头里的东西（要连谁、对端答应了没有）只能来自对端本人，所以跑在 ice3proxy 上的流在这之前只交出还在加密里的字节：
-    /// 对端的方向已经离开加密、头却还没读完时，读返回错误，未经认证的原始字节不会被当作头读进来。这之后才接着交出原始字节。
+    /// 若对端发送方向已离开加密而流头尚未读完，读操作将返回错误，确保未经认证的原始字节不会被当作流头解析；流头读完后才继续交付原始字节。
     /// 交出原始字节（[`wait_raw`](Self::wait_raw)）也算头已经读完。
     ///
     /// 跑在共用连接上的流整条都是加密的，默认什么都不做。
     fn end_header(&mut self) {}
 
     /// 等到知道这个方向接下来是什么：底下已经是一条不再加密的 TCP（见 [`RawRead`]）就交出来，之后这个 [`RecvStream`] 不再能读；
-    /// 不是（接下来还是加密的数据、或者已经结束），返回 `None`，照常读。
+    /// 否则（后续仍为加密数据或该方向已结束）返回 `None`，由调用方继续正常读取。
     ///
     /// 发起方读完 REPLY 之后调：对端在 REPLY 后面紧跟着切换，切换的标记可能还在路上。默认立刻返回 `None`。
     fn wait_raw(&mut self) -> impl Future<Output = Option<RawRead>> + Send {
@@ -160,7 +160,7 @@ impl Payload {
 /// - 正常结束时发 FIN（`shutdown(Write)`）；异常结束时绝不能发 FIN，而是重置连接。
 /// - 搬运时监听 [`revoked`](Self::revoked)。吊销时停止两个方向并按异常结束处理。
 /// - socket 处在"关闭时发 RST"的状态。交出去之后底下的传输不再管它怎么关：调用方在整条流两个方向都正常结束时
-///   才恢复正常关闭（`SO_LINGER` 关掉），否则保持原样，丢弃时对端看到重置。macOS 上两个方向都关了之后改不了，
+///   才恢复正常关闭（禁用 `SO_LINGER`），否则保持原状，丢弃时触发对端重置。macOS 上在双向关闭后无法再修改该选项，
 ///   要在发 FIN 时就改、出错时再设回来（`i3t_underlay::tcp_reset` 的 `shutdown_write`、`graceful_close` 就是这样做的）。
 #[derive(Debug)]
 pub struct RawWrite {
@@ -372,7 +372,7 @@ pub trait Acceptor: Send + Sync + 'static {
 
     /// 等下一条对端开过来的流。本端关闭之后返回 `None`。
     ///
-    /// 对端是谁由连接的握手确定（按公钥认证），所以 [`Incoming::peer`] 伪造不了。
+    /// 对端身份由连接握手阶段的公钥认证确定，[`Incoming::peer`] 不可伪造。
     fn accept(&self) -> impl Future<Output = Option<Incoming<Self::Send, Self::Recv>>> + Send;
 }
 
@@ -396,7 +396,7 @@ pub trait Datagrams: Send + Sync + 'static {
 
     /// 等下一个对端发来的、给 `recipient` 这一侧的数据报。本端关闭之后返回 `None`。
     ///
-    /// 这一层不解释数据报的内容，只看首字节里上层写明的"给哪一侧"（[`Recipient::peek`]），看不出来的直接丢掉。
+    /// 本层不解析数据报载荷，仅根据首字节中上层标记的目标侧（[`Recipient::peek`]）分发，无法识别时直接丢弃。
     /// 两侧各有一个有上限的队列：没有人来取、或者取得太慢时，新到的数据报被丢掉。
     /// 同一个 `recipient` 只应该有一个人在等。
     fn recv_datagram(&self, recipient: Recipient) -> impl Future<Output = Option<Datagram>> + Send;
@@ -453,7 +453,7 @@ pub trait PacketSender: Clone + Send + Sync + 'static {
     /// （[`DatagramSendError::TooLarge`] 带着现在的上限：调用方切开再发）。
     fn send_packet(&self, peer: NodeId, frame: Bytes) -> Result<(), DatagramSendError>;
 
-    /// 和 [`send_packet`](Self::send_packet) 一样把一帧交给 `peer`，只是允许实现先攒着，和紧接着交下来的几帧凑成一批一起发
+    /// 与 [`send_packet`](Self::send_packet) 类似，将一帧发往 `peer`，但允许实现先暂存并与后续相邻帧合并批量发送
     /// （少几次系统调用）。调用方在这一轮交完、要去等别的事之前必须调用 [`flush`](Self::flush)，不然攒着的发不出去。
     ///
     /// 默认就是 `send_packet`，不攒。
@@ -471,7 +471,7 @@ pub trait PacketSender: Clone + Send + Sync + 'static {
     /// 发给 `peer` 的几个小网络包现在能不能合成一帧发（`i3t_proto::flow::PacketHeader::Bundle`），能的话一帧最长多少字节。
     ///
     /// 能：和它之间有连接，它握手时说过认识这种帧，而且现在包是单独封好了直接发给它的（到它是直连）。经 relay 的路上不合：
-    /// 那里包是连接的数据报，排着的几个连接自己会装进一个包里。不认识这种帧的对端收到了只会丢掉。
+    /// 经 relay 时网络包作为 QUIC 数据报发送，多个待发包由 QUIC 自行合并封装。不支持该帧格式的对端收到后会直接丢弃。
     ///
     /// 默认是不能。
     fn bundle_capacity(&self, _peer: NodeId) -> Option<usize> {
@@ -489,7 +489,7 @@ pub trait PacketSender: Clone + Send + Sync + 'static {
 /// 对端发来的一个数据报。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Datagram {
-    /// 发它的节点。来自连接的握手，伪造不了。
+    /// 发送方节点，来源经连接握手认证，不可伪造。
     pub peer: NodeId,
     pub payload: Bytes,
 }
@@ -501,7 +501,7 @@ pub enum DatagramSendError {
     NotConnected(NodeId),
     #[error("节点 {0} 不接收数据报")]
     Unsupported(NodeId),
-    #[error("数据报有 {len} 字节，这条连接现在最长只能发 {max} 字节")]
+    #[error("数据报长度为 {len} 字节，超出当前连接上限（{max} 字节）")]
     TooLarge { len: usize, max: usize },
     #[error("和节点 {peer} 的连接断开了：{reason}")]
     ConnectionLost { peer: NodeId, reason: String },

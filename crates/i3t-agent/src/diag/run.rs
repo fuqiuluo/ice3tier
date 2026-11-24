@@ -2,7 +2,7 @@
 //!
 //! - 发起方：试直连 → 在直连上发一列探测（要吞吐时再量上下行）→ 在经 relay 的路径上做同样的事（指定的路径，或者两种模式默认会选的）
 //!   → 算两种模式的选择 → 一次报上去。
-//! - 接受方：试直连（它也要知道自己这一侧连不连得上）→ 先报一次 → 等测试结束或者时间窗到了 → 算自己这个方向上两种模式的选择 → 报最后一次。
+//! - 接受方：尝试直连（确认本侧直连可达性）→ 首次上报 → 等待测试结束或时间窗到期 → 计算本方向两种模式选路结果 → 最终上报。
 //!   探测由路径层回答，测量流由测量服务接，都不在这里。
 
 use std::time::{Duration, Instant};
@@ -76,7 +76,7 @@ pub(super) async fn initiate(diag: &Diag, order: &TestOrder) -> TestReport {
     if order.items.route {
         report.decision = endpoint.route_decision(peer).await.as_ref().map(decision);
     }
-    tracing::debug!(test = order.test, %me, %peer, paths = report.paths.len(), "主动测试量完了");
+    tracing::debug!(test = order.test, %me, %peer, paths = report.paths.len(), "主动测试测量完成");
     report
 }
 
@@ -205,7 +205,7 @@ async fn measure_path(
     let report = match train {
         Ok(report) => report,
         Err(error) => {
-            tracing::info!(test = order.test, %peer, ?path, %error, "这条路径量不了");
+            tracing::info!(test = order.test, %peer, ?path, %error, "路径探测失败");
             return failed(route, picked_by, TestCode::Unreachable);
         }
     };
@@ -238,7 +238,7 @@ async fn measure_path(
     }
 }
 
-/// 发一列探测；路径此刻走不了时（指定的路径还没建好会话）等一会儿再试。
+/// 发送一列探测；若指定路径尚未建立会话导致暂不可达，则等待后重试。
 async fn train_when_ready(endpoint: &Endpoint, spec: TrainSpec) -> Result<TrainReport, TrainError> {
     let deadline = Instant::now() + PATH_READY;
     loop {
@@ -292,14 +292,14 @@ async fn throughput(endpoint: &Endpoint, order: &TestOrder, path: TestPath, cong
     let open = |mode| OpenMeasure { test: order.test, mode, path: path.relays(), bytes: THROUGHPUT_BYTES, millis: millis(THROUGHPUT_TIME) };
     let up = measure(endpoint, peer, &open(MeasureMode::Sink)).await;
     let down = match &up {
-        // 对端拒绝了（关掉了吞吐测试、不认这个测试）：下行也不用试了。
+        // 对端拒绝了测量流（如已关闭吞吐测试或不识别该测试），无需再测试下行。
         Err(FlowError::Refused(_)) => None,
         _ => Some(measure(endpoint, peer, &open(MeasureMode::Source)).await),
     };
     let held = settled && on_path(endpoint, peer, path, Duration::ZERO).await;
     drop(pin);
     let failure = throughput_failure(&up, down.as_ref());
-    tracing::info!(test = order.test, %peer, ?path, up = ?up.as_ref().ok(), down = ?down.as_ref().and_then(|down| down.as_ref().ok()), held, "吞吐量完了");
+    tracing::info!(test = order.test, %peer, ?path, up = ?up.as_ref().ok(), down = ?down.as_ref().and_then(|down| down.as_ref().ok()), held, "吞吐测试完成");
     Throughput {
         up: up.ok().map(transfer),
         down: down.and_then(Result::ok).map(transfer),

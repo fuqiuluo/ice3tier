@@ -2,16 +2,16 @@
 //!
 //! # 规矩
 //!
-//! - 停着的 lane 只在拨号方的控制 lane 还在时才用。控制 lane 断了，停着的全部关掉：拨号方多半已经换了地址或者重启了，
-//!   它们大概率已经死了，而死了的 lane 不会收到重置。控制 lane 静默超过两个保活周期时就先不再取用（判它断开要三个周期）：
-//!   拨号方那边可能已经发现并换了 epoch 重拨，这时取到的多半是死了的 lane。
+//! - 驻留的 lane 仅在拨号方控制 lane 存活时使用。控制 lane 断开后立即关闭所有驻留 lane：拨号方大概率已变更地址或重启，
+//!   旧 lane 通常已失效且不会收到重置。控制 lane 静默超过两个保活周期即暂停取用（断开判定为三个周期）：
+//!   拨号方可能已感知异常并切换 epoch 重拨，此时取出的大概率是已失效的 lane。
 //! - 新的控制 lane 带着新的 epoch 来了，不是这个 epoch 的空闲 lane 立刻关掉（家宽重拨之后旧的 lane 不会有任何动静）。
 //!   不是当前 epoch 的停车请求不收。
-//! - 空闲的 lane 只由本节点关：多余的（逐条关）、旧 epoch 的、对端说要走了的。拨号方从不关它停在这里的空闲 lane，
-//!   所以两边不会在同一条 lane 上撞车：本节点刚取走一条，拨号方不会同时把它关了。
+//! - 空闲 lane 仅由本节点关闭（包括多余的逐条回收、旧 epoch 以及对端通知排空的 lane）。拨号方从不主动关闭已驻留的空闲 lane，
+//!   因此双方不会在同一条 lane 上产生竞态：本节点刚取出的 lane 不会被拨号方同时关闭。
 //! - 补拨由本节点要：本节点确切知道自己手上还有几条空闲的，拨号方要过半个往返才知道哪条被取走了。
 //!   每个维护周期（以及有人开始等的时候），缺多少就在控制 lane 上请对方拨多少（POOL 里的 `extra`）：
-//!   目标 + 正在等的 − 手上空闲的 − 已经请过、还在路上的。请过的 [`REQUEST_TTL`] 之内没到就不再算（多半拨号失败了），下一个周期再请。
+//!   目标值 + 等待数 − 当前空闲数 − 已请求但尚未到达的数量。已请求数量在 [`REQUEST_TTL`] 内未到达则不再计入（大概率拨号失败），待下一周期重新请求。
 //! - 池空时取的一方登记等待，最多等 [`LaneConfig::claim_wait`]。等不到就返回 [`OpenLaneError::PoolDry`]，调用方改走共用的连接。
 
 use std::collections::VecDeque;
@@ -38,7 +38,7 @@ pub(crate) const MAX_IDLE: usize = MAX_IDLE_TARGET + MAX_BURST;
 const TICK: Duration = Duration::from_millis(100);
 /// 多余的空闲 lane 每隔多久关一批。
 const TRIM_EVERY: Duration = Duration::from_secs(1);
-/// 请对方补拨的条数多久之内还算在路上。正常的补拨是两三个往返；超过这么久没到，多半是拨号失败了。
+/// 已请求对端补拨的 lane 计入在途状态的时长。正常补拨耗时两三个往返，超时未到达通常意味着拨号失败。
 const REQUEST_TTL: Duration = Duration::from_secs(3);
 
 /// 一个拨号方在本节点的停车场。
@@ -50,7 +50,7 @@ pub(crate) struct Holder {
     demand: Option<Demand>,
     /// 已经请对方补拨、还没到的：请的时刻，和还差几条。
     requested: VecDeque<(Instant, usize)>,
-    /// 对方在当前的控制 lane 上说了要走。
+    /// 对端已在当前控制 lane 上发送排空（GoAway）通知。
     going_away: bool,
     /// 上一次在控制 lane 上听到对方的时刻。
     heard: Option<Instant>,
@@ -68,12 +68,12 @@ enum Command {
     Want,
     /// 来了新的控制 lane，或者不再为这个对端开 lane 了：这一条停掉。
     Replace,
-    /// 本节点要走了：告诉对方。
+    /// 本节点进入排空状态：通知对端。
     GoAway,
 }
 
 impl Holder {
-    /// 现在能不能从这里取 lane：控制 lane 在，最近听到过对方，对方没说要走。
+    /// 检查当前是否可从池中取出 lane：控制 lane 存活、近期收到过对端消息且对端未通知排空。
     pub(crate) fn available(&self, ping_interval: Duration) -> bool {
         self.control.is_some() && !self.going_away && !self.silent(ping_interval)
     }
@@ -99,7 +99,7 @@ impl Holder {
 
     pub(crate) fn go_away(&self) {
         if let Some(control) = &self.control {
-            // 守控制 lane 的任务已经结束（lane 断了）时没有对方可告诉，不要紧。
+            // 若维护控制 lane 的任务已结束（lane 已断开），无需再通知对端，可忽略发送失败。
             let _ = control.commands.send(Command::GoAway);
         }
     }
@@ -156,7 +156,7 @@ pub(crate) async fn claim(inner: &Arc<Inner>, peer: NodeId, membership: &watch::
             if lane.is_usable() {
                 return Ok(lane);
             }
-            tracing::debug!(%peer, "扔掉一条已经被对方关掉的空闲 lane");
+            tracing::debug!(%peer, "丢弃已由对端关闭的空闲 lane");
         }
         let (sender, receiver) = oneshot::channel();
         holder.waiters.push_back(sender);
@@ -190,7 +190,7 @@ pub(crate) fn control_arrived(inner: &Arc<Inner>, mut lane: Lane) {
         let mut peers = inner.lock_peers();
         let Some(entry) = peers.get_mut(&peer).filter(|entry| entry.matches(&lane.membership)) else {
             drop(peers);
-            return inner.refuse(peer, &lane.membership, "对端的 lane 授权已经失效");
+            return inner.refuse(peer, &lane.membership, "对端 lane 授权已失效");
         };
         let holder = &mut entry.holder;
         if let Some(old) = holder.control.take() {
@@ -200,7 +200,7 @@ pub(crate) fn control_arrived(inner: &Arc<Inner>, mut lane: Lane) {
         let before = holder.idle.len();
         holder.idle.retain(|idle| idle.epoch == lane.epoch);
         if holder.idle.len() < before {
-            tracing::info!(%peer, dropped = before - holder.idle.len(), "对方换了 epoch（重启或者换了地址），关掉它旧的空闲 lane");
+            tracing::info!(%peer, dropped = before - holder.idle.len(), "对端已切换 epoch（可能重启或变更地址），关闭旧的空闲 lane");
         }
         holder.going_away = false;
         holder.heard = Some(Instant::now());
@@ -210,7 +210,7 @@ pub(crate) fn control_arrived(inner: &Arc<Inner>, mut lane: Lane) {
         holder.control = Some(Control { epoch: lane.epoch, generation, commands });
         generation
     };
-    tracing::info!(%peer, "对方的控制 lane 建立了，可以在它停在这里的 lane 上开流");
+    tracing::info!(%peer, "对端控制 lane 已建立，可使用其驻留 lane 开流");
     tokio::spawn(serve_control(Arc::clone(inner), lane, generation, receiver));
 }
 
@@ -220,14 +220,14 @@ pub(crate) fn parked_arrived(inner: &Arc<Inner>, lane: Lane) {
     let mut peers = inner.lock_peers();
     let Some(entry) = peers.get_mut(&peer).filter(|entry| entry.matches(&lane.membership)) else {
         drop(peers);
-        return inner.refuse(peer, &lane.membership, "对端的 lane 授权已经失效");
+        return inner.refuse(peer, &lane.membership, "对端 lane 授权已失效");
     };
     let holder = &mut entry.holder;
     let refusal = match &holder.control {
-        None => Some("它的控制 lane 不在"),
-        Some(control) if control.epoch != lane.epoch => Some("不是它当前的 epoch"),
-        Some(_) if holder.going_away => Some("它说了要走"),
-        Some(_) if holder.idle.len() >= MAX_IDLE => Some("它停在这里的空闲 lane 到了上限"),
+        None => Some("控制 lane 未建立"),
+        Some(control) if control.epoch != lane.epoch => Some("epoch 与当前控制 lane 不匹配"),
+        Some(_) if holder.going_away => Some("对端正在排空"),
+        Some(_) if holder.idle.len() >= MAX_IDLE => Some("空闲驻留 lane 数量已达上限"),
         Some(_) => None,
     };
     if let Some(reason) = refusal {
@@ -269,7 +269,7 @@ async fn serve_control(inner: Arc<Inner>, mut lane: Lane, generation: u64, mut c
         // 等着的随之失败（发送端被丢弃），调用方改走共用的连接。
         entry.holder.waiters.clear();
         drop(peers);
-        tracing::info!(%peer, dropped, %reason, "对方的控制 lane 断了，关掉它停在这里的空闲 lane，新的流改走共用的连接");
+        tracing::info!(%peer, dropped, %reason, "对端控制 lane 已断开，关闭其所有空闲驻留 lane，新流回退至共用连接");
     }
 }
 
@@ -343,7 +343,7 @@ impl Pool {
                 _ = ping.tick() => Event::Ping,
             };
             match event {
-                Event::Shutdown | Event::Command(None | Some(Command::Replace)) => return Ok("本节点不再用这条控制 lane"),
+                Event::Shutdown | Event::Command(None | Some(Command::Replace)) => return Ok("本节点主动关闭当前控制 lane"),
                 Event::Command(Some(Command::GoAway)) => lane.send(&Frame::GoAway).await?,
                 Event::Command(Some(Command::Want)) => self.request(inner, lane, false).await?,
                 Event::Frame(frame) => {
@@ -352,7 +352,7 @@ impl Pool {
                         entry.holder.heard = Some(self.heard);
                     }
                     match frame? {
-                        None => return Ok("对方关闭了控制 lane"),
+                        None => return Ok("对端关闭了控制 lane"),
                         Some(Frame::Ping(nonce)) => lane.send(&Frame::Pong(nonce)).await?,
                         Some(Frame::Pong(nonce)) => {
                             if let Some((sent, at)) = self.ping
@@ -364,7 +364,7 @@ impl Pool {
                         }
                         Some(Frame::GoAway) => self.peer_going_away(inner),
                         Some(Frame::Unknown(_)) => {}
-                        Some(_) => return Err(LaneError::Protocol("控制 lane 上不该出现的帧")),
+                        Some(_) => return Err(LaneError::Protocol("控制 lane 收到非预期帧")),
                     }
                 }
                 Event::Ping => {
@@ -374,7 +374,7 @@ impl Pool {
                 }
                 Event::Tick => {
                     if self.heard.elapsed() > self.config.ping_interval * 3 {
-                        return Ok("三个保活周期没有听到对方");
+                        return Ok("连续三个保活周期未收到对端响应");
                     }
                     self.maintain(inner);
                     self.request(inner, lane, false).await?;
@@ -438,6 +438,6 @@ impl Pool {
             entry.holder.waiters.clear();
         }
         drop(peers);
-        tracing::info!(peer = %self.peer, "对方说它要走了，不再在它的 lane 上开新的流");
+        tracing::info!(peer = %self.peer, "对端已通知进入排空状态，不再在其 lane 上开启新流");
     }
 }

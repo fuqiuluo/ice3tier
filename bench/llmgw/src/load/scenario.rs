@@ -135,7 +135,7 @@ pub enum Outcome {
     Corrupt,
     /// 代理拒绝了（SOCKS5 的错误码、HTTP 的非 2xx）。
     ProxyRefused,
-    /// 连不上代理（或者直连时连不上上游），或者和代理握手时出错。
+    /// 无法连接代理（直连模式下为无法连接上游），或代理握手失败。
     ConnectFailed,
     TlsFailed,
     /// 上游回了不该回的状态码。
@@ -306,7 +306,7 @@ impl Scenario {
 
     /// # Errors
     ///
-    /// 文件读不了或者内容不对。
+    /// 读取文件失败或内容无效。
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("读场景文件 {}", path.display()))?;
         Self::parse(&text).with_context(|| format!("场景文件 {} 有错", path.display()))

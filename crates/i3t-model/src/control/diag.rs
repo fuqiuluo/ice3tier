@@ -41,7 +41,7 @@ pub struct TestItems {
     pub route: bool,
     /// 在测质量的路径上另外量吞吐（要上面两项之一）。
     pub throughput: bool,
-    /// 两端各报一份这台机器、这个进程和到对端的那条连接的状况（[`HostReport`]）。旧的节点不认，也就不报。
+    /// 两端各上报一份主机、进程以及到对端连接的状况（[`HostReport`]）。旧版本节点不支持该项，不会上报。
     pub host: bool,
 }
 
@@ -91,7 +91,7 @@ pub struct TestReport {
 
 /// 一端在一个测试期间看到的：这台机器、节点这个进程，和它到对端的那条连接。
 ///
-/// 每一样读不到就是 `null`（这个平台上没有，或者读的时候出了错），不算测试失败。现在只有 Linux 读得到机器和进程的数。
+/// 无法采集的指标为 `null`（当前平台不支持或读取出错），不计为测试失败。目前仅 Linux 支持采集主机和进程指标。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostReport {
@@ -113,13 +113,13 @@ pub struct HostReport {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostSystem {
-    /// 发行版的名字，比如 `Debian GNU/Linux 13 (trixie)`；读不到发行版时是系统的种类（`linux`、`windows`、`macos`）。
+    /// 发行版名称，例如 `Debian GNU/Linux 13 (trixie)`；无法读取发行版信息时退回为操作系统类型（`linux`、`windows`、`macos`）。
     pub os: Option<String>,
     pub kernel: Option<String>,
     /// `x86_64`、`aarch64` 等。
     pub arch: String,
     pub cpu_model: Option<String>,
-    /// 这个进程用得上几个核。
+    /// 当前进程可用的 CPU 核心数。
     pub cores: u32,
     pub uptime_secs: Option<u64>,
 }
@@ -197,7 +197,7 @@ pub struct PeerConnection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestProblem {
     pub code: TestCode,
-    /// 是哪个节点的原因；说不上是哪个节点时是 `null`。
+    /// 导致问题的节点；无法归因到具体节点时为 `null`。
     #[serde(default)]
     pub node: Option<NodeId>,
     #[serde(default)]
@@ -211,11 +211,11 @@ impl TestProblem {
     }
 }
 
-/// 测试里的原因码。界面按它显示，`message` 只是给没有翻译的地方兜底。以后可能增加，不认识的读成 `unknown`。
+/// 测试原因码。界面按该字段渲染，`message` 仅作未翻译场景的兜底文本。后续可能新增枚举值，未知值反序列化为 `unknown`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestCode {
-    /// 节点的版本太旧，不懂主动测试。
+    /// 节点版本过旧，不支持主动测试。
     NotSupported,
     /// 节点不在线。
     NodeOffline,
@@ -229,25 +229,25 @@ pub enum TestCode {
     ThroughputOff,
     /// 网络里没有能用的 relay 路径。
     NoRelay,
-    /// 两个节点之间没有可用的直连，直连质量测不了。
+    /// 两个节点之间没有可用的直连，无法测量直连质量。
     NoDirect,
     /// 手上没有对端的候选地址。
     NoCandidates,
     /// 节点的 UDP 不通。
     UdpBlocked,
-    /// 节点映射出来的端口随对端变化（对称型 NAT），打不了洞。
+    /// 节点映射的端口随对端变化（对称型 NAT），无法打洞。
     MappingVaries,
     /// 两个节点都是只主动连接的。
     DialOutOnly,
     /// 试过了，没有在时限之内成功。
     Timeout,
-    /// 这条路径此刻走不了：到它的第一个 relay 没有会话，或者路径上有 relay 不转发。
+    /// 该路径当前不可达：与首跳 relay 无可用会话，或路径中存在未启用转发的 relay。
     Unreachable,
     /// 对端拒绝了测量流。
     Refused,
     /// 节点上同时进行的测试太多，或者和这个对端的上一次测试刚刚做过。
     Busy,
-    /// 同一对节点的上一次测试刚做过，要隔一会儿。
+    /// 同一对节点刚执行过测试，需间隔一段时间后再测。
     TooSoon,
     /// 测试被取消了。
     Cancelled,
@@ -264,32 +264,32 @@ pub enum TestCode {
 }
 
 impl TestCode {
-    /// 一小段给人看的说明。
+    /// 简短的中文说明。
     #[must_use]
     pub const fn text(self) -> &'static str {
         match self {
-            Self::NotSupported => "节点版本太旧，不支持主动测试",
+            Self::NotSupported => "节点版本过旧，不支持主动测试",
             Self::NodeOffline => "节点不在线",
-            Self::NotConnected => "访问规则没有连通这两个节点",
-            Self::RelayOnly => "节点只经中继，不参加直连测试",
-            Self::DirectOnly => "节点只用直连，不参加中继测试",
-            Self::ThroughputOff => "节点关掉了吞吐测试",
+            Self::NotConnected => "访问规则未允许这两个节点连通",
+            Self::RelayOnly => "节点仅经中继，不参加直连测试",
+            Self::DirectOnly => "节点仅使用直连，不参加中继测试",
+            Self::ThroughputOff => "节点已关闭吞吐测试",
             Self::NoRelay => "没有可用的中继路径",
             Self::NoDirect => "没有可用的直连",
             Self::NoCandidates => "没有对端的候选地址",
             Self::UdpBlocked => "UDP 不通",
-            Self::MappingVaries => "端口映射随对端变化，打不了洞",
-            Self::DialOutOnly => "两个节点都只主动连接",
+            Self::MappingVaries => "端口映射随对端变化，无法打洞",
+            Self::DialOutOnly => "两个节点均仅主动连接",
             Self::Timeout => "超时",
-            Self::Unreachable => "这条路径现在走不通",
-            Self::Refused => "对端拒绝了测量",
+            Self::Unreachable => "该路径当前不可达",
+            Self::Refused => "对端拒绝测量",
             Self::Busy => "节点正忙",
-            Self::TooSoon => "刚测过，稍后再试",
+            Self::TooSoon => "近期已测试，请稍后重试",
             Self::Cancelled => "已取消",
-            Self::NoReport => "节点没有按时报告结果",
+            Self::NoReport => "节点未按时上报结果",
             Self::StreamFailed => "测量中途断开",
-            Self::InvalidPath => "指定的路径不能用",
-            Self::Internal => "节点内部出错",
+            Self::InvalidPath => "指定的路径不可用",
+            Self::Internal => "节点内部错误",
             Self::Unknown => "未知原因",
         }
     }
@@ -315,7 +315,7 @@ pub struct DirectSide {
     /// 从开始尝试到验证通过，毫秒。
     #[serde(default)]
     pub elapsed_ms: Option<u32>,
-    /// 没有成功时这一端看到的原因。
+    /// 未成功时本端观测到的原因。
     #[serde(default)]
     pub failure: Option<TestCode>,
     /// 这一端的 UDP 通不通；不知道是 `null`。
@@ -337,7 +337,7 @@ pub struct PathMeasure {
     /// 为什么量这一条。
     #[serde(default)]
     pub picked_by: Vec<PathPick>,
-    /// 量不了时的原因。
+    /// 无法测量时的原因。
     #[serde(default)]
     pub failure: Option<TestCode>,
     #[serde(default)]
@@ -348,7 +348,7 @@ pub struct PathMeasure {
     /// 各段的测量值，按经过的顺序。
     #[serde(default)]
     pub hops: Vec<Hop>,
-    /// 经 relay 时，发起方到第一个 relay 的那一段走的是 UDP 还是 TCP。
+    /// 经 relay 时，发起方到首跳 relay 所使用的传输协议（UDP 或 TCP）。
     #[serde(default)]
     pub relay_leg: Option<LegTransport>,
     #[serde(default)]
@@ -386,7 +386,7 @@ pub struct Latency {
     pub jitter_us: Option<u32>,
     /// 往返的丢包，千分之几。
     pub loss_permille: u16,
-    /// 去程（发起方到对端）和回程的丢包，千分之几：按对端说它收到了几个分出来；分不出来时是 `null`。
+    /// 去程（发起方到对端）与回程的丢包率（千分比）：根据对端回报的接收数拆分计算；无法拆分时为 `null`。
     pub loss_up_permille: Option<u16>,
     pub loss_down_permille: Option<u16>,
     /// 回答里有几个是沿同一条路径倒着回来的。不是全部时，回程走的是对端自己的路。
@@ -416,7 +416,7 @@ pub struct Hop {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HopSource {
-    /// 这一段起点的节点自己测的（到 relay 的会话，或者直连）。
+    /// 由该段起点节点自行测量（到 relay 的会话或直连）。
     Measured,
     /// relay 之间的骨干矩阵。
     Backbone,
@@ -430,12 +430,12 @@ pub enum HopSource {
 /// 一条路径上的吞吐。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Throughput {
-    /// 发起方到对端，和对端到发起方。没有量（或者量不了）的方向是 `null`。
+    /// 发起方到对端及对端到发起方的传输结果。未测量或无法测量的方向为 `null`。
     #[serde(default)]
     pub up: Option<Transfer>,
     #[serde(default)]
     pub down: Option<Transfer>,
-    /// 量不了时的原因（对端拒绝、关掉了吞吐测试、流中途断了等）。
+    /// 无法测量时的原因（如对端拒绝、已关闭吞吐测试、流中途断开等）。
     #[serde(default)]
     pub failure: Option<TestCode>,
     /// 用的传输。现在总是 `"quic"`：测量流走这一对节点之间共用的连接，不经 ice3proxy。
@@ -481,7 +481,7 @@ pub enum TransferEnd {
 /// 一端发往对端的方向上，两种模式各会选哪条路。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
-    /// 这一端现在用的模式；比这个程序新的节点报了不认识的模式时是 `null`。
+    /// 本端当前使用的选路模式；较新版本节点上报未知模式时为 `null`。
     #[serde(default)]
     pub mode: Option<RoutingMode>,
     /// 这一端现在走的路。
@@ -532,7 +532,7 @@ pub enum ChoiceCode {
     OwnRelay,
     /// 对端挂靠的 relay。
     PeerRelay,
-    /// 默认模式：没有一个 relay 两端都用得上，经一串 relay（候选里代价最低的那一串）。
+    /// 默认模式：不存在两端均可用的单个 relay，改经多级 relay 链路（候选中代价最低的路径）。
     NoSharedRelay,
     /// 候选里代价最低的。
     LowestCost,
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn every_test_code_has_a_short_text() {
         assert_eq!(TestCode::UdpBlocked.to_string(), "UDP 不通");
-        assert_eq!(TestProblem::new(TestCode::TooSoon, None).message, "刚测过，稍后再试");
+        assert_eq!(TestProblem::new(TestCode::TooSoon, None).message, "近期已测试，请稍后重试");
         assert_eq!(serde_json::to_value(TestCode::ThroughputOff).unwrap(), "throughput_off");
     }
 }

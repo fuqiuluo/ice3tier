@@ -29,7 +29,7 @@ use crate::system::{Os, System};
 /// 一个发起节点同时能有多少条流在本节点上被处理（还在读 OPEN 的、连着目标在搬运的、数据报上下文都算）。
 ///
 /// 每条流在出口上占一个任务、两块搬运的缓冲区，连到目标的还占一个文件描述符。没有这个上限，
-/// 一个被允许访问本节点的节点可以开上万条流、每条都连到一个不说话的目标，把文件描述符耗尽，整个节点跟着用不了。
+/// 单个被允许访问本节点的对端可能并发开启上万条流，每条都连接到无响应目标，从而耗尽文件描述符，导致整个节点不可用。
 ///
 /// 取 16384，和一条连接上并发流的上限一样。它要装得下这个产品最重的正当用法：一个网关把几千个长时间挂着的请求
 /// 经同一个出口发出去（实测 2000 个并发请求时，取 1024 会让将近一半的请求被拒绝）。同一个对端最多有两条连接，
@@ -51,7 +51,7 @@ const BUSY_LOG_EVERY: Duration = Duration::from_secs(60);
 ///
 /// 1. 访问规则：发起节点在当前的 netmap 里必须被允许访问本节点。发起节点是谁来自连接的握手，这里不信任入口的判断。
 /// 2. 节点正在排空（[`Exit::set_draining`]）时一律拒绝，状态是 [`Status::Draining`]：调用方据此换一个出口。
-///    这一步排在访问规则之后，不能访问本节点的节点看不出它在排空。
+///    该步骤位于访问规则校验之后，无权访问本节点的对端无法探测本节点是否处于排空状态。
 /// 3. 按目标的种类查本节点的能力和策略：
 ///    - 互联网：本节点启用了出口，端口在允许的范围里；配额没有用完，发起节点对这个目标的建连预算没有用完；
 ///      解析出来的地址按地址族挑过之后，每个都过出站策略；
@@ -87,7 +87,7 @@ pub struct Exit<S = Os, C: Datagrams = Endpoint> {
     datagram_idle_timeout: Duration,
     /// 每个发起节点上一次因为流太多被拒绝而记 info 的时刻。
     busy_logged: Mutex<HashMap<NodeId, Instant>>,
-    /// 监听在本节点虚拟 IP 上的端口转发连不连得上目标，和入口记的是同一份（[`with_forward_health`](Self::with_forward_health)）。
+    /// 监听在本节点虚拟 IP 上的端口转发的目标连通性记录，与入口模块共用同一份状态（[`with_forward_health`](Self::with_forward_health)）。
     forward_health: ForwardHealth,
     /// 到各个对端现在走哪条路，写进每条流结束时的摘要（[`with_routes`](Self::with_routes)）。
     routes: SharedRoutes,
@@ -133,8 +133,8 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
         self
     }
 
-    /// 监听在本节点虚拟 IP 上的端口转发的流在目标那里成没成，记到哪里。装配时交进入口的那一份
-    /// （`i3t_access::Access::forward_health`），上报里就有这些转发的"目标连不上"。不设时记在一份没有人看的里面。
+    /// 指定监听在本节点虚拟 IP 上的端口转发目标连通性记录的写入位置。装配时传入入口模块的实例
+    /// （`i3t_access::Access::forward_health`），以便上报中包含这些转发的目标连接失败状态。未设置时仅写入内部默认实例，不会被读取。
     #[must_use]
     pub fn with_forward_health(mut self, health: ForwardHealth) -> Self {
         self.forward_health = health;
@@ -156,14 +156,14 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
         self
     }
 
-    /// 接着上一次运行记下的配额用量往下记。装配层在启动时交进来；账期已经换了的话自动从零算。
+    /// 恢复上一次运行记录的配额用量。由装配层在启动时传入；若账期已切换则自动归零重新统计。
     #[must_use]
     pub fn with_quota_state(mut self, state: QuotaState) -> Self {
         self.limits = Limits::new(state);
         self
     }
 
-    /// 现在的配额用量，装配层定期存下来，下次启动时交回 [`with_quota_state`](Self::with_quota_state)。
+    /// 返回当前配额用量，供装配层定期持久化，并在下次启动时通过 [`with_quota_state`](Self::with_quota_state) 恢复。
     #[must_use]
     pub fn quota_state(&self) -> QuotaState {
         self.limits.quota_state()
@@ -266,13 +266,13 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
             first
         };
         if first_in_a_while {
-            tracing::info!(%peer, limit = MAX_STREAMS_PER_PEER, "发起节点在本节点上同时开着的流到了上限，新的流被拒绝（{BUSY_LOG_EVERY:?} 之内不再为它记这一行）");
+            tracing::info!(%peer, limit = MAX_STREAMS_PER_PEER, "发起节点在本节点的并发流数已达上限，已拒绝新流（{BUSY_LOG_EVERY:?} 内不再重复记录）");
         } else {
-            tracing::debug!(%peer, "拒绝了一条流：发起节点同时开着的流到了上限");
+            tracing::debug!(%peer, "已拒绝流：发起节点的并发流数已达上限");
         }
         Screening::Refuse(Reply::new(
             Status::TooManyStreams,
-            format!("发起节点在这个节点上同时开着的流到了上限（{MAX_STREAMS_PER_PEER} 条），等手上的流结束一些再开"),
+            format!("发起节点在本节点的并发流数已达上限（{MAX_STREAMS_PER_PEER} 条），请等待现有流结束后重试"),
         ))
     }
 
@@ -297,7 +297,7 @@ impl<S: System, C: Connector + Datagrams> Exit<S, C> {
     /// 对组网里的节点开着（监听在本节点的虚拟 IP 或者全部地址上）、目标是别的节点的端口转发：替发起节点到目标节点开一条流。
     ///
     /// 访问规则查两段：发起节点要能访问本节点（已经查过），本节点要能访问目标节点（目标节点自己还会按转发的编号再查一遍）。
-    /// 往目标节点去的这一段和别的端口转发一样只走共用的连接，不走 ice3proxy。
+    /// 发往目标节点的这一段与其他端口转发相同，仅通过共用连接传输，不走 ice3proxy。
     async fn onward(&self, netmap: &Netmap, initiator: &Peer, forward: &Forward, open: &Open) -> Result<Flow<C::Send, C::Recv>, Reply> {
         check_allow_list(initiator, forward)?;
         if !netmap.peer(forward.target).is_some_and(|target| target.outbound) {
@@ -426,8 +426,10 @@ impl<S: System, C: Connector + Datagrams> Handler for Exit<S, C> {
             match self.contexts.acquire(peer) {
                 Some(slot) => OutboundSocket::bind()
                     .map(|socket| (slot, socket))
-                    .map_err(|error| Reply::new(Status::InternalError, format!("绑不出 UDP 端口：{error}"))),
-                None => Err(Reply::new(Status::PolicyDenied, format!("发起节点开着的数据报上下文到了上限（{MAX_CONTEXTS_PER_PEER} 个）"))),
+                    .map_err(|error| Reply::new(Status::InternalError, format!("绑定 UDP 端口失败：{error}"))),
+                None => {
+                    Err(Reply::new(Status::PolicyDenied, format!("发起节点的并发数据报上下文数已达上限（{MAX_CONTEXTS_PER_PEER} 个）")))
+                }
             }
         };
         let (_slot, socket) = match admitted {
@@ -440,7 +442,7 @@ impl<S: System, C: Connector + Datagrams> Handler for Exit<S, C> {
         };
         let context = match request.accept().await {
             Ok(context) => context,
-            Err(error) => return tracing::info!(%peer, ?class, ?error, "数据报上下文没有建成"),
+            Err(error) => return tracing::info!(%peer, ?class, ?error, "建立数据报上下文失败"),
         };
         tracing::debug!(%peer, ?class, "数据报上下文建立");
 
@@ -567,6 +569,6 @@ async fn present(mut stream: TcpStream, entry: &ForwardTarget, initiator: &Peer)
             tracing::debug!(forward = entry.id, ?version, initiator = %initiator.virtual_ip, "给端口转发的目标发了 PROXY protocol 的头");
             Ok(stream)
         }
-        Err(error) => Err(Reply::new(Status::ConnectionRefused, format!("目标在收到 PROXY protocol 的头之前断开了：{error}"))),
+        Err(error) => Err(Reply::new(Status::ConnectionRefused, format!("目标在接收 PROXY protocol 头前断开：{error}"))),
     }
 }

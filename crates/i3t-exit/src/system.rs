@@ -17,7 +17,7 @@ pub trait System: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// 系统不给。这时出口没法判断目标是不是在本机的内网里，会拒绝请求。
+    /// 操作系统返回错误。此时出口无法判断目标是否属于本机内网，将拒绝请求。
     fn interfaces(&self) -> io::Result<Vec<IpNet>>;
 
     /// 在本机解析一个域名。
@@ -46,7 +46,7 @@ pub enum ResolveError {
 
 /// 真正的操作系统。
 ///
-/// 域名用系统的解析器（`getaddrinfo`）解析，所以 hosts 文件、本机的 DNS 配置都照常生效，结果和这台机器上别的程序看到的一样。
+/// 域名通过系统解析器（`getaddrinfo`）解析，因此 hosts 文件与本机 DNS 配置均正常生效，解析结果与本机其他程序一致。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Os;
 
@@ -78,7 +78,7 @@ impl System for Os {
     }
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
-        // 目标多半不是我们的程序：只有本端通告的 MSS 能让它别发路上送不到的大分段（见 `i3t_underlay::tcp_mss`）。
+        // 目标通常并非本程序：仅能通过本端通告的 MSS 避免对端发送链路无法承载的大分段（见 `i3t_underlay::tcp_mss`）。
         i3t_underlay::tcp_mss::connect(addr).await
     }
 }

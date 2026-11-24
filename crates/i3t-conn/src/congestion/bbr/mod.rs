@@ -15,7 +15,7 @@
 //! # 和标准 BBR 的差别：只控制在途量
 //!
 //! 标准的 BBR 主要靠发送速率控制，拥塞窗口只是保险。QUIC 库的拥塞控制接口只有 [`Controller::window`] 一个输出，
-//! 它自己的发送节奏固定取"窗口 ÷ 平滑往返时间 × 1.25"，控制器指定不了速率。所以这里把各阶段的增益都作用在窗口上：
+//! 其内置发送节奏固定为“窗口 ÷ 平滑往返时间 × 1.25”，控制器无法直接指定速率，因此将各阶段增益统一作用于窗口：
 //!
 //! | 阶段 | 允许的在途量 |
 //! |---|---|
@@ -45,14 +45,14 @@
 //!   流的接收窗口挡住发送时也算没有数据可发，所以单条流被接收窗口限速时，样本都带着应用受限的标记，只能抬高带宽估计。
 //! - 一次丢包检测里判丢的包一起报告，只带其中最晚的那个的发送时刻，丢包就按这个时刻记账（见 [`loss`]）。
 //! - 换路发生在库的下面，库和控制器都得不到通知，只能从往返时间和送达速率的变化自己发现（上一节）。
-//! - 断路之后库的平滑往返时间被旧包的确认抬高，那一阵它的发送节奏比窗口允许的慢得多，这时的送达速率不拿来拉低带宽估计
+//! - 链路中断恢复后，QUIC 库的平滑往返时间会被旧包确认抬高，导致其发送节奏远慢于窗口允许值，此阶段的送达速率不用于拉低带宽估计
 //!   （见 [`PACER_LAG`]）。
 //!
 //! # 没有做的
 //!
 //! - 不看 ECN 的拥塞标记。库把它和丢包用同一个回调通知，但不带字节数，这里忽略。
 //! - 多条连接共用一个缓冲很浅的瓶颈时，彼此造成的丢包会被当成背景丢包容忍下来，上限是 10%。
-//! - 瓶颈处的缓冲比库一次连发的量（10 个包）还小时，丢包来自库的发送节奏，窗口管不了。
+//! - 当瓶颈缓冲区小于 QUIC 库单次突发发送量（10 个包）时，丢包源于库自身的发送节奏，拥塞窗口无法消除。
 //!
 //! # 依据
 //!
@@ -310,7 +310,7 @@ impl Bbr {
             window = self.window,
             in_flight = self.in_flight,
             round = self.sampler.round(),
-            "拥塞控制的估计"
+            "拥塞控制估计值"
         );
     }
 
@@ -331,7 +331,7 @@ impl Bbr {
         let outage = silence > self.outage_after();
         if outage {
             // 路断了，或者路径层换了一条路。断的时候发出去的包会在这批确认之后被判丢失，那不是发得太多。
-            tracing::debug!(?silence, "在途的数据很久没有回音，算路断过一次，那之前发出的包的丢失不当作拥塞");
+            tracing::debug!(?silence, "在途数据长时间未收到确认，判定发生链路中断，此前发包的丢包不计为拥塞");
             self.ledger.restart(now, self.epoch_kind(), self.window);
             self.epoch_stale = false;
             self.outage_ended = Some(now);
@@ -382,9 +382,9 @@ impl Bbr {
         if lost_bytes == 0 {
             return;
         }
-        // 库判"持续拥塞"的依据是一长段时间里发出的包全丢了。这些包是断路的时候发出的话，那一段已经按断路处理过
-        // （见 `end_acks`，库总是先报这一批确认、再报丢包），和发多少无关，不从头开始。从头开始的话窗口落到最小，
-        // 库的发送节奏又还按断路时抬高的往返时间走（见 [`PACER_LAG`]）：恢复之后一两秒都发不快。
+        // QUIC 栈判定"持续拥塞"的依据是较长时间段内发出的包全部丢失。若这些包发出于断路期间，对应区间已按断路处理
+        // （见 `end_acks`，QUIC 栈总是先上报该批确认再上报丢包），与发送量无关，不触发重启。若重启，窗口将回落至最小值，
+        // 而发送节奏仍受断路期间抬高的往返时间约束（见 [`PACER_LAG`]），导致恢复后 1～2 秒内速率难以回升。
         if is_persistent && self.outage_ended.is_some_and(|ended| sent < ended) {
             return;
         }
@@ -393,15 +393,15 @@ impl Bbr {
             return;
         }
         if self.ledger.on_lost(sent, lost_bytes, self.mtu) {
-            // 试探造成的丢包过多：马上停止试探。上限缩多少等这一段结清、知道实际送达了多少再定。
-            self.stop_probing("试探时丢包过多");
+            // 探测引起的丢包过多：立即停止探测。上限缩减幅度待当前周期结算、确定实际送达量后再定。
+            self.stop_probing("探测阶段丢包过多");
             self.update_window();
         }
     }
 
     /// 一长段时间里发出去的包全丢了：原来的路径多半已经不在，之前的估计都不可信，从最小的窗口重新开始。
     fn restart(&mut self, now: Instant) {
-        tracing::debug!(window = self.window, "持续丢包，拥塞控制从头开始");
+        tracing::debug!(window = self.window, "持续丢包，重置拥塞控制状态");
         self.base_window = MIN_WINDOW_PACKETS * self.mtu;
         self.window = self.base_window;
         self.state = State::Startup;
@@ -425,7 +425,7 @@ impl Bbr {
     }
 
     fn enter(&mut self, state: State, why: &'static str) {
-        tracing::trace!(from = ?self.state, to = ?state, why, bw = self.bw.get(), min_rtt = ?self.min_rtt.get(), "拥塞控制换阶段");
+        tracing::trace!(from = ?self.state, to = ?state, why, bw = self.bw.get(), min_rtt = ?self.min_rtt.get(), "拥塞控制切换阶段");
         self.state = state;
         self.epoch_stale = true;
     }
@@ -473,10 +473,10 @@ impl Bbr {
             let floor = MIN_WINDOW_PACKETS * self.mtu;
             self.inflight_hi = Some(fits.max(mul_div(ceiling, BETA_PERCENT, 100)).max(floor));
             if verdict.kind == EpochKind::Probing {
-                self.stop_probing("试探的那一段丢包过多");
+                self.stop_probing("探测阶段丢包过多");
             } else if matches!(self.state, State::ProbeBw(Phase::Cruise { .. })) {
                 // 没有在试探也丢得多。把在途量压低看看：还照样丢的话，这些丢包和发多少无关，之后就不再为它降速。
-                self.enter_down(BASELINE_DOWN_ROUNDS, "巡航时丢包过多");
+                self.enter_down(BASELINE_DOWN_ROUNDS, "巡航阶段丢包过多");
             }
         } else if verdict.kind == EpochKind::Probing
             && let Some(hi) = self.inflight_hi
@@ -529,12 +529,12 @@ impl Bbr {
                     self.state = State::ProbeBw(Phase::Up { rounds, base_bw });
                 } else {
                     self.probe_backoff = 0;
-                    self.enter_down(1, "多发之后送达速率没有涨");
+                    self.enter_down(1, "探测增发后送达速率未增长");
                 }
             }
             State::ProbeBw(Phase::Down { rounds_left, samples_before }) => {
                 if rounds_left <= 1 || self.ledger.baseline_samples() != samples_before {
-                    self.enter_cruise("向下的阶段结束");
+                    self.enter_cruise("回落阶段结束");
                 } else {
                     self.state = State::ProbeBw(Phase::Down { rounds_left: rounds_left - 1, samples_before });
                 }
@@ -591,7 +591,7 @@ impl Bbr {
         match self.state {
             State::Drain => {
                 if self.in_flight <= self.target_window(State::ProbeBw(Phase::Cruise { rounds_left: 0 })) {
-                    self.enter_cruise("启动时多发的部分排空了");
+                    self.enter_cruise("启动阶段超发数据已排空");
                 }
             }
             State::ProbeRtt(probe) => {
@@ -618,12 +618,11 @@ impl Bbr {
         // 探测期间的在途量按最近一轮实际的送达速率算，不按带宽估计：带宽估计偏高时，按它算出来的一半未必排得空队列。
         let window = self.bounded_by_inflight_hi(bytes_in(bw, min_rtt.max(MIN_RTT_FLOOR)) / 2).max(MIN_WINDOW_PACKETS * self.mtu);
         if sample.app_limited && self.in_flight <= window {
-            // 应用发得少，在途量本来就比探测时还低，样本里没有自己造成的排队，用不着专门去量。
+            // 应用发送量较低，当前在途字节数已不高于探测目标窗口，样本不含自身引入的排队时延，无需进入探测。
             self.replace_floor(now, sample.rtt);
             return;
         }
-        let why =
-            if inflation.is_some() { "往返时间连续几轮高于该有的值" } else { "往返时间的下限太久没有见到" };
+        let why = if inflation.is_some() { "往返时间连续多轮高于预期值" } else { "往返时间下限长时间未刷新" };
         self.enter(State::ProbeRtt(ProbeRtt { window, stage: ProbeStage::Draining, inflation }), why);
     }
 
@@ -672,7 +671,7 @@ impl Bbr {
         if self.min_rtt.replace(now, rtt)
             && let Some(hi) = self.inflight_hi.take()
         {
-            tracing::debug!(inflight_hi = hi, ?rtt, "往返时间的下限被大幅抬高，路径多半变了，按原来的路定下的在途量上限作废");
+            tracing::debug!(inflight_hi = hi, ?rtt, "往返时间下限大幅抬升，可能已切换路径，清除旧路径对应的在途量上限");
         }
     }
 

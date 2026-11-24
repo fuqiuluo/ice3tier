@@ -1,11 +1,11 @@
-//! TCP 中转的一条 TCP：UDP 用不了的节点和 relay 之间的那一段。分帧见 [`i3t_proto::tcp_frame`]。
+//! TCP 中继连接封装：用于无法使用 UDP 的节点与 relay 之间的传输。分帧格式见 [`i3t_proto::tcp_frame`]。
 //!
 //! 节点和 relay 两头往这条 TCP 里写的方式完全一样，所以放在这里共用。
 //!
 //! # 为什么要限制积压
 //!
-//! 这条 TCP 里装的是端到端连接的包。TCP 自己会重传，所以这一段丢包时两端的连接看不到丢包，只看到延迟变大，
-//! 于是不降速，包越积越多。要把积压变回丢包，两处都得设上限（实测：往返 50ms、这一段丢包 1% 时，
+//! 该 TCP 连接承载端到端传输数据包。由于 TCP 会自行重传，该段丢包时两端连接无法感知丢包而仅表现为延迟升高，
+//! 从而不会降速并导致数据包持续积压。为将积压转化为丢包信号，需在两处设置上限（实测：RTT 50ms、丢包 1% 时，
 //! 只设第一处小消息往返的中位数是 780ms，两处都设是 113ms）：
 //!
 //! 1. 待发队列最多 [`SEND_QUEUE_PACKETS`] 个包，满了就丢新来的；
@@ -55,7 +55,7 @@ fn limit_unsent(socket: &SockRef<'_>) -> io::Result<()> {
     socket.set_send_buffer_size(WRITE_BATCH_BYTES)
 }
 
-/// 往一条 TCP 中转腿里发包的一头。可以克隆，谁都不会被它阻塞。
+/// TCP 中继连接的非阻塞发送端，支持克隆。
 #[derive(Debug, Clone)]
 pub struct FrameSender {
     queue: mpsc::Sender<Bytes>,
@@ -99,7 +99,7 @@ pub fn frame_queue() -> (FrameSender, FrameQueue) {
 ///
 /// # Errors
 ///
-/// 这条 TCP 写不进去了。
+/// 写入 TCP 数据时失败或因关闭写入端失败时返回错误。
 pub async fn write_frames(mut writer: OwnedWriteHalf, mut queue: FrameQueue) -> io::Result<()> {
     let mut batch = BytesMut::with_capacity(2 * WRITE_BATCH_BYTES);
     while let Some(first) = queue.queue.recv().await {
@@ -117,11 +117,11 @@ pub async fn write_frames(mut writer: OwnedWriteHalf, mut queue: FrameQueue) -> 
 fn put(batch: &mut BytesMut, datagram: &[u8]) {
     if let Err(error) = tcp_frame::put_frame(batch, datagram) {
         // 数据报都是从 UDP 或者连接层来的，长不到 64KB；真有的话丢掉这一个，不影响别的。
-        tracing::warn!(%error, "数据报装不进 TCP 中转的一帧，丢弃");
+        tracing::warn!(%error, "数据报超出 TCP 中继单帧长度上限，已丢弃");
     }
 }
 
-/// 从一条 TCP 中转腿里按帧读数据报。
+/// 逐帧读取 TCP 中继连接中的数据报。
 #[derive(Debug)]
 pub struct FrameReader {
     reader: OwnedReadHalf,
@@ -138,7 +138,7 @@ impl FrameReader {
     ///
     /// # Errors
     ///
-    /// 读 TCP 出错；或者对方在一帧的中间断开了（[`io::ErrorKind::UnexpectedEof`]）。
+    /// 读取 TCP 数据失败，或在读完当前帧前遇到 EOF（[`io::ErrorKind::UnexpectedEof`]）。
     pub async fn next(&mut self) -> io::Result<Option<Bytes>> {
         loop {
             if let Some(frame) = self.decoder.next_frame() {

@@ -10,14 +10,14 @@ pub(super) struct DefaultRoute {
     pub(super) local: Ipv4Addr,
 }
 
-/// 读系统的默认路由。没有默认路由、网关没有 IPv4 地址时返回 `None`。
+/// 读取系统的默认路由。没有默认路由或网关没有 IPv4 地址时返回 `None`。
 ///
-/// 它要枚举网卡、问路由表，会阻塞，调用方放在阻塞线程里跑。
+/// 枚举网络接口和查询路由表会阻塞，异步调用方应通过 `spawn_blocking` 执行。
 pub(super) fn default_route() -> Option<DefaultRoute> {
     let interface = match netdev::get_default_interface() {
         Ok(interface) => interface,
         Err(error) => {
-            tracing::debug!(error, "找不到默认路由的网卡，不做端口映射");
+            tracing::debug!(error, "无法确定默认路由的网络接口，跳过端口映射");
             return None;
         }
     };
@@ -28,9 +28,9 @@ pub(super) fn default_route() -> Option<DefaultRoute> {
     Some(DefaultRoute { gateway, local })
 }
 
-/// 这个本机地址要不要映射。公网地址本来就连得上，用不着；回环和链路本地地址后面没有网关。
+/// 判断本机地址是否需要端口映射。公网地址已可直接访问，无需映射；回环和链路本地地址之后没有网关。
 ///
-/// 运营商级 NAT 的那一段（100.64.0.0/10）也算：PCP 本来就是给它设计的。
+/// 运营商级 NAT 地址段（100.64.0.0/10）也纳入映射范围：PCP 本身即面向该场景设计。
 pub(super) fn needs_mapping(local: Ipv4Addr) -> bool {
     let [first, second, ..] = local.octets();
     local.is_private() || (first == 100 && second & 0xc0 == 64)

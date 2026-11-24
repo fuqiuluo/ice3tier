@@ -34,7 +34,7 @@ use crate::texts::texts;
 ///
 /// 它就是这个包在 `Cargo.toml` 里的版本号。唯一的例外是编译时设了环境变量 `I3T_TEST_VERSION`：
 /// 端到端测试要有"同一份代码、版本号不同"的两个程序才能把更新跑一遍，用它编出第二个。
-/// 发布不用它：发布流水线会核对标签和 `Cargo.toml`，清单上的版本号和程序自己报的对不上时，节点的自检也不会放行。
+/// 发布流程不使用该变量：发布流水线会校验标签与 `Cargo.toml`，且清单版本号与程序上报版本号不一致时节点自检不会通过。
 //noinspection ALL
 const VERSION: &str = match option_env!("I3T_TEST_VERSION") {
     Some(version) => version,
@@ -120,7 +120,7 @@ enum ServiceCommand {
     Uninstall,
 }
 
-/// `i3t hosts` 做什么：打印那一段、写进 hosts 文件（`--apply`）、从里面去掉（`--remove`）。
+/// `i3t hosts` 执行的操作：输出条目区块、写入 hosts 文件（`--apply`）或移除区块（`--remove`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostsAction {
     Print,
@@ -182,7 +182,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    // 清理残留规则不需要状态目录，免得状态目录打不开时 systemd 的 ExecStopPost 也跟着失败。
+    // 清理残留规则无需访问状态目录，避免状态目录无法打开时导致 systemd 的 ExecStopPost 失败。
     if matches!(cli.command, Command::Network { command: NetworkCommand::Cleanup }) {
         network::cleanup()?;
         return Ok(ExitCode::SUCCESS);
@@ -262,14 +262,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             match change {
                 Change::Declare(_, true) => println!("{}", t.declare_hint),
                 Change::Profile(profile) => {
-                    // 读不出上次的 netmap 只是少一句提示。
+                    // 无法读取上次保存的 netmap 时仅省略该提示。
                     let chosen = state.netmap().ok().flatten().and_then(|netmap| netmap.me.profile);
                     if let Some(chosen) = chosen.filter(|chosen| *chosen != profile) {
                         println!("{}", (t.profile_chosen)(chosen.spelling()));
                     }
                 }
                 Change::Network(false) | Change::Firewall(false) => {
-                    // 问的时候出错也当它在运行：只有确实没有节点在运行，才去拆上次留下的东西。
+                    // 查询失败时按节点仍在运行处理：仅在确认无运行中节点时才清理残留规则。
                     let running = current_thread()?.block_on(local::query(&state)).map_or(true, |live| live.is_some());
                     network::after_switch_off(running);
                 }
@@ -366,16 +366,16 @@ fn runs_as_service(state: &StateDir) -> bool {
 #[cfg(windows)]
 fn run_as_service(state: StateDir, version: Version, r#static: Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let job = move |stop: service::Stop| {
-        // 到这里才碰日志文件：这时确实是服务控制管理器启动的（在终端里执行 `i3t run --service` 走不到这里，
-        // 动不了正在运行的服务的日志），也已经向它报了"运行中"，旧版本留下的大文件裁多久都不耽误启动。
+        // 到此处再打开日志文件：此时已确认由服务控制管理器启动（终端直接执行 `i3t run --service` 不会到达此处，
+        // 不会影响运行中服务的日志），且已上报"运行中"状态，旧版本遗留的大日志文件截断耗时不会阻塞服务启动。
         let log = service_log(&state);
         match run_node(&state, &version, r#static, &LogTo::File(std::sync::Arc::clone(&log)), stop) {
             Ok(Outcome::Stopped) => 0,
             Ok(Outcome::Restart) => u32::from(RESTART_EXIT_CODE),
             Err(error) => {
-                // 出错可能早于日志初始化（配置文件读不了），所以直接写进日志文件。
+                // 错误可能发生在日志初始化之前（例如配置文件无法读取），因此直接追加写入日志文件。
                 log.append_line(&format!("i3t: {}", i3t_lang::current().chain(error.chain())));
-                // 重启也救不了的以 0 停止，服务控制管理器不再拉；别的它过一会儿重新启动。
+                // 无法通过重启恢复的错误以 0 退出，使服务控制管理器不再重启；其余错误返回非 0 以触发自动重启。
                 if is_unrecoverable(&error) { 0 } else { 1 }
             }
         }
@@ -384,7 +384,7 @@ fn run_as_service(state: StateDir, version: Version, r#static: Option<PathBuf>) 
     Ok(ExitCode::SUCCESS)
 }
 
-/// 打开服务的日志文件。一个文件的上限有默认值，可以用环境变量改；给的值读不懂就用默认的，在日志里说一声。
+/// 打开服务日志文件。单文件大小上限有默认值，可通过环境变量覆盖；若配置值无法解析则回退默认值并在日志中提示。
 #[cfg(windows)]
 fn service_log(state: &StateDir) -> std::sync::Arc<log_file::LogFile> {
     let setting = std::env::var_os(log_file::LIMIT_ENV).map(|value| value.to_string_lossy().into_owned());
@@ -414,7 +414,7 @@ fn change_service(command: &ServiceCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 这条错误重启也救不了：`i3t run` 应以 [`NO_RESTART_EXIT_CODE`]（78 / `EX_CONFIG`）退出，让 systemd 停止自动重启。
+/// 判断错误是否无法通过重启恢复：若是，`i3t run` 应以 [`NO_RESTART_EXIT_CODE`]（78 / `EX_CONFIG`）退出，使 systemd 停止自动重启。
 fn is_unrecoverable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<InvalidConfig>() || cause.is::<StopError>())
 }
@@ -451,8 +451,8 @@ fn runtime(threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build()
 }
 
-/// glibc 默认会把释放的内存留在进程里，大块的阈值还会随用量往上调，一次大流量之后常驻内存就降不下来。
-/// 把两个阈值固定在 128KB：大于它的分配直接向系统要、用完就还，堆顶空出这么多就还。
+/// glibc 默认会将释放的内存保留在进程堆中，且动态调高大块分配阈值，导致大流量过后常驻内存难以回落。
+/// 将两个阈值固定为 128KB：超过该阈值的分配直接使用 mmap 并在释放时归还，堆顶空闲达到该阈值即归还系统。
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn return_memory_promptly() {
     const THRESHOLD: libc::c_int = 128 * 1024;
@@ -498,7 +498,7 @@ fn init_logging(level: &str, to: &LogTo) {
         // 输出到文件或者日志服务时不带颜色的控制符。
         LogTo::Stderr => logs.with_ansi(std::io::stderr().is_terminal()).with_writer(std::io::stderr).init(),
         #[cfg(windows)]
-        // 日志文件打不开不该让节点起不来：写不进去的那几条丢掉，下一条再试。
+        // 日志文件无法打开不应阻止节点启动：写入失败的记录予以丢弃，后续记录再重试。
         LogTo::File(file) => logs.with_ansi(false).with_writer(std::sync::Arc::clone(file)).init(),
     }
 }
@@ -506,14 +506,14 @@ fn init_logging(level: &str, to: &LogTo) {
 /// 把能同时打开的文件数的软上限抬到硬上限。
 ///
 /// 经过本节点的每条流在入口或者出口上占一个文件描述符（客户端的连接、到目标的连接），每个数据报上下文占一个 UDP 端口。
-/// 直接在终端里执行 `i3t run` 时软上限常常只有 1024，一千来条流就会让整个节点打不开新的连接。
+/// 直接在终端执行 `i3t run` 时软上限通常仅为 1024，约千条并发流即可耗尽描述符，导致节点无法建立新连接。
 /// 硬上限是系统允许这个用户自己抬到的数，抬上去不需要特权。装成系统服务时单元文件里另外设了 `LimitNOFILE`，这里只是兜底。
 /// macOS 的硬上限常常写着"不限"，实际能抬到的是 `kern.maxfilesperproc`，`rlimit` 会按它取。
 #[cfg(unix)]
 fn raise_open_file_limit() {
     match rlimit::increase_nofile_limit(u64::MAX) {
-        Ok(limit) => tracing::info!(limit, "能同时打开的文件数的上限"),
-        Err(error) => tracing::warn!(%error, "无法抬高能同时打开的文件数的上限，流多时可能打不开新的连接"),
+        Ok(limit) => tracing::info!(limit, "最大打开文件数上限"),
+        Err(error) => tracing::warn!(%error, "无法提高打开文件数上限，并发流较多时可能无法建立新连接"),
     }
 }
 
@@ -531,7 +531,7 @@ async fn shutdown_signal() {
                 }
             }
             Err(err) => {
-                tracing::warn!("装不上 SIGTERM 的处理（{err}），只响应 Ctrl-C");
+                tracing::warn!("无法注册 SIGTERM 信号处理（{err}），仅响应 Ctrl-C");
                 interrupt.await;
             }
         }
@@ -542,11 +542,11 @@ async fn shutdown_signal() {
 
 /// 等 Ctrl-C（`ctrl_c` 是 [`tokio::signal::ctrl_c`] 的结果）。
 ///
-/// 处理装不上时它立刻以错误结束；把这当作收到了信号，节点一启动就会停下，日志里还什么都没有。
-/// 所以记下原因，然后一直等：Unix 上 SIGTERM 照样能让节点停下。
+/// 信号处理注册失败时该 Future 会立即返回错误；若误将其视为收到终止信号，节点将在启动后立刻退出且不留日志。
+/// 因此记录错误原因后保持挂起：Unix 平台上仍可通过 SIGTERM 正常停止节点。
 async fn interrupted(ctrl_c: impl Future<Output = std::io::Result<()>>) {
     if let Err(error) = ctrl_c.await {
-        tracing::error!(%error, "装不上 Ctrl-C 的处理，Ctrl-C 停不了节点");
+        tracing::error!(%error, "无法注册 Ctrl-C 信号处理，节点将无法通过 Ctrl-C 停止");
         std::future::pending::<()>().await;
     }
 }

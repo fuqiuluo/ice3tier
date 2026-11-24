@@ -5,8 +5,8 @@
 //! - QUIC 包的首字节一定带 `0x40` 这一位（RFC 9000 §17.2、§17.3 的 Fixed Bit）。带这一位的数据报是对端直连发来的连接包，
 //!   整个交给连接层。这要求两端都不启用 RFC 9287 的"把这一位随机化"。
 //! - 不带这一位的是路径层的帧，首字节是帧的类型，取值在 `0x00`～`0x3f` 之间。
-//!   `0x80`～`0xbf` 不分配给任何帧：QUIC 的版本协商包可能落在这一段（它的这一位是随机填的）。
-//!   两端的 QUIC 版本相同时不会有这种包，收到就按不认识的帧丢掉。
+//!   `0x80`～`0xbf` 不分配给任何帧：QUIC 版本协商包可能落在该区间（其对应位为随机填充）。
+//!   两端 QUIC 版本一致时不会出现此类包，收到时按未知帧直接丢弃。
 //!
 //! 帧的类型：
 //!
@@ -21,7 +21,7 @@
 //! | `0x0e` | 骨干矩阵的一行，也是 relay 的过载和下线通知 | [`crate::backbone`] |
 //! | `0x11` | 封好的网络包：虚拟网卡的 IP 包，单独加密，不进 QUIC | [`crate::sealed`] |
 //!
-//! [`Datagram::parse`] 一次调用就把上面这些全部分出来。其余的首字节不认识，数据报直接丢掉，不回应。
+//! [`Datagram::parse`] 单次调用即可区分上述各类数据报。其余首字节为未知帧类型，数据报直接丢弃且不回应。
 //!
 //! 经 relay 转发的包：
 //!
@@ -188,9 +188,9 @@ pub struct Neighbours {
 /// 一组 relay 不能当作路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidRelayPath {
-    #[error("路径上要有 1 到 {MAX_RELAY_HOPS} 个 relay，给了 {len} 个")]
+    #[error("路径须包含 1 到 {MAX_RELAY_HOPS} 个 relay，实际传入 {len} 个")]
     Length { len: usize },
-    #[error("relay {0} 在路径上出现了两次")]
+    #[error("relay {0} 在路径中重复出现")]
     Repeated(NodeId),
 }
 
@@ -267,7 +267,7 @@ pub enum Datagram<'a> {
     Relayed { header: RelayHeader, packet: &'a [u8] },
     /// 经多个 relay 转发的包。`packet` 是去掉头之后的连接包。
     Routed { header: RouteHeader, packet: &'a [u8] },
-    /// 对端直连发来的封好的网络包，就是整个数据报。这里只核对过长度；密钥在连接层，认不认由它定。
+    /// 对端直连发来的加密网络包，即整个数据报。此处仅校验长度，密钥管理与合法性校验由连接层负责。
     Sealed(&'a [u8]),
     /// 骨干矩阵的一行，是整个数据报。这里只核对过长度对得上，内容用 [`backbone::Row::parse`] 取，签名由收的一方去验。
     Row(&'a [u8]),
@@ -284,7 +284,7 @@ pub enum Datagram<'a> {
 impl<'a> Datagram<'a> {
     /// # Errors
     ///
-    /// 数据报是空的、帧的类型不认识、帧不完整或者里面的节点编号是 0。
+    /// 数据报为空、帧类型未知、帧不完整，或包含为 0 的节点编号。
     /// 这些数据报都应该直接丢掉，不回应。
     pub fn parse(datagram: &'a [u8]) -> Result<Self, DatagramError> {
         let &first = datagram.first().ok_or(DatagramError::Empty)?;
@@ -340,20 +340,20 @@ pub fn forwarding_header_len(datagram: &[u8]) -> Option<usize> {
     (len <= datagram.len() && len <= RouteHeader::MAX_LEN).then_some(len)
 }
 
-/// 数据报解析不了的原因。
+/// 数据报解析失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DatagramError {
-    #[error("数据报是空的")]
+    #[error("数据报为空")]
     Empty,
-    #[error("不认识的帧类型 {0:#04x}")]
+    #[error("未知的帧类型 {0:#04x}")]
     UnknownKind(u8),
-    #[error("中转头要 {} 字节，整个数据报只有 {len} 字节", RelayHeader::LEN)]
+    #[error("中转头需要 {} 字节，但数据报仅有 {len} 字节", RelayHeader::LEN)]
     TruncatedRelayHeader { len: usize },
-    #[error("中转头里的节点编号是 0")]
+    #[error("中转头中的节点编号为 0")]
     ZeroNodeId,
-    #[error("多级中转的头里 relay 的个数不在 1 到 {MAX_RELAY_HOPS} 之间，或者同一个 relay 出现了两次")]
+    #[error("多级中转头中 relay 数量不在 1 到 {MAX_RELAY_HOPS} 之间，或包含重复的 relay")]
     BadRoute,
-    #[error("类型是 {kind:#04x} 的帧不完整，或者内容不合格式")]
+    #[error("类型为 {kind:#04x} 的帧不完整或格式无效")]
     Malformed { kind: u8 },
 }
 

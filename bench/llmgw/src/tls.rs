@@ -17,7 +17,7 @@ const CA_CERT: &str = "ca.pem";
 const CA_KEY: &str = "ca-key.pem";
 const ALPN: &[u8] = b"http/1.1";
 
-/// CA 的参数。沿用已有的 CA 时要用同样的主体名，签出来的证书的颁发者才对得上。
+/// CA 参数。沿用已有 CA 时必须保持相同的主体名，以确保签发证书的颁发者一致。
 fn ca_params() -> anyhow::Result<CertificateParams> {
     let mut params = CertificateParams::new(Vec::<String>::new()).context("CA 的证书参数")?;
     params.distinguished_name.push(DnType::CommonName, "i3t-llmgw test CA");
@@ -67,7 +67,7 @@ pub fn server_config(dir: &Path, names: &[String]) -> anyhow::Result<Arc<ServerC
 ///
 /// # Errors
 ///
-/// 文件读不了或者里面没有证书。
+/// 无法读取文件或文件中不包含有效证书。
 pub fn client_config(ca_file: &Path) -> anyhow::Result<Arc<ClientConfig>> {
     let ca = CertificateDer::from_pem_file(ca_file).with_context(|| format!("读 CA 证书 {}", ca_file.display()))?;
     let mut roots = RootCertStore::empty();

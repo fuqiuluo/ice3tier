@@ -28,7 +28,7 @@ pub async fn read_head<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>) 
         let mut chunk = [0_u8; 4096];
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
-            let detail = if buf.is_empty() { "连接在 HTTP 头部之前就关了" } else { "连接在 HTTP 头部中间关了" };
+            let detail = if buf.is_empty() { "读取 HTTP 头部前连接已关闭" } else { "读取 HTTP 头部中途连接已关闭" };
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, detail));
         }
         buf.extend_from_slice(&chunk[..read]);
@@ -77,7 +77,7 @@ impl RequestHead {
                 headers: collect_headers(request.headers),
             }),
             Ok(httparse::Status::Partial) => Err(invalid("请求头不完整".to_owned())),
-            Err(err) => Err(invalid(format!("请求头解析不了：{err}"))),
+            Err(err) => Err(invalid(format!("无法解析请求头：{err}"))),
         }
     }
 
@@ -105,7 +105,7 @@ impl ResponseHead {
                 headers: collect_headers(response.headers),
             }),
             Ok(httparse::Status::Partial) => Err(invalid("响应头不完整".to_owned())),
-            Err(err) => Err(invalid(format!("响应头解析不了：{err}"))),
+            Err(err) => Err(invalid(format!("无法解析响应头：{err}"))),
         }
     }
 

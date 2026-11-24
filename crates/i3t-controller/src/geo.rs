@@ -19,8 +19,8 @@ const ISO_CODE: [PathElement<'static>; 2] = [PathElement::Key("country"), PathEl
 static READER: LazyLock<Option<Reader<Vec<u8>>>> = LazyLock::new(|| match open() {
     Ok(reader) => Some(reader),
     Err(reason) => {
-        // 随程序编译进来的文件坏了才会走到这里；节点照常工作，只是不显示国家。
-        tracing::warn!(%reason, "地址库打不开，节点不显示所在的国家");
+        // 仅当随程序编译内嵌的数据文件损坏时才会走到此处；节点仍正常工作，只是不显示所在国家或地区。
+        tracing::warn!(%reason, "无法加载离线地址库，节点将不显示所在国家或地区");
         None
     }
 });

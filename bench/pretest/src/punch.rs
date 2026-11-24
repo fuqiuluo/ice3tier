@@ -151,7 +151,7 @@ pub struct Attempt {
     index: u32,
     /// 汇合点看到的本节点地址。
     mapped: Option<SocketAddr>,
-    /// 汇合点的第二个端口看到的地址和第一个不一样：映射随目的地变化，这种 NAT 基本打不了洞。
+    /// 汇合点第二个端口观测到的地址与第一个不同：映射随目的地变化，此类 NAT 通常无法打洞。
     mapping_varies: Option<bool>,
     peer_announced: Option<SocketAddr>,
     /// 实际收到对端探测包的来源地址。和汇合点通告的不一样，说明对端的映射随目的地变化。
@@ -292,7 +292,7 @@ async fn punch(
                         send(socket, &Message::ProbeAck { nonce: theirs }, from).await?;
                     }
                     Some(Message::ProbeAck { nonce: echoed }) if echoed == nonce => {
-                        // 再多回应一会儿，让对端也收到确认，否则它那边会算失败。
+                        // 额外持续回应一段时间，确保对端也能收到确认，否则对端会判定失败。
                         linger(socket, nonce, from, buf).await?;
                         return Ok(Some((from, started.elapsed())));
                     }

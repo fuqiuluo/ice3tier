@@ -31,19 +31,19 @@ impl Controller {
         let overview = inner.update_overview()?;
         let counters = &inner.counters;
         let mut out = Exposition::new();
-        out.gauge("i3t_controller_info", "controller 的版本", &[("version", &overview.controller_version.to_string())], 1.0);
-        out.gauge("i3t_controller_networks", "网络的数量", &[], f64::from(count(inner.store.networks()?.len())));
-        out.gauge("i3t_controller_nodes", "注册了的节点的数量", &[], f64::from(inner.store.node_count(None)?));
-        out.gauge("i3t_controller_nodes_online", "现在连着的节点的数量", &[], f64::from(count(inner.live.len())));
-        out.counter("i3t_controller_snapshots_sent_total", "启动以来发给节点的 netmap 的份数", &[], counters.snapshots_sent);
-        out.counter("i3t_controller_route_queries_total", "启动以来发给节点的路由查询的条数", &[], counters.route_queries);
+        out.gauge("i3t_controller_info", "controller 版本", &[("version", &overview.controller_version.to_string())], 1.0);
+        out.gauge("i3t_controller_networks", "网络数量", &[], f64::from(count(inner.store.networks()?.len())));
+        out.gauge("i3t_controller_nodes", "已注册节点数量", &[], f64::from(inner.store.node_count(None)?));
+        out.gauge("i3t_controller_nodes_online", "当前在线节点数量", &[], f64::from(count(inner.live.len())));
+        out.counter("i3t_controller_snapshots_sent_total", "启动以来下发给节点的 netmap 份数", &[], counters.snapshots_sent);
+        out.counter("i3t_controller_route_queries_total", "启动以来发送给节点的路由查询次数", &[], counters.route_queries);
 
-        out.gauge("i3t_controller_update_auto", "自动更新的开关：开是 1，关是 0", &[], f64::from(u8::from(overview.auto_update)));
+        out.gauge("i3t_controller_update_auto", "自动更新开关（1 表示开启，0 表示关闭）", &[], f64::from(u8::from(overview.auto_update)));
         let release = overview.release.as_ref().map(|release| release.version.to_string());
         if let Some(version) = &release {
             out.gauge("i3t_controller_update_release_info", "已知的最新正式版", &[("version", version)], 1.0);
         }
-        out.gauge("i3t_controller_update_paused_versions", "被暂停自动更新的版本的数量", &[], f64::from(count(overview.paused.len())));
+        out.gauge("i3t_controller_update_paused_versions", "已暂停自动更新的版本数量", &[], f64::from(count(overview.paused.len())));
         let nodes = overview.nodes;
         let by_state = [
             ("updating", nodes.updating),
@@ -53,19 +53,19 @@ impl Controller {
             ("up_to_date", nodes.up_to_date),
         ];
         for (state, nodes) in by_state {
-            out.gauge("i3t_controller_update_nodes", "节点按更新情况数出来的数量", &[("state", state)], f64::from(nodes));
+            out.gauge("i3t_controller_update_nodes", "按更新状态统计的节点数量", &[("state", state)], f64::from(nodes));
         }
-        out.counter("i3t_controller_update_orders_total", "启动以来下发的更新指令的条数", &[], counters.orders_sent);
-        out.counter("i3t_controller_update_cancels_total", "启动以来撤回的更新指令的条数", &[], counters.orders_cancelled);
+        out.counter("i3t_controller_update_orders_total", "启动以来下发的更新指令数", &[], counters.orders_sent);
+        out.counter("i3t_controller_update_cancels_total", "启动以来撤回的更新指令数", &[], counters.orders_cancelled);
         out.counter(
             "i3t_controller_update_version_failures_total",
-            "启动以来节点报告的归因于版本的更新失败的次数",
+            "启动以来节点上报的归因于版本的更新失败次数",
             &[],
             counters.version_failures,
         );
-        out.counter("i3t_controller_release_checks_total", "启动以来查发布源的次数", &[], counters.release_checks);
-        out.counter("i3t_controller_release_check_failures_total", "其中没有成功的次数", &[], counters.release_check_failures);
-        out.counter("i3t_controller_package_bytes_sent_total", "启动以来发给节点的更新包的字节数", &[], counters.package_bytes);
+        out.counter("i3t_controller_release_checks_total", "启动以来检查发布源的次数", &[], counters.release_checks);
+        out.counter("i3t_controller_release_check_failures_total", "启动以来检查发布源失败的次数", &[], counters.release_check_failures);
+        out.counter("i3t_controller_package_bytes_sent_total", "启动以来发送给节点的更新包字节数", &[], counters.package_bytes);
         Ok(out.finish())
     }
 }

@@ -10,7 +10,7 @@
 //! 整数都是大端，有效期的单位是秒，IPv4 地址写成映射的 IPv6 地址。请求和回答都是 60 字节。
 //!
 //! - 客户端地址必须就是发请求的那个源地址，网关靠它发现中间还有没有别的地址转换。
-//! - 随机数由客户端为每个映射选定，续期和删除都要带同一个：别的机器不知道它，动不了这个映射。
+//! - 随机数由客户端为每个映射选定，续期和删除均需携带同一随机数，防止其他主机篡改该映射。
 //! - 删除映射是"有效期填 0"的 MAP 请求。
 //!
 //! 只会 NAT-PMP 的网关收到 PCP 的请求时，按 NAT-PMP 的格式回一个"不支持的版本"（RFC 6887 附录 A）。
@@ -23,7 +23,7 @@ use super::{Protocol, Refused};
 const VERSION: u8 = 2;
 const OP_MAP: u8 = 1;
 const REPLY_BIT: u8 = 0x80;
-/// 结果码：网关不认这个版本。
+/// 结果码：网关不支持该协议版本。
 const UNSUPPORTED_VERSION: u16 = 1;
 
 const HEADER_LEN: usize = 24;
@@ -72,7 +72,7 @@ impl MapRequest {
         bytes
     }
 
-    /// 这个数据报是不是对这个请求的回答。不是时返回 `None`，调用方接着等。
+    /// 判断数据报是否为当前请求的响应。不匹配时返回 `None`，由调用方继续等待。
     pub(super) fn parse_reply(&self, datagram: &[u8]) -> Option<Result<Granted, Refused>> {
         let (&[version, op, _, code], rest) = datagram.split_first_chunk::<4>()?;
         if version != VERSION {

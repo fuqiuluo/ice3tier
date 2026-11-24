@@ -11,19 +11,19 @@
 //!
 //! 调用方是拿着 controller 的锁调用这里的，所以每一种等都有期限：
 //!
-//! - 连不上（包括连上了端口、对面却不答话）有总的期限；刚试过没连上的话，过一小会儿才再去连，这期间的读写马上失败
-//!   （[`StoreError::Disconnected`]），不是每一次都把期限等满。
+//! - 连接失败（包括已连通端口但对端无响应）受总超时限制；刚重连失败后会在冷却期内跳过重连，期间读写立即失败
+//!   （[`StoreError::Disconnected`]），避免每次请求都等待完整超时。
 //! - 一条语句等回答有期限，过了就当这条连接坏了。
-//! - 别的连接占着锁时（有人在库里开着事务改同一行、锁了表）最多等 [`LOCK_TIMEOUT`]。刚等满过一次的话，接下来同样长的
-//!   一段时间里不再等：被占着的马上失败，没被占着的照常写。一把一直不放的锁因此最多让 controller 有一半的时间在等，
-//!   而且挡不住别的行。
+//! - 其他连接持有锁时（例如外部事务正在修改同一行或锁表），单条语句最多等待 [`LOCK_TIMEOUT`]。刚触发锁超时后，在随后的同等
+//!   时长内不再等待：涉及被锁资源的语句立即失败，未受影响的资源仍正常写入。长期不释放的锁因此最多占用 controller 一半的等待时间，
+//!   且不会阻塞其他行的操作。
 //!
 //! # 连接断了
 //!
 //! 连接断了（数据库重启、网络闪断）时，下一次读写会换一条新的连接再做。断的那一刻正在做的读写报错。
-//! 它要是在事务里，事务不算数，数据库那边已经撤销了，只有一种情况说不准：断在"提交"发出去之后、回答回来之前。
-//! 那时数据库可能已经提交了，也可能没有，这里报 [`StoreError::CommitUnknown`]，调用方不能当成"没有做"。
-//! 后来到底算没算数是问得出来的：提交之前记下了事务的编号，连接恢复之后拿它去问（[`Store::settle_commits`]）。
+//! 若断开发生在事务中，事务不会生效且数据库侧会自动回滚，仅有一种情况结果不确定：连接断在发出提交指令之后、收到响应之前。
+//! 此时数据库可能已提交也可能未提交，此处返回 [`StoreError::CommitUnknown`]，调用方不可按未执行处理。
+//! 最终提交结果可在后续查明：提交前已记录事务编号，待连接恢复后可向数据库查询确认（[`Store::settle_commits`]）。
 
 mod codec;
 mod cooldown;
@@ -85,8 +85,8 @@ pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// 刚等满过一次锁之后，"不等"的那段时间里用的期限：被占着的语句马上失败。不能是 0，0 是"一直等"。
 const NO_LOCK_WAIT: Duration = Duration::from_millis(1);
 
-/// 没连上之后至少、至多隔多久再去连。隔多久看那一次花了多久：马上被拒绝的可以很快再试，等满了期限的要多隔一会儿，
-/// 不然连不上的那段时间里 controller 就一直卡在"连"上。
+/// 重连失败后的最小、最大退避间隔。具体时长取决于本次建连耗时：立即被拒绝的可较快重试，耗时触达超时的则退避更久，
+/// 避免在数据库不可达期间 controller 持续阻塞在建连上。
 const RECONNECT_PAUSE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(30));
 
 /// 连接串里没有另外写的话，连接闲着这么久就发 TCP 保活，发出去的数据这么久没人确认就当连接断了。
@@ -177,8 +177,8 @@ enum Transaction {
 
 pub struct Store {
     database: Database,
-    /// 现在用着的连接。发现它不能用了就马上丢掉、留空，不等到下一次连上才换：丢掉就是关套接字，数据库那边由此撤销
-    /// 它没做完的事务、放开它的锁。留着的话，这个 `Store` 闲着或者一直连不上的那段时间里，那些锁就一直占着。
+    /// 当前活跃的连接。一旦检测到失效便立即丢弃并置空，而非等到下次建连才替换：丢弃会关闭套接字，促使数据库侧尽快回滚
+    /// 未完成事务并释放持有的锁；若保留失效连接，在该 `Store` 空闲或持续无法重连期间，这些锁将被长期占用。
     session: RefCell<Option<Session>>,
     transaction: Cell<Transaction>,
     /// 等锁平时肯等多久。
@@ -202,20 +202,20 @@ pub struct Store {
 }
 
 impl Store {
-    /// 连上数据库，并把表结构升到当前版本；库是空的就从头建。
+    /// 连接数据库并将表结构迁移至当前版本；若为空库则初始化建表。
     ///
     /// # Errors
     ///
-    /// 连不上，或者库里的表是更新版本的程序建的。
+    /// 无法连接数据库，或数据库中的表结构由更新版本的程序创建。
     pub fn open(database: &Database) -> Result<Self, StoreError> {
         Self::prepare(database, schema::MIGRATIONS, Missing::Create)
     }
 
-    /// 和 [`Store::open`] 一样，只是库里还没有 controller 的表时不建，报 [`StoreError::Empty`]。
+    /// 与 [`Store::open`] 相同，但当库中尚不存在 controller 数据表时不自动建表，而是返回 [`StoreError::Empty`]。
     ///
     /// # Errors
     ///
-    /// 连不上，库是空的，或者库里的表是更新版本的程序建的。
+    /// 无法连接数据库、库为空，或库中的表结构由更新版本的程序创建。
     pub fn open_existing(database: &Database) -> Result<Self, StoreError> {
         Self::prepare(database, schema::MIGRATIONS, Missing::Refuse)
     }
@@ -266,15 +266,15 @@ impl Store {
 
     /// 把 `f` 里的读写放进一个事务：`f` 返回错误时全部撤销。
     ///
-    /// 事务里的一条语句失败之后，这个事务就不能再用了（PostgreSQL 的规矩）：`f` 应该把那个错误传出来。
-    /// 它要是把错误吞了、照常返回，这里报 [`StoreError::Aborted`]，同样全部撤销。
+    /// 事务中某条语句失败后，该事务即不可再用（PostgreSQL 语义）：`f` 应将该错误向上返回。
+    /// 若 `f` 吞掉错误并正常返回，此处返回 [`StoreError::Aborted`] 并回滚整个事务。
     ///
-    /// 要 `&mut self` 是为了让编译器保证事务不会嵌套。
+    /// 要求 `&mut self` 是为了在编译期避免事务嵌套。
     ///
     /// # Errors
     ///
-    /// `f` 返回的错误，或者开始、提交事务时数据库出的错。提交发出去了、回答没有回来时是
-    /// [`StoreError::CommitUnknown`]：这一种说不准事务算不算数。
+    /// `f` 返回的错误，或开启、提交事务时的数据库错误。若提交请求已发出但未收到响应，则返回
+    /// [`StoreError::CommitUnknown`]：此时无法立即确认该事务是否已提交。
     pub fn atomically<T, E: From<StoreError>>(&mut self, f: impl FnOnce(&Self) -> Result<T, E>) -> Result<T, E> {
         self.run(|session| session.batch("BEGIN"))?;
         self.transaction.set(Transaction::Open);
@@ -291,11 +291,11 @@ impl Store {
         self.unsettled_wake = Some(wake);
     }
 
-    /// 去问数据库，结果不明的那些提交后来怎么样了。有了结果的不再记着；数据库那边还没做完的留着，下次再问。
+    /// 向数据库查询先前提交结果未明的事务最终状态。已确定结果的事务会从记录中移除；数据库侧仍在执行中的保留至下次查询。
     ///
     /// # Errors
     ///
-    /// 读数据库失败。这一次问到的都不算，一个也没有忘掉：过后全部再问。
+    /// 读取数据库失败。此时本次已查到的结果均不生效，所有待查事务保持原样，供后续重新查询。
     pub(crate) fn settle_commits(&self) -> Result<Settled, StoreError> {
         let transactions = self.unsettled.borrow().clone();
         let mut settled = Settled::default();
@@ -453,7 +453,7 @@ impl Store {
         result
     }
 
-    /// 没有能用的连接的话连一条新的。刚试过没连上的那一小会儿里不去连，直接说连不上。
+    /// 若当前无可用连接则建立新连接。在近期重连失败后的退避窗口内不发起建连，直接返回连接断开错误。
     fn reconnect_if_closed(&self) -> Result<(), StoreError> {
         {
             let mut current = self.session.borrow_mut();
@@ -476,7 +476,7 @@ impl Store {
                 *self.session.borrow_mut() = Some(session);
                 self.reconnect_after.set(None);
                 self.impatient.set(false);
-                tracing::info!("重新连上了数据库");
+                tracing::info!("已重新连接数据库");
                 Ok(())
             }
             Err(error) => {
@@ -596,10 +596,10 @@ fn migrate(session: &Session, migrations: &[&str], missing: Missing) -> Result<(
             Err(error) => Err(error),
         };
         match done {
-            Ok(Some(version)) => tracing::info!(version, "数据库的表结构已升级"),
+            Ok(Some(version)) => tracing::info!(version, "数据库表结构已升级"),
             Ok(None) => return Ok(()),
             Err(error) => {
-                // 撤销不了只会是连接断了，那样数据库已经自己撤销了。
+                // 回滚失败只可能是连接已断开，此时数据库侧已自动回滚该事务。
                 let _ = session.batch("ROLLBACK");
                 return Err(error);
             }
@@ -643,43 +643,43 @@ fn migrate_one(session: &Session, migrations: &[&str], supported: u32, missing: 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StoreError {
-    /// 连接串读不懂，或者里面没有主机。不带解析器的原话：那里面会有连接串的片段，连密码在内。
-    #[error("数据库的连接串写得不对：要写成 postgres://用户:密码@主机/库名")]
+    /// 无法解析连接串，或连接串中缺少主机信息。不附带解析器的原始错误信息，避免暴露连接串片段及密码。
+    #[error("数据库连接串格式无效：应为 postgres://用户:密码@主机/库名")]
     BadConnectionString,
-    #[error("连接串要求 TLS（sslmode=require），这个程序连数据库不支持 TLS：数据库要在同一台机器上或者可信的内网里")]
+    #[error("连接串要求启用 TLS（sslmode=require），但当前不支持数据库 TLS 连接：请将数据库部署在同机或可信内网中")]
     TlsUnsupported,
-    #[error("连不上数据库")]
+    #[error("无法连接数据库")]
     Connect(#[source] tokio_postgres::Error),
-    #[error("连数据库等了 {} 秒没有连上（连上了端口、对面一直不答话也算）", .0.as_secs())]
+    #[error("连接数据库超时（已等待 {} 秒，含已建立 TCP 连接但对端无响应的情况）", .0.as_secs())]
     ConnectTimedOut(Duration),
-    /// 连接断着，刚试过重新连、没连上：过一小会儿才再去连，这期间的读写直接是这个错。
-    #[error("和数据库的连接断了，刚试过没连上，过一会儿再试")]
+    /// 连接已断开且近期重连失败：将在短暂间隔后再次尝试重连，期间的读写请求直接返回此错误。
+    #[error("数据库连接已断开且近期重连失败，请稍后重试")]
     Disconnected,
-    #[error("起不了照看数据库连接的线程")]
+    #[error("无法启动数据库连接驱动线程")]
     Driver(#[source] io::Error),
     #[error("数据库操作失败")]
     Postgres(#[from] tokio_postgres::Error),
-    #[error("数据库 {} 秒没有回答", .0.as_secs())]
+    #[error("数据库在 {} 秒内无响应", .0.as_secs())]
     Unresponsive(Duration),
-    #[error("事务里有一步失败了，整个事务没有提交")]
+    #[error("事务中存在失败的操作，整个事务未提交")]
     Aborted,
-    /// 提交发出去了，回答没有回来：数据库那边可能已经提交了，也可能没有。过后问得出来，见 [`Store::settle_commits`]。
-    #[error("提交之后没有等到数据库的回答，不知道这次改动算不算数")]
+    /// 提交请求已发送但未收到响应：数据库侧可能已提交，也可能未提交。后续可通过 [`Store::settle_commits`] 查询最终状态。
+    #[error("提交事务后未收到数据库响应，无法确认变更是否生效")]
     CommitUnknown(#[source] Box<StoreError>),
-    #[error("search_path 里没有一个存在的 schema，表没有地方建")]
+    #[error("search_path 中不存在有效的 schema，无法创建数据表")]
     NoSchema,
-    #[error("数据库里没有 controller 的表")]
+    #[error("数据库中缺少 controller 的数据表")]
     Empty,
-    #[error("数据库是更新版本的程序写的（表结构第 {found} 版，这个程序只认识到第 {supported} 版）")]
+    #[error("数据库由更新版本的程序创建（当前表结构版本为 {found}，本程序最高支持到第 {supported} 版）")]
     NewerSchema { found: u32, supported: u32 },
 }
 
 impl StoreError {
-    /// 这次失败是不是整个数据库的事：连不上、连接断了、不答话，数据库只读、正在关闭、没有空间。
-    /// 这时换一行写、马上再写一次都是一样的结果。
+    /// 判断此次失败是否属于整个数据库级别的故障：无法连接、连接断开、无响应，或数据库处于只读、关闭中、空间不足等状态。
+    /// 此类情况下立即重试其他写入也会得到相同结果。
     ///
-    /// 别的失败只和那一条语句有关，别的行照样写得进去：约束、触发器、读出来的值不对、语句被取消之类。
-    /// 等锁等到了期限（[`StoreError::is_lock_timeout`]）也在这一边：被占着的可能只是这一行。
+    /// 其他失败仅与单条语句有关，其他行仍可正常写入（例如约束冲突、触发器拒绝、值类型不匹配、语句被取消等）。
+    /// 等待锁超时（[`StoreError::is_lock_timeout`]）同样归为此类：被锁定的可能仅为单行。
     #[must_use]
     pub fn is_database_wide(&self) -> bool {
         match self {
@@ -705,14 +705,14 @@ impl StoreError {
         }
     }
 
-    /// 这次失败是不是等别的连接放开锁等到了期限。被占着的可能是一整张表，也可能只是这一行：
-    /// 别的行多半照样写得进去，所以不该因为它就不去试别的。
+    /// 判断此次失败是否为等待其他连接释放锁超时。被锁定的可能是整张表，也可能仅为单行：
+    /// 其他行大概率仍可正常写入，因此不应据此跳过其余操作。
     #[must_use]
     pub fn is_lock_timeout(&self) -> bool {
         matches!(self, Self::Postgres(error) if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE))
     }
 
-    /// 请求发出去了，数据库没有答话：连接断了、读写它出了错，或者等过了头。参数、结果转换不了的不算，那是这一条语句的事。
+    /// 请求已发送但数据库未响应：连接断开、套接字读写出错或等待超时。参数或结果类型转换失败不属此类，仅与当前语句有关。
     fn left_unanswered(&self) -> bool {
         match self {
             Self::Unresponsive(_) => true,

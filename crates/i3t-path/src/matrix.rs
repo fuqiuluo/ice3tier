@@ -1,12 +1,12 @@
-//! 骨干延迟矩阵在节点一侧的样子：每个 relay 最新的那一行。帧的格式和它是怎么传过来的见 [`i3t_proto::backbone`]。
+//! 节点侧保存的骨干延迟矩阵（记录各 relay 最新矩阵行）。帧格式与传输协议见 [`i3t_proto::backbone`]。
 //!
-//! 这里只管存和查。行是不是从有会话的 relay 来的、签名对不对，由控制任务在放进来之前核对。
-//! 每一行记着收到的时刻，过期作废，所以一个不再发行的 relay 过一阵就从矩阵里消失，
-//! 经它的多级路径也就不再是候选。
+//! 本模块仅负责存储与查询；来源会话校验与签名验证由控制任务在写入前完成。
+//! 每行均记录接收时间戳并设有效期，因此停止发布的 relay 会在超时后自动从矩阵中失效，
+//! 经由其的多级路径也将不再进入候选集。
 //!
-//! 一行是它的主人自己报的，签名只说明是它报的，不说明报得对。所以骨干上的一段要两头的行都说连得上才算，
-//! 质量取两边测的里差的那个：一个恶意的 relay 可以把自己到别人的链路报得很好，但改不了别人的行，
-//! 它就没法用自报的低代价把多级路径都引到自己身上；它停了之后有人重放它最后的一行，别的 relay 的行里它也已经是连不上的。
+//! 矩阵行由各 relay 自行上报，签名仅证明发布者身份而不保证数值真实。因此骨干链路须经两端矩阵行共同确认可达方视为有效，
+//! 链路质量取两侧测量值中的较差者：恶意 relay 虽可虚报极优质量，但无法篡改对端矩阵行，
+//! 因而无法通过虚报低代价诱导多级流量；在其下线后即使有人重放其最后一行，其他 relay 的矩阵行亦已标记其不可达。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -36,7 +36,7 @@ impl Matrix {
         self.rows.get(&origin).filter(|stored| now.saturating_duration_since(stored.received) < ESTIMATE_TTL)
     }
 
-    /// `origin` 的这一行是不是比手上的新。不是的话不值得去验它的签名：重放一行旧的换不掉新的。
+    /// 检查 `origin` 的矩阵行序号是否更新于本地缓存；若非更新则无需验签（重放旧行无法覆盖新行）。
     pub(crate) fn is_news(&self, origin: NodeId, seq: u64, now: Instant) -> bool {
         self.fresh(origin, now).is_none_or(|stored| seq > stored.row.seq)
     }
@@ -55,8 +55,8 @@ impl Matrix {
         row.links.iter().any(|link| link.quality.is_some() && !held.contains(&link.relay))
     }
 
-    /// 从 `from` 出发连得上的 relay 和这一段的质量。两头的行都要说连得上（没有过期、列了对方、不是连不上），
-    /// 质量取两头测的里差的那个，见模块文档。
+    /// 返回从 `from` 出发可达的相邻 relay 及链路质量。须两端矩阵行均未过期且互报可达，
+    /// 质量取两侧测量值中的较差者（见模块文档）。
     pub(crate) fn links_from(&self, from: NodeId, now: Instant) -> impl Iterator<Item = (NodeId, LinkQuality)> + '_ {
         self.reported_from(from, now).filter_map(move |(to, forward)| {
             let back = self.reported_from(to, now).find(|(relay, _)| *relay == from)?.1;
@@ -64,7 +64,7 @@ impl Matrix {
         })
     }
 
-    /// `from` 自己的行里说连得上的 relay。
+    /// 返回 `from` 自身矩阵行中上报为可达的相邻 relay。
     fn reported_from(&self, from: NodeId, now: Instant) -> impl Iterator<Item = (NodeId, LinkQuality)> + '_ {
         let links = self.fresh(from, now).map_or(&[][..], |stored| &stored.row.links[..]);
         links.iter().filter_map(|link| Some((link.relay, link.quality?)))

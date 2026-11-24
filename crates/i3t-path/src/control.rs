@@ -6,19 +6,19 @@
 //!
 //! 选路有两种模式，按 netmap 里本节点的设置（没有就用网络的默认值）：
 //!
-//! - **默认模式**：直连可用就走直连；否则只经一个 relay，按 [`relay_candidates`](route::relay_candidates) 的顺序取第一个能用的；一个都用不了时
-//!   经一串 relay（`View::chain`）。每一轮都重新看，所以直连一验证通过、一个 relay 一断开，路马上跟着变。
-//! - **延迟优先**：候选路径（直连、经 1 到最大中转级数个 relay）按代价比较，规则见 [`crate::routing`]。
-//!   代价每个评估窗口（5 秒）算一次；窗口之间只看现在的路还在不在，不在了立刻换。
+//! - **默认模式**：直连可用时优先直连；否则经单个 relay，按 [`relay_candidates`](route::relay_candidates) 顺序取首个可用者；
+//!   无可用单跳 relay 时经多级 relay（`View::chain`）。每轮均重新评估，直连验证通过或 relay 断开时立即切换。
+//! - **延迟优先**：候选路径（直连、经 1 至最大跳数个 relay）按代价比较，规则见 [`crate::routing`]。
+//!   代价每个评估窗口（5 秒）计算一次；窗口之间仅检查当前路径是否仍可用，不可用时立即切换。
 //!
-//! 两种模式下都会定期把候选路径和代价算出来放进对外公布的状态，给界面解释"为什么走这条路"。
+//! 两种模式下都会定期将候选路径及代价写入对外发布的状态，供界面说明选路原因。
 //!
 //! # 不可信的输入
 //!
-//! 收包路径交来的帧都没有经过认证，来源地址也可以伪造。这里的规矩是：
+//! 收包路径提交的帧均未经过认证，来源地址也可能被伪造，因此采用以下防护规则：
 //!
-//! - 验签名之前先扣额度（[`crate::budget`]），额度按对端、按候选地址、按矩阵行的主人分开算，一个来源灌包花不掉别人的额度；
-//! - relay 的错误帧只在回显对得上时才算数（[`crate::attach`]），说多级路径走不通的还要是本节点正在用的路径；
+//! - 验签前先扣除配额（[`crate::budget`]），配额按对端、候选地址、矩阵行来源分别隔离，单一来源洪泛不会耗尽其他来源配额；
+//! - relay 错误帧仅在回显匹配时生效（[`crate::attach`]），报告多级路径不可达时还需匹配本节点当前正在使用的路径；
 //! - 一个直连地址被几个对端认领时，收包表归正在把它当直连用的那个（[`rebuild_direct`]）；
 //! - 对端回答直连探测时报的"看到的本节点地址"必须像是本节点的（[`observed_is_mine`]），
 //!   不然可能是有人在中间来回转发，把自己插进了"直连"里。
@@ -73,54 +73,52 @@ const LOCAL_ADDRESS_REFRESH: Duration = Duration::from_secs(5);
 const ATTACH_REVIEW: Duration = Duration::from_secs(1);
 /// 多久刷新一次对外公布的状态（路由表里的延迟等）。路变了的时候不等这个间隔。
 const STATUS_REFRESH: Duration = Duration::from_millis(500);
-/// relay 说某个对端没挂在它上面、或者某条骨干连接走不通之后，多久之内不走那条路。
+/// relay 报告目标对端未挂靠或某条骨干链路不可达后，暂停使用该路径的时长。
 const UNATTACHED_HOLD: Duration = Duration::from_secs(10);
-/// 陌生地址（不是对端的候选地址）来的 PING，全体加起来每秒最多验多少个签名。对端候选地址来的各有各的额度（见 `direct`）。
+/// 陌生地址（不属于对端候选地址）发来的 PING 全体每秒最大验签速率。候选地址自带独立配额（见 `direct`）。
 const STRANGER_VERIFIES_PER_SEC: f64 = 50.0;
-/// 陌生地址来的、自称是同一个对端的 PING，每秒最多验多少个，最多攒多少个。伪造某一个对端的 PING 只花得掉这一份，
-/// 别的对端从新地址发来的真 PING 还能用上面那个总的额度。
+/// 陌生地址发来、声明属于同一对端的 PING 每秒最大验签速率及突发上限，防止伪造单个对端耗尽其他对端的全局配额。
 const STRANGER_VERIFIES_PER_PEER: f64 = 5.0;
 const STRANGER_VERIFY_BURST_PER_PEER: f64 = 10.0;
-/// 每个 relay 的矩阵行每秒最多验多少个签名，最多攒多少个。正常情况下一个 relay 几秒才有一行新的。
+/// 每个 relay 的矩阵行每秒最大验签速率与突发上限（正常情况下每数秒仅更新一行）。
 const ROW_VERIFIES_PER_SEC: f64 = 2.0;
 const ROW_VERIFY_BURST: f64 = 5.0;
-/// 状态变了的行、说哪一段骨干又通了的行不等下一轮就转给本节点 relay 上的会话，但同一个 relay 的行最多这么频繁地转：
-/// 状态或者连通来回翻的行再多，经本节点放大出去的也有限，其余的跟着下一轮一起发。
+/// 状态变更或骨干链路恢复的行不等下一轮即转发给本节点 relay 上的会话，但同一 relay 最多按该间隔即时转发：
+/// 避免状态或连通性频繁抖动的行被放大，其余随下一轮周期广播发送。
 const ROW_FORWARD_GAP: Duration = Duration::from_secs(1);
-/// 控制任务每一轮从每个队列最多处理多少条，免得一个队列被灌满时别的等太久。
+/// 控制任务每轮从单个队列最多处理的事件条数，防止单一队列积压阻塞其余队列。
 const BATCH: usize = 256;
-/// 经多个 relay 的路径上后面的 relay 没法把"送不到"告诉来源节点，所以本节点自己经这条路径给对端发端到端的探测
-/// （对端从它自己的路回答）。有流量时每隔这么久探测一次，没有流量时按普通的探测间隔。
+/// 多级 relay 路径中后续 relay 无法将投递失败通知回源节点，因此本节点需经该路径向对端发送端到端探测
+/// （对端沿自身路由应答）。有流量时按该间隔探测，无流量时按常规探测间隔。
 const PATH_PROBE_BUSY: Duration = Duration::from_secs(1);
-/// 一个路径探测等多久没有回答算丢了。连续丢 [`MAX_TIMEOUTS`] 个就认为这条路径中间断了。
+/// 单次路径探测的超时阈值；连续超时 [`MAX_TIMEOUTS`] 次则判定路径中断。
 const PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-/// 同一个对端的路径探测最多这么频繁地回答：验签名不便宜，对端正常情况下一秒才发一个。
+/// 应答同一对端路径探测的最小间隔（验签开销较高，对端正常最多每秒发送一次）。
 const PATH_PING_MIN_GAP: Duration = Duration::from_millis(200);
-/// 量"本节点的 relay → 对端"那一段的探测（见 [`View::local_leg`]）和经多级路径的探测至少隔这么久才发：两条路的延迟不一样，
-/// 发出去隔了这么久，到对端时一般也还隔着 [`PATH_PING_MIN_GAP`] 以上，不会有一个被它的频率上限挡掉。
+/// 测量“本节点 relay → 对端”链路的探测（见 [`View::local_leg`]）与多级路径探测之间的最小发送间隔：
+/// 两条路径延迟不同，拉开该间隔可确保到达对端时仍大于 [`PATH_PING_MIN_GAP`]，避免被对端限频丢弃。
 const LOCAL_PROBE_APART: Duration = Duration::from_millis(500);
-/// 被这样怀疑的路径多久之内不再用（除非没有别的路）。
+/// 疑似不可达路径的暂停使用时长（除非无其他可用路径）。
 const SUSPECT_HOLD: Duration = Duration::from_secs(20);
-/// relay 宣布下线之后，多久之内把它排在别的 relay 后面。比通知本身的有效期短得多：它要是升级完很快回来了，
-/// 不该因为一行旧的通知一直被冷落；它回来之后发的新的一行到了，这个标记也就提前解除。
-/// 这段时间里到它的会话照常保持、断了照常重连（带退避和随机抖动）：只有它一个 relay 可走的节点还得靠它。
+/// relay 通知即将下线后将其降级的时长。远短于通知有效期：若其升级重启后迅速恢复，
+/// 收到新矩阵行即提前解除降级，避免长期冷落。
+/// 期间仍维持其会话并正常断线重连（含退避与抖动），以保障仅依赖该 relay 的节点可用。
 const DRAIN_HOLD: Duration = Duration::from_secs(30);
-/// relay 通知过载之后，至少这么久不回去用它，另外每个节点再加上 0 到这么久的一段随机时间。
+/// relay 通知过载后的最低回避时长，各节点另附加 0 至该时长的随机抖动。
 const OVERLOAD_HOLD: Duration = Duration::from_secs(30);
-/// 有新的会话时，至少隔这么久才为它们额外发一轮矩阵。
+/// 出现新会话后，为其触发额外矩阵广播的最小间隔。
 const NEWCOMER_BATCH: Duration = Duration::from_millis(500);
-/// 一个对端的候选路径最多报多少条给界面。
+/// 上报给界面的单个对端最大候选路径条数。
 const MAX_REPORTED_CANDIDATES: usize = 16;
-/// 每分钟的 UDP 询问没有回答的 relay，隔这么久用一次会话（UDP 和 TCP 一起）去试：看它是只有 TCP 连得上，还是根本连不上。
+/// 每分钟 UDP 探测无响应的 relay，每隔该时长通过会话（同时尝试 UDP 与 TCP）检测一次，以区分仅 TCP 可达与完全不可达。
 const PROBE_AGAIN: Duration = Duration::from_secs(600);
-/// 这样的一次试最多多久。同一时刻只试一个，所以网络里 relay 再多，多出来的也只有一个会话。
+/// 单次补充会话探测的超时上限。同一时刻仅探测一个 relay，避免随网络规模放大连接数。
 const PROBE_LIMIT: Duration = Duration::from_secs(20);
-/// 本节点能访问的对端不超过这么多个时，不等流量就去试到每一个的直连（见 [`eager_direct`]）。
+/// 当本节点可访问的对端数量不超过该阈值时，无需等待实际流量即提前尝试直连（见 [`eager_direct`]）。
 ///
-/// 只在第一次用到时才试的话，两台还没说过话的公网服务器的路由表上是"经 relay，直连：未尝试"，看起来像打洞失败了。
-/// 一个节点为每个这样的对端付出的是：开始时一次尝试（几个探测、一条打洞信令），通了之后每 5 秒一个保活探测，
-/// 不通的照常退避，最后每分钟再试一次，和一对正在用的节点一样。个数封顶，免得网络大了之后每个节点都要和所有节点保持探测，
-/// 合起来随节点数的平方增长；超过的网络照旧在第一次用到时才试。
+/// 若仅在首次通信时才尝试，未曾通信的公网节点在路由表中会显示为“经 relay，直连：未尝试”，易被误判为打洞失败。
+/// 提前探测仅需初始尝试（若干探测帧与打洞信令），建立后每 5 秒保活一次，
+/// 不可达时按常规退避至每分钟重试一次，与活跃对端一致。设置上限可避免大规模网络产生平方级探测开销，超出时退回按需探测。
 pub(crate) const EAGER_DIRECT_PEERS: usize = 32;
 /// 测试用的开关：环境变量 `I3T_TEST_EAGER_DIRECT_PEERS` 改上面那个上限（实验环境里搭 33 个节点太重）。
 const EAGER_DIRECT_TEST_SWITCH: &str = "I3T_TEST_EAGER_DIRECT_PEERS";
@@ -158,7 +156,7 @@ pub(crate) enum Ctrl {
     Train { spec: TrainSpec, reply: oneshot::Sender<Result<TrainReport, TrainError>> },
     /// 把到对端的路暂时固定在一条路径上。
     Pin { peer: NodeId, pin: Pin },
-    /// 解除固定。`id` 对不上（已经被新的固定替换了）时不做什么。
+    /// 解除路由固定。若 `id` 不匹配（已被新的固定请求覆盖）则忽略。
     Unpin { peer: NodeId, id: u64 },
     /// 现在就试一次直连（带头），或者等对端来试（跟随），最多等 `limit`。
     AttemptDirect { peer: NodeId, side: Side, limit: Duration, reply: oneshot::Sender<DirectAttempt> },
@@ -247,7 +245,7 @@ struct PeerState {
     other_mode: Option<Option<PathId>>,
     /// 不等流量就试到它的直连（见 [`EAGER_DIRECT_PEERS`]）：从这个时刻起。不这样试的对端是 `None`。
     eager_from: Option<Instant>,
-    /// 对端挂在本节点的 relay 上、这一段又没有别的测量值时，本节点经这个会话发的端到端探测（见 [`View::local_leg`]）。
+    /// 当对端挂靠在本节点 relay 上且该链路无其他测量值时，本节点经该会话发送端到端探测的采样器（见 [`View::local_leg`]）。
     local_leg: Sampler,
     /// 最近一次收到它的打洞信令的时刻：之后一段时间里陪它把直连试完（见 [`direct_policy`]）。
     signalled: Option<Instant>,
@@ -358,7 +356,7 @@ pub(crate) struct Control {
     status_refreshed: Option<Instant>,
     /// 手上的骨干矩阵。
     matrix: Matrix,
-    /// relay 说走不通的骨干连接（从前一个到后一个），到什么时候为止不用。两个编号相同表示那个 relay 不肯转发多级路径。
+    /// relay 报告不可达的骨干链路（前驱至后继节点）及其回避截止时刻；两个节点 ID 相同表示该 relay 拒绝转发任何多级路径。
     broken: Vec<(NodeId, NodeId, Instant)>,
     /// 上一个评估窗口是什么时候开始的。
     evaluated: Option<Instant>,
@@ -534,7 +532,7 @@ impl Control {
             Ctrl::Frame { from, frame: Inbound::Probe(probe::Frame::Pong(pong)) } => self.on_pong(from, &pong, now),
             Ctrl::Frame { from, frame: Inbound::AddrReply(reply) } => {
                 if let Some(observation) = self.addr_query.handle_reply(from, &reply, now) {
-                    tracing::debug!(observer = %from, observed = %observation.observed, "地址查询有了回答");
+                    tracing::debug!(observer = %from, observed = %observation.observed, "已收到地址查询应答");
                 }
             }
             Ctrl::Frame { from, frame: Inbound::Row(frame) } => {
@@ -596,7 +594,7 @@ impl Control {
     fn apply_netmap(&mut self, netmap: Arc<Netmap>, now: Instant) {
         let me = self.shared.me;
         if netmap.me.id != me {
-            tracing::error!(expected = %me, got = %netmap.me.id, "netmap 里本节点的编号变了，忽略这份 netmap");
+            tracing::error!(expected = %me, got = %netmap.me.id, "netmap 中本节点 ID 发生变更，忽略该份 netmap");
             return;
         }
         let reach = netmap.me.reach.unwrap_or(netmap.network.reach);
@@ -607,7 +605,7 @@ impl Control {
         let max_hops = usize::from(netmap.network.max_relay_hops).clamp(1, MAX_RELAY_HOPS);
         if (mode, max_hops) != (self.mode, self.max_hops) {
             let name = match mode {
-                RoutingMode::DirectFirst => "默认模式（直连优先，否则经一个 relay，没有两端都用得上的 relay 时经一串）",
+                RoutingMode::DirectFirst => "默认模式（直连优先，否则经单个 relay，无两端共同可达的单个 relay 时经多级 relay）",
                 RoutingMode::LowestCost => "延迟优先（按代价比较直连和各条 relay 路径）",
             };
             tracing::info!(mode = name, max_relay_hops = max_hops, "本节点的选路模式");
@@ -624,7 +622,7 @@ impl Control {
             table.peers.remove(&id);
             peer.slot.set_hop(Hop::None);
             if peer.route != RouteKey::None {
-                self.announce(id, RouteKey::None, Reason::new("对端不在 netmap 里了", RouteCause::PeerRemoved));
+                self.announce(id, RouteKey::None, Reason::new("对端已从 netmap 中移除", RouteCause::PeerRemoved));
             }
         }
         if !gone.is_empty() {
@@ -632,7 +630,7 @@ impl Control {
         }
         drop(table);
         for test in self.windows.iter().filter(|(_, window)| gone.contains(&window.peer)).map(|(test, _)| *test).collect::<Vec<_>>() {
-            self.close_test(test, "对端不在 netmap 里了");
+            self.close_test(test, "对端已从 netmap 中移除");
         }
         let mut table = self.shared.table_mut();
         let local = self.shared.port.local_addr();
@@ -678,7 +676,7 @@ impl Control {
             });
             if peer.key != info.key {
                 // 换了密钥就是另一个身份：以前验证过的地址全部作废。
-                tracing::info!(peer = %info.id, "对端的公钥变了，重新验证它的直连地址");
+                tracing::info!(peer = %info.id, "对端公钥已变更，重新验证其直连地址");
                 peer.key = info.key;
                 peer.direct = DirectPath::for_port(local);
             }
@@ -695,7 +693,7 @@ impl Control {
             };
         }
         if !eager.is_empty() {
-            tracing::debug!(peers = eager.len(), "能访问的对端不多：不等流量就试到它们的直连");
+            tracing::debug!(peers = eager.len(), "可达对端数量未超过阈值，提前发起直连探测");
         }
 
         let gone: Vec<NodeId> = self.relays.keys().copied().filter(|id| netmap.relay(*id).is_none()).collect();
@@ -703,7 +701,7 @@ impl Control {
             self.relays.remove(&id);
             self.legs.remove(&id);
             self.inbound.remove(&id);
-            tracing::info!(relay = %id, "relay 不在 netmap 里了，到它的中转会话关闭");
+            tracing::info!(relay = %id, "relay 已从 netmap 中移除，关闭对应中转会话");
         }
         let own = self.own_addresses();
         for info in netmap.relays.iter().filter(|relay| relay.id != me) {
@@ -774,7 +772,7 @@ impl Control {
         if self.local_refreshed.is_none_or(|at| now.saturating_duration_since(at) >= LOCAL_ADDRESS_REFRESH) {
             let local = outside_overlay(self.shared.port.local_candidates(), &self.netmap);
             if local != self.local_candidates {
-                // 网卡地址变了多半是换了网络：网关可能也换了，端口映射要重新申请。头一次读到地址不算变化。
+                // 本机接口地址变更通常意味着网络环境切换：网关可能变更，需重新申请端口映射。首次采集地址不视为变更。
                 if let (Some(mapper), true) = (&self.portmap, self.local_refreshed.is_some()) {
                     mapper.network_changed();
                 }
@@ -800,12 +798,12 @@ impl Control {
         public.sort_unstable();
         public.dedup();
         if public != self.public_addresses {
-            tracing::debug!(addresses = ?public, "别人看到的本节点地址变了");
+            tracing::debug!(addresses = ?public, "外部观测到的本节点公网地址已变更");
             self.public_addresses = public;
             self.status_refreshed = None;
         }
 
-        // 两边的公网地址相同，说明在同一个 NAT 后面：对端的私有地址多半就在本节点的局域网里。
+        // 若双方公网地址相同，说明处于同一 NAT 之后，对端的私有地址通常位于本节点同一局域网内。
         let public: Vec<IpAddr> = observed.iter().chain(&mapped).map(SocketAddr::ip).filter(|ip| !ifaddr::is_private(*ip)).collect();
         for peer in self.peers.values_mut() {
             peer.direct.set_same_nat(shares_public_address(&public, &peer.endpoints));
@@ -817,7 +815,7 @@ impl Control {
         endpoints.sort_unstable();
         endpoints.dedup();
         if endpoints != self.endpoints {
-            tracing::debug!(?endpoints, "本节点的候选端点变了");
+            tracing::debug!(?endpoints, "本节点候选端点已变更");
             self.endpoints = endpoints;
             let clock = &self.shared.clock;
             for peer in self.peers.values_mut() {
@@ -897,8 +895,8 @@ impl Control {
                     peer.probe = PathProbe { answered: peer.probe.answered, ..PathProbe::default() };
                 }
             }
-            // 延迟优先要拿"经本节点的 relay"这条路和别的比，得知道对端的会话那一段多长（见 `View::local_leg`）。
-            // 和上面经多级路径的探测错开：对端回答同一个对端的路径探测有频率上限，挤在一起的会被它挡掉一个。
+            // 延迟优先模式需将“经本节点 relay”路径与其他候选对比，因此需测量对端会话段的质量（见 `View::local_leg`）。
+            // 与上方多级路径探测错开：对端对同一来源的路径探测有限频，间隔过近会导致其中一个被限频丢弃。
             let apart = peer.probe.pending.is_none()
                 && peer.probe.last_sent.is_none_or(|at| now.saturating_duration_since(at) >= LOCAL_PROBE_APART);
             let wanted = *mode == RoutingMode::LowestCost
@@ -915,7 +913,7 @@ impl Control {
             let mut why = None;
             let path = match mode {
                 RoutingMode::DirectFirst => {
-                    // 直连、一个 relay 都走不了时经一串 relay（见 `View::chain`）。现在走着的一串还走得了就不用每一轮重算候选。
+                    // 直连和单跳 relay 均不可达时回退至多级 relay（见 `View::chain`）；当前使用的多级路径仍可用时无需每轮重算候选。
                     let single = view.direct_first(id, peer);
                     let chain = match peer.policy_route {
                         RouteKey::Relay { path, .. } if path.as_slice().len() > 1 => {
@@ -953,10 +951,10 @@ impl Control {
             let (policy_key, policy_hop) = path.and_then(|path| view.resolve(id, peer, path)).unwrap_or((RouteKey::None, Hop::None));
             peer.policy_route = policy_key;
             if peer.pin.is_some_and(|pin| now >= pin.until) {
-                tracing::info!(peer = %id, "主动测试固定的路到期了，解除");
+                tracing::info!(peer = %id, "主动测试的固定路由已到期，自动解除");
                 peer.pin = None;
             }
-            // 固定的路此刻走不了（直连没了、到第一个 relay 的会话断了）时照常按选路规则走：有路总比没有强。
+            // 若固定路径当前不可达（直连失效或首个 relay 会话断开），则仍按常规选路规则转发，确保尽量保持连通。
             let pinned = peer.pin.and_then(|pin| {
                 let path = match pin.path {
                     TestPath::Direct => PathId::Direct(peer.direct.active()?.0),
@@ -1056,7 +1054,7 @@ fn rebuild_direct(table: &mut Table, peers: &HashMap<NodeId, PeerState>) {
         for addr in &peer.sources {
             if let Some(owner) = table.direct.get(addr) {
                 if owner.id != id {
-                    tracing::debug!(%addr, owner = %owner.id, claimant = %id, "两个对端认领同一个直连地址，只算其中一个的");
+                    tracing::debug!(%addr, owner = %owner.id, claimant = %id, "多个对端声明同一条直连地址，仅保留归属对端");
                 }
                 continue;
             }
@@ -1066,16 +1064,16 @@ fn rebuild_direct(table: &mut Table, peers: &HashMap<NodeId, PeerState>) {
     }
 }
 
-/// 对端回答直连探测时报的、它看到的本节点地址 `observed` 像不像真的是本节点的。
+/// 校验对端在直连探测应答中上报的本节点观测地址 `observed` 是否可信。
 ///
-/// 有人在两个节点之间来回转发探测（经过的 relay、局域网里恰好占着某个候选地址的主机），两边就会把它的地址验证成对方的直连地址，
-/// 流量改走它那里。这时对端看到的是转发者的地址，不是本节点的，所以看一眼就分得出来：
+/// 若中间节点在两节点之间转发探测（如经由 relay 或局域网中占用候选地址的其他主机），两端会将该转发者误认为直连地址。
+/// 此时对端观测到的是转发者地址而非本节点地址，因此可通过比对排除：
 ///
-/// - `local_network`：探测发往的地址不经过地址转换（私有地址、局域网信标里来的）。对端看到的必须是本节点网卡上的地址。
-/// - 其余的：必须是本节点已知的地址之一（网卡上的，relay 和地址查询服务器看到的，路由器映射出来的）。
-///   本节点还不知道自己这个地址族的任何公网地址时没法判断，只好接受。
+/// - `local_network`：探测目标不经过地址转换（私有地址或局域网信标地址），对端观测地址须属于本机网络接口地址。
+/// - 其余情况：对端观测地址须属于本节点已知地址（接口地址、relay/地址查询观测地址或路由器映射地址）。
+///   若本节点尚未知晓该地址族的任何公网地址，无法校验，则默认接受。
 ///
-/// 读不到网卡地址时同样没法判断，接受。
+/// 无法获取本机网络接口地址时同样默认接受。
 fn observed_is_mine(observed: SocketAddr, local_network: bool, interfaces: &[SocketAddr], known: &[SocketAddr]) -> bool {
     let ip = observed.ip().to_canonical();
     let same = |addr: &SocketAddr| addr.ip().to_canonical() == ip;
@@ -1087,14 +1085,13 @@ fn observed_is_mine(observed: SocketAddr, local_network: bool, interfaces: &[Soc
     !public_known || known.iter().chain(interfaces).any(same)
 }
 
-/// 这个对端此刻适用的直连限制。
+/// 计算该对端当前适用的直连策略。
 ///
-/// 一对正在用的节点（有包要发、或者有人要和它通信）要直连；小网络里不等流量的那些对端（[`EAGER_DIRECT_PEERS`]）过了错开的时刻也要。
-/// 后一种只是在路径层验证这条直连、照常保活和退避：不碰连接层，不建连接，也不让已有的连接晚关一点；第一条流来的时候路已经是直连。
+/// 活跃通信中的对端需要尝试直连；小规模网络中提前探测的对端（[`EAGER_DIRECT_PEERS`]）在错峰时刻到达后亦会尝试。
+/// 后者仅在路径层验证直连并按常规保活与退避：不涉及连接层，不主动建连，也不延长已有连接存活期，使首条流到达时直连已就绪。
 ///
-/// 对端刚发来过打洞信令的也要（[`PeerState::signalled`]）：它想和本端建立直连，后面几轮探测要跟上。这不等于本端有包要发给它：
-/// 信令不算流量。原来算，小网络里对端每分钟不等流量地试一次直连，直连又永远打不通时（比如它没有 UDP），本端就每分钟
-/// 把它当成活跃的 45 秒：为它建一次临时的中转会话、把路换过去，会话回收之后路又换回来，一直这样来回。
+/// 近期收到过打洞信令的对端同样开启直连尝试（[`PeerState::signalled`]），以配合完成后续探测轮次。需注意信令不视为实际流量：
+/// 此前将信令计入活跃会导致小网络中无法 UDP 直连的对端每分钟周期性触发 45 秒伪活跃，反复建立并回收临时中转会话、引发路由来回切换。
 fn direct_policy<'a>(
     shared: &Shared,
     allow_direct: bool,
@@ -1141,13 +1138,13 @@ fn eager_direct_limit() -> usize {
     *LIMIT
 }
 
-/// 映射出来的端口是不是随对端变化。要有两个以上的观察点看到同一个地址族的地址才知道。
-/// 去掉覆盖网的地址：本节点的虚拟 IP 在虚拟网卡上（`i3t-vnet`），它只在组网里有意义，
-/// 别的节点连不上它，也不该去试。
+/// 过滤掉覆盖网地址：本节点的虚拟 IP 绑定在虚拟网卡（`i3t-vnet`）上，仅在覆盖网内有效，
+/// 其他节点无法通过 underlay 访问，不应纳入候选端点。
 fn outside_overlay(candidates: Vec<SocketAddr>, netmap: &Netmap) -> Vec<SocketAddr> {
     candidates.into_iter().filter(|addr| !netmap.network.is_overlay_address(addr.ip().to_canonical())).collect()
 }
 
+/// 判断 NAT 映射端口是否随对端地址变化（需至少两个观察点看到同一地址族的地址）。
 fn mapping_varies(observed: &[SocketAddr]) -> Option<bool> {
     let verdict = |family: fn(&SocketAddr) -> bool| {
         let mut seen = observed.iter().filter(|addr| family(addr));

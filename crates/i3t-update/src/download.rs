@@ -1,4 +1,4 @@
-//! 把包取到暂存文件里：分块、断点续传、核对。
+//! 更新包下载到暂存文件：支持分块下载、断点续传与完整性校验。
 
 use std::io::{self, SeekFrom};
 use std::path::Path;
@@ -12,35 +12,35 @@ use crate::digest::FileDigest;
 use crate::error::UpdateError;
 use crate::source::{ChunkRequest, PackageSource, SourceError};
 
-/// 一次要多少。控制链路上一帧最多 16 MB，而且同一条链路上还有别的消息要走，所以块不能大；
-/// 256 KB 时一个 20 MB 的包是 80 来回。
+/// 单次请求的块大小。控制链路单帧上限为 16 MB，且同一链路还承载其他消息，因此分块不宜过大；
+/// 使用 256 KB 分块时，下载 20 MB 更新包约需 80 次往返。
 const CHUNK_LEN: u32 = 256 * 1024;
 
-/// 被打断之后隔多久再要：从 1 秒起每次加倍，到 30 秒为止；取到东西就回到 1 秒。
+/// 下载中断后的退避重试间隔：从 1 秒开始指数退避，上限 30 秒；成功接收到数据后重置为 1 秒。
 const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// 一次下载：把 `artifact` 取到 `path`。
+/// 单次下载任务：将 `artifact` 下载到 `path`。
 pub(crate) struct Download<'a, S> {
     pub source: &'a S,
     pub version: &'a Version,
     pub platform: &'a Platform,
     pub artifact: &'a Artifact,
-    /// 暂存文件。里面已经有的字节算作取过了，所以进程重启之后是接着取。
+    /// 暂存文件路径。文件中已存在的字节视为已下载，进程重启后将从该位置断点续传。
     pub path: &'a Path,
 }
 
 impl<S: PackageSource> Download<'_, S> {
-    /// 取完整并核对。`report` 在每取到一块、以及开始核对的时候被调用，参数是这时候的状态。
+    /// 完整下载更新包并校验其完整性。每下载完一个分块及开始校验时，均会调用 `report` 上报当前状态。
     ///
-    /// 链路中断不是错误：一直等到能接着取为止，调用方不想等了就丢弃这个 future。任何时刻丢弃都可以，下次从暂存文件的长度接着来。
+    /// 链路中断不视为失败：将持续重试直至恢复下载，调用方可在任意时刻丢弃该 future 以取消下载，下次会从暂存文件长度处续传。
     ///
-    /// 接着上次的文件取完却核对不上时，丢掉重新取一遍：上次留下的那一部分可能在断电时写坏了。
-    /// 从头取的还对不上，就是给包的一方的问题，报错。
+    /// 若断点续传完成后的校验失败，会删除暂存文件并从头重新下载一次（此前保留的部分可能因异常断电损坏）。
+    /// 若从头完整下载后的校验仍失败，则说明更新源提供的数据有误，直接返回错误。
     ///
     /// # Errors
     ///
-    /// 给包的一方明确说没有、给出的内容和清单对不上，或者暂存文件写不了。
+    /// 当更新源明确无法提供更新包、完整下载的内容与发布清单不符，或暂存文件读写失败时返回错误。
     pub async fn run(&self, mut report: impl FnMut(UpdateStatus)) -> Result<(), UpdateError> {
         loop {
             let resumed_from = self.fetch(&mut report).await?;
@@ -48,14 +48,14 @@ impl<S: PackageSource> Download<'_, S> {
             let path = self.path.to_owned();
             let digest = tokio::task::spawn_blocking(move || FileDigest::of_file(&path))
                 .await
-                .expect("算哈希的线程不会 panic：里面只有读文件和喂数据")
-                .map_err(self.io("读暂存文件"))?;
+                .expect("文件摘要计算任务异常终止")
+                .map_err(self.io("读取暂存文件"))?;
             if digest.matches(self.artifact) {
                 return Ok(());
             }
             fs::remove_file(self.path).await.map_err(self.io("删除暂存文件"))?;
             if resumed_from == 0 {
-                tracing::warn!(version = %self.version, actual = %digest.sha256, expected = %self.artifact.sha256, "取到的包和清单对不上");
+                tracing::warn!(version = %self.version, actual = %digest.sha256, expected = %self.artifact.sha256, "更新包校验失败：大小或 SHA-256 与发布清单不符");
                 return Err(UpdateError::Corrupt {
                     expected_size: self.artifact.size,
                     expected: self.artifact.sha256,
@@ -63,28 +63,28 @@ impl<S: PackageSource> Download<'_, S> {
                     actual: digest.sha256,
                 });
             }
-            tracing::warn!(version = %self.version, resumed_from, "接着上次取完的包和清单对不上，丢掉重新取");
+            tracing::warn!(version = %self.version, resumed_from, "断点续传后的更新包与发布清单不符，已删除暂存文件并将重新下载");
         }
     }
 
-    /// 把暂存文件补到清单上写的大小，返回这一次是从哪个位置接着取的。
+    /// 将暂存文件下载补齐至发布清单声明的大小，并返回本次续传的起始偏移量。
     async fn fetch(&self, report: &mut impl FnMut(UpdateStatus)) -> Result<u64, UpdateError> {
         let size = self.artifact.size;
         let mut progress = |received| report(UpdateStatus::Downloading { version: self.version.clone(), received, total: size });
         let resumed_from = match fs::metadata(self.path).await {
             Ok(metadata) if metadata.len() <= size => metadata.len(),
-            // 比清单上写的还长，肯定不是这个包的前一部分。
+            // 文件长度超出发布清单声明的大小，说明并非当前更新包的前缀，需从头下载。
             Ok(_) => 0,
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(self.io("查看暂存文件")(error)),
+            Err(error) => return Err(self.io("查询暂存文件信息")(error)),
         };
-        // 按位置写，不用追加：上一次下载被丢弃时可能还有一块正在后台落盘，按位置写的话它落下来的是同样的字节，不会错位。
+        // 使用按偏移写入而非追加模式：上次下载被取消时可能仍有分块在后台落盘，按偏移覆盖可保证字节位置不错位。
         let mut file =
             OpenOptions::new().create(true).truncate(false).write(true).open(self.path).await.map_err(self.io("打开暂存文件"))?;
         file.set_len(resumed_from).await.map_err(self.io("截断暂存文件"))?;
         file.seek(SeekFrom::Start(resumed_from)).await.map_err(self.io("定位暂存文件"))?;
         if resumed_from > 0 {
-            tracing::info!(version = %self.version, resumed_from, size, "暂存文件里已经有一部分，接着取");
+            tracing::info!(version = %self.version, resumed_from, size, "检测到已有部分暂存文件，将从断点继续下载");
         }
 
         let mut received = resumed_from;
@@ -97,27 +97,30 @@ impl<S: PackageSource> Download<'_, S> {
                 Ok(chunk) => {
                     let got = u32::try_from(chunk.len()).ok().filter(|got| (1..=len).contains(got));
                     let Some(got) = got else {
-                        return Err(UpdateError::Unavailable(format!("在位置 {received} 要 {len} 字节，对方给了 {} 字节", chunk.len())));
+                        return Err(UpdateError::Unavailable(format!(
+                            "在偏移量 {received} 请求 {len} 字节，但更新源返回了 {} 字节",
+                            chunk.len()
+                        )));
                     };
-                    file.write_all(&chunk).await.map_err(self.io("写暂存文件"))?;
-                    // 等这一块真的交给了系统再报进度：tokio 的文件写是在后台线程上做的，不等的话报出去的数会比文件里的多。
-                    file.flush().await.map_err(self.io("写暂存文件"))?;
+                    file.write_all(&chunk).await.map_err(self.io("写入暂存文件"))?;
+                    // 等待当前分块刷新到操作系统后再上报进度：tokio 的文件写入在后台线程执行，未刷新前上报的字节数可能超前于文件内容。
+                    file.flush().await.map_err(self.io("写入暂存文件"))?;
                     received += u64::from(got);
                     progress(received);
                     retry_in = RETRY_FIRST;
                 }
                 Err(SourceError::Interrupted(reason)) => {
-                    tracing::info!(version = %self.version, received, size, %reason, ?retry_in, "取包被打断，稍后从断点接着取");
+                    tracing::info!(version = %self.version, received, size, %reason, ?retry_in, "更新包下载中断，将在等待后从断点继续下载");
                     tokio::time::sleep(retry_in).await;
                     retry_in = (retry_in * 2).min(RETRY_MAX);
                 }
                 Err(SourceError::Unavailable(reason)) => {
-                    tracing::warn!(version = %self.version, platform = %self.platform, %reason, "对方给不了这个包，不再取");
+                    tracing::warn!(version = %self.version, platform = %self.platform, %reason, "更新源无法提供该更新包，已停止下载");
                     return Err(UpdateError::Unavailable(reason));
                 }
             }
         }
-        file.sync_all().await.map_err(self.io("把暂存文件落盘"))?;
+        file.sync_all().await.map_err(self.io("同步暂存文件到磁盘"))?;
         Ok(resumed_from)
     }
 

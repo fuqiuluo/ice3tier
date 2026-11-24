@@ -1,7 +1,7 @@
 //! 测试项 `host`：测试期间这台机器、节点这个进程和它到对端的那条连接的状况。
 //!
 //! 不为它多发一个包、多等一秒：CPU 在测试开着的这段时间里每秒看一次，别的在测试做完时读一遍。
-//! 机器和进程的数从 `/proc` 读，所以只有 Linux 上有；读不到的每一样各自是 `None`，连接的那几样哪个平台都有。
+//! 主机与进程指标从 `/proc` 读取，因此仅在 Linux 平台可用；读取失败的指标各自为 `None`，连接相关指标在所有平台均可用。
 
 use std::fs;
 use std::time::Duration;
@@ -36,9 +36,9 @@ impl Watch {
 
     /// 测试做完了：这一端的报告。
     pub(super) async fn finish(mut self, diag: &Diag, peer: NodeId) -> HostReport {
-        // 只要了这一项的测试不到一秒就做完了：等头一秒量完。读不了 CPU 的平台上采样的任务已经结束，这里马上返回。
+        // 仅包含该测试项的测试可能不足一秒即完成，因此等待首秒采样结束；不支持 CPU 采集的平台采样任务已退出，此处会立即返回。
         if tokio::time::timeout(FIRST_SAMPLE_WAIT, self.cpu.wait_for(|seen| seen.first.is_some())).await.is_err() {
-            tracing::debug!(%peer, "主动测试：头一秒的 CPU 一直没有量出来");
+            tracing::debug!(%peer, "主动测试：等待首秒 CPU 采样超时");
         }
         self.sampler.abort();
         let seen = *self.cpu.borrow();
@@ -77,7 +77,7 @@ impl CpuSeen {
     }
 }
 
-/// 每秒看一次 CPU，直到被停掉。读不了（不是 Linux）就结束，接收的一方凭发送的一头没了知道不用等。
+/// 每秒采样一次 CPU，直至任务被中止。无法读取（非 Linux 平台）时直接退出，接收端可通过发送端关闭感知无需继续等待。
 async fn sample(seen: watch::Sender<CpuSeen>) {
     let Some(mut last) = CpuTimes::read() else { return };
     let mut tick = tokio::time::interval(SAMPLE);
@@ -124,13 +124,13 @@ impl CpuTimes {
         Some(Self { total, busy: total.saturating_sub(idle + iowait), process: utime + stime, cores: u64::try_from(cores).ok()?.max(1) })
     }
 
-    /// 从 `earlier` 到现在这一段里用了多少。时间没有往前走（两次读挨得太近）时是 `None`。
+    /// 计算自 `earlier` 至今的 CPU 使用率。若两次采样间隔过短导致时间未推进，则返回 `None`。
     fn since(self, earlier: Self) -> Option<CpuUse> {
         let total = self.total.checked_sub(earlier.total).filter(|&total| total > 0)?;
         let percent = |part: u64| u32::try_from(part.saturating_mul(100) / total).unwrap_or(u32::MAX);
         Some(CpuUse {
             system_percent: percent(self.busy.saturating_sub(earlier.busy)).min(100),
-            // 这一段里每个核走了 total / cores 个滴答：进程用掉的按一个核算。
+            // 该时间段内每个核心累计 total / cores 个时钟滴答，进程占用按单核折算。
             process_percent: percent(self.process.saturating_sub(earlier.process).saturating_mul(self.cores)),
         })
     }

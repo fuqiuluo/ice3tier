@@ -1,7 +1,7 @@
-//! relay 一侧的 TCP 中转：UDP 用不了的节点连上来，在这条 TCP 里做同样的握手、收发同样的帧。
+//! relay 侧的 TCP 中继服务：无法使用 UDP 的节点连接到此处，在 TCP 连接上执行相同的握手并收发相同的帧。
 //!
-//! 拨进来的是 netmap 里别的 relay 时，这条 TCP 还是骨干上的一段（[`i3t_path::backbone`]）：本节点的路径层在上面反过来
-//! 和它建会话，所以这条 TCP 上来的应答、矩阵行和送给本节点的包交给路径层，别的照常。
+//! 当拨入方为 netmap 中的其他 relay 时，该 TCP 连接同时作为骨干链路（[`i3t_path::backbone`]）：本节点路径层会在其上反向
+//! 建立会话，因此该连接上收到的应答、矩阵行以及目标为本节点的数据包会交由路径层处理，其余帧按常规中继流程处理。
 //!
 //! # 没有握手成功的连接
 //!
@@ -52,7 +52,7 @@ const LISTEN_BACKLOG: i32 = 1024;
 ///
 /// # Errors
 ///
-/// 绑不上（端口被别的程序占着）。调用方稍后再试。
+/// 端口绑定失败（例如端口已被其他进程占用），调用方应稍后重试。
 pub(crate) fn listen(inner: &Arc<Inner>) -> io::Result<JoinHandle<()>> {
     let addr = inner.port.local_addr();
     let listener = bind(addr)?;
@@ -66,7 +66,7 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     if addr.is_ipv6()
         && let Err(error) = socket.set_only_v6(false)
     {
-        tracing::debug!(%error, "这个系统上 IPv6 的 TCP 监听不能同时接 IPv4 的连接");
+        tracing::debug!(%error, "当前系统不支持通过 IPv6 TCP 监听 socket 同时接受 IPv4 连接");
     }
     // 和标准库在 Unix 上的做法一样：进程重启之后不用等旧连接的 TIME_WAIT 过去就能重新绑定。Windows 上这个选项的含义是
     // "允许别的进程抢同一个端口"，不能设。
@@ -98,7 +98,7 @@ async fn accept(inner: Arc<Inner>, listener: TcpListener) {
         let (stream, addr) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
-                // 多半是文件描述符用完了。歇一下再接，不然会空转。
+                // 通常由文件描述符耗尽引起，短暂休眠后再继续接收，避免空转。
                 tracing::warn!(%error, "relay 接受 TCP 连接失败");
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -110,7 +110,7 @@ async fn accept(inner: Arc<Inner>, listener: TcpListener) {
             None => gate.serve_leg(&inner, stream, addr),
             Some(handoff) => {
                 let Some(ticket) = gate.unclassified.admit(addr.ip()) else {
-                    gate.refused(addr, "这个来源还没认出协议的 TCP 太多，拒绝新的连接");
+                    gate.refused(addr, "该来源未识别协议的 TCP 连接数已达上限，拒绝新连接");
                     continue;
                 };
                 let (gate, inner) = (Arc::clone(&gate), Arc::clone(&inner));
@@ -121,9 +121,9 @@ async fn accept(inner: Arc<Inner>, listener: TcpListener) {
                     match peeked {
                         Ok(Ok(1..)) if first[0] == LANE_FIRST_BYTE => handoff(stream, addr),
                         Ok(Ok(1..)) => gate.serve_leg(&inner, stream, addr),
-                        // 什么都没发就断了、出错了，或者迟迟不说话：不值得留着。外人能造成的，只记 debug。
-                        Ok(Ok(_) | Err(_)) => tracing::debug!(from = %addr, "TCP 连接没有发来任何字节就结束了"),
-                        Err(_) => tracing::debug!(from = %addr, "TCP 连接 {CLASSIFY_TIMEOUT:?} 之内没有发来第一个字节，断开"),
+                        // 对端未发送数据即断开、发生读取错误或首字节超时：直接关闭连接；外部来源可触发，仅记录 debug 日志。
+                        Ok(Ok(_) | Err(_)) => tracing::debug!(from = %addr, "TCP 连接未发送任何字节即关闭"),
+                        Err(_) => tracing::debug!(from = %addr, "TCP 连接在 {CLASSIFY_TIMEOUT:?} 内未收到首字节，已断开"),
                     }
                 });
             }
@@ -153,15 +153,15 @@ impl Gate {
     /// 按中转的规矩接下一条 TCP：总数上限、同一来源还没握手成功的上限，然后服务它。
     fn serve_leg(&self, inner: &Arc<Inner>, stream: TcpStream, addr: SocketAddr) {
         let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
-            return self.refused(addr, "TCP 中转的连接数到了上限，拒绝新的连接");
+            return self.refused(addr, "TCP 中继连接总数已达上限，拒绝新连接");
         };
         let Some(handshake) = self.pending.admit(addr.ip()) else {
-            return self.refused(addr, "这个来源已经有太多条 TCP 还没握手成功，拒绝新的连接");
+            return self.refused(addr, "该来源未完成握手的 TCP 连接数已达上限，拒绝新连接");
         };
         let inner = Arc::clone(inner);
         tokio::spawn(async move {
             let reason = serve(&inner, stream, addr, handshake).await;
-            tracing::debug!(from = %addr, reason, "一条 TCP 中转结束");
+            tracing::debug!(from = %addr, reason, "TCP 中继连接结束");
             drop(slot);
         });
     }
@@ -278,8 +278,8 @@ fn is_handshake(frame: &[u8]) -> bool {
 /// 服务一条 TCP，直到它断开、超时或者 relay 被停用。返回结束的原因，给日志用。
 async fn serve(inner: &Inner, stream: TcpStream, addr: SocketAddr, handshake: Handshaking) -> &'static str {
     if let Err(error) = tcp_leg::configure(&stream) {
-        tracing::debug!(from = %addr, %error, "给 TCP 中转设置选项失败");
-        return "设置不了 socket 选项";
+        tracing::debug!(from = %addr, %error, "设置 TCP 中继连接选项失败");
+        return "socket选项无法修改";
     }
     // 重传上限和放弃时限一起设（见 `i3t_underlay::tcp_recovery`）。放弃时限取会话的有效期：relay 自己留着一条没有任何帧的
     // TCP 也就这么久，TCP 不会比它先判死，也不会在它关掉之后还留着。
@@ -313,7 +313,7 @@ async fn serve(inner: &Inner, stream: TcpStream, addr: SocketAddr, handshake: Ha
             frame = tokio::time::timeout_at(until, reader.next()) => match frame {
                 Ok(Ok(Some(frame))) => {
                     if owner.is_none() && !is_handshake(&frame) {
-                        break "握手成功之前发来了别的帧";
+                        break "握手完成前收到非握手帧";
                     }
                     // 拨进来的是别的 relay：本节点自己在它那里的会话也在这条 TCP 上，那一部分的帧归路径层。
                     // 它的会话还在不在这条 TCP 上由 `neighbour_frame` 现看，不用上面等这一帧之前看到的。
@@ -331,11 +331,11 @@ async fn serve(inner: &Inner, stream: TcpStream, addr: SocketAddr, handshake: Ha
                         }
                     }
                 }
-                Ok(Ok(None)) => break "对方关闭",
-                Ok(Err(_)) => break "读出错",
+                Ok(Ok(None)) => break "对端关闭连接",
+                Ok(Err(_)) => break "读取失败",
                 Err(_) if has_session => break "会话过期",
-                Err(_) if owner.is_some() => break "会话没了之后迟迟没有重新握手",
-                Err(_) => break "迟迟没有握手成功",
+                Err(_) if owner.is_some() => break "会话失效后重握手超时",
+                Err(_) => break "握手超时",
             },
         }
     };

@@ -1,23 +1,22 @@
-//! 和系统之间的接缝：执行 `ip`、`nft`、`iptables`、`resolvectl`（Windows 上是 `powershell`），看本进程有没有需要的能力。
+//! 系统交互抽象层：执行 `ip`、`nft`、`iptables`、`resolvectl`（Windows 为 `powershell`），并检测当前进程所需权限。
 //!
-//! 网卡的地址和 MTU、两条防火墙规则、名字的设置，装、拆、读回都只经过 [`Machine`]，所以单元测试换一个假的机器
-//! 就能把整个过程走一遍，不需要 root。真的机器是 [`Shell`]：它执行系统里的程序。用程序而不是直接说 netlink，
-//! 是因为 nft 的脚本是一个事务，程序自己保证要么全换上、要么一点不动；`iptables` 用的是这台机器的防火墙自己用的那一套
-//! （nftables 或者老的 xtables）；出错时程序给的说明也正是使用者该看的。
+//! 网卡防火墙规则与 DNS 解析器的安装、清理和状态探测均经由 [`Machine`] 完成，便于单元测试使用模拟实现覆盖完整流程而无需 root 权限。
+//! 生产环境实现为 [`Shell`]，通过调用系统命令而非直接发送 netlink 消息：nftables 脚本具备事务性（原子全量替换或保持原状），
+//! `iptables` 会自动沿用主机当前使用的后端（nftables 或传统 xtables），且报错信息直观便于排查。
 
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// 要执行的程序。
+/// 支持调用的外部系统程序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Program {
     Nft,
     Ip,
     Iptables,
     Resolvectl,
-    /// Windows PowerShell（`powershell.exe`）：Windows 防火墙的规则。
+    /// Windows PowerShell（`powershell.exe`），用于管理 Windows 防火墙规则。
     PowerShell,
 }
 
@@ -40,22 +39,22 @@ impl fmt::Display for Program {
     }
 }
 
-/// 执行一个程序没有成功。
+/// 执行外部命令失败时的错误类型。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandError {
-    /// 系统里没有这个程序。
-    #[error("找不到程序 {0}")]
+    /// 系统中未安装该程序。
+    #[error("未找到可执行程序 {0}")]
     Missing(Program),
-    /// 程序执行了，但是报错退出。`detail` 是它在标准错误上说的话（去掉了首尾的空白）。
-    #[error("{program} 失败（退出码 {status:?}）：{detail}")]
+    /// 程序已启动但以非零状态码退出。`detail` 为去除首尾空白后的标准错误输出。
+    #[error("执行 {program} 失败（退出码 {status:?}）：{detail}")]
     Failed { program: Program, status: Option<i32>, detail: String },
-    /// 程序没能启动起来，或者和它之间的管道出错。
+    /// 无法启动子进程，或与子进程标准 I/O 通信失败。
     #[error("执行 {program} 出错：{detail}")]
     Io { program: Program, detail: String },
 }
 
 impl CommandError {
-    /// 程序说的话里有 `needle`（不分大小写）。用来分辨"东西本来就不在"这类可以当作成功的失败。
+    /// 判断命令标准错误输出是否包含 `needle`（不区分大小写），用于识别“目标本就不存在”等可按空结果处理的场景。
     #[must_use]
     pub fn says(&self, needle: &str) -> bool {
         match self {
@@ -64,8 +63,9 @@ impl CommandError {
         }
     }
 
-    /// 读防火墙里有什么时的这个失败说明要读的东西根本不在，当作一样都没有，不当作读不了：没有这个程序（没有它就装不了这一类东西），
-    /// 或者链所在的表不在（内核里没有 `raw` 表的模块、容器里，`iptables` 说 "Table does not exist"）。没有权限这类失败不算。
+    /// 判断探测防火墙配置时的失败是否表明目标类别在系统中本就不存在，从而按空结果而非读取失败处理：
+    /// 包括对应程序未安装，或目标表不存在（例如内核未加载 `raw` 表模块，或容器环境中 `iptables` 提示 "Table does not exist"）。
+    /// 权限不足等错误不在此列。
     #[must_use]
     pub fn means_absent(&self) -> bool {
         match self {
@@ -76,23 +76,23 @@ impl CommandError {
     }
 }
 
-/// 执行程序的地方。真的是 [`Shell`]，测试里是一个按命令应答的假机器。
+/// 外部命令执行环境抽象。生产实现为 [`Shell`]，单元测试可注入模拟实现。
 pub trait Machine {
-    /// 执行 `program args…`，`input` 交给它的标准输入。成功时返回它的标准输出。
+    /// 执行 `program args…`，将 `input` 写入其标准输入，成功时返回标准输出。
     ///
     /// # Errors
     ///
-    /// 程序不存在、启动不了，或者以非零的退出码结束。
+    /// 程序不存在、启动失败或以非零退出码结束时返回错误。
     fn run(&mut self, program: Program, args: &[String], input: Option<&str>) -> Result<String, CommandError>;
 }
 
-/// 真的系统：在 `PATH` 和几个常见的系统目录里找程序，执行它。
+/// 真实系统命令执行器：在 `PATH` 及常见系统目录下查找并执行外部程序。
 ///
-/// 系统服务的 `PATH` 里通常有 `/usr/sbin`，用户的 shell 里不一定有，所以另外看那几个目录；Windows 上另外看 `System32`。
+/// 系统服务环境的 `PATH` 通常包含 `/usr/sbin`，而普通用户 shell 可能不包含，因此额外搜索常见系统目录；Windows 额外搜索 `System32`。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Shell;
 
-/// `PATH` 之外再看的目录。
+/// 除 `PATH` 外的补充搜索目录。
 #[cfg(unix)]
 fn system_dirs() -> Vec<PathBuf> {
     ["/usr/sbin", "/sbin", "/usr/bin", "/bin"].into_iter().map(PathBuf::from).collect()
@@ -105,7 +105,7 @@ fn system_dirs() -> Vec<PathBuf> {
 }
 
 impl Shell {
-    /// 程序在哪里；找不到时是 `None`。
+    /// 查找可执行文件的完整路径；未找到时返回 `None`。
     #[must_use]
     pub fn locate(program: Program) -> Option<PathBuf> {
         let from_path = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect::<Vec<_>>()).unwrap_or_default();
@@ -132,7 +132,7 @@ impl Machine for Shell {
         let io = |error: std::io::Error| CommandError::Io { program, detail: error.to_string() };
         let mut child = Command::new(path)
             .args(args)
-            // 程序的输出要按固定的写法解析，不能跟着使用者的语言变。
+            // 强制使用 C locale，确保命令输出格式固定以便稳定解析，不受系统语言环境影响。
             .env("LC_ALL", "C")
             .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
@@ -154,19 +154,19 @@ impl Machine for Shell {
     }
 }
 
-/// 虚拟网卡要的进程能力。
+/// 虚拟网卡功能所需的 Linux 进程能力（Capabilities）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
-    /// 建虚拟网卡、给它地址，改防火墙规则。没有它就装不上。
+    /// 创建虚拟网卡、配置地址及修改防火墙规则；缺少该能力时无法启用虚拟网卡。
     NetAdmin,
-    /// 绑 1024 以下的端口：名字服务的 53（[`DNS_PORT`](crate::DNS_PORT)）。没有它网卡照装，名字解析不了。
+    /// 绑定 1024 以下特权端口（名称服务监听 53 端口，见 [`DNS_PORT`](crate::DNS_PORT)）；缺少时仍可启用网卡，但内置名称服务不可用。
     NetBindService,
 }
 
 impl Capability {
     pub const ALL: [Self; 2] = [Self::NetAdmin, Self::NetBindService];
 
-    /// 内核里的编号（`linux/capability.h`）。
+    /// 内核能力位编号（定义于 `linux/capability.h`）。
     const fn bit(self) -> u32 {
         match self {
             Self::NetAdmin => 12,
@@ -174,7 +174,7 @@ impl Capability {
         }
     }
 
-    /// 写法和 systemd 的 `AmbientCapabilities=` 一样。
+    /// 返回能力名称（与 systemd `AmbientCapabilities=` 格式一致）。
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -183,14 +183,14 @@ impl Capability {
         }
     }
 
-    /// 本进程缺哪些能力。读不出来（不是 Linux）时一律算缺。
+    /// 查询当前进程缺失的能力列表。无法读取 `/proc/self/status`（如非 Linux 平台）时一律视为全部缺失。
     #[must_use]
     pub fn missing() -> Vec<Self> {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         Self::missing_in(&status)
     }
 
-    /// `/proc/<pid>/status` 的内容里，`CapEff` 缺哪些能力。
+    /// 解析 `/proc/<pid>/status` 内容中的 `CapEff` 位图，返回缺失的能力列表。
     fn missing_in(status: &str) -> Vec<Self> {
         let effective = status
             .lines()
@@ -207,8 +207,8 @@ impl fmt::Display for Capability {
     }
 }
 
-/// 建网卡缺的权限，写成给人看的样子：Linux 上是 `CAP_NET_ADMIN`，Windows 上是 `Administrator`（要以管理员运行），
-/// macOS 上是 `root`。不缺时是 `None`。看不出来的平台按缺算。
+/// 检查创建虚拟网卡是否缺少所需权限，返回用于提示的权限名称：Linux 为 `CAP_NET_ADMIN`，Windows 为 `Administrator`（需以管理员身份运行），
+/// macOS 为 `root`；权限满足时返回 `None`，无法判断的平台默认视为缺失。
 #[must_use]
 pub fn missing_privilege() -> Option<&'static str> {
     if cfg!(target_os = "linux") {
@@ -222,7 +222,7 @@ pub fn missing_privilege() -> Option<&'static str> {
 
 #[cfg(unix)]
 fn is_root() -> bool {
-    // SAFETY: geteuid 没有参数，不会失败，只读本进程的一个数。
+    // SAFETY: geteuid 无参数且不会失败，仅读取当前进程的有效用户 ID。
     unsafe { libc::geteuid() == 0 }
 }
 
@@ -231,7 +231,7 @@ fn is_root() -> bool {
     false
 }
 
-/// Windows：本进程的令牌是不是提升过的（以管理员运行）。读不出来按没有算。
+/// Windows：检测当前进程令牌是否已提权（以管理员身份运行）。无法读取时按未提权处理。
 #[cfg(windows)]
 fn elevated() -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -239,16 +239,16 @@ fn elevated() -> bool {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token: HANDLE = std::ptr::null_mut();
-    // SAFETY: GetCurrentProcess 返回的是一个不用关的伪句柄；`token` 是一个局部变量，成功时系统往里写一个要关的句柄。
+    // SAFETY: GetCurrentProcess 返回无需关闭的伪句柄；`token` 为局部变量，调用成功后由系统写入需关闭的令牌句柄。
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
         return false;
     }
     let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
     let mut written = 0u32;
-    let size = u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).expect("TOKEN_ELEVATION 只有 4 个字节");
-    // SAFETY: `token` 是上面打开的、有查询权限的句柄；缓冲区是一个 TOKEN_ELEVATION，长度给的是它自己的长度。
+    let size = u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).expect("TOKEN_ELEVATION 大小固定为 4 字节");
+    // SAFETY: `token` 为已打开且具查询权限的句柄；缓冲区为有效的 TOKEN_ELEVATION 实例，大小与结构长度一致。
     let ok = unsafe { GetTokenInformation(token, TokenElevation, (&raw mut elevation).cast(), size, &raw mut written) } != 0;
-    // SAFETY: `token` 是 OpenProcessToken 给的句柄，只关这一次。
+    // SAFETY: `token` 由 OpenProcessToken 返回，此处仅关闭一次。
     unsafe { CloseHandle(token) };
     ok && elevation.TokenIsElevated != 0
 }

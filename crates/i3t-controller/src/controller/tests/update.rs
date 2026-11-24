@@ -272,7 +272,7 @@ fn nodes_that_cannot_update_themselves_are_never_told_to() {
     fleet.sync();
     assert_eq!((fleet.last_order(&mut blocked), fleet.last_order(&mut ancient)), (None, None));
 
-    for (member, expected) in [(&blocked, "容器"), (&ancient, "太旧")] {
+    for (member, expected) in [(&blocked, "容器"), (&ancient, "过旧")] {
         let update = fleet.update_of(member);
         assert_eq!(update.available, Some(version(NEW)), "仍然标出有新版本，好让管理员手动更新");
         let error = fleet.controller().force_update(fleet.network, member.id, UpdateTiming::Now).unwrap_err();
@@ -374,7 +374,7 @@ fn a_package_that_does_not_match_the_manifest_is_not_cached_or_offered() {
     };
     let linux = package(&fleet, LINUX);
     assert_eq!(linux.state, PackageState::Failed);
-    assert!(linux.error.as_deref().is_some_and(|reason| reason.contains("对不上")), "{:?}", linux.error);
+    assert!(linux.error.as_deref().is_some_and(|reason| reason.contains("校验失败")), "{:?}", linux.error);
     assert_eq!(package(&fleet, "windows-x86_64").state, PackageState::NotNeeded, "没有节点用的平台不取");
     assert_eq!(fleet.update_of(&node).waiting, Some(UpdateWait::Package));
     let cached: Vec<_> = fs::read_dir(fleet.cache.path().join("v0.2.0")).unwrap().collect();
@@ -1075,7 +1075,7 @@ fn a_failure_for_a_version_the_node_was_never_given_does_not_pause_anything_but_
     assert_eq!(waiting.cancels, 0, "别的节点照常更新");
     let log = fleet.controller().oplog(10).unwrap();
     let entry = log.iter().find(|entry| entry.action == "update.failure").expect("这次报告记进了操作记录");
-    assert!(entry.detail.contains("没有让它装过"), "{}", entry.detail);
+    assert!(entry.detail.contains("未曾向其下发"), "{}", entry.detail);
     assert_eq!(
         fleet.controller().lock().store.node(liar.id).unwrap().unwrap().update_failure.map(|failure| failure.version),
         Some(version(NEW))

@@ -19,9 +19,9 @@ use crate::tuning::Tuning;
 /// 节点之间的连接在 TLS 握手里声明的协议名。
 pub(crate) const ALPN: &[u8] = b"i3t/1";
 /// 同一个协议，外加"收得了封好的网络包"（见 [`crate::sealed`]）。两端都声明了才会协商出它；
-/// 对端是不认识它的旧程序时，握手落到 [`ALPN`]，那条连接上网络包照旧走数据报。
+/// 对端为不支持该协议的旧版本时，握手回退至 [`ALPN`]，该连接上的网络包仍走数据报传输。
 pub(crate) const ALPN_SEALED: &[u8] = b"i3t/2";
-/// 再外加"认识一帧里合着好几个小网络包的"（`i3t_proto::flow::PacketHeader::Bundle`）。不认识的程序收到那样的帧只会丢掉，
+/// 并进一步支持单帧合并多个小网络包（`i3t_proto::flow::PacketHeader::Bundle`）。不支持该特性的版本收到此类帧后会直接丢弃，
 /// 所以要两端都声明了才发。
 pub(crate) const ALPN_BUNDLES: &[u8] = b"i3t/3";
 /// TLS 要一个服务器名字。校验只看公钥，这个名字没有人看。
@@ -45,7 +45,7 @@ const MAX_STREAMS: u32 = 16_384;
 // 都能开满流、每条流压满 2MB 却不让本端读得动（比如在流的开头留一个空洞），把本端的内存吃光：16384 条流 × 2MB 是 32GB。
 // 有了上限，一条连接最多压住这么多。和发送窗口取一样的数：守规矩的对端本来就不会让没确认的数据超过它。
 /// 对端最多能同时开多少条单向流。单向流用来送打洞信令和要求可靠送达的数据报，每个数据报一条，读完就关。
-/// 这个数也是对端一次能压过来多少个这样的数据报：本端来不及收时，对端开不出新的流，就在那里等。
+/// 该上限同时决定了此类数据报的并发在途数：本端消费不及导致队列满时，对端无法继续开启新流而进入等待。
 const UNI_STREAMS: u32 = 256;
 /// 收到了、上层还没有取走的数据报最多攒多少字节，超过了丢最旧的。上层取得很快，这只是给突发留的余量。
 const DATAGRAM_RECV_BUFFER: usize = 256 * 1024;
@@ -99,7 +99,7 @@ pub(crate) fn transport(tuning: &Tuning, algorithm: Algorithm, ack: AckFrequency
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))))
         .mtu_discovery_config(Some(mtu))
         // 默认用自己写的 BBR；库自带的那份不能用（窄带宽上多发一倍流量，带宽估计只升不降）。
-        // 节点对可以设成 Cubic；没有设置时环境变量 I3T_CONGESTION=cubic 也可以换回 Cubic，做对比测试时用。
+        // 节点对配置可指定 Cubic；未指定时也可通过环境变量 I3T_CONGESTION=cubic 切换为 Cubic，用于对比测试。
         .congestion_controller_factory(algorithm.factory())
         .datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER))
         .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
@@ -113,7 +113,7 @@ const CID_KEY_PURPOSE: &str = "i3t-conn connection id";
 /// 端点的参数。`key` 是本节点的私钥，从它派生两把重启之后不变的密钥：
 ///
 /// - 连接编号里带一个校验值，不是本节点发出去的编号一眼就能认出来丢掉；
-/// - 收到"编号是本节点发的、连接却不认识"的包时，回一个无状态重置，对端凭它立刻知道这条连接没了。
+/// - 收到连接标识由本节点签发但本地无对应连接记录的包时，回复无状态重置，使对端立即感知连接已失效。
 ///
 /// QUIC 库默认每次启动随机生成这两把密钥。那样节点崩溃重启之后，对端手上的旧连接发来的包在新进程看来编号不合法，
 /// 直接丢掉、什么都不回，对端要等空闲超时（30 秒）才发现，这期间它开的新流全都没有回音。
@@ -121,7 +121,7 @@ const CID_KEY_PURPOSE: &str = "i3t-conn connection id";
 pub(crate) fn endpoint(key: &NodeKey) -> Result<EndpointConfig, QuicConfigError> {
     let reset_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key.derive_secret(RESET_KEY_PURPOSE));
     let mut config = EndpointConfig::new(Arc::new(reset_key));
-    let cid_key = u64::from_le_bytes(*key.derive_secret(CID_KEY_PURPOSE).first_chunk().expect("派生出来的密钥是 32 字节，取得出前 8 个"));
+    let cid_key = u64::from_le_bytes(*key.derive_secret(CID_KEY_PURPOSE).first_chunk().expect("派生密钥固定为 32 字节，足以提取前 8 字节"));
     config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(cid_key)));
     // 端口上靠"QUIC 包的首字节一定带 0x40 这一位"把连接包和路径层的帧分开，所以这一位不能被随机化。
     config.grease_quic_bit(false);
@@ -141,7 +141,7 @@ fn protocols(packets: PacketTransport) -> Vec<Vec<u8>> {
     }
 }
 
-/// 接受连接一方的配置。`is_allowed` 决定认不认对端的公钥，每次握手都会问。
+/// 接受连接方的配置。每次握手都会调用 `is_allowed` 校验是否信任对端公钥。
 pub(crate) fn server(
     key: &NodeKey,
     is_allowed: impl Fn(&PublicKey) -> bool + Send + Sync + 'static,
@@ -172,14 +172,14 @@ pub(crate) fn client(
     Ok(client)
 }
 
-/// QUIC 的配置建不出来。都是不该发生的事，发生了说明程序或者密钥有问题。
+/// QUIC 配置构建失败。此类错误仅在程序逻辑或节点密钥异常时出现。
 #[derive(Debug, thiserror::Error)]
 pub enum QuicConfigError {
-    #[error("建不出 TLS 配置")]
+    #[error("构建 TLS 配置失败")]
     Tls(#[from] TlsError),
-    #[error("TLS 配置里没有 QUIC 需要的加密套件")]
+    #[error("TLS 配置缺少 QUIC 所需的加密套件")]
     CipherSuite,
-    #[error("最大数据报长度不在 QUIC 允许的范围里")]
+    #[error("最大数据报长度超出 QUIC 允许范围")]
     DatagramLen,
 }
 

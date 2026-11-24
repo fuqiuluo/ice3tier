@@ -99,7 +99,7 @@ impl<S: SendStream, R: RecvStream> Request<S, R> {
         }
     }
 
-    /// 发起这条流的节点。它来自连接的握手，伪造不了。
+    /// 发起该流的节点，来源经连接握手认证，不可伪造。
     #[must_use]
     pub fn peer(&self) -> NodeId {
         self.peer
@@ -139,7 +139,7 @@ impl<S: SendStream, R: RecvStream> Request<S, R> {
     /// 拒绝：把 `reply` 发回去，然后结束这条流。
     ///
     /// 发送方向是正常结束的，这样 REPLY 一定送得到；接收方向叫停，让发起方别再发数据。
-    /// 发起方已经不在了的话，REPLY 送不到也没有人需要它，所以这里不报错。
+    /// 若发起方已断开，REPLY 无法送达且已无必要，因此此处不返回错误。
     pub async fn refuse(mut self, reply: &Reply) {
         refuse(self.peer, &mut self.send, &mut self.recv, reply).await;
     }
@@ -161,9 +161,9 @@ pub(crate) async fn refuse(peer: NodeId, send: &mut impl SendStream, recv: &mut 
     };
     match time::timeout(REFUSE_DEADLINE, sent).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::debug!(%peer, %error, "拒绝的 REPLY 没有送出去"),
+        Ok(Err(error)) => tracing::debug!(%peer, %error, "发送拒绝 REPLY 失败"),
         Err(_) => {
-            tracing::debug!(%peer, "拒绝的 REPLY {REFUSE_DEADLINE:?} 之内没有送出去，重置这条流");
+            tracing::debug!(%peer, "拒绝 REPLY 在 {REFUSE_DEADLINE:?} 内未发送完成，重置流");
             send.reset(code);
         }
     }
@@ -182,8 +182,8 @@ async fn answer_ping(peer: NodeId, mut send: impl SendStream, mut recv: impl Rec
         send.shutdown().await
     };
     match time::timeout(REFUSE_DEADLINE, answered).await {
-        Ok(Ok(())) => tracing::trace!(%peer, "回答了一个往返测量"),
-        Ok(Err(error)) => tracing::debug!(%peer, %error, "往返测量的回答没有送出去"),
+        Ok(Ok(())) => tracing::trace!(%peer, "已响应往返测量请求"),
+        Ok(Err(error)) => tracing::debug!(%peer, %error, "发送往返测量响应失败"),
         Err(_) => send.reset(StreamCode(Reason::Cancelled.to_wire())),
     }
 }
@@ -258,14 +258,14 @@ pub trait Handler: Send + Sync + 'static {
         &self,
         request: datagram::Request<S, R, T>,
     ) -> impl Future<Output = ()> + Send {
-        async move { request.refuse(&Reply::new(Status::NotEnabled, "这个节点不接受数据报上下文")).await }
+        async move { request.refuse(&Reply::new(Status::NotEnabled, "当前节点不接受数据报上下文")).await }
     }
 
     /// 处理对端开过来的一条测量流（主动测试量吞吐用，见 [`crate::measure`]），直到它结束。每条在自己的任务里调用。
     ///
     /// 不提供测量服务的实现不用写它：默认拒绝。
     fn handle_measure<S: SendStream, R: RecvStream>(&self, request: MeasureRequest<S, R>) -> impl Future<Output = ()> + Send {
-        async move { request.refuse(&Reply::new(Status::NotEnabled, "这个节点不提供测量服务")).await }
+        async move { request.refuse(&Reply::new(Status::NotEnabled, "当前节点不提供测量服务")).await }
     }
 }
 
@@ -285,7 +285,7 @@ pub async fn serve<A: Acceptor + Datagrams, H: Handler>(acceptor: &A, handler: A
     loop {
         let incoming = tokio::select! {
             incoming = acceptor.accept() => incoming,
-            // 数据报那一边先关了：流照常接到 `acceptor` 自己关闭为止。
+            // 数据报接收端先结束时，仍继续接受流直至 `acceptor` 关闭。
             () = &mut pump, if pumping => {
                 pumping = false;
                 continue;
@@ -319,7 +319,7 @@ pub async fn serve<A: Acceptor + Datagrams, H: Handler>(acceptor: &A, handler: A
                 Ok(Arrival::Measure(request)) => handler.handle_measure(request).await,
                 Ok(Arrival::Ping { peer, send, recv }) => answer_ping(peer, send, recv).await,
                 // 对端每开一条这样的流就是一行，不记成 info：不然它能拿日志刷屏。
-                Err(error) => tracing::debug!(%peer, ?error, "重置了一条流：没有读到合法的 OPEN"),
+                Err(error) => tracing::debug!(%peer, ?error, "未读取到合法的 OPEN，已重置流"),
             }
         });
     }

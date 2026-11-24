@@ -28,23 +28,23 @@ impl Control {
         }
         let gate = self.row_gates.entry(origin).or_insert_with(|| RowGate::new(now));
         if !gate.budget.take(now) {
-            tracing::debug!(%via, %origin, "这个 relay 的矩阵行来得太多，这一行不验了");
+            tracing::debug!(%via, %origin, "该 relay 矩阵行接收速率超限，跳过验签并丢弃");
             return;
         }
         let (Some((row, signature)), Some(signed)) = (Row::parse(frame), Row::signed_part(frame)) else { return };
         if i3t_crypto::verify(&origin_key, Row::PURPOSE, signed, &Signature::from_bytes(signature)).is_err() {
-            tracing::debug!(%via, %origin, "骨干矩阵的一行签名不对，丢弃");
+            tracing::debug!(%via, %origin, "骨干矩阵行签名校验失败，已丢弃");
             return;
         }
         let state = row.state;
         let brings_up = self.matrix.brings_up_links(&row, now);
         let state_changed = self.matrix.insert(row, frame.clone(), now);
         if state_changed {
-            tracing::info!(relay = %origin, ?state, %via, "relay 的状态变了");
+            tracing::info!(relay = %origin, ?state, %via, "relay 状态已变更");
         }
-        // 状态变了的行、说哪一段又通了的行不等下一轮，立刻传给本节点 relay 上的会话：经它中转的节点也要尽快知道。
-        // 后一种是骨干从 TCP 回到 UDP 时那一行的更正（见 `publish_rows`），等下一轮的话经这一段的多级路径要断上几秒。
-        // 同一个 relay 的行转得太勤就等下一轮一起发，状态或者连通来回翻的 relay 借不了本节点放大。
+        // 状态变更或骨干链路恢复的行不等下一轮即广播给本节点 relay 上的会话，使下游节点尽快感知。
+        // 后者用于修正骨干由 TCP 切回 UDP 时的矩阵行（见 `publish_rows`），避免多级路径中断数秒。
+        // 同一 relay 的即时转发受速率限制，防止状态或连通性频繁抖动的行被本节点放大。
         if (state_changed || brings_up)
             && let Some(local) = self.shared.local_relay.get()
             && gate.forward(now)
@@ -53,7 +53,7 @@ impl Control {
         }
     }
 
-    /// 本节点是 relay 时：把自己测到的骨干链路和手上别的 relay 的行发给会话。定期发；自己的状态变了、骨干上有一段刚通了立刻发。
+    /// 本节点作为 relay 时，向会话发布自身测得的骨干链路与其他 relay 的矩阵行（周期性发布，状态变更或骨干链路恢复时立即发布）。
     pub(super) fn publish_rows(&mut self, now: Instant) {
         let Some(local) = self.shared.local_relay.get() else { return };
         let Some(status) = local.status() else {
@@ -66,9 +66,9 @@ impl Control {
         // 有新的会话：让它马上拿到矩阵。一批节点同时挂上来时合成一次发，不是每来一个发一轮。
         let newcomers = self.sessions_seen != status.sessions_opened && since_sent.is_none_or(|since| since >= NEWCOMER_BATCH);
         let links = self.own_links(local.as_ref(), now);
-        // 上一行里断着的一段通了：也不等下一轮。骨干从 TCP 回到 UDP 时两个会话一前一后地搬，前一个一搬，对方在本节点上就算新会话，
-        // 马上发的那一行里这一段是断的；不这样的话它要到下一轮（ROW_INTERVAL）才更正，经它的多级路径这期间都不是候选。
-        // 这样多发的行不会接连出现：它前面总有一行说这一段断着，那一行只按上面几种节奏发。
+        // 若上一行中处于断开状态的骨干链路现已恢复，则立即发布更新。骨干由 TCP 切回 UDP 时双向会话依次迁移，
+        // 首个会话迁入触发新会话广播时该链路仍显示断开；若等到下一周期（ROW_INTERVAL）再更正，期间多级路径将无法使用该链路。
+        // 此类补发行不会连续触发：其前必然存在一条标注该链路断开的矩阵行，而断开行仅按常规周期或新会话节奏发布。
         let came_up = links.iter().any(|link| link.quality.is_some() && !self.rows_linked.contains(&link.relay));
         if !due && !state_changed && !newcomers && !came_up {
             return;
@@ -76,8 +76,8 @@ impl Control {
         self.own_state = Some(status.state);
         self.rows_linked = links.iter().filter(|link| link.quality.is_some()).map(|link| link.relay).collect();
         local.publish_row(&links);
-        // 只多发了自己这一行的（状态变了、有一段刚通了）不算一轮：新挂上来的会话还等着整张矩阵，定期的那一轮也照原来的时候来。
-        // 不然骨干一段接一段通起来的那一阵，每多发一行就把整张矩阵往后推一轮，刚挂上来的节点迟迟拿不到别的 relay 的行。
+        // 仅额外发布本节点单行（状态变更或链路恢复）不重置全表周期：新接入会话仍需整张矩阵，周期广播亦保持原定节奏，
+        // 避免骨干链路陆续恢复期间反复推迟整表广播，导致新接入节点迟迟无法收到其他 relay 的矩阵行。
         if due || newcomers {
             self.sessions_seen = status.sessions_opened;
             self.rows_sent = Some(now);

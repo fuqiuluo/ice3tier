@@ -10,10 +10,10 @@ use subtle::ConstantTimeEq;
 
 use crate::message::ProxyAuth;
 
-/// 本机配置文件里的一个组网入口（`config.toml` 的 `[proxy]`）：不认证，没有出口，只通到组网里的节点。
+/// 本机配置文件定义的组网入口（`config.toml` 的 `[proxy]`）：无需认证，不经出口节点，仅可访问组网内的节点。
 ///
-/// 它是给本机的程序用的，配置文件只收回环地址。万一不是回环地址，它和没有用户名密码的代理一样谁都不让用。
-/// 它不是 controller 下发的代理，没有 ice3proxy 的选项：它的流只走共用的连接。
+/// 该入口仅供本机程序使用，配置文件仅接受回环地址。若绑定地址非回环地址，则与未配置凭据的非回环代理一样拒绝所有请求。
+/// 该入口不由 controller 下发，不支持 ice3proxy 选项，其流仅通过共用连接传输。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEntry {
     /// 上报和日志里的名字（`local-socks5`、`local-http`）。
@@ -66,7 +66,7 @@ pub(crate) enum Gate {
     Open,
     /// 要对上用户名和密码。
     Verify(Verifier),
-    /// 不在回环地址上却没有用户名和密码：谁都不让用。controller 不下发这样的代理，静态模式的 netmap 可能这样写。
+    /// 绑定在非回环地址且未配置用户名和密码：拒绝所有请求。controller 不会下发此类代理，仅静态模式 netmap 可能出现。
     Closed,
 }
 

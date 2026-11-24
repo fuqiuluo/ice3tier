@@ -27,7 +27,7 @@ use crate::netmap::{MAX_ENDPOINTS, VnetFacts};
 use crate::store::{NewSwitch, NodeRecord};
 use crate::{node_addresses, relay_reach};
 
-/// 一个节点的挂靠关系最多留这么多个 relay。默认只挂靠 2 个；管理员固定的和 controller 要它另外挂靠的加起来也到不了这么多。
+/// 单个节点的挂靠关系最多保留的 relay 数量。默认仅挂靠 2 个；管理员固定与 controller 分配的共享挂靠合计亦远低于此上限。
 const MAX_ATTACHMENTS: usize = 16;
 /// 节点自报的版本号、平台最长留这么多个字符。
 const MAX_HELLO_TEXT: usize = 64;
@@ -166,7 +166,7 @@ impl Controller {
         };
         let chunk = match cached {
             Some((path, size)) => range.read(&path, size),
-            None => Err(format!("controller 上没有 {version} 的 {platform} 平台的包")),
+            None => Err(format!("controller 未缓存 {version} 版本 {platform} 平台的更新包")),
         };
         let mut inner = self.lock();
         if !is_current(&inner) {
@@ -178,7 +178,7 @@ impl Controller {
                 ToNode::PackageChunk { request, data }
             }
             Err(reason) => {
-                tracing::warn!(node = %session.node, %version, %platform, offset = range.offset, %reason, "给不了节点要的这一段更新包");
+                tracing::warn!(node = %session.node, %version, %platform, offset = range.offset, %reason, "无法提供节点请求的更新包片段");
                 ToNode::PackageUnavailable { request, reason }
             }
         };
@@ -194,7 +194,7 @@ fn observed_endpoint(public_host: Option<IpAddr>, remote: IpAddr, port: u16) -> 
     (port != 0).then(|| SocketAddr::new(ip, port))
 }
 
-/// 节点要的那一段：从哪里起，最多多少字节。
+/// 节点请求的更新包片段范围：起始偏移量与最大字节数。
 #[derive(Debug, Clone, Copy)]
 struct PackageRange {
     offset: u64,
@@ -202,11 +202,11 @@ struct PackageRange {
 }
 
 impl PackageRange {
-    /// 从缓存里的包读出这一段。给出来的不会是空的，也不会超过 [`MAX_PACKAGE_CHUNK`]；读不出来时返回给节点看的原因。
+    /// 从缓存的更新包中读取指定片段。返回数据非空且不超过 [`MAX_PACKAGE_CHUNK`]；读取失败时返回可返回给节点的错误原因。
     fn read(self, path: &Path, size: u64) -> Result<Vec<u8>, String> {
         let wanted = u64::from(self.len.min(MAX_PACKAGE_CHUNK)).min(size.saturating_sub(self.offset));
         if wanted == 0 {
-            return Err(format!("要的位置 {} 不在包里（包有 {size} 字节），或者要的长度是 0", self.offset));
+            return Err(format!("请求的偏移量 {} 超出包大小（共 {size} 字节），或请求长度为 0", self.offset));
         }
         let read = || -> std::io::Result<Vec<u8>> {
             let mut file = File::open(path)?;
@@ -217,8 +217,8 @@ impl PackageRange {
         };
         match read() {
             Ok(data) if !data.is_empty() => Ok(data),
-            Ok(_) => Err("缓存里的包比清单上写的短".to_owned()),
-            Err(error) => Err(format!("读不了缓存里的包：{error}")),
+            Ok(_) => Err("缓存中的更新包小于清单声明的大小".to_owned()),
+            Err(error) => Err(format!("无法读取缓存中的更新包：{error}")),
         }
     }
 }
@@ -270,11 +270,11 @@ impl Inner {
         }
         tracing::info!(node = %node.id, name = %node.name, %remote, version = %node.version, platform = %node.platform, enrolling, "节点上线");
         let outcome = match self.refresh_reporting(node.network, seeds, Some(node.id)) {
-            // 它自己的 netmap 发出去了，没做成的是同一批里别的节点。那些已经排上了重试，不该因此不让它上线：
-            // 不然只要有一个节点一直记不下来，谁都连不上来。"做成了"不等于发到了：发送队列的另一头已经关了、
-            // 或者满了时，连接在下发的那一刻就被断开了，所以还要看它是不是还连着。
+            // 节点自身的 netmap 已下发成功，仅同批次中的其他节点失败（已进入重试队列），不应因此阻止当前节点上线：
+            // 否则只要有一个节点持续持久化失败，其余所有节点都将无法上线。「完成」不代表已送达：发送队列对端已关闭
+            // 或队列已满时，连接会在下发当下被断开，因此还需确认当前连接仍处于活跃状态。
             Err(unfinished) if unfinished.done.contains(&node.id) && self.live.get(&node.id).is_some_and(|live| live.conn == conn) => {
-                tracing::error!(node = %node.id, "节点上线时，同一批里别的节点的 netmap 没发成，稍后再试：{}", error_chain(&unfinished.error));
+                tracing::error!(node = %node.id, "节点上线时，同批次部分其他节点的 netmap 下发失败，将稍后重试：{}", error_chain(&unfinished.error));
                 Ok(())
             }
             outcome => outcome.map_err(|unfinished| unfinished.error),
@@ -287,7 +287,7 @@ impl Inner {
         }
         // 注册时那一条连接不算"最近在线"：节点真的跑起来、带着 Hello 连上来才算。上线了才记，没上线的不该被记成刚刚在线过；
         // 整个数据库被别的进程锁着时，也就只在重算那里拿着 controller 的锁等一次超时，不是两次。
-        // 记不下来只影响界面上的"最近在线"（和 `drop_session` 一样），不因此拒绝它：它的自我介绍记下了，netmap 也发了。
+        // 写入失败仅影响界面展示的「最近在线」（与 `drop_session` 相同），不因此拒绝上线：节点信息已落盘，netmap 也已下发。
         if !enrolling && let Err(err) = self.store.set_node_last_seen(node.id, self.clock.now()) {
             tracing::warn!(node = %node.id, "记录节点最近在线的时间失败：{}", error_chain(&err));
         }
@@ -320,7 +320,7 @@ impl Inner {
         node.declared = hello.declared;
         // 别的节点会去连声明的地址，所以只收一个能连的单播地址。节点自己也查过，这里防的是乱报的节点。
         if let Some(address) = node.declared.relay_address.filter(|address| !node_addresses::declarable(*address, cidr)) {
-            tracing::warn!(node = %node.id, %address, "节点声明的 relay 地址别的节点连不了，不用它");
+            tracing::warn!(node = %node.id, %address, "节点声明的 relay 地址不可供其他节点连接，已忽略");
             node.declared.relay_address = None;
         }
         node.platform = clip(&hello.platform);
@@ -329,7 +329,7 @@ impl Inner {
         node.self_update = hello.self_update;
         // 节点自报的版本号不清它的失败记录，哪怕它说自己已经在跑那个版本（或者更新的）：否则它报一个高版本、
         // 再报回原来的版本，就能把同一次失败报成"新的"，让管理员已经继续的版本再被暂停一次。
-        // 已经用不上的失败记录在管理 API 里不显示（见 `Inner::node_update`），管理员点"立即更新"时清掉。
+        // 已过时的失败记录在管理 API 中不再展示（见 `Inner::node_update`），仅在管理员触发「立即更新」时清除。
 
         let mut whole_network = false;
         let mut affected = BTreeSet::from([node.id]);
@@ -348,8 +348,8 @@ impl Inner {
         let declared_changed = *node != before;
         node.observed = self.observed_endpoint(remote, hello.port);
         let observed_changed = node.observed != before.observed;
-        // 一起写进存储，要么都写进去、要么都没写：写了一半就返回的话，比如能力已经关了，因此要重算的节点却没报给调用方，
-        // 就没人去重算了。什么都没变时（多数重连都是这样）不用开事务。
+        // 在同一事务内原子写入：若只写入部分变更即返回（例如能力已关闭但未返回待重算节点集合），
+        // 将导致无人触发重算。当没有任何变更时（大多数重连场景）无需开启事务。
         if declared_changed || observed_changed {
             self.store.atomically(|store| {
                 for (action, what) in &withdrawn {
@@ -367,10 +367,10 @@ impl Inner {
             })?;
         }
         if before.relay.is_some() && node.relay.is_none() {
-            tracing::warn!(node = %node.id, name = %node.name, "节点撤回了可以作为 relay 的声明，关闭它的 relay");
+            tracing::warn!(node = %node.id, name = %node.name, "节点已撤回 relay 能力声明，自动关闭其 relay 功能");
         }
         if before.exit.is_some() && node.exit.is_none() {
-            tracing::warn!(node = %node.id, name = %node.name, "节点撤回了可以作为出口的声明，关闭它的出口");
+            tracing::warn!(node = %node.id, name = %node.name, "节点已撤回出口能力声明，自动关闭其出口功能");
             self.usage.exit_disabled(node.id);
         }
         if observed_changed {
@@ -379,7 +379,7 @@ impl Inner {
         }
         // relay 的地址写在全网每个节点的 netmap 里：声明的或者 controller 看到的地址变了，大家都要知道。
         if node.relay.is_some() && node_addresses::relay_addresses(node, cidr) != addresses_before {
-            tracing::info!(node = %node.id, name = %node.name, "relay 的地址变了");
+            tracing::info!(node = %node.id, name = %node.name, "relay 地址已变更");
             whole_network = true;
         }
         Ok(if whole_network { Seeds::All } else { Seeds::Nodes(affected) })
@@ -387,17 +387,16 @@ impl Inner {
 
     /// controller 看到的节点地址：这条连接的来源 IP 加上节点自报的 UDP 端口，节点没报端口时是 `None`。
     ///
-    /// 节点和 controller 在同一台机器上、走回环连过来时，回环地址对别的机器没有用，换成 controller 对外地址里的主机；
-    /// 那个主机是域名、还没解析出来时照旧用回环地址：同一台机器上的节点还用得上它。
+    /// 当节点与 controller 位于同一主机并通过回环连接时，回环地址对其他主机无效，改用 controller 对外地址中的主机；
+    /// 若该主机为域名且尚未解析成功，则仍保留回环地址以供同机节点使用。
     fn observed_endpoint(&self, remote: IpAddr, port: u16) -> Option<SocketAddr> {
         observed_endpoint(self.public_host, remote, port)
     }
 
-    /// controller 对外地址里的主机解析出来了（或者变了）：走回环连着的节点，controller 看到的地址跟着变。
+    /// controller 对外地址中的主机已解析或发生变更：同步更新通过回环连接的节点的观测地址。
     ///
-    /// 走回环连着的节点在一个事务里一起改，提交了才记下新的主机：中途读写不了存储时一个都没改，主机也还是旧的，
-    /// 下次解析出来不管是新的还是旧的 IP，存储里的地址都和记着的主机对得上。一个一个地改的话，改了一半时
-    /// 下次解析出的 IP 和记着的一样就不做了，已经改过的（或者还没改的）节点一直用着不对的地址。
+    /// 所有回环连接节点在同一事务中批量更新，仅在事务提交后才记录新主机 IP：若中途读写存储失败则全部回滚，主机记录维持旧值，
+    /// 保证存储中的地址始终与已记录的主机一致。若逐条更新，中途失败会导致部分节点更新而部分未更新，后续解析出相同 IP 时又会跳过处理。
     pub(super) fn set_public_host(&mut self, host: Option<IpAddr>) -> Result<(), Error> {
         if self.public_host == host {
             return Ok(());
@@ -426,7 +425,7 @@ impl Inner {
         for (network, affected) in changed {
             self.defer(network, affected, self.timing.report_coalesce);
         }
-        tracing::info!(?host, "controller 对外地址里的主机是这个 IP");
+        tracing::info!(?host, "已解析 controller 对外地址的主机 IP");
         self.public_host = host;
         Ok(())
     }
@@ -457,8 +456,8 @@ impl Inner {
             self.update_reported(&node, status)?;
         }
 
-        // 挂靠关系和试 relay 的结果都拿本网络的 relay 核对。挂靠关系只留核对过的那一份：统计、判断变没变、存下来的都是它。
-        // 三样都没有时用不着（`relay_tries_reported` 这时也什么都不做），不去读：没有 relay 的网络、只直连的节点每次上报都是这样。
+        // 挂靠关系与 relay 探测结果均需对照本网络的已启用 relay 过滤。统计、变更判断与持久化均使用过滤后的挂靠列表。
+        // 当三者均为空时无需查询数据库（此时 `relay_tries_reported` 也是空操作），避免无 relay 网络或纯直连节点每次上报都访问存储。
         let relays = if report.attached.is_empty() && report.relays.is_empty() && node.relay_reach.is_empty() {
             BTreeSet::new()
         } else {
@@ -487,7 +486,7 @@ impl Inner {
         if same_endpoints(&node.endpoints, &endpoints) && !attachments_differ(&node.attached, &attached) {
             return Ok(());
         }
-        tracing::debug!(node = %id, endpoints = endpoints.len(), attached = attached.len(), "节点的端点或挂靠关系变了");
+        tracing::debug!(node = %id, endpoints = endpoints.len(), attached = attached.len(), "节点端点或挂靠关系已变更");
         self.store.set_node_report(id, &endpoints, &attached)?;
         let holders = self.holders_of(id);
         self.defer_report(node.network, holders);
@@ -517,8 +516,8 @@ impl Inner {
         Ok(())
     }
 
-    /// 节点报的"试过的 relay 连没连上"，并进存着的那一份。连得上与否变了时，它和它的对端的 netmap 要重算：
-    /// 两个节点之间缺不缺一个共同的 relay 跟着变。
+    /// 将节点上报的 relay 连通性探测结果合并到持久化记录中。若可达性发生变化，则触发本节点及其对端的 netmap 重算，
+    /// 因为节点间是否缺少共同可达 relay 可能随之改变。
     /// `relays` 是它所在网络的 relay。
     fn relay_tries_reported(&mut self, node: &NodeRecord, tries: &[RelayTry], relays: &BTreeSet<NodeId>) -> Result<(), Error> {
         if tries.is_empty() && node.relay_reach.is_empty() {
@@ -526,11 +525,11 @@ impl Inner {
         }
         let Some(merged) = relay_reach::merge(&node.relay_reach, tries, node.id, relays, self.clock.now()) else { return Ok(()) };
         self.store.set_node_relay_reach(node.id, &merged.records)?;
-        // UDP 换成 TCP（或者反过来）不改变连不连得上，下面不重算；用不用得了 UDP 另外看（见 `no_udp`）。
+        // 传输协议在 UDP 与 TCP 之间切换不改变可达性，此处不触发重算；节点是否不可用 UDP 由 `no_udp` 另行判定。
         self.no_udp_dirty.insert(node.network);
         if merged.reach_changed {
             let reached: Vec<NodeId> = merged.records.iter().filter(|record| record.outcome.reached()).map(|record| record.relay).collect();
-            tracing::debug!(node = %node.id, ?reached, "节点连得上的 relay 变了");
+            tracing::debug!(node = %node.id, ?reached, "节点可达的 relay 集合已变更");
             let holders = self.holders_of(node.id);
             self.defer_report(node.network, holders);
             self.defer(node.network, [node.id], self.timing.report_coalesce);
@@ -544,7 +543,7 @@ impl Inner {
         let lacks = !vnet.is_some_and(|vnet| matches!(vnet.state, VnetState::Installed { .. }));
         let changed = if lacks { self.no_vnet.insert(node.id) } else { self.no_vnet.remove(&node.id) };
         if changed {
-            tracing::info!(node = %node.id, name = %node.name, installed = !lacks, "节点的虚拟网卡装上了或者没有了，对端的 netmap 跟着改");
+            tracing::info!(node = %node.id, name = %node.name, installed = !lacks, "节点虚拟网卡安装状态已变更，将更新对端 netmap");
             let holders = self.holders_of(node.id);
             self.defer_report(node.network, holders);
         }
@@ -557,10 +556,10 @@ impl Inner {
         self.store.set_node_local_addresses(node.id, &local)?;
         node.local_addresses = Some(local);
         for warning in node_addresses::warnings(node, cidr) {
-            tracing::warn!(node = %node.id, name = %node.name, ?warning, %cidr, "节点的网卡地址落在网络的地址段里");
+            tracing::warn!(node = %node.id, name = %node.name, ?warning, %cidr, "节点本地网卡地址落入网络虚拟地址段");
         }
         if node.relay.is_some() && node_addresses::relay_addresses(node, cidr) != before {
-            tracing::info!(node = %node.id, name = %node.name, "relay 网卡上的地址变了");
+            tracing::info!(node = %node.id, name = %node.name, "relay 本地网卡地址已变更");
             let everyone: Vec<NodeId> = self.store.nodes(node.network)?.into_iter().map(|record| record.id).collect();
             self.defer(node.network, everyone, self.timing.report_coalesce);
         }
@@ -569,14 +568,14 @@ impl Inner {
 
     fn ack(&mut self, id: NodeId, version: u64) -> Result<(), Error> {
         let Some(sync) = self.sync.get_mut(&id) else { return Ok(()) };
-        // 节点确认不了还没发给它的版本。
+        // 节点不能确认尚未下发给它的版本号。
         let version = version.min(sync.state.sent);
         if version <= sync.state.acked {
             return Ok(());
         }
         sync.state.acked = version;
         let released = sync.confirm(version);
-        // 等它确认的对端先排上重算，再去记：节点不会把同一版再确认一遍，记不下来时不能让它们跟着没人管。
+        // 先将等待该确认的对端排入重算队列，再持久化 acked：节点不会重复确认同一版本，避免持久化失败时遗漏对端重算。
         if let Some(network) = self.live.get(&id).map(|live| live.network) {
             self.defer(network, released, self.timing.ack_coalesce);
         }
@@ -588,17 +587,17 @@ impl Inner {
     fn signal(&mut self, from: NodeId, to: NodeId, signal: Signal) {
         let knows = |a: NodeId, b: NodeId| self.sync.get(&a).is_some_and(|sync| sync.knows(b));
         if !(knows(from, to) && knows(to, from)) {
-            tracing::debug!(%from, %to, "丢掉信令：两个节点不是彼此的对端");
+            tracing::debug!(%from, %to, "丢弃信令：两个节点互不为对端");
             return;
         }
         let Some(live) = self.live.get(&to) else {
-            tracing::debug!(%from, %to, "丢掉信令：目的节点不在线");
+            tracing::debug!(%from, %to, "丢弃信令：目的节点不在线");
             return;
         };
         // 信令是尽力而为的。目的节点的队列已经积了一半时不再往里放：
         // 不能让一个猛发信令的节点把别人的队列塞满，害得它被当成"不读"而断开。
         if live.outbox.capacity() * 2 < live.outbox.max_capacity() {
-            tracing::debug!(%from, %to, "丢掉信令：目的节点的发送队列积压");
+            tracing::debug!(%from, %to, "丢弃信令：目的节点发送队列积压");
             return;
         }
         self.send(to, ToNode::Signal { from, signal });
@@ -615,9 +614,9 @@ fn same_endpoints(old: &[SocketAddr], new: &[SocketAddr]) -> bool {
     old.len() == new.len() && new.iter().all(|endpoint| old.contains(endpoint))
 }
 
-/// 节点报的挂靠关系里留下的那些：只要本网络的 relay（`relays`），不要它自己；按报的顺序最多留 [`MAX_ATTACHMENTS`] 个，
-/// 不算数的条目不占名额。同一个 relay 报了几次只留一条，在它第一次出现的位置：有一条说是节点自己挑的（`shared` 为假）
-/// 就留那一条，不然留第一条。controller 只把 `shared` 为假的当成节点自己挑的，留错了会以为它和对端缺一个共同的 relay。
+/// 过滤节点上报的挂靠关系：仅保留本网络已启用的 relay（`relays`）且排除节点自身；按上报顺序最多保留 [`MAX_ATTACHMENTS`] 条，
+/// 无效条目不占名额。同一 relay 重复上报时仅在其首次出现的位置保留一条：若存在节点自主选择的条目（`shared` 为 `false`）
+/// 则保留该条目，否则保留首条。controller 仅将 `shared` 为 `false` 的条目视为节点自主挂靠，误留共享条目会导致误判缺少共同 relay。
 ///
 /// 这是在 controller 的锁里做的，一帧最多能塞几十万条：留满了以后只看还能不能把留下的另外挂靠的换成自己挑的，
 /// 留下的都是自己挑的就不再往后看。

@@ -2,9 +2,9 @@
 //!
 //! 分工是这样的：
 //!
-//! - 这里管"知道什么"：发布源上最新的正式版是哪个（清单验过签才算数）、各个平台的包取回来没有、哪些版本被暂停了。
-//! - [`rollout`](super::rollout) 管"让谁更新"：按这里知道的东西和每个节点的情况，决定给谁下发指令、撤回谁的。
-//! - 节点自己再验一遍签名，自己决定装不装。controller 被攻破也只能让节点不更新，换不了它的程序。
+//! - 本模块负责维护更新元信息：发布源最新正式版（清单验签通过后生效）、各平台更新包缓存状态及暂停版本列表。
+//! - [`rollout`](super::rollout) 负责调度更新：结合此处维护的信息与各节点状态，决定向哪些节点下发或撤回更新指令。
+//! - 节点自身会重新校验签名并决定是否安装。即使 controller 被攻破，也只能阻止节点更新，无法篡改节点程序。
 //!
 //! 查发布源和取包都要走网络，不能拿着 controller 的锁做。所以这两件事是"拿锁取出要做什么 → 放开锁去做 → 再拿锁记下结果"三段，
 //! 入口是 [`Controller::check_release`] 和 [`Controller::fetch_packages`]，由后台任务和管理 API 在阻塞线程上调用。
@@ -86,7 +86,7 @@ pub(crate) struct Paused {
     pub(crate) cause: Option<UpdateCause>,
 }
 
-/// 查发布源或者取包没有成功：给管理员看的一句话，和它的代码。
+/// 检查发布源或下载更新包失败的详情：面向管理员的错误说明及错误码。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReleaseFailure {
     pub(crate) reason: String,
@@ -140,8 +140,8 @@ pub(crate) struct Updates {
     pub(crate) relay_turns: BTreeMap<NetworkId, Turn>,
     /// 这次运行以来给各个节点下发过的版本，自动的和强制的都算。节点说某个版本不能用时，只有这里有记录才暂停自动更新。
     ///
-    /// 只在内存里：controller 在下发和节点报告失败之间重启的话，这次失败不暂停，只记在节点头上。这时同一网络里下一个
-    /// 失败的节点会让它暂停，代价是多一个节点试装一次（失败的节点会自己换回旧程序）。
+    /// 仅保存在内存中：若 controller 在下发指令与节点上报失败之间重启，本次失败不会触发暂停，仅记录在该节点上；此时同网络内下一个
+    /// 失败的节点将触发暂停，代价仅是多一台节点尝试安装一次（失败节点会自动回滚至旧版本）。
     pub(crate) offered: BTreeMap<NodeId, Version>,
     /// 到这个时刻要再看一遍该让谁更新（等 relay 重新上线之后站稳）。
     pub(crate) next_rollout: Option<Instant>,
@@ -171,7 +171,7 @@ impl Updates {
         Ok(updates)
     }
 
-    /// 读出上次存下来的发布。存的是原文和签名，用现在认的公钥重新验：程序换了版本，认的公钥可能也换了。
+    /// 读取上次持久化的发布信息。存储内容为清单原文与签名，加载时使用当前受信任公钥重新验签（程序升级后信任公钥可能变更）。
     fn load_release(&mut self, store: &Store) -> Result<(), Error> {
         self.release = None;
         self.checked_at = None;
@@ -181,7 +181,7 @@ impl Updates {
                 self.release = Some(Release { signed: stored.signed, manifest });
                 self.checked_at = Some(stored.checked_at);
             }
-            Err(error) => tracing::warn!(reason = %error_chain(&error), "上次存下来的发布清单现在验不过了，丢掉它，等下一次查发布源"),
+            Err(error) => tracing::warn!(reason = %error_chain(&error), "已存储的发布清单验签失败，已丢弃，等待下次检查发布源"),
         }
         Ok(())
     }
@@ -244,16 +244,16 @@ impl Controller {
         self
     }
 
-    /// 取回来的包缓存在哪个目录。不设的话取不了包，也就下发不了更新。
+    /// 设置更新包的本地缓存目录。未配置时无法下载更新包，也无法下发更新。
     #[must_use]
     pub fn with_release_cache(mut self, dir: PathBuf) -> Self {
         self.inner_mut().updates.cache_dir = Some(dir);
         self
     }
 
-    /// 换一组 controller 认的发布公钥。默认是编译在程序里的那些；测试用这个入口换成自己的。
+    /// 替换 controller 信任的发布签名公钥集合。默认使用编译内置公钥；测试可通过此接口注入测试公钥。
     ///
-    /// 节点不受它影响：节点只认编译在节点程序里的公钥，controller 认了一份节点不认的清单，节点照样不装。
+    /// 该设置不影响节点：节点仅信任编译内置在节点程序中的公钥，即便 controller 接受了节点不信任的清单，节点仍会拒绝安装。
     ///
     /// # Errors
     ///
@@ -303,7 +303,7 @@ impl Controller {
             let detail = format!("自动更新 {}，发布源 {source}", if after.auto_update { "开" } else { "关" });
             let params = json!({ "auto_update": after.auto_update, "source": source, "source_is_default": after.source.is_none() });
             inner.store.log(now, None, action::UPDATE_SETTINGS, &detail, params)?;
-            tracing::info!(auto_update = after.auto_update, source = after.source.as_deref().unwrap_or(DEFAULT_SOURCE), "更新的设置变了");
+            tracing::info!(auto_update = after.auto_update, source = after.source.as_deref().unwrap_or(DEFAULT_SOURCE), "更新设置已变更");
             let source_changed = after.source != before.source;
             inner.updates.settings = after;
             if source_changed {
@@ -319,8 +319,8 @@ impl Controller {
         inner.update_overview()
     }
 
-    /// 查一次发布源，返回查完之后的现状。查不到、验不过都不是这个函数的错误：原因写在
-    /// [`UpdateOverview::check_error`] 里，已知的发布保持上一次查到的。
+    /// 检查一次发布源并返回最新状态。获取失败或验签不通过不视为函数错误：原因写入
+    /// [`UpdateOverview::check_error`]，已缓存的发布版本保持不变。
     ///
     /// 这个调用要走网络，会阻塞到查完或者超时，期间不拿 controller 的锁。
     ///
@@ -338,7 +338,7 @@ impl Controller {
         let finished = if inner.updates.source_text() == source_text {
             inner.check_finished(&source_text, checked)
         } else {
-            tracing::info!(source = %source_text, "查的时候发布源被改了，这次的结果不要");
+            tracing::info!(source = %source_text, "检查期间发布源已变更，丢弃本次结果");
             Ok(())
         };
         self.wake_if_needed(&inner);
@@ -393,7 +393,7 @@ impl Controller {
         let now = inner.clock.now();
         write_meta(&inner.store, PAUSED_META, &inner.updates.paused)?;
         inner.store.log(now, None, action::UPDATE_RESUME, &format!("继续版本 {version} 的自动更新"), json!({ "version": version }))?;
-        tracing::info!(%version, "管理员继续了这个版本的自动更新");
+        tracing::info!(%version, "管理员已恢复该版本的自动更新");
         let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
         rolled?;
@@ -422,7 +422,7 @@ impl Controller {
         if let Some(blocked) = inner.cannot_force(&node) {
             return Err(blocked.error);
         }
-        // 管理员明说了要再试一次，上一次的失败就不再算数。这样它要是又失败了，会被当成新的失败重新告警。
+        // 管理员明确要求重试时清除上次失败记录，以便再次失败时可作为新失败重新告警。
         let node = inner.forget_update_failure(node)?;
         inner.updates.forced.insert(id, Forced { timing, skips_relay_queue: true });
         let now = inner.clock.now();
@@ -434,14 +434,14 @@ impl Controller {
             &[LogRef::node(node.id)],
             json!({ "node": node.id, "node_name": node.name, "timing": timing }),
         )?;
-        tracing::info!(node = %id, name = %node.name, ?timing, "管理员让这个节点立即更新");
+        tracing::info!(node = %id, name = %node.name, ?timing, "管理员已触发节点立即更新");
         let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
         rolled?;
         Ok(inner.node_update(&node))
     }
 
-    /// 让全部网络里所有能更新的节点立即更新。relay 仍然一个一个来。
+    /// 触发所有网络中可更新节点立即更新。relay 仍按序逐台更新。
     ///
     /// # Errors
     ///
@@ -474,7 +474,7 @@ impl Controller {
         let detail = format!("让全部节点立即更新（{}）：{} 个节点", describe_timing(timing), accepted.len());
         let params = json!({ "timing": timing, "nodes": accepted.len(), "skipped": outcome.skipped.len() });
         inner.store.log(now, None, action::UPDATE_FORCE_ALL, &detail, params)?;
-        tracing::info!(?timing, nodes = accepted.len(), skipped = outcome.skipped.len(), "管理员让全部节点立即更新");
+        tracing::info!(?timing, nodes = accepted.len(), skipped = outcome.skipped.len(), "管理员已触发全部节点立即更新");
         let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
         rolled?;
@@ -490,7 +490,7 @@ fn require_forced(timing: UpdateTiming) -> Result<(), Error> {
     if timing.is_forced() {
         Ok(())
     } else {
-        Err(Error::invalid_field("timing", "not_allowed", "立即更新的时机要写 now 或者 after_drain；idle 是自动更新用的"))
+        Err(Error::invalid_field("timing", "not_allowed", "立即更新的时机必须为 now 或 after_drain；idle 仅用于自动更新"))
     }
 }
 
@@ -512,11 +512,11 @@ fn check(source_text: &str, keys: &TrustedKeys) -> Result<Release, ReleaseFailur
             i3t_update::ManifestError::BadSignature => ReleaseCause::BadSignature,
             i3t_update::ManifestError::Malformed(_) => ReleaseCause::BadManifest,
         };
-        ReleaseFailure { reason: format!("发布源给的清单不能用：{}", error_chain(&error)), cause }
+        ReleaseFailure { reason: format!("发布源返回的清单无效：{}", error_chain(&error)), cause }
     })?;
     if manifest.is_prerelease() {
         return Err(ReleaseFailure {
-            reason: format!("发布源的最新版是预发布版 {}，不取", manifest.version),
+            reason: format!("发布源最新版本 {} 为预发布版，已忽略", manifest.version),
             cause: ReleaseCause::Prerelease { version: manifest.version },
         });
     }
@@ -526,10 +526,11 @@ fn check(source_text: &str, keys: &TrustedKeys) -> Result<Release, ReleaseFailur
 impl FetchJob {
     fn run(&self) -> Result<PathBuf, ReleaseFailure> {
         let source = self.source.as_ref().map_err(Clone::clone)?;
-        let cache_dir =
-            self.cache_dir.as_deref().ok_or_else(|| ReleaseFailure {
-                reason: "这个 controller 没有配置放包的缓存目录".to_owned(),
-                cause: ReleaseCause::Internal,
+        let cache_dir = self
+            .cache_dir
+            .as_deref()
+            .ok_or_else(|| ReleaseFailure {
+                reason: "controller 未配置更新包缓存目录".to_owned(), cause: ReleaseCause::Internal
             })?;
         source.fetch(&self.version, &self.artifact, cache_dir).map_err(|error| ReleaseFailure::fetch(&error))
     }
@@ -546,7 +547,7 @@ impl Inner {
                 self.updates.check_error = None;
                 let version = release.manifest.version.clone();
                 if self.updates.release.as_ref() == Some(&release) {
-                    tracing::debug!(%version, source, "查了发布源，最新的正式版没有变");
+                    tracing::debug!(%version, source, "发布源检查完成，最新正式版无变化");
                 } else {
                     let security_floor = release.manifest.security_floor.as_ref().map(ToString::to_string);
                     tracing::info!(
@@ -565,7 +566,7 @@ impl Inner {
                     )?;
                     self.updates.release = Some(release.clone());
                     self.updates.packages.clear();
-                    // 只有当前的发布会被暂停，别的版本的下发记录用不上了。
+                    // 仅当前发布版本可能被暂停，清理其他版本的历史下发记录。
                     self.updates.offered.retain(|_, offered| *offered == version);
                     if let Some(cache_dir) = &self.updates.cache_dir {
                         release::prune_cache(cache_dir, &version);
@@ -577,10 +578,10 @@ impl Inner {
                         %version,
                         needs = %release.manifest.min_controller,
                         controller = %self.updates.version,
-                        "这个版本的节点需要更新的 controller，先更新 controller 才会下发"
+                        "该版本节点要求更高版本的 controller，请先更新 controller 才会下发"
                     );
                 }
-                // 每查一次就把上次没成的事再试一遍：没取成的包，和没装成（不怪版本）的节点。
+                // 每次检查发布源时重试此前失败的操作：未下载成功的更新包，以及非版本原因更新失败的节点。
                 self.updates.packages.retain(|_, package| !matches!(package, Package::Failed(_)));
                 for live in self.live.values_mut() {
                     if live.order.as_ref().is_some_and(|order| order.failed) {
@@ -590,7 +591,7 @@ impl Inner {
             }
             Err(failure) => {
                 self.counters.release_check_failures += 1;
-                tracing::warn!(source, reason = %failure.reason, "查发布源没有成功，已知的发布保持不变");
+                tracing::warn!(source, reason = %failure.reason, "检查发布源失败，保留当前已知发布版本");
                 self.updates.check_error = Some(failure);
             }
         }
@@ -611,7 +612,7 @@ impl Inner {
         };
         self.updates.packages.insert(platform.clone(), Package::Fetching);
         let source = self.updates.source_text().parse::<Source>().map_err(|error| ReleaseFailure::invalid_source(&error));
-        tracing::info!(%version, %platform, file = %artifact.file, size = artifact.size, "从发布源取这个平台的包");
+        tracing::info!(%version, %platform, file = %artifact.file, size = artifact.size, "开始从发布源下载该平台的更新包");
         Some(FetchJob { source, cache_dir: self.updates.cache_dir.clone(), version, platform, artifact })
     }
 
@@ -622,11 +623,11 @@ impl Inner {
         }
         let package = match outcome {
             Ok(path) => {
-                tracing::info!(version = %job.version, platform = %job.platform, path = %path.display(), "包已经取回来并且核对过");
+                tracing::info!(version = %job.version, platform = %job.platform, path = %path.display(), "更新包下载并校验完成");
                 Package::Cached(path)
             }
             Err(failure) => {
-                tracing::warn!(version = %job.version, platform = %job.platform, reason = %failure.reason, "包没有取成，下次查发布源时再试");
+                tracing::warn!(version = %job.version, platform = %job.platform, reason = %failure.reason, "更新包下载失败，将在下次检查发布源时重试");
                 Package::Failed(failure)
             }
         };
@@ -655,7 +656,7 @@ impl Inner {
             | UpdateStatus::Restarting { .. }
             | UpdateStatus::Confirmed { .. }
             | UpdateStatus::Failed { .. }
-            | UpdateStatus::Unknown => tracing::info!(node = %node.id, name = %node.name, status = %described, "节点的更新进度变了"),
+            | UpdateStatus::Unknown => tracing::info!(node = %node.id, name = %node.name, status = %described, "节点更新进度已变更"),
         }
         live.update = Some(status.clone());
         let UpdateStatus::Failed { version, kind, reason, cause } = status else {
@@ -664,24 +665,24 @@ impl Inner {
         };
         match (kind, version) {
             (FailureKind::VersionRejected, Some(version)) => self.version_rejected(node, &version, &reason, cause)?,
-            // 连是哪个版本都没有说的失败，没法记到某个版本头上，和没装成一样对待。
+            // 未指明版本号的失败无法归因于特定版本，按非版本安装失败处理。
             (FailureKind::VersionRejected, None) | (FailureKind::NotInstalled, _) => {
                 self.order_failed(node.id, None);
-                tracing::warn!(node = %node.id, name = %node.name, %reason, "节点没有装成这个版本（不怪版本），下次查发布源时再试");
+                tracing::warn!(node = %node.id, name = %node.name, %reason, "节点安装更新失败（非版本原因），将在下次检查发布源时重试");
             }
         }
         self.roll_out()
     }
 
-    /// 节点说某个版本在它那台机器上不能用：记在它头上；信得过的话，暂停这个版本在它所在网络里的自动更新。
+    /// 处理节点上报的版本不可用失败：记录在节点上；若满足信任条件，则暂停该版本在节点所属网络的自动更新。
     ///
-    /// 一个节点的一句话影响不了别的网络，也不能一再生效：
+    /// 单个节点的上报不会影响其他网络，也不能重复触发暂停：
     ///
-    /// - controller 这次运行以来确实让它装过这个版本，它的失败才暂停自动更新。没让它装过的节点说什么都只记在它自己头上，
-    ///   另记一条操作记录给管理员看；
-    /// - 暂停只在它所在的网络生效，别的网络照常更新；
-    /// - 同一个节点在同一个版本上只失败一次：记录在 controller 上，节点自报的版本号清不掉，管理员点"立即更新"才清。
-    ///   所以管理员继续之后，同一个节点不能把这个版本再暂停一次。
+    /// - 仅当 controller 本次运行期间确实向该节点下发过该版本时，才触发自动更新暂停；否则仅记录在节点上，
+    ///   并另写一条操作记录供管理员审阅；
+    /// - 暂停仅作用于该节点所在的网络，其他网络正常更新；
+    /// - 同一节点在同一版本上仅记录一次失败：记录持久化在 controller 侧，无法被节点自报版本号清除，仅在管理员触发「立即更新」时清除。
+    ///   因此管理员恢复自动更新后，同一节点无法再次暂停该版本。
     fn version_rejected(&mut self, node: &NodeRecord, version: &Version, reason: &str, cause: Option<UpdateCause>) -> Result<(), Error> {
         self.order_failed(node.id, Some(version));
         // 节点每次上报都带着同一条失败，重启之后也还带着。记过的就不是新闻，不能因此把管理员已经继续的版本再暂停一次。
@@ -700,14 +701,14 @@ impl Inner {
         };
         self.store.set_node_update_failure(node.id, Some(&failure))?;
         self.counters.version_failures += 1;
-        tracing::warn!(node = %node.id, name = %node.name, %version, %reason, "节点说这个版本在它那里不能用，以后不再自动让它装这个版本");
+        tracing::warn!(node = %node.id, name = %node.name, %version, %reason, "节点报告该版本不可用，后续不再自动向其下发该版本");
 
         let params = json!({ "node": node.id, "node_name": node.name, "version": version, "reason": reason, "cause": cause });
         let offered = self.updates.offered.get(&node.id) == Some(version);
         if !offered {
-            tracing::warn!(node = %node.id, name = %node.name, %version, "controller 没有让这个节点装过这个版本，它的失败不暂停自动更新");
+            tracing::warn!(node = %node.id, name = %node.name, %version, "controller 未曾向该节点下发过此版本，本次失败不会暂停自动更新");
             let detail =
-                format!("节点 {} 说版本 {version} 在它那里不能用（{reason}）；controller 没有让它装过这个版本，不因此暂停", node.name);
+                format!("节点 {} 报告版本 {version} 不可用（{reason}）；controller 未曾向其下发过此版本，因此不暂停自动更新", node.name);
             self.store.log_refs(now, Some(node.network), action::UPDATE_FAILURE, &detail, &[LogRef::node(node.id)], params)?;
             return Ok(());
         }
@@ -723,14 +724,14 @@ impl Inner {
                 cause,
             });
             write_meta(&self.store, PAUSED_META, &self.updates.paused)?;
-            let detail = format!("节点 {} 更新到 {version} 失败（{reason}），暂停这个版本在这个网络里的自动更新", node.name);
+            let detail = format!("节点 {} 更新至 {version} 失败（{reason}），已暂停该版本在本网络的自动更新", node.name);
             self.store.log_refs(now, Some(node.network), action::UPDATE_PAUSE, &detail, &[LogRef::node(node.id)], params)?;
-            tracing::warn!(%version, node = %node.id, network = %node.network, "暂停这个版本在这个网络里的自动更新，等管理员看过之后继续");
+            tracing::warn!(%version, node = %node.id, network = %node.network, "已暂停该版本在本网络的自动更新，等待管理员确认后恢复");
         }
         Ok(())
     }
 
-    /// 这次连接上发给节点的指令没有成：记下来，不在同一条连接上反复重发；强制的更新到此为止。
+    /// 标记本次连接下发给节点的更新指令已失败：避免在同一连接上反复重发，并终止关联的强制更新任务。
     fn order_failed(&mut self, node: NodeId, version: Option<&Version>) {
         if let Some(order) = self.live.get_mut(&node).and_then(|live| live.order.as_mut())
             && version.is_none_or(|version| order.version == *version)
@@ -759,10 +760,10 @@ impl Inner {
             cause,
         };
         let Some(ability) = node.self_update.filter(|_| live.understands_updates()) else {
-            return Some(cannot(SkipCause::TooOld, "它的版本太旧，不懂更新，要手动换程序".to_owned()));
+            return Some(cannot(SkipCause::TooOld, "节点版本过旧，不支持自动更新协议，需手动升级".to_owned()));
         };
         if !ability.able {
-            let reason = ability.blocker.map_or_else(|| "节点说它不能自己更新".to_owned(), |blocker| blocker.to_string());
+            let reason = ability.blocker.map_or_else(|| "节点上报当前环境不支持自主更新".to_owned(), |blocker| blocker.to_string());
             return Some(cannot(SkipCause::CannotSelfUpdate { blocker: ability.blocker }, reason));
         }
         let (cause, message) = self.unavailable_reason(node)?;
@@ -772,12 +773,12 @@ impl Inner {
     /// 为什么没有可以让这个节点更新到的版本：原因的代码和给人看的一句话；有的话是 `None`。
     fn unavailable_reason(&self, node: &NodeRecord) -> Option<(SkipCause, String)> {
         let Some(release) = &self.updates.release else {
-            return Some((SkipCause::NoRelease, "还没有从发布源查到任何发布".to_owned()));
+            return Some((SkipCause::NoRelease, "尚未从发布源获取到任何发布版本".to_owned()));
         };
         let manifest = &release.manifest;
         if manifest.min_controller > self.updates.version {
             let message = format!(
-                "最新的发布 {} 需要 controller 至少是 {}，现在是 {}。先更新 controller",
+                "最新发布版本 {} 要求 controller 版本不低于 {}，当前为 {}，请先更新 controller",
                 manifest.version, manifest.min_controller, self.updates.version
             );
             let cause = SkipCause::ControllerTooOld {
@@ -788,16 +789,16 @@ impl Inner {
             return Some((cause, message));
         }
         let Ok(running) = node.version.parse::<Version>() else {
-            let message = format!("节点 {} 报的版本号 {:?} 看不懂", node.name, node.version);
+            let message = format!("无法解析节点 {} 上报的版本号 {:?}", node.name, node.version);
             return Some((SkipCause::UnreadableVersion { version: node.version.clone() }, message));
         };
         if running >= manifest.version {
-            let message = format!("节点 {} 已经是 {running}，不比最新的发布 {} 旧", node.name, manifest.version);
+            let message = format!("节点 {} 当前版本为 {running}，不低于最新发布版本 {}", node.name, manifest.version);
             return Some((SkipCause::UpToDate { running, latest: manifest.version.clone() }, message));
         }
         let has_package = node.platform.parse::<Platform>().is_ok_and(|platform| manifest.artifact(&platform).is_some());
         (!has_package).then(|| {
-            let message = format!("发布 {} 里没有 {} 平台的包", manifest.version, node.platform);
+            let message = format!("发布版本 {} 中不包含 {} 平台的更新包", manifest.version, node.platform);
             (SkipCause::NoPackage { version: manifest.version.clone(), platform: node.platform.clone() }, message)
         })
     }
@@ -813,7 +814,7 @@ impl Inner {
             status: live.and_then(|live| live.update.clone()).unwrap_or_default(),
             ordered: order.map(|order| UpdateOrder { version: order.version.clone(), timing: order.timing }),
             waiting: plan.waiting,
-            // 节点已经在跑失败过的那个版本（或者更新的）了，多半是手动换的程序：那条失败不再值得显示。记录本身留着，见 `apply_hello`。
+            // 节点已在运行曾失败的版本（或更高版本），通常是人工手动升级所致：不再展示该失败提示，但保留记录本身，见 `apply_hello`。
             failure: node
                 .update_failure
                 .clone()
@@ -822,8 +823,8 @@ impl Inner {
         }
     }
 
-    /// 节点在跑的版本比已知的最新发布写的安全下限旧。看的是已知的发布，不管 controller 够不够新、它有没有这个平台的包：
-    /// 这是告诉人的，人可以手动更新。版本号看不懂时说不上来，算 `false`。
+    /// 判断节点当前版本是否低于最新发布清单声明的安全下限。基于已知发布计算，不考虑 controller 版本或平台包是否齐全：
+    /// 该标记仅用于提示管理员以便决定是否手动升级。版本号无法解析时返回 `false`。
     fn below_security_floor(&self, node: &NodeRecord) -> bool {
         let Some(release) = &self.updates.release else { return false };
         node.version.parse::<Version>().is_ok_and(|running| release.manifest.is_below_security_floor(&running))
@@ -899,8 +900,8 @@ fn read_meta<T: serde::de::DeserializeOwned>(store: &Store, key: &str) -> Result
     match serde_json::from_slice(&bytes) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
-            // 多半是更新版本的程序写的。按没有处理：这些都是可以重新查、重新设的东西，不值得为此启动不了。
-            tracing::warn!(key, %error, "数据库里的这项更新设置读不懂，按没有处理");
+            // 通常由更高版本的程序写入。按未配置处理：此类状态均可重新查询或配置，不应阻碍启动。
+            tracing::warn!(key, %error, "无法解析数据库中的更新设置，将按未配置处理");
             Ok(None)
         }
     }

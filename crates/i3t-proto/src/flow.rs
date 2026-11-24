@@ -27,8 +27,8 @@
 //! +------+------+
 //! | 0x04 | 0x00 |
 //! +------+------+
-//! 接受方读到它就回一个成功的 REPLY（状态 0x00，没有说明），然后结束这条流。访问规则和每个对端的流数上限照常在读 OPEN 之前查。
-//! 比它旧的接受方不认这一种，用 [`Reason::ProtocolError`] 重置这条流。
+//! 接受方读到它就回一个成功的 REPLY（状态 0x00，没有说明），然后结束这条流。访问规则和每个对端的流数上限仍会在读取 OPEN 之前检查。
+//! 较旧版本的接受方不识别该类型，会以 [`Reason::ProtocolError`] 重置该流。
 //!
 //! 标志        bit 0～1  服务等级：0 auto，1 interactive，2 reliable，3 bulk
 //!             bit 2     后面有凭据名
@@ -95,8 +95,8 @@
 //! 片数        2～255
 //! ```
 //!
-//! 「目标 + 载荷」叫做内容，最长 [`MAX_DATAGRAM_BODY_LEN`] 字节。一帧装得下就不分片；装不下时把内容切成几片，
-//! 除了最后一片都把帧填满，收的一方按片序号拼回去再解析。分片只发生在两个端点之间，relay 看到的只是连接的包。
+//! 「目标 + 载荷」称为内容，最长 [`MAX_DATAGRAM_BODY_LEN`] 字节。单帧可容纳时不分片；超出时将内容拆分为多片，
+//! 除最后一片外均填满单帧，接收方按片序号重组后再解析。分片仅发生在两端节点之间，relay 看到的仍是连接包。
 //!
 //! 连接层只看首字节的 bit 0：一个节点既可能是某些上下文的发起方，也可能是另一些上下文的接受方，
 //! 两种数据报要交给不同的人处理（[`Recipient::peek`]）。
@@ -113,7 +113,7 @@
 //! +------+=======+
 //!    1
 //!
-//! 一片（包装不进一个数据报时）
+//! 分片（单个数据报无法容纳完整 IP 包时）
 //! +------+--------+--------+------+==============+
 //! | 0x06 | 包号   | 片序号 | 片数 | 这个包的一片 |
 //! +------+--------+--------+------+==============+
@@ -136,7 +136,7 @@
 //! 片数        2～[`MAX_PACKET_PIECES`]
 //! ```
 //!
-//! 一个包装得进一个数据报就不切；装不下时切成两片，第一片把帧填满，收的一方拼回去再写进自己的网卡。
+//! 单个数据报可容纳时不分片；超出时拆分为两片，第一片填满帧长，接收方重组后再写入本地虚拟网卡。
 //! 合在一起发的是同一时刻要发给同一个对端的小包（TCP 的确认之类）：少发几个包，线路按包数限速的方向上省得多。
 //! 包里写的来源和目的地址由收的一方核对，这一层只管怎么送。
 
@@ -206,7 +206,7 @@ macro_rules! wire_enum {
                 }
             }
 
-            /// 不认识的数值返回 `None`。
+            /// 未知数值返回 `None`。
             #[must_use]
             pub const fn from_wire(raw: $repr) -> Option<Self> {
                 match raw {
@@ -258,8 +258,8 @@ wire_enum! {
     /// 数值按归因分段：`0x1_` 归因于目标，`0x2_` 是被规则或策略拒绝，`0x3_` 是出口自己出了问题。
     /// 只有最后一段计入出口节点的健康度，见 [`Status::attribution`]。
     ///
-    /// `0x24`～`0x27` 是后来加的：出口有意不接（排空、配额、建连预算、同时开着的流太多）。比它们旧的发起方读到这几个值时
-    /// 认不出来，按 REPLY 不合法处理，流照样是失败的，只是说明不够准确。
+    /// `0x24`～`0x27` 为后续新增：出口有意拒绝（排空、配额、建连预算、并发流上限）。较旧版本发起方读取这些值时
+    /// 无法识别，按 REPLY 无效处理，流仍会失败，仅错误说明不够精确。
     pub enum Status: u8 {
         /// 目标已经连上，后面是它发回来的数据。
         Ok = 0x00,
@@ -299,7 +299,7 @@ wire_enum! {
     pub enum Reason: u32 {
         /// 这一端不要这条流了，没有更具体的原因。
         Cancelled = 0,
-        /// 流上的头解析不了，或者迟迟没有发来。
+        /// 流头部无法解析，或等待头部超时。
         ProtocolError = 1,
         /// 目标重置了连接。
         TargetReset = 2,
@@ -395,9 +395,9 @@ impl FromStr for DomainName {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidDomainName {
-    #[error("域名应该是 1 到 {MAX_DOMAIN_LEN} 字节，实际 {0} 字节")]
+    #[error("域名长度应为 1 到 {MAX_DOMAIN_LEN} 字节，实际为 {0} 字节")]
     Length(usize),
-    #[error("域名里有不允许的字节 {0:#04x}")]
+    #[error("域名包含不允许的字节 {0:#04x}")]
     Byte(u8),
 }
 
@@ -500,7 +500,7 @@ impl Target {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Origin {
     /// 调用者用的接入凭据的名字。超过 [`MAX_CREDENTIAL_LEN`] 字节时编码会截断。接入凭据去掉之后入口不再写它，
-    /// 线上的写法留着：旧版本的入口还会发，照样读得出来。
+    /// 线上格式予以保留，以便兼容解析旧版本入口发送的字段。
     pub credential: Option<String>,
     /// 入口看到的客户端地址。
     pub client: Option<SocketAddr>,
@@ -718,28 +718,28 @@ pub enum Decoded<T> {
     Incomplete { more: usize },
 }
 
-/// 一个头解析不了的原因。
+/// 头部解析失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
-    #[error("不认识的建流请求类型 {0:#04x}")]
+    #[error("未知的建流请求类型 {0:#04x}")]
     UnknownKind(u8),
-    #[error("标志里的保留位不是 0：{0:#010b}")]
+    #[error("标志中的保留位非 0：{0:#010b}")]
     ReservedFlags(u8),
-    #[error("不认识的目标类型 {0:#04x}")]
+    #[error("未知的目标类型 {0:#04x}")]
     UnknownTarget(u8),
-    #[error("目标里的域名不合法")]
+    #[error("目标中的域名无效")]
     InvalidDomain(#[source] InvalidDomainName),
-    #[error("凭据名有 {0} 字节，最长 {MAX_CREDENTIAL_LEN} 字节")]
+    #[error("凭据名长度为 {0} 字节，超过上限 {MAX_CREDENTIAL_LEN} 字节")]
     CredentialTooLong(usize),
-    #[error("文字不是合法的 UTF-8")]
+    #[error("文本不是有效的 UTF-8")]
     NotUtf8,
-    #[error("不认识的地址族 {0}")]
+    #[error("未知的地址族 {0}")]
     UnknownAddressFamily(u8),
-    #[error("不认识的状态 {0:#04x}")]
+    #[error("未知的状态 {0:#04x}")]
     UnknownStatus(u8),
-    #[error("不认识的测量方式 {0}")]
+    #[error("未知的测量方式 {0}")]
     UnknownMeasureMode(u8),
-    #[error("测量流里的路径不合法：超过 4 个 relay、编号是 0，或者同一个 relay 出现了两次")]
+    #[error("测量流路径无效：超过 4 个 relay、节点编号为 0 或存在重复 relay")]
     BadPath,
 }
 

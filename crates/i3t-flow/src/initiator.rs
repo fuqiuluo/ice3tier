@@ -17,11 +17,11 @@ use crate::{FlowError, header};
 /// 一条承载 TCP 连接的流可以怎么走（ice3proxy 只归选了它的代理）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Carriage {
-    /// 只走这一对节点之间共用的连接（[`Connector::open`]）：端口转发（监听的一侧和中间节点往目标去的那一段）、
-    /// 本机配置文件里的组网入口、没有选 ice3proxy 的代理。和对端之间备着 ice3proxy 也不用。
+    /// 仅走节点对之间的共用连接（[`Connector::open`]）：包括端口转发（监听侧及中间节点到目标节点段）、
+    /// 本机配置文件中的组网入口，以及未启用 ice3proxy 的代理。即使对端间已预备 ice3proxy 也不使用。
     Shared,
-    /// 和对端之间备着 ice3proxy、开得出 lane 时走 lane，开不出时退回共用的连接（[`Connector::open_tcp`]，由连接层决定）。
-    /// 选了 ice3proxy 的代理的流。
+    /// 对端间已预备 ice3proxy 且可开启 lane 时走 lane，否则回退到共用连接（[`Connector::open_tcp`]，由连接层决定）。
+    /// 用于启用 ice3proxy 的代理流。
     Lane,
 }
 
@@ -66,8 +66,8 @@ pub async fn open<C: Connector>(
 /// # Errors
 ///
 /// 开流失败返回 [`FlowError::Connect`]；对端的访问规则不允许本节点访问它时是 [`FlowError::Refused`]（状态是
-/// [`Status::AccessDenied`](i3t_proto::flow::Status::AccessDenied)）；对端的版本太旧不认这种 OPEN 时，它用
-/// [`Reason::ProtocolError`] 重置流，这里是 [`FlowError::Read`]。
+/// [`Status::AccessDenied`](i3t_proto::flow::Status::AccessDenied)）；若对端版本过旧无法识别此类 OPEN，会以
+/// [`Reason::ProtocolError`] 重置流，此处表现为 [`FlowError::Read`]。
 pub async fn ping<C: Connector>(connector: &C, peer: NodeId) -> Result<std::time::Duration, FlowError> {
     let (mut send, mut recv) = connector.open(peer).await?;
     send.set_priority(relay::priority_of(Class::Interactive));
@@ -112,7 +112,7 @@ impl<S: SendStream, R: RecvStream> Pending<S, R> {
     /// # Errors
     ///
     /// 对端拒绝时返回 [`FlowError::Refused`]，里面是它给的状态和说明（对端没读 OPEN 就以访问规则为由重置了流时，
-    /// 状态是 [`Status::AccessDenied`](i3t_proto::flow::Status::AccessDenied)）；REPLY 读不到或者不合法时返回对应的错误。
+    /// 状态为 [`Status::AccessDenied`](i3t_proto::flow::Status::AccessDenied)）；读取 REPLY 失败或其格式不合法时返回对应错误。
     /// 出错时这条流已经被放弃。
     pub async fn established(mut self) -> Result<Flow<S, R>, FlowError> {
         let failure = match header::read_reply(&mut self.recv).await {

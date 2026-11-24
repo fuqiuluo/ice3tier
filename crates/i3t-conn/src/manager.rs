@@ -45,12 +45,12 @@ const RELIABLE_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 /// 对端发来、上层还没有取走的数据报，每一侧最多排多少个。
 pub(crate) const DATAGRAM_BACKLOG: usize = 1024;
 /// 对端发来、虚拟网卡还没有取走的网络包最多排多少个，满了丢新来的（和路由器的队列一样）。
-/// 每个最多一千四百字节左右，所以最多压住两三 MB；取的一方一次取走一批，正常时排不起来。
+/// 每包最大约 1400 字节，队列内存占用上限约 2～3 MB；消费侧批量拉取，正常情况下不会积压。
 pub(crate) const PACKET_BACKLOG: usize = 2048;
 
 /// 和同一个对端最多同时留几条连接。
 ///
-/// 正常情况下是一条；两边同时拨号会多出一条（它空闲一会儿就关）；对端重启之后，旧的那条要等空闲超时才断，新的已经连进来了。
+/// 正常情况下保持 1 条连接；双向同时拨号时会暂时多出 1 条（空闲后很快关闭）；对端重启后，旧连接在空闲超时前可能与新连入连接短暂共存。
 /// 再多就不正常了：每条连接能让对端压住一个接收窗口（64MB）的数据和上万条流，条数不设限的话，内存的上限也就没有了。
 /// 超出时关掉最旧的：一个正常的对端只有在它那边已经没有能用的连接时才会再拨，所以最旧的那条在它那边早就不在了。
 const MAX_CONNS_PER_PEER: usize = 2;
@@ -103,7 +103,7 @@ pub struct ConnectionCounters {
     pub lost_bytes: u64,
     /// 拥塞控制认定发生了拥塞的次数。
     pub congestion_events: u64,
-    /// 线上的字节数（UDP 数据报的内容，含 QUIC 的头），连同不进 QUIC 的、封好的网络包。
+    /// 线路实际收发字节数（UDP 数据报载荷，含 QUIC 头部），同时包含绕过 QUIC 的独立加密网络包。
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }
@@ -154,7 +154,7 @@ struct Conn {
     bundles: bool,
     /// 这条连接是谁拨的。两边同时拨号时，双方都留下编号小的那个节点拨的那一条。
     dialer: NodeId,
-    /// 对端握手时用的公钥。netmap 里它的公钥变了，这条连接就不算数了。
+    /// 对端握手时使用的公钥；若 netmap 中其公钥变更，该连接即失效。
     key: PublicKey,
     /// 越新的越大。
     serial: u64,
@@ -248,8 +248,8 @@ pub(crate) struct Manager {
     server: quinn::ServerConfig,
     /// 节点对没有指定拥塞控制时用哪一种（环境变量 `I3T_CONGESTION`，没有就是 BBR），进程启动时定。
     default_algorithm: Algorithm,
-    /// controller 现在连得上：打洞的信令有路可走。装配方没有说过时当作连得上（静态模式没有 controller 可失去），
-    /// 空闲回收照旧。
+    /// controller 当前是否在线（决定打洞信令是否可达）。装配层未通知时默认在线（静态模式不依赖 controller），
+    /// 空闲连接按常规策略回收。
     controller_online: AtomicBool,
     peers: Mutex<HashMap<NodeId, PeerEntry>>,
     next_serial: AtomicU64,
@@ -326,14 +326,14 @@ impl Manager {
         tracing::info!(
             eliciting_threshold = ack.eliciting_threshold,
             max_delay = ?ack.max_delay,
-            "网络的确认设置换了：之后建立的连接请对端照它确认"
+            "网络 ACK 频率配置已更新，后续新建连接将通知对端采用新配置"
         );
     }
 
     /// 按新的档位和确认设置重建配置。调用者一直拿着 `current` 的锁，换档位的和换确认设置的不会互相盖掉对方的那一半。
     fn rebuild(&self, current: &mut Configs, tuning: Tuning, ack: AckFrequency) {
         let configs = Configs::new(tuning, ack, &self.server);
-        // 认不出是哪个对端的连接请求（不会走到握手）也要有一份配置可用：用默认的拥塞控制。
+        // 无法识别具体对端的连接请求（不会进入握手）也需提供默认服务端配置，此处使用默认拥塞控制算法。
         self.quic.set_server_config(Some(configs.server(self.default_algorithm).as_ref().clone()));
         *current = configs;
     }
@@ -434,9 +434,9 @@ impl Manager {
         let arrival = arrived.notified();
         tokio::pin!(arrival);
         arrival.as_mut().enable();
-        // 拨号放在自己的任务里，对端的连接先到时也让它拨完，不半路丢掉。两边同时拨的时候，对端可能已经把本端这一条
-        // 登记了、正在上面开流：这时丢掉它，那些流跟着断（对端看到的是"closed by peer"）；对端要是也因为本端的连接先到
-        // 而丢了它那一条，两边就都没有连接可用，开流报"没有路"。多出来的一条不要紧，每个对端本来就留两条。
+        // 在独立任务中执行拨号，即使对端先连入也允许本次拨号完成而不中途取消。双向同时拨号时，对端可能已登记本端连接并开始开流，
+        // 若中途丢弃会导致这些流断开（对端看到 "closed by peer"）；若对端同样因本端先连入而丢弃自身连接，双方将无可用连接而报错。
+        // 多余的并发连接无碍，每个对端本来允许保留两条并由空闲回收清理。
         let manager = Arc::clone(self);
         let mut dialing = tokio::spawn(async move { manager.dial(peer).await });
         loop {
@@ -448,7 +448,7 @@ impl Manager {
                     if let Some(conn) = self.preferred(peer) {
                         return Ok(conn);
                     }
-                    // 连进来的那一条已经没了：接着等自己拨的。
+                    // 对端连入的连接已关闭，继续等待本端拨号结果。
                     arrival.set(arrived.notified());
                     arrival.as_mut().enable();
                 }
@@ -462,12 +462,12 @@ impl Manager {
             None => return Err(OpenError::UnknownPeer(peer)),
         };
         if dial_out_only {
-            tracing::info!(%peer, "对端只主动连接，不接受连进去的连接；只能等它连过来");
+            tracing::info!(%peer, "对端配置为仅主动出站，不接受入站连接，需等待其主动连入");
             return Err(OpenError::NoRoute(peer));
         }
         let deadline = tokio::time::Instant::now() + DIAL_TIMEOUT;
         if !self.paths.wait_for_route(peer, DIAL_TIMEOUT).await {
-            tracing::info!(%peer, "{} 秒内没有等到任何到对端的路（直连没有打通，也没有 relay 可走）", DIAL_TIMEOUT.as_secs());
+            tracing::info!(%peer, "{} 秒内未获取到对端可用路径（直连未建立且无可用 relay）", DIAL_TIMEOUT.as_secs());
             return Err(OpenError::NoRoute(peer));
         }
         let lost = |reason: String| OpenError::ConnectionLost { peer, reason };
@@ -482,7 +482,7 @@ impl Manager {
         match tokio::time::timeout_at(deadline, connecting).await {
             Ok(Ok(connection)) => self
                 .register(peer, connection, Origin { dialer: self.me, key: peer_key, algorithm })
-                .ok_or_else(|| lost("握手期间对端从 netmap 里消失了，或者换了公钥".to_owned())),
+                .ok_or_else(|| lost("握手期间对端已从 netmap 移除或公钥已变更".to_owned())),
             Ok(Err(error)) => {
                 tracing::info!(%peer, %error, "和对端的握手失败");
                 Err(lost(error.to_string()))
@@ -496,7 +496,7 @@ impl Manager {
 
     /// 登记一条握手完成的连接，并开始接收它上面的流。
     ///
-    /// 握手要花时间，这期间 netmap 可能变了：对端被删掉，或者换了公钥。所以拿着连接表的锁再核对一次，对不上的不登记，
+    /// 握手期间 netmap 可能已更新（对端被移除或公钥变更），因此在持有连接表锁的情况下再次校验，不匹配则拒绝登记、
     /// 关掉，返回 `None`。[`follow_netmap`](Self::follow_netmap) 清扫时也要这把锁：这里读到的还是旧的 netmap，
     /// 清扫就排在登记之后，会看到这一条；读到的是新的，就在这里拦下。这条连接封包用的密钥也在这把锁下面登记，
     /// 道理一样。
@@ -523,7 +523,7 @@ impl Manager {
             let mut peers = self.peers();
             if self.netmap.borrow().peer(peer).map(|info| info.key) != Some(key) {
                 drop(peers);
-                tracing::info!(%peer, %dialer, "握手期间对端从 netmap 里消失了，或者换了公钥：这条连接不登记，关闭");
+                tracing::info!(%peer, %dialer, "握手期间对端已从 netmap 移除或公钥已变更，不予登记并关闭连接");
                 conn.quic.close(VarInt::from_u32(CLOSE_REVOKED), b"revoked");
                 return None;
             }
@@ -546,7 +546,7 @@ impl Manager {
             "和对端的连接建立"
         );
         for old in surplus {
-            tracing::info!(%peer, dialer = %old.dialer, "和这个对端的连接超过了 {MAX_CONNS_PER_PEER} 条，关闭最旧的一条");
+            tracing::info!(%peer, dialer = %old.dialer, "与该对端的连接数超过上限（{MAX_CONNS_PER_PEER}），关闭最早的连接");
             old.quic.close(VarInt::from_u32(CLOSE_SURPLUS), b"too many connections");
         }
         tokio::spawn(Arc::clone(self).serve(peer, Arc::clone(&conn)));
@@ -559,7 +559,7 @@ impl Manager {
         match Session::derive(quic, role) {
             Ok(session) => Some(Arc::new(session)),
             Err(error) => {
-                tracing::warn!(%peer, ?error, "从握手里导不出封包的密钥：这条连接上网络包走数据报");
+                tracing::warn!(%peer, ?error, "无法从握手导出封包密钥，该连接上的网络包回退为数据报传输");
                 None
             }
         }
@@ -632,7 +632,7 @@ impl Manager {
                     // 关掉之后上层有包要发时会重建，新的连接是新的密钥。
                     if conn.sealed.as_ref().is_some_and(|session| session.is_spent()) {
                         conn.quic.close(VarInt::from_u32(CLOSE_KEYS_SPENT), b"sealed packet keys spent");
-                        break "封包的密钥用到头了".to_owned();
+                        break "封包会话密钥已达使用上限".to_owned();
                     }
                 }
             }
@@ -651,10 +651,10 @@ impl Manager {
                 conn.packets.touch(conn.established);
                 &self.datagrams.packets
             }
-            None => return tracing::trace!(%peer, len = payload.len(), "丢掉一个数据报：首字节看不出它是给谁的"),
+            None => return tracing::trace!(%peer, len = payload.len(), "丢弃数据报：首字节无法识别目标通道"),
         };
         if queue.try_send(Datagram { peer, payload }).is_err() {
-            tracing::trace!(%peer, "丢掉一个数据报：上层的队列满了，或者本端正在关闭");
+            tracing::trace!(%peer, "丢弃数据报：上层接收队列已满或本端正在关闭");
         }
     }
 
@@ -675,8 +675,8 @@ impl Manager {
 
     /// 读一个走单向流的数据报，排进上层的队列。
     ///
-    /// 先在队列里占到位置再读流：队列满着的时候这条流就留在那里不读，对端能同时开的流数有上限，
-    /// 它开不出新的流，发送就慢下来。这样本端不丢这种数据报，占的内存也有上限。
+    /// 先向队列预留槽位再读取流：队列满时暂停读取，利用对端并发单向流上限形成反压，
+    /// 阻止对端继续开启新流从而降低发送速率，既避免丢弃可靠数据报，也限制内存占用。
     async fn read_reliable_datagram(
         &self,
         peer: NodeId,
@@ -697,8 +697,8 @@ impl Manager {
         let limit = DatagramHeader::LEN + MAX_DATAGRAM_BODY_LEN - first.len();
         let rest = match tokio::time::timeout(RELIABLE_DATAGRAM_TIMEOUT, read_rest(&mut stream, limit)).await {
             Ok(Ok(rest)) => rest,
-            Ok(Err(error)) => return tracing::debug!(%peer, %error, "丢掉一个走单向流的数据报：没有读完整，或者超过了长度上限"),
-            Err(_) => return tracing::debug!(%peer, "丢掉一个走单向流的数据报：迟迟没有发完"),
+            Ok(Err(error)) => return tracing::debug!(%peer, %error, "丢弃单向流数据报：读取不完整或超出长度上限"),
+            Err(_) => return tracing::debug!(%peer, "丢弃单向流数据报：读取超时"),
         };
         let mut payload = BytesMut::with_capacity(first.len() + rest.len());
         payload.put_slice(&first);
@@ -718,7 +718,7 @@ impl Manager {
         if frame.len() > max {
             return Err(DatagramSendError::TooLarge { len: frame.len(), max });
         }
-        // 内核一次收不了几个包的平台上（没有分段卸载）上限是 1，每个包各发各的。
+        // 在不支持分段卸载（GSO）的平台上上限为 1，逐包单独发送。
         let limit = self.paths.max_transmit_segments().clamp(1, sealed::BATCH_PACKETS);
         let mut batch = self.batch();
         if batch.must_send_before(peer, session, frame.len() + SealedHeader::OVERHEAD, limit) {
@@ -737,7 +737,7 @@ impl Manager {
         if session.probe_due()
             && let Err(error) = conn.quic.send_datagram(Bytes::new())
         {
-            tracing::trace!(%peer, %error, "没能让连接去问对端还在不在");
+            tracing::trace!(%peer, %error, "发送空数据报探测对端存活失败");
         }
         Ok(())
     }
@@ -771,7 +771,7 @@ impl Manager {
     /// 这条连接该不该因为空闲而关掉；该关的话返回原因。
     ///
     /// 空闲是"没有流，也没有网络包"：从最后一条流结束和最后一个网络包两者里晚的那个算起。只运包的连接（虚拟网卡上的 ping、
-    /// 一条经网卡的 TCP）因此包在走就一直留着，包停了照常回收。
+    /// 如经虚拟网卡的 TCP 连接）在有网络包收发时保持存活，停止流量后按常规策略回收。
     fn idle_verdict(&self, peer: NodeId, conn: &Arc<Conn>) -> Option<&'static str> {
         let streams_ended = conn.streams.idle_since()?;
         let idle = conn.last_packet().map_or(streams_ended, |packet| packet.max(streams_ended)).elapsed();
@@ -787,9 +787,9 @@ impl Manager {
         let hold = hold_idle(preferred, online, || self.paths.has_relay_path(peer));
         if hold != conn.held.swap(hold, Ordering::Relaxed) {
             if hold {
-                tracing::info!(%peer, "空闲的连接先不关：controller 连不上，也没有 relay 可以退回去，关掉就建不回来");
+                tracing::info!(%peer, "暂不回收空闲连接：controller 不可达且无 relay 路径可回退，关闭后无法重建");
             } else {
-                tracing::info!(%peer, online, "controller 又连上了，或者有了经 relay 的路：空闲的连接照常回收");
+                tracing::info!(%peer, online, "controller 已恢复连接或已有经 relay 路径，恢复正常回收空闲连接");
             }
         }
         (!hold).then_some(reason)
@@ -804,12 +804,12 @@ impl Manager {
                 (claimed.filter(|id| netmap.peer(*id).is_some()), netmap.me.dial_out_only)
             };
             let Some(claimed) = known else {
-                tracing::debug!(from = %incoming.remote_address(), "连进来的不是 netmap 里的对端，不理");
+                tracing::debug!(from = %incoming.remote_address(), "忽略非 netmap 节点的入站连接");
                 incoming.ignore();
                 continue;
             };
             if dial_out_only {
-                tracing::info!(peer = %claimed, "本节点只主动连接，拒绝对端连进来的连接");
+                tracing::info!(peer = %claimed, "本节点配置为仅主动出站，拒绝入站连接");
                 incoming.refuse();
                 continue;
             }
@@ -821,13 +821,13 @@ impl Manager {
                 }
                 HandshakeGate::Retry => {
                     // 每个这样的包一行，不记成 info：伪造来源的人能让这里每秒来很多次。
-                    tracing::debug!(peer = %claimed, ?crowd, "在握手的连接太多：先要它证明来源地址（QUIC Retry）");
+                    tracing::debug!(peer = %claimed, ?crowd, "并发握手连接数过多，发送 QUIC Retry 验证来源地址");
                     if let Err(error) = incoming.retry() {
-                        tracing::debug!(peer = %claimed, %error, "发不了 Retry");
+                        tracing::debug!(peer = %claimed, %error, "发送 QUIC Retry 失败");
                     }
                 }
                 HandshakeGate::Ignore => {
-                    tracing::debug!(peer = %claimed, ?crowd, "在握手的连接太多：不理这个连接请求");
+                    tracing::debug!(peer = %claimed, ?crowd, "并发握手连接数过多，忽略该连接请求");
                     incoming.ignore();
                 }
             }
@@ -836,13 +836,13 @@ impl Manager {
 
     /// 和一个连进来的对端握手，核对它是谁。`slot` 在握手结束（成功或者失败）之前占着握手的名额。
     async fn welcome(self: Arc<Self>, incoming: quinn::Incoming, claimed: NodeId, slot: HandshakeSlot) {
-        // 拥塞控制按它自称的对端选：握手之后核对公钥，对不上的连接本来就要关掉。
+        // 拥塞控制算法先按对端宣称的身份选择；握手完成后再核对公钥，不匹配的连接会被直接关闭。
         let algorithm = self.algorithm_for(claimed);
         let server = self.configs().server(algorithm);
         let connecting = match incoming.accept_with(server) {
             Ok(connecting) => connecting,
             Err(error) => {
-                tracing::debug!(peer = %claimed, %error, "对端连进来的连接没有接成");
+                tracing::debug!(peer = %claimed, %error, "接受对端入站连接失败");
                 return;
             }
         };
@@ -852,11 +852,11 @@ impl Manager {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => {
                 // 公钥不在 netmap 里的对端在这里被拒绝。
-                tracing::info!(peer = %claimed, %error, "对端连进来的连接握手失败");
+                tracing::info!(peer = %claimed, %error, "对端入站连接握手失败");
                 return;
             }
             Err(_) => {
-                tracing::info!(peer = %claimed, "对端连进来的连接握手超时");
+                tracing::info!(peer = %claimed, "对端入站连接握手超时");
                 return;
             }
         };
@@ -865,7 +865,7 @@ impl Manager {
         match self.identify(&connection) {
             Some((peer, key)) if peer == claimed => drop(self.register(peer, connection, Origin { dialer: peer, key, algorithm })),
             identified => {
-                tracing::warn!(peer = %claimed, identified = ?identified.map(|(peer, _)| peer), "连进来的对端的公钥和它自称的节点对不上，关闭连接");
+                tracing::warn!(peer = %claimed, identified = ?identified.map(|(peer, _)| peer), "连入对端的公钥与其宣称的节点身份不匹配，关闭连接");
                 connection.close(VarInt::from_u32(CLOSE_IDENTITY), b"identity mismatch");
             }
         }
@@ -889,7 +889,7 @@ impl Manager {
                 entry.conns.retain(|conn| {
                     let valid = expected == Some(conn.key);
                     if !valid {
-                        tracing::info!(%peer, "对端不在 netmap 里了，或者换了公钥：关闭和它的连接");
+                        tracing::info!(%peer, "对端已从 netmap 移除或公钥已变更，关闭现有连接");
                         conn.quic.close(VarInt::from_u32(CLOSE_REVOKED), b"revoked");
                         // 它的封好的包从现在起也不收了，不等这条连接的任务自己收场。
                         if let Some(session) = &conn.sealed {
@@ -920,7 +920,7 @@ impl Manager {
                 stream.finish().map_err(|error| error.to_string())
             };
             if let Err(error) = sent.await {
-                tracing::debug!(peer = %to, error, "信令没有在连接里送出去");
+                tracing::debug!(peer = %to, error, "通过连接发送信令失败");
             }
         });
     }
@@ -940,7 +940,7 @@ impl Manager {
     }
 }
 
-/// 一个封好的包可不可以先攒着，等紧接着交下来的几个一起发。
+/// 指示独立加密的网络包是否允许暂存，以便与后续数据包合并批量发送。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hold {
     No,
@@ -1051,20 +1051,20 @@ impl Drop for HandshakeSlot {
     }
 }
 
-/// 一个连接请求接下来怎么办。
+/// 连接请求的处理策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandshakeGate {
-    /// 和它握手。
+    /// 接受并开始握手。
     Accept,
-    /// 先回一个 Retry，要它带着令牌再来：证明来源地址是真的，本端不用为此花任何算力，也不记任何状态。
-    /// Retry 发往它自称的那个节点的路上，伪造来源的人收不到。
+    /// 先返回 Retry，要求对端携带令牌重试以验证源地址真实性；本端无需消耗算力或保存状态。
+    /// Retry 会发往对端声称的源地址，伪造源地址的发送方无法收到该令牌。
     Retry,
-    /// 不理。它真是那个节点的话会重发，等名额空出来再接。
+    /// 忽略请求。真实对端会自动重传，待名额释放后再行接纳。
     Ignore,
 }
 
 impl HandshakeGate {
-    /// `validated`：来源地址已经验证过（带着 Retry 的令牌）；`may_retry`：还能要它 Retry（带着令牌的不能再要一次）。
+    /// `validated`：源地址已通过 Retry 令牌验证；`may_retry`：允许要求对端 Retry（已携带令牌的请求不能再次要求 Retry）。
     fn decide(crowd: Crowd, validated: bool, may_retry: bool) -> Self {
         let crowded = crowd.peer >= MAX_HANDSHAKES_PER_PEER || crowd.total >= MAX_HANDSHAKES;
         match (crowded, validated) {
@@ -1080,21 +1080,21 @@ impl HandshakeGate {
 /// 没有流的连接最多留多久、到时候关闭的原因；不回收时返回 `None`。
 ///
 /// `preferred`：到这个对端开新的流用的就是这一条。不是的话它是两边同时拨号多出来的那一条，很快就关。
-/// `keep_alive`：netmap 把这个对端设成了常驻。它可能连不进去，关掉之后只能等它再连过来，所以不回收。
+/// `keep_alive`：netmap 将该对端标记为常驻连接。由于对端可能不可直接连入，关闭后只能等待其重连，因此不回收。
 /// `idle_close`：档位定的空闲回收时间，默认 5 分钟，这样 N 个节点不会留下 N² 条常驻连接和保活流量；`None` 不回收。
 fn idle_limit(preferred: bool, keep_alive: bool, idle_close: Option<Duration>) -> Option<(Duration, &'static str)> {
     match (preferred, keep_alive, idle_close) {
-        (false, _, _) => Some((DUPLICATE_IDLE_CLOSE, "到同一个对端有两条连接，多出来的这一条空闲了")),
+        (false, _, _) => Some((DUPLICATE_IDLE_CLOSE, "同一对端存在多余连接，回收空闲的冗余连接")),
         (true, true, _) | (true, false, None) => None,
-        (true, false, Some(limit)) => Some((limit, "没有流超过了档位定的空闲回收时间")),
+        (true, false, Some(limit)) => Some((limit, "空闲时长已超过档位配置的回收阈值")),
     }
 }
 
 /// 到了空闲回收的时间，这条连接是不是要先留着。
 ///
-/// 关掉的连接要重建，握手的包得有路走：经 relay，或者重新打洞，而打洞的信令要经 controller。两样都没有的时候
-/// （controller 连不上，到这个对端也没有经 relay 的路），关掉的连接就建不回来了，所以先留着；controller 又连上了、
-/// 或者有了经 relay 的路，下一次检查（每秒一次）就照常回收。多出来的那一条（`preferred` 为假）照样关：留着的是另一条。
+/// 连接关闭后若要重建，握手包需经 relay 转发或重新打洞（打洞信令依赖 controller）。当两者均不可用时
+/// （controller 不可达且无经 relay 路径），关闭后将无法重建，因此暂缓回收；待 controller 恢复连接
+/// 或出现经 relay 路径后，下一次周期检查（每秒一次）恢复正常回收。冗余连接（`preferred` 为 `false`）仍按原规则关闭，保留主连接。
 /// `relay_path` 只在需要时才问。
 fn hold_idle(preferred: bool, controller_online: bool, relay_path: impl FnOnce() -> bool) -> bool {
     preferred && !controller_online && !relay_path()
@@ -1129,18 +1129,18 @@ async fn read_signal(paths: &Paths, peer: NodeId, first: [u8; 1], mut stream: qu
     let rest = match tokio::time::timeout(SIGNAL_TIMEOUT, read_rest(&mut stream, SIGNAL_MAX_BYTES - first.len())).await {
         Ok(Ok(rest)) => rest,
         Ok(Err(error)) => {
-            tracing::debug!(%peer, %error, "读连接里的信令失败");
+            tracing::debug!(%peer, %error, "读取连接内信令失败");
             return;
         }
         Err(_) => {
-            tracing::debug!(%peer, "连接里的信令迟迟没有发完");
+            tracing::debug!(%peer, "读取连接内信令超时");
             return;
         }
     };
     let body = [&first[..], &rest].concat();
     match serde_json::from_slice::<Signal>(&body) {
         Ok(signal) => paths.handle_signal(peer, signal),
-        Err(error) => tracing::debug!(%peer, %error, "连接里的信令解析不了"),
+        Err(error) => tracing::debug!(%peer, %error, "连接内信令解析失败"),
     }
 }
 

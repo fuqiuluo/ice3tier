@@ -64,7 +64,7 @@ impl ExitTests {
     /// controller 要测 `host:port`。在长连接的任务里调用，不等：测试在自己的任务里做。
     pub(crate) fn order(self: &Arc<Self>, request: u64, host: String, port: u16) {
         if !self.gate.lock().expect("exit test gate mutex poisoned").enter(Instant::now()) {
-            tracing::info!(request, "拒绝了一个出口测试：另一个正在做，或者 {MIN_INTERVAL:?} 之内刚做过");
+            tracing::info!(request, "已拒绝出口测试：已有测试正在执行，或距上次测试不足 {MIN_INTERVAL:?}");
             return self.answer(request, refused(ExitTestCause::Busy));
         }
         let running = Running(Arc::clone(self));
@@ -76,7 +76,7 @@ impl ExitTests {
 
     async fn run(&self, host: &str, port: u16) -> ExitTestResult {
         let Ok(target) = host.parse::<Host>() else {
-            tracing::info!(host, "出口测试的目标读不懂");
+            tracing::info!(host, "无法解析出口测试目标");
             return refused(ExitTestCause::BadTarget);
         };
         let probe = self.outbound.probe(&target, port).await;
@@ -92,14 +92,14 @@ impl ExitTests {
             resolve = ?result.resolve.as_ref().map(|step| (step.ms, step.cause)),
             connect = ?result.connect.as_ref().map(|step| (step.ms, step.address, step.cause)),
             tls = ?result.tls.as_ref().map(|step| (step.ms, step.cause)),
-            "出口测试做完了"
+            "出口测试完成"
         );
         result
     }
 
     fn answer(&self, request: u64, result: ExitTestResult) {
         if self.answers.try_send((request, result)).is_err() {
-            tracing::debug!(request, "出口测试的回答没有地方放（长连接没在收），丢掉");
+            tracing::debug!(request, "无法发送出口测试结果（长连接通道已满或已关闭），已丢弃");
         }
     }
 }
@@ -113,7 +113,7 @@ impl Drop for Running {
     }
 }
 
-/// 什么都没做就拒绝了。
+/// 未执行探测即拒绝测试。
 fn refused(cause: ExitTestCause) -> ExitTestResult {
     ExitTestResult { via: ExitVia::Direct, refused: Some(cause), resolve: None, connect: None, tls: None }
 }
@@ -162,7 +162,7 @@ fn client_config() -> ClientConfig {
     }
 }
 
-/// 接受任何证书，只验握手签名（证明对方持有证书里的私钥）。只用在出口测试里：这一步量的是握手，不认网站。
+/// 接受任意证书，仅校验握手签名（证明对端持有证书对应私钥）。仅用于出口测试：此步骤仅测量握手过程，不验证站点身份。
 #[derive(Debug)]
 struct AnyCertificate {
     algorithms: WebPkiSupportedAlgorithms,

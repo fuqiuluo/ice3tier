@@ -1,6 +1,6 @@
 //! 上游和负载端共用的东西：每个事件带的序号、写出时刻和累积哈希，以及请求里描述"这条流该怎么回答"的参数。
 //!
-//! 累积哈希把每个事件和它前面的所有事件串在一起：收到的一方按收到的内容重算一遍，丢了、乱序了、改了一个字节都对不上。
+//! 累积哈希将每个事件与其之前的所有事件关联在一起：接收方按收到的数据重新计算，任何丢失、乱序或单字节篡改都会导致校验不匹配。
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -94,11 +94,11 @@ impl Chain {
         Stamp { seq, t_ns, hash: self.hash }
     }
 
-    /// 验一个收到的事件。验过的才算进链里；验不过时链不变，调用者应当把这条流判为损坏。
+    /// 校验收到的事件。仅通过校验的事件会计入哈希链；校验失败时链状态不变，调用方应将该流判定为损坏。
     ///
     /// # Errors
     ///
-    /// 序号不是下一个（丢了或者乱序），或者按收到的内容算出的哈希和事件带的对不上。
+    /// 序号与预期不符（丢失或乱序），或根据内容计算的哈希与事件携带的累积哈希不匹配。
     pub fn check(&mut self, stamp: Stamp, payload: &[u8]) -> Result<(), ChainError> {
         if stamp.seq != self.next_seq {
             return Err(ChainError::OutOfOrder { expected: self.next_seq, got: stamp.seq });
@@ -123,7 +123,7 @@ impl Default for Chain {
 pub enum ChainError {
     #[error("该收到第 {expected} 个事件，收到的是第 {got} 个")]
     OutOfOrder { expected: u64, got: u64 },
-    #[error("第 {seq} 个事件的内容和它带的累积哈希对不上")]
+    #[error("第 {seq} 个事件的内容与累积哈希不匹配")]
     BadHash { seq: u64 },
 }
 
@@ -254,7 +254,7 @@ pub enum WsText {
     TurnDone { turn: u32, events: u64 },
     /// 上游：对 `Sync` 的回答。客户端消息和客户端二进制帧的累计数和累积哈希，以及收到的 pong 数。
     Synced { notes: u64, notes_hash: String, binary: u64, binary_hash: String, pongs: u64 },
-    /// 上游：客户端发来的东西验不过，或者请求不对。之后上游关闭会话。
+    /// 上游：客户端消息校验失败或请求无效，随后上游关闭会话。
     Error { detail: String },
 }
 

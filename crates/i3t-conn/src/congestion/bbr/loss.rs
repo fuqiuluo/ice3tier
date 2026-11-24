@@ -1,21 +1,21 @@
 //! 丢包账本：把丢掉的和送达的字节记回"它们是哪一段时间发出去的"，判断丢包是不是发得太多造成的。
 //!
-//! 丢包要过大约一个往返时间才看得出来，那时控制器多半已经换了阶段。所以账不按"发现丢包的时刻"记，
-//! 而按包的发送时刻记到当时那一段上：每一轮、每换一次阶段各开一段。
+//! 丢包通常需经过约一个往返时间才能检测到，届时控制器可能已切换阶段。因此统计不按“发现丢包的时刻”归属，
+//! 而是按数据包发送时刻归入对应周期段：每完成一轮或切换一次阶段开启一个新段。
 //!
 //! 丢包率超过门限，就认为那时的在途量超过了路径装得下的量。门限是 2% 加上这条路径的背景丢包率。
 //! 背景丢包率取自"故意把在途量压到估计值以下"的那些段：那时瓶颈处没有自己造成的排队，还在丢的就和发多少无关。
 //!
 //! 丢包率是从有限的几百个包里量出来的，而且丢包常常成片（一片就是十来个包），单独一段的数字出入很大。
-//! 所以判断时留出两倍标准差的余地，并且把相邻的段并在一起看：一下子超出很多的，一段就看得出来；
-//! 只超出一点但一直超的，并上几段也看得出来。
+//! 因此判定时预留两倍标准差容限，并将相邻同类型周期段合并统计：突发超标可在单段内检出，
+//! 持续小幅超标也可在合并多段后检出。
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
 /// 丢掉的字节超过这个比例（千分比）算丢包过多。和 BBRv2 的取值相同。
 const LOSS_THRESHOLD_PERMILLE: u64 = 20;
-/// 至少丢了这么多个包才下结论。在途只有几十个包时，丢一个就是百分之几，说明不了什么。
+/// 触发丢包过量判定的最小丢包数。在途仅有几十个包时，丢弃单个包即达百分之几，不具备统计显著性。
 const MIN_LOST_PACKETS: u64 = 3;
 /// 相邻的段最多并到这么多个包。再多的话，早先的情况已经和现在无关了。
 const POOL_PACKETS: u64 = 4000;
@@ -31,7 +31,7 @@ const BASELINE_SAMPLES: usize = 3;
 /// 背景丢包率最多认到这个数（千分比）。再高的话宁可降速：分不清它是不是好几条连接一起挤出来的。
 const BASELINE_CAP_PERMILLE: u64 = 100;
 
-/// 一段时间里控制器在做什么，决定这一段的丢包怎么用。
+/// 周期段内控制器所处的行为模式，决定该段丢包统计的用途。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EpochKind {
     /// 在试探更大的在途量。这时丢包过多，说明试探到头了。
@@ -46,7 +46,7 @@ pub(super) enum EpochKind {
 struct Epoch {
     start: Instant,
     kind: EpochKind,
-    /// 这一段允许的在途量。
+    /// 该周期段允许的在途字节数上限。
     window: u64,
     sent: u64,
     acked: u64,
@@ -65,7 +65,7 @@ impl Epoch {
         self.sent == 0 && self.acked == 0 && self.lost == 0
     }
 
-    /// 丢包率的分母。取"发出的"和"允许在途的"里较大的：应用发得少的那些段，丢几个包不说明路径装不下。
+    /// 计算丢包率的分母，取已发送量与窗口上限的较大值：在应用发送量较少的周期段，少量丢包并不代表路径容量不足。
     fn base(&self) -> u64 {
         self.sent.max(self.window)
     }
@@ -77,7 +77,7 @@ pub(super) struct Verdict {
     pub(super) kind: EpochKind,
     pub(super) window: u64,
     pub(super) sent: u64,
-    /// 一轮里丢了多少字节：这一段自己的，或者并在一起的几段的平均值，取较大的。
+    /// 单轮等效丢包字节数：取当前段自身丢包量与合并多段平均值的较大值。
     pub(super) lost: u64,
     pub(super) too_high: bool,
 }
@@ -93,7 +93,7 @@ struct Pool {
 
 #[derive(Debug, Clone)]
 pub(super) struct Ledger {
-    /// 按开始时刻递增，最后一个是当前这一段。
+    /// 按起始时刻递增排列，末尾元素为当前活跃周期段。
     epochs: VecDeque<Epoch>,
     /// 已确认的包里最晚的发送时刻。
     acked_through: Instant,
@@ -120,7 +120,7 @@ impl Ledger {
     /// 从 `now` 起开新的一段。
     pub(super) fn begin(&mut self, now: Instant, kind: EpochKind, window: u64) {
         match self.epochs.back_mut() {
-            // 上一段里什么都没发生（同一时刻连着换了两次阶段），直接换掉，不留空段。
+            // 若上一段为空（同一时刻连续切换阶段），直接覆写而不保留空段。
             Some(last) if last.is_empty() => *last = Epoch::new(last.start, kind, window),
             _ => self.epochs.push_back(Epoch::new(now, kind, window)),
         }
@@ -146,9 +146,9 @@ impl Ledger {
         self.pool = None;
     }
 
-    /// 记一次丢包。试探的那一段丢包第一次超过门限时返回 `true`，调用方可以马上停止试探，不必等这一段结清。
+    /// 记录一次丢包。当探测周期段的丢包首次超过阈值时返回 `true`，调用方可立即停止探测而不必等待该段结算。
     pub(super) fn on_lost(&mut self, sent: Instant, bytes: u64, mtu: u64) -> bool {
-        // 不属于留着的任何一段的丢包（那一段已经结清，或者是断路之前发的）不记，也不拿来估计一片丢多少。
+        // 不属于任何在保留周期段的丢包（该段已结算或属于链路中断前发出）不予计入，也不用于估算单次突发丢包量。
         if self.epoch_of(sent).is_none() {
             return false;
         }
@@ -169,7 +169,7 @@ impl Ledger {
     pub(super) fn settle(&mut self, mtu: u64) -> Option<Verdict> {
         let complete = self.epochs.get(1).is_some_and(|next| next.start <= self.settled_through);
         if !complete {
-            // 这一批确认之后库会接着做丢包检测；下一次调用时，到这一批为止的包才算都有了下落。
+            // 本批确认处理后 QUIC 库会执行丢包检测；至下次调用时，本批之前的发包才全部确定确认或丢失状态。
             self.settled_through = self.acked_through;
             return None;
         }
@@ -201,7 +201,7 @@ impl Ledger {
         LOSS_THRESHOLD_PERMILLE + self.baseline.permille()
     }
 
-    /// 在 `sent` 发出的包属于哪一段。比留着的段都早的不记：它所在的那一段已经结清了，记到别的段上会冤枉那一段。
+    /// 查找发送时刻 `sent` 所属的周期段。早于所有保留段的包不予归属：其原周期段已结算，归入后续段会造成误判。
     fn epoch_of(&mut self, sent: Instant) -> Option<&mut Epoch> {
         let index = self.epochs.iter().rposition(|epoch| epoch.start <= sent)?;
         self.epochs.get_mut(index)

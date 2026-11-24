@@ -4,7 +4,7 @@
 //!
 //! - **方式** 1 是"收"：发起方往流里写，测量服务读完丢掉。发起方写完（或者到了自己的上限）就正常结束发送方向；
 //!   测量服务到了它自己的上限就叫停这个方向。之后测量服务写一个 [`MeasureSummary`]（它收到了多少、用了多久、为什么停，
-//!   后面可以跟着去掉起步之后的那一段）并正常结束。
+//!   末尾可附带去除预热阶段后的稳态统计）并正常结束。
 //! - **方式** 2 是"发"：测量服务往回写，最多写字节上限那么多、最多写时长上限那么久，然后正常结束。发起方不写任何东西。
 //! - **测试编号** 和主动测试的探测（[`crate::probe::TestPing`]）里的是同一个。测量服务只接受它知道的、还在时间窗里的测试，
 //!   并且只接受指令里那个对端开来的流。
@@ -88,19 +88,19 @@ impl OpenMeasure {
 }
 
 /// 测量服务在"收"的方式下最后写回的一段：它收到了多少、从第一个字节到最后一个字节用了多久、为什么停，
-/// 后面可以跟着去掉起步之后的那一段（[`MeasureSteady`]）。
+/// 末尾可附带去除预热阶段后的稳态统计（[`MeasureSteady`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeasureSummary {
     pub bytes: u64,
     /// 从收到第一个字节到收到最后一个字节，毫秒。
     pub millis: u32,
     pub end: MeasureEnd,
-    /// 去掉开头起步的那一段之后的数。搬运没有过完起步就结束了的时候没有；较早的版本不写这一段，读的一方读不到就当作没有。
+    /// 去除初始预热阶段后的统计数据。传输未完成预热阶段即结束时为 `None`；较早版本不写入该部分，读取方读不到时视为 `None`。
     pub steady: Option<MeasureSteady>,
 }
 
-/// 一次搬运去掉开头起步的那一段之后：收到多少、用了多久。连接刚开始发的时候速率是从很低爬上来的，
-/// 把那一段算进去，量到的吞吐就偏低，而且偏多少取决于这条连接之前有没有发过数据。
+/// 单次传输去除初始预热阶段后的统计：接收字节数与耗时。连接刚开始发送时速率需从低位爬升，
+/// 若将预热阶段计入会导致测得吞吐偏低，且偏差程度取决于该连接此前是否已发送过数据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeasureSteady {
     pub bytes: u64,
@@ -138,7 +138,7 @@ pub enum MeasureEnd {
 }
 
 impl MeasureSummary {
-    /// 前面固定的那一段有多长。后面可有可无的一段是 [`MeasureSteady::LEN`]。
+    /// 前部固定字段的长度。末尾可选稳态段长度为 [`MeasureSteady::LEN`]。
     pub const LEN: usize = 8 + 4 + 1;
     pub const MAX_LEN: usize = Self::LEN + MeasureSteady::LEN;
 
@@ -155,7 +155,7 @@ impl MeasureSummary {
         }
     }
 
-    /// 解析前面固定的那一段，`steady` 留空。不认识的结束原因返回 `None`。
+    /// 解析前部固定字段，`steady` 置为 `None`。未知结束原因返回 `None`。
     #[must_use]
     pub fn from_bytes(bytes: &[u8; Self::LEN]) -> Option<Self> {
         let (count, rest) = bytes.split_first_chunk::<8>()?;

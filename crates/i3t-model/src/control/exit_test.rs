@@ -78,13 +78,13 @@ pub struct TlsStep {
     pub cause: Option<ExitTestCause>,
 }
 
-/// 出口测试里一步没有成功的原因，给界面按自己的语言写。
+/// 出口测试中某一步骤失败的原因码，供界面按当前语言展示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ExitTestCause {
     /// 出口节点上另一个测试正在做，或者刚做过（每 2 秒最多一个）。
     Busy,
-    /// 出口节点读不懂这个目标。
+    /// 出口节点无法解析该目标。
     BadTarget,
     /// 这个节点没有启用出口。
     NotEnabled,
@@ -108,15 +108,15 @@ pub enum ExitTestCause {
     Refused,
     /// 目标所在的网络或主机不可达。
     Unreachable,
-    /// 连不上出口的上游代理。
+    /// 无法连接出口的上游代理。
     UpstreamFailed,
-    /// TLS 握手完成之前对方关掉了连接。
+    /// TLS 握手完成前对端关闭了连接。
     Closed,
-    /// TLS 握手时对方回了一个告警（比如不认这个服务器名字）。
+    /// TLS 握手时对端返回告警（例如不识别该服务器名称）。
     Alert,
-    /// 别的原因，见出口节点的日志。
+    /// 其他原因，详见出口节点日志。
     Other,
-    /// 比这个程序新的节点报的、这里不认识的原因。
+    /// 较新版本节点上报的未知原因。
     #[serde(other)]
     Unknown,
 }

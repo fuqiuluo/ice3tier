@@ -2,7 +2,7 @@
 //! 卡在哪一步、经什么出去。
 //!
 //! controller 只转达：给出口节点发一条查询（和路由查询同一套编号和等待），节点按自己的规矩做（一次只做一个、每 2 秒最多一个、
-//! 每一步有时限），回答原样交给管理 API。节点不在线时是 `node_offline`；节点版本太旧不懂、或者时限之内没有回答时 `answered` 是 `false`。
+//! 每一步均有超时限制），应答原样返回给管理 API。节点离线时返回 `node_offline`；节点版本过旧不支持该消息或超时未应答时，`answered` 为 `false`。
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -77,7 +77,7 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// 节点不在这个网络里或者不是出口（`not_found`），目标写得不对（`invalid_request`），节点不在线（`node_offline`）。
+    /// 节点不在该网络中或未启用为出口（`not_found`），目标格式无效（`invalid_request`），或节点不在线（`node_offline`）。
     pub async fn exit_test(self: &Arc<Self>, network: NetworkId, node: NodeId, input: ExitTestInput) -> Result<ExitTestView, Error> {
         let asked = blocking(self, move |controller| controller.ask_exit_test(network, node, &input)).await?;
         let result = match asked.answer {
@@ -88,7 +88,7 @@ impl Controller {
         blocking(self, move |controller| controller.exit_test_view(network, node, target, result)).await
     }
 
-    /// [`Controller::exit_test`] 的前一半：检查，然后给出口节点发查询。节点的版本太旧不懂这条消息时不发。
+    /// [`Controller::exit_test`] 的前半部分：校验条件并向出口节点下发查询。若节点版本过旧不支持该消息则不下发。
     ///
     /// # Errors
     ///
@@ -102,7 +102,7 @@ impl Controller {
         let target = Target::parse(&input.target)?;
         let Some(live) = inner.live.get(&node) else { return Err(Error::NodeOffline(record.name)) };
         if !live.understands_updates() {
-            tracing::info!(%node, "不给这个出口发出口测试：它的版本太旧，收到不认识的消息会断开");
+            tracing::info!(%node, "跳过向该出口节点下发出口测试：节点版本过旧，收到未知消息类型会断开连接");
             return Ok(AskedExitTest { target, answer: None });
         }
         let (reply, answer) = oneshot::channel();
@@ -110,7 +110,7 @@ impl Controller {
         if inner.query(node, message, Reply::ExitTest(reply)).is_none() {
             return Err(Error::NodeOffline(record.name));
         }
-        tracing::info!(%node, %target, "让出口试着连一个目标");
+        tracing::info!(%node, %target, "向出口节点下发目标连通性测试");
         Ok(AskedExitTest { target, answer: Some(answer) })
     }
 

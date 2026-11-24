@@ -80,7 +80,7 @@ pub struct Ui {
     /// 安全下限比这次发布的版本新：下限，这次的版本。
     pub floor_above_version: fn(&str, &str) -> String,
     pub file_ok: fn(&str, &str) -> String,
-    /// 一个文件和清单对不上：平台，文件名，哪里不对。
+    /// 文件与清单校验不匹配时的提示：平台、文件名、不匹配原因。
     pub file_bad: fn(&str, &str, &str) -> String,
     pub mismatched: fn(usize) -> String,
     pub all_match: fn(usize) -> String,
@@ -94,36 +94,36 @@ pub struct Ui {
 static ZH: Texts = Texts {
     help: Help {
         about: "ice3tier 的发布工具",
-        keygen: "生成一把新的发布签名密钥，写进文件（只有属主可读），并打印它的公钥",
-        keygen_out: "私钥写到哪个文件。已经存在的文件不会被覆盖",
+        keygen: "生成新的发布签名密钥，写入文件（仅属主可读），并输出其公钥",
+        keygen_out: "私钥输出路径。已存在的文件不会被覆盖",
         manifest: "为发布目录里的节点程序生成 manifest.json 并签名，得到 manifest.json.sig",
         manifest_version: "这次发布的版本号，例如 0.3.0；预发布版写成 0.3.0-rc.1",
-        manifest_dir: "发布目录。里面的节点程序要叫 i3t-<平台>，例如 i3t-linux-x86_64、i3t-windows-x86_64.exe",
-        manifest_key: "发布签名密钥的文件（keygen 生成的那个）",
+        manifest_dir: "发布目录。其中的节点程序需命名为 i3t-<平台>，例如 i3t-linux-x86_64、i3t-windows-x86_64.exe",
+        manifest_key: "发布签名密钥文件路径（由 keygen 生成）",
         min_controller: "这个版本的节点需要的 controller 最低版本。比它旧的 controller 不会下发这个版本",
-        security_floor: "安全下限：最低的没有已知安全问题的版本，比它旧的节点标为有安全更新。默认没有；写了就每一版都带上",
+        security_floor: "安全下限：最低的没有已知安全问题的版本，比它旧的节点标为有安全更新。默认没有；设置后应在后续版本中持续保留",
         verify: "核对一个发布目录：清单的签名，以及清单里每个文件的大小和 SHA-256",
         verify_dir: "发布目录",
-        verify_key: "只认这一把公钥（base64url）。不给的话用编译在本程序里的发布公钥，和节点认的一样",
+        verify_key: "仅信任指定的公钥（base64url）。未指定时使用编译内置的发布公钥，与节点行为一致",
     },
     values: Values { file: "文件", version: "版本号", dir: "目录", key: "公钥" },
     ui: Ui {
         generate_key: "生成密钥",
         create_key_file: |path| format!("创建 {path}（已经存在的文件不会被覆盖）"),
-        write: |path| format!("写 {path}"),
-        read: |path| format!("读 {path}"),
-        read_dir: |dir| format!("读目录 {dir}"),
+        write: |path| format!("写入 {path}"),
+        read: |path| format!("读取 {path}"),
+        read_dir: |dir| format!("读取目录 {dir}"),
         key_written: |path| {
             format!(
-                "私钥已经写到 {path}。上面这一行是公钥：节点只认编译在程序里的公钥，\n\
-                 所以要么把它加进 i3t-update 的公钥列表，要么编译时设 I3T_RELEASE_EXTRA_KEY=<公钥>。"
+                "私钥已写入 {path}。上方输出为对应公钥：节点仅信任编译内置的公钥，\n\
+                 请将其加入 i3t-update 的公钥列表，或在编译时设置 I3T_RELEASE_EXTRA_KEY=<公钥>。"
             )
         },
-        read_key: |path| format!("读签名密钥 {path}"),
+        read_key: |path| format!("读取签名密钥 {path}"),
         parse_key: |path| format!("解析签名密钥 {path}"),
-        already_signed: |path| format!("{path} 已经存在。签过名的清单不覆盖；确实要重做的话先把它删掉"),
+        already_signed: |path| format!("{path} 已经存在。已签名的清单不会被覆盖；如需重新生成，请先手动删除"),
         no_programs: |dir, program| {
-            format!("{dir} 里没有节点程序。它们应该叫 {program}-<平台>，例如 {program}-linux-x86_64、{program}-windows-x86_64.exe")
+            format!("{dir} 中没有节点程序。文件应命名为 {program}-<平台>，例如 {program}-linux-x86_64、{program}-windows-x86_64.exe")
         },
         not_a_file: |path| format!("{path} 不是一个普通文件"),
         empty_file: |path| format!("{path} 是空的"),
@@ -132,21 +132,21 @@ static ZH: Texts = Texts {
         signed: |version, kind, key| format!("版本 {version}（{kind}），签名用的公钥 {key}"),
         artifact: |platform, file, size, sha256| format!("  {platform:<16} {file}  {size} 字节  {sha256}"),
         written: |manifest, signature| format!("已写出 {manifest} 和 {signature}"),
-        untrusted_key: "注意：这把钥匙不在本程序编译进去的发布公钥里。同样编译出来的节点不会认这份清单。",
+        untrusted_key: "注意：该密钥不在本程序内置的发布公钥列表中，使用相同内置公钥编译的节点不会信任此清单。",
         release: "正式版",
         prerelease: "预发布版",
         parse_signature: |file| format!("解析 {file}"),
-        check_signature: |file, keys| format!("核对 {file} 的签名（认的公钥：{keys}）"),
+        check_signature: |file, keys| format!("校验 {file} 的签名（信任的公钥：{keys}）"),
         verified: |version, kind, min| format!("版本 {version}（{kind}），需要 controller {min} 或更新，签名正确"),
         security_floor: |floor| format!("安全下限 {floor}：比它旧的版本有已知的安全问题"),
-        floor_above_version: |floor, version| format!("安全下限 {floor} 比这次发布的版本 {version} 还新"),
+        floor_above_version: |floor, version| format!("安全下限 {floor} 高于本次发布的版本 {version}"),
         file_ok: |platform, file| format!("  通过  {platform:<16} {file}"),
         file_bad: |platform, file, error| format!("  不符  {platform:<16} {file}：{error}"),
-        mismatched: |count| format!("清单里有 {count} 个文件和目录里的对不上"),
+        mismatched: |count| format!("发布清单中有 {count} 个文件条目未通过校验"),
         all_match: |count| format!("清单里的 {count} 个文件都核对无误"),
-        directory_in_name: "文件名里不应该有目录",
-        key_file_mismatch: |key, file| format!("键名是 {key}，文件名却是 {file}"),
-        unreadable: "读不了",
+        directory_in_name: "文件名中不能包含目录路径",
+        key_file_mismatch: |key, file| format!("键名 {key} 与文件名 {file} 不一致"),
+        unreadable: "无法读取文件",
         size_differs: |size, listed| format!("大小是 {size} 字节，清单上是 {listed} 字节"),
         sha256_differs: |sha256, listed| format!("SHA-256 是 {sha256}，清单上是 {listed}"),
     },

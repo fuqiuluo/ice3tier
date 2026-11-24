@@ -94,7 +94,7 @@ impl Drop for Gauge<'_> {
 
 /// # Errors
 ///
-/// 端口绑不上，或者证书目录读写失败。
+/// 端口绑定失败或证书目录读写失败。
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let tls = TlsAcceptor::from(crate::tls::server_config(&args.cert_dir, &args.names)?);
     let counters = Arc::new(Counters::default());
@@ -167,7 +167,7 @@ async fn accept_loop(listener: TcpListener, tls: Option<TlsAcceptor>, counters: 
             counters.connections.fetch_add(1, Ordering::Relaxed);
             let _open = Gauge::new(&counters.open);
             if let Err(err) = tcp.set_nodelay(true) {
-                tracing::debug!(%err, "设置不了 TCP_NODELAY");
+                tracing::debug!(%err, "启用 TCP_NODELAY 失败");
             }
             let served = match tls {
                 Some(tls) => match tokio::time::timeout(HEAD_TIMEOUT, tls.accept(tcp)).await {

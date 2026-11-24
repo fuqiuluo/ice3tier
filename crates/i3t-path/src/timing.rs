@@ -42,7 +42,7 @@ pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const MAX_TIMEOUTS: u8 = 3;
 /// 有包发出去、却这么久没有从这条路上收到任何东西时，不等探测间隔，立刻探测。
 pub(crate) const SILENCE: Duration = Duration::from_secs(1);
-/// 判断"发了却没有回音"时，多久之内发的包算数。
+/// 判定“发送后无响应”时纳入统计的最近发送时间窗口。
 pub(crate) const UNANSWERED_WINDOW: Duration = Duration::from_secs(6);
 
 /// 一个对端多久没有包要发就算不活跃：停止探测它的直连，为它临时建的中转会话可以回收。
@@ -65,8 +65,8 @@ pub(crate) const PUNCH_BACKOFF: [Duration; 8] = [
 ];
 /// 上面那一轮都不成之后：连接还在走 relay 并且有流量时，每隔这么久再试一次。
 pub(crate) const PUNCH_IDLE_RETRY: Duration = Duration::from_secs(60);
-/// 一次打洞尝试里，从开始算起在这些时刻各向所有候选地址发一轮探测。
-/// 头一轮多半被对面的 NAT 挡掉（它那边还没有往外发过），后面两轮才是真正能通的。
+/// 单次打洞尝试中，自起始时刻起向全部候选地址发送探测的各轮偏移时刻。
+/// 首轮探测通常会被对端 NAT 拦截（此时对端尚未向外发包），后续两轮用于完成双向穿透。
 pub(crate) const PUNCH_VOLLEYS: [Duration; 3] = [Duration::ZERO, Duration::from_millis(300), Duration::from_millis(600)];
 /// 一次打洞尝试从开始到判为失败的时间。
 pub(crate) const PUNCH_ATTEMPT: Duration = Duration::from_millis(1500);
@@ -78,44 +78,43 @@ pub(crate) const HANDSHAKE_TRIES: u8 = 4;
 /// 丢包的链路上一次重传就是一两秒，按 UDP 的节奏（半秒一次、两秒放弃）会在链路只是慢的时候白白放弃。
 /// 两步加起来要比 relay 给握手留的时间（10 秒）短。
 ///
-/// 保活没有回答时不这样等，照样尽快拆掉重连。真实链路上量过（晚高峰，丢包两成）：卡住的 TCP 三分之二
-/// 等 20 秒也不恢复，而新拨一条通常不到 1 秒就握上手；能自己恢复的那三分之一，恢复得也不比重连快。
+/// 保活无响应时不采用此长等待，仍尽快关闭重建。实测（晚高峰、20% 丢包链路）：约三分之二卡死的 TCP 连接
+/// 等待 20 秒仍无法恢复，而新建连接通常在 1 秒内即可完成握手；可自行恢复的三分之一也并不比重连更快。
 pub(crate) const TCP_HANDSHAKE_STEP: Duration = Duration::from_secs(4);
-/// 到 relay 的 TCP 上，发出去的数据这么久没有被确认，内核就放弃这条连接（`TCP_USER_TIMEOUT`，和重传上限一起设，
+/// 到 relay 的 TCP 连接上，已发送数据超过该时长仍未获确认时，内核将终止连接（`TCP_USER_TIMEOUT`，与重传上限配合设置，
 /// 见 `i3t_underlay::tcp_recovery`）。
 ///
-/// 上面这一层自己判断这条 TCP 的死活：会话建立之后保活连续 3 次没有回答（最多 4.5 秒左右）就拆掉重连，握手时每一步等
-/// [`TCP_HANDSHAKE_STEP`]。所以这里取 10 秒：比上面那一层能等的都长，TCP 不会先把它判死；上面那一层换掉它之后，
-/// 关掉的那个 socket 在内核里也最多再留这么久。
+/// 上层自行判定该 TCP 连接存活：会话建立后保活连续 3 次无响应（约 4.5 秒内）即关闭重连，握手阶段每步等待
+/// [`TCP_HANDSHAKE_STEP`]。此处取 10 秒可确保长于上层全部等待阈值，避免内核抢先终止连接，同时限制已关闭 socket 在内核中的最长残留时间。
 pub(crate) const TCP_LEG_GIVE_UP: Duration = Duration::from_secs(10);
-/// UDP 和 TCP 同时试的时候，UDP 这么久还没握上手就先用 TCP。
+/// UDP 与 TCP 并发连接时，预留给 UDP 握手的先行时间窗口，超时未完成则放行 TCP 握手。
 pub(crate) const UDP_HEAD_START: Duration = Duration::from_secs(1);
-/// 走着 TCP 的节点多久再试一次 UDP。
+/// 使用 TCP 中继的节点定期重试 UDP 的间隔。
 pub(crate) const UDP_RETRY: Duration = Duration::from_secs(30);
-/// 连不上的 relay 隔多久重试：从 1 秒起每次加倍，到这个数为止。
-/// 试一次只是一个 TCP 连接加几个 UDP 包，而一个 relay 都连不上的节点和别人是断开的，所以不让它等太久。
+/// 不可达 relay 的指数退避重试上限（从 1 秒起逐次翻倍直至该上限）。
+/// 单次重试开销仅为一个 TCP 连接与若干 UDP 包，而无法连接任何 relay 的节点处于孤立状态，因此上限不宜过长。
 pub(crate) const RELAY_RETRY_MAX: Duration = Duration::from_secs(10);
-/// 没有挂靠的 relay 多久测一次延迟。
+/// 非挂靠 relay 的周期性延迟探测间隔。
 pub(crate) const RELAY_SURVEY: Duration = Duration::from_secs(60);
 /// 测量结果的有效期，过期作废。
 pub(crate) const ESTIMATE_TTL: Duration = Duration::from_secs(120);
 
-/// relay 和 relay 之间多久探测一次。只管 UDP 上的会话，骨干走 TCP 时照 [`PROBE_INTERVAL`]（见 `crate::relays`）。
+/// relay 间骨干链路的 UDP 保活探测间隔；骨干切换为 TCP 时沿用 [`PROBE_INTERVAL`]（见 `crate::relays`）。
 pub(crate) const BACKBONE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
-/// 骨干上：到对方的 UDP 会话通着、对方却这么久都没有经 UDP 在本节点上建会话，就当它连不上本节点，这一段改走本节点拨出去的 TCP。
-/// 对方的 netmap 晚到几秒、它的握手重试几次都在这之内；比它短的话，对方重启的那一阵会被误判。
+/// 骨干链路单向可达宽限期：到对方的 UDP 会话已建立，但对方超过该时长仍未通过 UDP 在本节点建立会话时，
+/// 判定对方无法直达本节点，切换为由本节点主动拨出的 TCP 连接。该时长足以覆盖对方 netmap 延迟与握手重试，避免对方重启时误判。
 pub(crate) const ONE_SIDED_GRACE: Duration = Duration::from_secs(10);
-/// 骨干走 TCP、按编号不该本节点先拨时，等对方拨进来最多等多久，之后自己拨（对方可能连不进本节点）。
-/// 对方拨号要等它自己的 UDP 握不上手（两秒）再加上连 TCP、握手（连不上的地址每个最多四秒）。
+/// 骨干链路采用 TCP 且按节点 ID 规则不由本节点优先拨号时，等待对方拨入的最大时长，超时后由本节点主动拨号（对方可能无法连入）。
+/// 对方发起拨号需经历自身 UDP 握手超时（2 秒）及 TCP 建连与握手（单个不可达地址最多 4 秒）。
 pub(crate) const DIAL_DEFER: Duration = Duration::from_secs(10);
-/// 借来的 TCP 上没有建成会话（对方不在上面回答，比如它是不懂这件事的旧版本）之后，多久之内不再借同一条。
+/// 复用的入站 TCP 连接未能建立会话（例如对方为不支持反向复用的旧版本）后，不再复用同一连接的冷却时长。
 pub(crate) const OFFER_RETRY: Duration = Duration::from_secs(60);
-/// 骨干上的一段从 TCP 回到 UDP 之后，这么久之内又改走 TCP 的话算"没有回成"：之后在后台试 UDP 的间隔加倍（见 `crate::relays`）。
-/// 回不成的样子都在这之内现出来：对方连不上本节点要 [`ONE_SIDED_GRACE`]，对方的 UDP 握不上手两秒，
-/// 再加上拨 TCP 时等对方的 [`DIAL_DEFER`]，合起来二十来秒；留一倍多的余量给忙的机器。保持过这么久的回归算成了，间隔复原。
+/// 骨干链路从 TCP 切回 UDP 后的稳定观察期：若在该时长内再次退回 TCP，则视为切回失败并加倍后台 UDP 重试间隔（见 `crate::relays`）。
+/// 各类切回失败场景均会在此窗口内暴露（单向不可达需 [`ONE_SIDED_GRACE`]、对方 UDP 握手失败 2 秒、
+/// 加之 TCP 拨号等待 [`DIAL_DEFER`]，合计约 20 余秒，预留余量应对高负载）；稳定超过该时长则重置重试间隔。
 pub(crate) const RETURN_PROBATION: Duration = Duration::from_secs(60);
-/// 骨干在后台试 UDP 的间隔最多加倍到这么久。对方是比这个改动旧的 relay、而且只有本节点的 UDP 到得了它时，
-/// 每一次回到 UDP 都要断上几秒到十几秒（见 `crate::relays`），所以一小时最多一次。
+/// 骨干链路后台尝试 UDP 的最大退避间隔。若对端为不支持双向探测的旧版 relay 且仅单向 UDP 可达，
+/// 每次切回 UDP 都会引发数秒至十余秒中断（见 `crate::relays`），因此将频率限制为最多每小时一次。
 pub(crate) const BACKBONE_RETRY_MAX: Duration = Duration::from_secs(3600);
 /// 骨干走着 TCP 时，对方经 UDP 敲门（它的 AUTH 被本节点的 relay 挡下了）引出的 UDP 尝试至少隔这么久才再来一次。
 /// 比一次没有回答的 UDP 握手（[`HANDSHAKE_TRIES`] × [`HANDSHAKE_RETRY`]，两秒）长：对方一次尝试里的几个 AUTH 只引出一次，
@@ -152,10 +151,10 @@ pub(crate) fn backbone_udp_retry() -> Duration {
     *RETRY
 }
 
-/// "本节点的 UDP 到得了那个 relay"（它回答了本节点经 UDP 发的 INIT）这件事多久之内算数：两个 [`backbone_udp_retry`] 再多 5 秒。
+/// “本节点 UDP 可达该 relay”（对方应答了本节点经 UDP 发送的 INIT）这一可达证据的有效期：两个 [`backbone_udp_retry`] 周期另加 5 秒。
 ///
-/// 骨干走着 TCP 时本节点每隔那么久在后台试一次 UDP，UDP 通着的话每一次都把它刷新；中间有一次没有回答（丢了几个包）也还算数，
-/// 5 秒是一次握手的时间（两秒）再加上一点余量。再长的话，早已不通的 UDP 会被当作通的，对方一搬过来骨干就断。
+/// 骨干链路使用 TCP 期间，本节点按该周期在后台试探 UDP，UDP 正常时每次均会刷新证据；即使偶发单次丢包未响应，证据仍保持有效，
+/// 附加的 5 秒涵盖一次完整握手耗时（2 秒）及余量。有效期不宜更长，否则已失效的 UDP 会被误判为可达并导致迁移中断。
 pub(crate) fn udp_evidence_ttl() -> Duration {
     backbone_udp_retry() * 2 + Duration::from_secs(5)
 }

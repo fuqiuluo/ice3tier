@@ -4,14 +4,14 @@
 //!   被拒绝的拨号方在握手那一刻还不知道）。控制 lane 不在时，本节点不在任何 lane 上往这个对端开流，调用方改走共用的连接。
 //! - 停多少条由对方说了算：它在 POOL 里说再拨几条就拨几条（它确切知道手上还有几条）。
 //! - 自己开流用的热 lane 由本节点自己定：和接受方的池同一个估计（新流的速率 × 补一条要多久），补一条的时间是测到的拨号时间。
-//!   热的用完了才当场拨。本节点往这个对端开第一条流之前一条不备（第一条当场拨）：只为对方停 lane 的拨号方用不着它们。
+//!   预热池耗尽后才按需现拨。本节点首次向该对端开流前不预备（首条流按需拨号），避免仅为对端驻留 lane 的拨号方浪费连接。
 //! - 停过去的 lane 每条有一个任务守着：对方在上面开流（OPENING）就把它交给本节点的接受队列；
 //!   对方关掉它（多余的、旧 epoch 的）或者它死了，这个任务就结束。
 //! - 每次拨号各自完成、立刻投入使用，不按批等：一次慢的拨号（SYN 重传）不拖住别的。
 //!   同时在拨的最多 [`MAX_CONCURRENT_DIALS`] 条，多出来的排着，有空位再拨。
 //! - 拨号失败就停一段时间再拨，时间逐次加倍，最长 [`MAX_BACKOFF`]；停着的这段时间里别的失败不再加倍：
 //!   对方重启时几十条同时失败，只算一次。
-//! - 控制 lane 断了就换一个新的 epoch 再拨。旧 epoch 停着的 lane 不再算数，由对方在新的控制 lane 到来时关掉；
+//! - 控制 lane 断开后切换新的 epoch 重新拨号。旧 epoch 下的驻留 lane 失效，由对端在收到新控制 lane 时关闭；
 //!   在那之前对方要是在其中一条上开了流，照样服务。
 
 use std::collections::VecDeque;
@@ -197,7 +197,7 @@ impl Dialler {
         Instant::now() < self.paused_until
     }
 
-    /// 拨号失败：停一段时间。已经在停着时不再加倍，同一阵子的失败只算一次。
+    /// 拨号失败后进入退避等待；若已处于退避期则不再加倍，将同一批并发失败合并为一次。
     fn failed(&mut self) {
         if self.paused() {
             return;
@@ -242,7 +242,7 @@ impl Dialler {
                 };
                 match time::timeout_at(Instant::now() + DIAL_DEADLINE, first).await {
                     Ok(Ok(Some(Frame::Pool { extra, .. }))) => Ok((lane, addr, extra)),
-                    Ok(Ok(_)) => Err(LaneError::Protocol("对方在控制 lane 上的第一个帧不是 POOL")),
+                    Ok(Ok(_)) => Err(LaneError::Protocol("对端在控制 lane 上发送的首帧不是 POOL")),
                     Ok(Err(error)) => Err(error),
                     Err(_) => Err(LaneError::Deadline(DIAL_DEADLINE)),
                 }
@@ -259,12 +259,12 @@ impl Dialler {
                 self.goaway_sent = false;
                 self.add_pending(usize::from(extra));
                 inner.set_control_up(self.peer, &self.generation, true);
-                tracing::info!(peer = %self.peer, %addr, "到对方的控制 lane 建立了");
+                tracing::info!(peer = %self.peer, %addr, "到对端的控制 lane 已建立");
                 true
             }
             Err(error) => {
                 plan.book.bump(|tally| &tally.dial_failures);
-                tracing::debug!(peer = %self.peer, %error, "拨控制 lane 失败（对方不认本节点时也是这样）");
+                tracing::debug!(peer = %self.peer, %error, "拨号建立控制 lane 失败（对端拒绝或未识别本节点时也会出现该错误）");
                 self.failed();
                 false
             }
@@ -277,28 +277,28 @@ impl Dialler {
         self.pending += extra.min(room);
     }
 
-    /// 控制 lane 断了：换一个新的 epoch，旧的停车不再算数，重新拨。
+    /// 控制 lane 断开：切换新的 epoch，旧的驻留 lane 失效，并重新拨号。
     fn lose_control(&mut self, inner: &Inner, reason: &str) {
         self.control = None;
         self.epoch = inner.random_u64();
         self.pending = 0;
         self.parked_idle = 0;
         inner.set_control_up(self.peer, &self.generation, false);
-        tracing::info!(peer = %self.peer, %reason, "到对方的控制 lane 断了，换一个新的 epoch 重新拨");
+        tracing::info!(peer = %self.peer, %reason, "到对端的控制 lane 已断开，切换新 epoch 重新拨号");
     }
 
     async fn handle(&mut self, inner: &Arc<Inner>, step: Step) -> Result<(), String> {
         match step {
             Step::Frame(frame) => {
                 self.heard = Instant::now();
-                let frame = frame.map_err(|error| error.to_string())?.ok_or("对方关闭了控制 lane")?;
+                let frame = frame.map_err(|error| error.to_string())?.ok_or("对端关闭了控制 lane")?;
                 let control = self.control.as_mut().expect("控制 lane 在时才会读到它的帧");
                 match frame {
                     Frame::Pool { extra, .. } => self.add_pending(usize::from(extra)),
                     Frame::Ping(nonce) => control.send(&Frame::Pong(nonce)).await.map_err(|error| error.to_string())?,
                     Frame::Pong(_) | Frame::Unknown(_) => {}
                     Frame::GoAway => inner.peer_going_away(self.peer, &self.generation),
-                    _ => return Err("控制 lane 上不该出现的帧".to_owned()),
+                    _ => return Err("控制 lane 收到非预期帧".to_owned()),
                 }
             }
             Step::Event(event) => match event.expect("发送端一直在这里，接收不会结束") {
@@ -327,7 +327,7 @@ impl Dialler {
             Step::Tick => {
                 let interval = inner.config.ping_interval;
                 if self.heard.elapsed() > interval * 3 {
-                    return Err("三个保活周期没有听到对方".to_owned());
+                    return Err("连续三个保活周期未收到对端响应".to_owned());
                 }
                 let control = self.control.as_mut().expect("同上");
                 if self.ping_sent.elapsed() >= interval {
@@ -371,13 +371,13 @@ impl Dialler {
 
 /// 拨一条停在对方那里的 lane，然后守着它：对方在上面开流就交给接受队列。
 async fn park(inner: Arc<Inner>, peer: NodeId, generation: Arc<Notify>, epoch: u64, events: mpsc::UnboundedSender<Event>) {
-    // 下面几处报回去的事，收的一方是这个对端的维护任务。它已经结束（本节点在关闭、不再拨这个对端）时没有人要听，发不出去不要紧。
+    // 以下事件上报给该对端的维护任务；若任务已结束（节点关闭或不再拨号该对端），发送失败可安全忽略。
     let Some(mut lane) = dial_one(&inner, peer, &generation, Purpose::Parked, epoch).await else {
         let _ = events.send(Event::Parked { epoch, ok: false });
         return;
     };
     if let Err(error) = lane.flush().await {
-        tracing::debug!(%peer, %error, "停过去的 lane 刚拨通就断了");
+        tracing::debug!(%peer, %error, "驻留 lane 刚建立即断开");
         let _ = events.send(Event::Parked { epoch, ok: false });
         return;
     }
@@ -391,7 +391,7 @@ async fn park(inner: Arc<Inner>, peer: NodeId, generation: Arc<Notify>, epoch: u
     match opening {
         Ok(Some(opening)) => inner.deliver(lane, &opening, Some(&generation)),
         Ok(None) => {}
-        Err(error) => tracing::debug!(%peer, %error, "停过去的一条 lane 结束了"),
+        Err(error) => tracing::debug!(%peer, %error, "驻留 lane 已关闭"),
     }
 }
 
@@ -401,7 +401,7 @@ async fn warm_up(inner: Arc<Inner>, peer: NodeId, generation: Arc<Notify>, epoch
         Some(mut lane) => match lane.flush().await {
             Ok(()) => Some(lane),
             Err(error) => {
-                tracing::debug!(%peer, %error, "热 lane 刚拨通就断了");
+                tracing::debug!(%peer, %error, "预热 lane 刚建立即断开");
                 None
             }
         },
@@ -411,7 +411,7 @@ async fn warm_up(inner: Arc<Inner>, peer: NodeId, generation: Arc<Notify>, epoch
     if let Some(lane) = lane {
         inner.add_warm(lane, &generation);
     }
-    // 维护任务已经结束（本节点在关闭、不再拨这个对端）时没有人要听，发不出去不要紧。
+    // 若该对端的维护任务已结束（节点关闭或不再拨号该对端），发送失败可安全忽略。
     let _ = events.send(Event::Own { ok });
 }
 
@@ -439,7 +439,7 @@ async fn dial_one(inner: &Arc<Inner>, peer: NodeId, generation: &Arc<Notify>, pu
         }
         Err(error) => {
             plan.book.bump(|tally| &tally.dial_failures);
-            tracing::debug!(%peer, ?purpose, %error, "拨 lane 失败");
+            tracing::debug!(%peer, ?purpose, %error, "拨号建立 lane 失败");
             None
         }
     }
@@ -460,11 +460,11 @@ pub(crate) async fn await_opening(lane: &mut Lane) -> Result<Option<Opening>, La
     match lane.read_frame().await {
         Ok(Some(Frame::Opening { mode, header })) => {
             if mode == Mode::Early && !lane.sealed.at_record_boundary() {
-                return Err(LaneError::Protocol("passthrough 的 OPENING 后面同一条记录里还有东西"));
+                return Err(LaneError::Protocol("passthrough 模式的 OPENING 帧后同一 TLS 记录内存在多余数据"));
             }
             Ok(Some(Opening { mode, header }))
         }
-        Ok(Some(_)) => Err(LaneError::Protocol("空闲 lane 上的第一个帧不是 OPENING")),
+        Ok(Some(_)) => Err(LaneError::Protocol("空闲 lane 收到的首帧不是 OPENING")),
         Ok(None) | Err(LaneError::Closed) => Ok(None),
         Err(error) => Err(error),
     }

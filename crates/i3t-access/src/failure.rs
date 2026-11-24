@@ -19,7 +19,7 @@ pub(crate) enum Failure {
     ConnectionRefused,
     /// 连接目标超时。
     TimedOut,
-    /// 到不了出口节点，或者出口节点自己出了问题。
+    /// 无法到达出口节点，或出口节点内部发生故障。
     ExitUnavailable,
     /// 本节点在出口上同时开着的流到了出口给每个节点的上限。
     TooManyConnections,

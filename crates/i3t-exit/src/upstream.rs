@@ -1,7 +1,7 @@
 //! 经上游 SOCKS5 代理去连目标。
 //!
 //! 出口可以配置一个本机的 SOCKS5 代理（`upstream_socks5`），把流交给它去连，而不是自己直接连。
-//! 这里是 SOCKS5 的客户端一侧，只做不认证的 CONNECT，目标一律用地址：域名已经在出口上解析并且过了出站策略，
+//! 此处实现 SOCKS5 客户端侧，仅执行无认证 CONNECT，且目标一律使用解析后的 IP 地址：域名已在出口完成解析并通过出站策略校验，
 //! 交域名给上游的话它会再解析一次，结果可能和检查过的不一样。
 
 use std::net::{IpAddr, SocketAddr};
@@ -18,7 +18,7 @@ const ATYP_V6: u8 = 0x04;
 
 /// 在一条已经连到上游代理的连接上，请它去连 `target`。成功之后这条连接就是到目标的通道。
 ///
-/// 问候和请求合在一次写里发出去，不等上游对问候的回答，省一个往返；上游不接受"不认证"时，两个回答里的第一个就会说明。
+/// 将问候与连接请求合并在单次写入中发送，不等待上游回复问候，可减少一次往返；若上游不支持无认证方式，首个应答会立即体现。
 ///
 /// # Errors
 ///
@@ -43,7 +43,7 @@ pub(crate) async fn connect(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), 
     let mut selection = [0; 2];
     stream.read_exact(&mut selection).await.map_err(|_| broken("断开了连接"))?;
     if selection != [VERSION, METHOD_NONE] {
-        return Err(broken("不接受不认证的连接，或者不是 SOCKS5"));
+        return Err(broken("拒绝无认证连接，或协议不是 SOCKS5"));
     }
 
     let mut head = [0; 4];
@@ -52,12 +52,12 @@ pub(crate) async fn connect(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), 
     if version != VERSION {
         return Err(broken("的应答不是 SOCKS5"));
     }
-    // 应答后面跟着上游绑定的地址，用不上，但要读走：它后面就是目标的数据。
+    // 应答后紧跟上游绑定地址，此处无需使用，但必须读取完毕，其后即为目标数据流。
     let bound_len = match address_type {
         ATYP_V4 => 4 + 2,
         ATYP_V6 => 16 + 2,
         ATYP_DOMAIN => usize::from(stream.read_u8().await.map_err(|_| broken("断开了连接"))?) + 2,
-        _ => return Err(broken("的应答里有不认识的地址类型")),
+        _ => return Err(broken("的应答包含不支持的地址类型")),
     };
     let mut bound = [0; u8::MAX as usize + 2];
     stream.read_exact(&mut bound[..bound_len]).await.map_err(|_| broken("断开了连接"))?;

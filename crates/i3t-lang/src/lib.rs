@@ -83,21 +83,21 @@ pub fn set(lang: Lang) -> Lang {
     *CURRENT.get_or_init(|| lang)
 }
 
-/// 操作系统的语言设置；问不到时是 `None`。
+/// 操作系统的语言设置；无法获取时返回 `None`。
 #[cfg(windows)]
 fn system_locale() -> Option<String> {
     use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
     // Windows 的头文件里 LOCALE_NAME_MAX_LENGTH 是 85，含结尾的 0。
     let mut buffer = [0u16; 85];
     let capacity = i32::try_from(buffer.len()).expect("85 放得进 i32");
-    // SAFETY: 传进去的是一块可写的缓冲区和它的长度（UTF-16 的个数）。函数最多写这么多个，返回写了几个（含结尾的 0），
-    // 失败时返回 0。缓冲区在调用期间一直有效，之后只读返回值说的那一段。
+    // SAFETY: 传入一块可写缓冲区及其长度（UTF-16 码元数）。函数最多写入该长度并返回写入的码元数（含结尾的 0），
+    // 失败时返回 0。缓冲区在调用期间保持有效，调用后仅读取返回值指示的有效区间。
     let written = unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), capacity) };
     let len = usize::try_from(written).ok()?.checked_sub(1)?;
     String::from_utf16(buffer.get(..len)?).ok()
 }
 
-/// 操作系统的语言设置；问不到时是 `None`。
+/// 操作系统的语言设置；无法获取时返回 `None`。
 ///
 /// macOS 的终端一般设着 `LANG`，走到这里的多是从图形界面或者 launchd 启动的。读系统的偏好不想为此引一个绑定库，
 /// 所以问一下 `defaults`：只在环境变量都没有时问，一次，十来毫秒。

@@ -158,9 +158,9 @@ def basics(lab: Lab, work: Path, t: Checks) -> None:
 
     status = i3t(a, "network", "status").stdout
     t.check("i3t network status 列出装了什么",
-            all(part in status for part in ("装着", "i3t0 10.66.0.1/16", "table ip i3t0", "-i i3t0，INPUT 的第 1 条", "放行开着")), status)
+            all(part in status for part in ("已启用", "i3t0 10.66.0.1/16", "table ip i3t0", "-i i3t0，INPUT 的第 1 条", "放行已启用")), status)
     overall = i3t(a, "status").stdout
-    t.check("i3t status 里有虚拟网卡的状态和计数", "虚拟网卡" in overall and "装着" in overall and "发 " in overall, overall[-600:])
+    t.check("i3t status 里有虚拟网卡的状态和计数", "虚拟网卡" in overall and "已启用" in overall and "发 " in overall, overall[-600:])
 
     a.stop()
     after = system_snapshot(a.host)
@@ -587,7 +587,7 @@ def privilege(lab: Lab, work: Path, t: Checks) -> None:
     a.proc = a.host.spawn("setpriv", "--bounding-set=-net_admin", "--inh-caps=-net_admin", binary("i3t"), "--state-dir", str(a.state),
                           "run", "--static", str(path), log=a.log)
     t.check("没有 CAP_NET_ADMIN：不装", vnet_ready(a) == "failed", tail(a.read_log()))
-    t.check("状态说缺 CAP_NET_ADMIN", "缺 CAP_NET_ADMIN" in i3t(a, "status").stdout, i3t(a, "status").stdout[-500:])
+    t.check("状态说缺 CAP_NET_ADMIN", "缺少 CAP_NET_ADMIN" in i3t(a, "status").stdout, i3t(a, "status").stdout[-500:])
     proxied = a.curl(f"http://{b.virtual_ip}:8080/")
     t.check("经本机入口访问 b 照常", proxied.stdout == b.host.ip, f"{proxied.stdout!r} {proxied.stderr.strip()}")
     t.check("系统里什么都没动", comparable(system_snapshot(a.host)) == comparable(before), snapshot_difference(before, system_snapshot(a.host)))
@@ -598,7 +598,7 @@ def privilege(lab: Lab, work: Path, t: Checks) -> None:
                           f"run --static {path}", log=a.log)
     t.check("没有 /dev/net/tun：不装", vnet_ready(a) == "failed", tail(a.read_log()))
     status = i3t(a, "status").stdout
-    t.check("状态说打不开建网卡用的设备", "打不开建网卡用的设备" in status, status[-500:])
+    t.check("状态说打不开建网卡用的设备", "无法打开虚拟网卡设备" in status, status[-500:])
     proxied = a.curl(f"http://{b.virtual_ip}:8080/")
     t.check("经本机入口访问 b 照常", proxied.stdout == b.host.ip, f"{proxied.stdout!r} {proxied.stderr.strip()}")
     if t.failures:
@@ -643,7 +643,7 @@ def appears(lab: Lab, work: Path, t: Checks) -> None:
     started = time.monotonic()
     wait_until(lambda: not device(), timeout=20, what="a 拆掉虚拟网卡")
     t.check("多了一个地址段里的地址：几秒之内拆掉", time.monotonic() - started < 10)
-    t.check("日志说出为什么拆", "重叠了，虚拟网卡当场拆掉" in a.read_log(), tail(a.read_log()))
+    t.check("日志说出为什么拆", "重叠，立即停用并清理虚拟网卡" in a.read_log(), tail(a.read_log()))
     t.check("规则也拆了", "table ip i3t0" not in a.host.run("nft", "list", "ruleset").stdout)
     real = a.host.run("curl", "-sS", "--max-time", "10", "http://10.66.200.2:8080/", check=False)
     t.check("那个网络照常通", real.stdout == "10.66.200.1", f"{real.stdout!r} {real.stderr.strip()}")
@@ -671,7 +671,7 @@ def leftover(lab: Lab, work: Path, t: Checks) -> None:
     left = system_snapshot(a.host)
     t.check("被杀掉：网卡和它的地址、路由跟着没了", " i3t0:" not in left["links"] and "10.66.0.0/16" not in left["routes"], left["links"])
     t.check("被杀掉：规则留着", "table ip i3t0" in left["nft"] and "ice3tier" in firewall_rules(a.host)["iptables"], left["nft"])
-    t.check("i3t network status 说这些是上次留下的", "上次留下的" in i3t(a, "network", "status").stdout)
+    t.check("i3t network status 说这些是上次留下的", "上次遗留的" in i3t(a, "network", "status").stdout)
 
     a.log.write_text("")
     a.start_static(netmap)
@@ -684,14 +684,14 @@ def leftover(lab: Lab, work: Path, t: Checks) -> None:
     a.host.stop(a.proc, signal.SIGKILL)
     a.proc = None
     switched = i3t(a, "set", "network", "off")
-    t.check("节点没运行时 i3t set network off 拆掉留下的", "拆掉了上次留下的" in switched.stdout, switched.stdout + switched.stderr)
+    t.check("节点没运行时 i3t set network off 拆掉留下的", "已清理上次遗留的" in switched.stdout, switched.stdout + switched.stderr)
     after = system_snapshot(a.host)
     t.check("拆掉之后和装之前一样", comparable(after) == comparable(before), snapshot_difference(before, after))
     a.log.write_text("")
     a.start_static(netmap)
     time.sleep(1.5)
     t.check("关着启动：什么都不装", comparable(system_snapshot(a.host)) == comparable(before), snapshot_difference(before, system_snapshot(a.host)))
-    t.check("关着：状态说关着", "关着" in i3t(a, "status").stdout)
+    t.check("关着：状态说关着", "已关闭" in i3t(a, "status").stdout)
     if t.failures:
         print(tail(a.read_log(), 30))
 
@@ -885,7 +885,7 @@ def lan_checks(a: Node, b: Node, lan, box, sink: Path, to_self: dict, t: Checks,
         t.check("开关关着：虚拟 IP 上别的服务由这台机器自己管，内核照样收", seen.stdout == "192.168.77.2", f"{seen.stdout!r} {seen.stderr.strip()}")
         seen = fetch(lan, f"http://{a.virtual_ip}:8080/", "--interface", "192.168.77.2")
         t.check("  ……虚拟 IP 上的端口转发自己不收从别的网卡来的连接", seen.stdout != "127.0.0.1", f"{seen.stdout!r} {seen.stderr.strip()}")
-        t.check("  ……节点记下了为什么", "来源既不是本机，也不是可以访问本节点的节点" in a.read_log(), tail(a.read_log()))
+        t.check("  ……节点记下了为什么", "来源既非本机，也非有权访问本节点的对端节点" in a.read_log(), tail(a.read_log()))
         seen = fetch(b.host, f"http://{a.virtual_ip}:8080/")
         t.check("  ……别的节点照常", seen.stdout == "127.0.0.1", f"{seen.stdout!r} {seen.stderr.strip()}")
     if t.failures:
@@ -1040,7 +1040,7 @@ def managed(lab: Lab, work: Path, t: Checks) -> None:
             reported.get("device") == "i3t0" and reported.get("firewall") == {"accept": {"state": "on"}, "guard": {"state": "on"}}, str(reported))
     wait_until(lambda: (detail(c).get("vnet") or {}).get("state") == "off", timeout=30, what="c 报虚拟网卡关着")
     shown = controller.host.run(binary("i3tctl"), "--token", controller.token, "node", "show", str(a.id), check=False).stdout
-    t.check("i3tctl node show 写出虚拟网卡的状态", "虚拟网卡" in shown and "装着" in shown, shown[-500:])
+    t.check("i3tctl node show 写出虚拟网卡的状态", "虚拟网卡" in shown and "已启用" in shown, shown[-500:])
 
     wait_until(lambda: received(ping(a, b.virtual_ip, count=1)) == 1, timeout=20, what="a ping 通 b")
     wait_until(lambda: "Unreachable" in ping(a, c.virtual_ip, count=1).stdout, timeout=30, what="a 知道 c 没有网卡")
@@ -1108,7 +1108,7 @@ def legacy(lab: Lab, work: Path, t: Checks) -> None:
     a.host.run("ip", "link", "add", "i3t0", "type", "dummy")
     a.host.run("ip", "link", "set", "i3t0", "alias", "ice3tier", "up")
     start_pair(a, b)
-    t.check("[intercept] 不让节点起不来，记一行", "这一节已经不起作用" in a.read_log(), tail(a.read_log()))
+    t.check("[intercept] 不让节点起不来，记一行", "该节已废弃" in a.read_log(), tail(a.read_log()))
     if installed(t, a, b):
         left = system_snapshot(a.host)
         t.check("以前的表、规则、路由都拆掉了", "table ip i3t {" not in left["nft"] and "2033" not in left["rules"] + left["routes"],

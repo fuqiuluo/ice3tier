@@ -18,8 +18,8 @@ pub struct Texts {
     pub help: Help,
     pub values: Values,
     pub ui: Ui,
-    /// 一条操作记录写成一句话：按 `action` 和 `params`。说不出来时（旧的记录没有参数、不认识的操作）是 `None`，
-    /// 那时显示 controller 记下的原话。
+    /// 根据 `action` 和 `params` 将操作记录格式化为可读描述。若缺少参数或遇到未知操作类型则返回 `None`，
+    /// 此时回退显示 controller 记录的原始文本。
     pub log: fn(&LogEntry) -> Option<String>,
 }
 
@@ -381,9 +381,9 @@ pub struct Ui {
     /// 出口地址和它所在的国家或地区。
     pub egress: &'static str,
     pub attached: &'static str,
-    /// 另外挂靠的 relay（controller 要它挂上去，好让别的节点到得了它）。
+    /// 额外挂靠的中继（由 controller 指定挂靠，以便其他节点经该中继可达本节点）。
     pub shared_attachment: &'static str,
-    /// 在线的节点里几个连得上、几个连不上、几个没报。
+    /// 在线节点中可达、不可达与未上报的数量统计。
     pub reach_counts: fn(u32, u32, u32) -> String,
     pub relay_reach: &'static str,
     /// 试过一个 relay 的节点：节点、在线、结果、时间。
@@ -397,7 +397,7 @@ pub struct Ui {
     pub relays_header: [&'static str; 7],
     pub nat: &'static str,
     pub mapping_varies: &'static str,
-    /// controller 认定节点用不了 UDP 时的一行。
+    /// controller 判定节点无法使用 UDP 时的提示文案。
     pub no_udp: &'static str,
     pub reported: &'static str,
 
@@ -452,7 +452,7 @@ pub struct Ui {
     pub ordered_to: fn(&str, &str) -> String,
     pub available: fn(&str) -> String,
     pub up_to_date: &'static str,
-    /// 节点的版本比安全下限旧：跟在更新情况后面的括注；没有可以更新到的版本时单说一句。
+    /// 节点版本低于安全下限时的提示：有可用更新时作为括注附在状态后，无可用更新时单独显示。
     pub security_update: &'static str,
     pub security_problem: &'static str,
 
@@ -520,7 +520,7 @@ pub struct Ui {
     pub note: &'static str,
     pub hosts_title: &'static str,
     pub hosts_header: [&'static str; 9],
-    /// 进程：常驻内存，线程数（读不到时没有），运行了多久。
+    /// 进程信息：常驻内存、线程数（无法获取时省略）与运行时长。
     pub host_process: fn(&str, Option<u32>, &str) -> String,
     /// 连接数：对端，挂靠的 relay，本节点作为 relay 的会话（不是 relay 时没有），流，ice3proxy 在用的和空闲的。
     pub host_connections: fn(&HostConnections) -> String,
@@ -616,7 +616,7 @@ impl<'a> Params<'a> {
         self.0.get(key).is_some_and(|value| !value.is_null())
     }
 
-    /// 一个嵌套的值，读成模型里的类型；读不懂是 `None`。
+    /// 将嵌套字段反序列化为模型类型；解析失败时返回 `None`。
     pub(crate) fn decode<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.0.get(key).and_then(|value| serde_json::from_value(value.clone()).ok())
     }

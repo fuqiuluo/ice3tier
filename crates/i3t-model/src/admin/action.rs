@@ -1,7 +1,7 @@
 //! 操作记录里的操作名（[`LogEntry::action`](super::LogEntry::action)）：controller 记的时候写它，`i3tctl` 照它把记录写成一句话。
 //!
 //! 名字已经写进了数据库，也是管理 API 的一部分（`GET /log` 的 `action` 可以按它的前缀筛），不能改。
-//! 以前的版本记过、现在不再记的名字也留在这里：旧的记录里还有，要读得懂。
+//! 早期版本记录过、现已不再写入的操作名也保留在此，以便兼容解析历史记录。
 
 /// 生成了新的管理令牌。
 pub const ADMIN_TOKEN: &str = "admin.token";

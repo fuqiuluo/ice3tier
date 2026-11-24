@@ -40,7 +40,7 @@ async fn read_bytes<T>(recv: &mut (impl AsyncRead + Unpin), decode: fn(&[u8]) ->
 ///
 /// 和 [`read`] 不同，只有要一条流（[`Opening::Stream`]）的 OPEN 读完时才告诉流头读完了。别的几种（数据报上下文、测量、往返）
 /// 不会开在 ice3proxy 上（只有 [`i3t_conn::Connector::open_tcp`] 开出来的流会），所以它们之后也只读得到加密送来的字节：
-/// 对端在 lane 上开了这几种、又选了不再加密时，读到原始字节之前就出错，路上的人插不进它们的数据（issue #17）。
+/// 若对端在 lane 上开启上述类型并选择透传模式，会在读到原始字节前报错，防止中间人注入数据（issue #17）。
 pub(crate) async fn read_open(recv: &mut impl RecvStream) -> Result<Opening, FlowError> {
     let opening = read_bytes(recv, Opening::decode).await?;
     if matches!(opening, Opening::Stream(_)) {
@@ -57,7 +57,7 @@ pub(crate) async fn read_open(recv: &mut impl RecvStream) -> Result<Opening, Flo
 pub(crate) async fn read_reply(recv: &mut impl RecvStream) -> Result<Reply, FlowError> {
     match read(recv, Reply::decode).await {
         Err(FlowError::Read(error)) if refused_unread(&error) => {
-            Ok(Reply::new(Status::AccessDenied, "对端没有读建流请求就重置了流：访问规则不允许本节点访问它"))
+            Ok(Reply::new(Status::AccessDenied, "对端未读取建流请求即重置流：访问规则不允许本节点访问"))
         }
         other => other,
     }

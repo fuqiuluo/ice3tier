@@ -396,16 +396,16 @@ def rollback_pauses_rollout(lab: Lab, work: Path, t: Checks) -> None:
     download.kill()
     download.wait()
 
-    started = waited(lambda: a.count("这是刚换上来的新版本") >= 1, 40, "a 的新程序启动")
+    started = waited(lambda: a.count("新版本已启动，将在成功连接 controller 后确认更新") >= 1, 40, "a 的新程序启动")
     t.check("流没了之后 a 换上新程序并重启", started and a.installed_version() == new, tail(a.read_log(), 8))
     t.check("旧程序留作备份", (a.program.parent / "i3t.old").exists() or len(list(a.program.parent.iterdir())) > 1,
             str(sorted(p.name for p in a.program.parent.iterdir())))
     # 新程序一直连不上 controller。让它像连着崩溃一样重启：第 4 次启动时它应该自己换回旧程序。
     for attempt in (1, 2, 3):
-        wait_until(lambda: a.count("这是刚换上来的新版本") >= attempt, timeout=20, what=f"a 的新程序第 {attempt} 次启动")
+        wait_until(lambda: a.count("新版本已启动，将在成功连接 controller 后确认更新") >= attempt, timeout=20, what=f"a 的新程序第 {attempt} 次启动")
         time.sleep(1)
         a.kill()
-    rolled_back = waited(lambda: "已经换回旧程序" in a.read_log(), 30, "a 换回旧程序")
+    rolled_back = waited(lambda: "已回滚至旧版本" in a.read_log(), 30, "a 换回旧程序")
     t.check("启动 3 次都没连上 controller 之后，a 自己换回了旧程序", rolled_back and a.installed_version() == old, tail(a.read_log(), 10))
     t.check("换回之后以“请重启我”退出，旧程序重新启动",
             waited(lambda: a.read_log().rstrip().count(f"退出码 {RESTART_EXIT_CODE}") >= 2, 15, "a 以旧程序重启"), tail(a.read_log(), 6))
@@ -537,10 +537,10 @@ def download_resumes_after_link_loss(lab: Lab, work: Path, t: Checks) -> None:
     before = received()
     t.check("a 正在一段一段地取包", partly and before < size, f"取了 {before} / {size}")
     a.block_controller(controller)
-    interrupted = waited(lambda: "取包被打断" in a.read_log(), 30, "a 发现取包被打断")
+    interrupted = waited(lambda: "更新包下载中断" in a.read_log(), 30, "a 发现取包被打断")
     t.check("连接断了之后 a 知道取包被打断，等着重试", interrupted, tail(a.read_log(), 6))
     time.sleep(3)
-    t.check("断着的时候 a 没有放弃这次更新，也没有重启", a.count("节点启动") == 1 and "更新没有成功" not in a.read_log(), tail(a.read_log(), 6))
+    t.check("断着的时候 a 没有放弃这次更新，也没有重启", a.count("节点启动") == 1 and "更新失败" not in a.read_log(), tail(a.read_log(), 6))
     a.block_controller(controller, False)
     a.host.shape(None)
 

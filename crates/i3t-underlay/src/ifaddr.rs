@@ -4,14 +4,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// 本机网卡上能拿来当候选端点的地址。
 ///
-/// 去掉了回环地址和链路本地地址：前者别的机器连不上，后者要带网卡编号才有意义。
-/// 读不到网卡列表时返回空表并记一条日志，节点照常工作，只是少了局域网的候选。
+/// 已过滤回环地址和链路本地地址：前者无法从其他主机访问，后者需指定接口索引才有效。
+/// 无法获取网络接口列表时记录警告并返回空列表，节点可继续运行，仅缺少局域网候选地址。
 #[must_use]
 pub fn local_addresses() -> Vec<IpAddr> {
     let interfaces = match if_addrs::get_if_addrs() {
         Ok(interfaces) => interfaces,
         Err(error) => {
-            tracing::warn!(%error, "读不到本机的网卡地址，候选端点里不会有局域网地址");
+            tracing::warn!(%error, "无法获取本机网络接口地址，候选端点将不包含局域网地址");
             return Vec::new();
         }
     };
@@ -32,7 +32,7 @@ pub struct InterfaceAddr {
     pub prefix: u8,
 }
 
-/// 本机启用着的网卡上的全部地址，不做筛选（回环和链路本地的也在）。读不到网卡列表时返回空表。
+/// 本机已启用网络接口上的全部地址（不做筛选，包含回环与链路本地地址）。无法获取接口列表时返回空列表。
 #[must_use]
 pub fn interface_addresses() -> Vec<InterfaceAddr> {
     let Ok(interfaces) = if_addrs::get_if_addrs() else { return Vec::new() };

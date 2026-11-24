@@ -1,7 +1,7 @@
-//! 运行中要跨重启留下来的两样东西：端口写 0 的端口转发挑定的端口，和出口本账期的流量用量。
+//! 运行期间需要跨重启持久化的两项数据：配置端口为 0 的端口转发所分配的监听端口，以及出口本账期的流量用量。
 //!
-//! 都存在状态目录里（见 [`crate::state`]）。存不下来不影响这次运行，只记一条日志：端口下次可能换一个，
-//! 用量下次从上一次存下的数接着记。
+//! 两者均保存在状态目录中（见 [`crate::state`]）。保存失败不影响本次运行，仅记录日志：端口在下次启动时可能重新分配，
+//! 用量在下次启动时将从上次已保存的数值继续累计。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,7 @@ use crate::state::{QuotaRecord, StateDir};
 /// 出口的用量多久存一次。节点被杀掉时最多丢这么久的计数。
 const QUOTA_SAVE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// 端口写 0 的端口转发挑定的端口，记在状态目录的 `ports.json` 里。
+/// 配置端口为 0 的端口转发所分配的监听端口，持久化在状态目录的 `ports.json` 中。
 #[derive(Debug)]
 pub(crate) struct StatePorts {
     state: StateDir,
@@ -26,7 +26,7 @@ pub(crate) struct StatePorts {
 impl StatePorts {
     pub(crate) fn open(state: StateDir) -> Self {
         let ports = state.forward_ports().unwrap_or_else(|error| {
-            tracing::warn!("端口转发挑定的端口读不出来，这次重新挑：{error:#}");
+            tracing::warn!("无法加载已保存的端口转发监听端口，将重新分配：{error:#}");
             BTreeMap::new()
         });
         Self { state, ports: Mutex::new(ports) }
@@ -42,12 +42,12 @@ impl PortBook for StatePorts {
         let mut ports = self.ports.lock().expect("forward ports mutex poisoned");
         ports.insert(forward, port);
         if let Err(error) = self.state.save_forward_ports(&ports) {
-            tracing::warn!(forward, port, "端口转发挑定的端口没有存下来，重启之后可能换一个：{error:#}");
+            tracing::warn!(forward, port, "保存端口转发监听端口失败，重启后可能重新分配：{error:#}");
         }
     }
 }
 
-/// 每隔一会儿把出口的用量存下来（有变化才写），直到任务被取消。
+/// 定期保存出口流量用量（仅在有变化时写入），直至任务被取消。
 pub(crate) async fn save_quota(state: StateDir, exit: Arc<NodeExit>) {
     let mut saved = None;
     let mut tick = tokio::time::interval(QUOTA_SAVE_INTERVAL);
@@ -72,7 +72,7 @@ pub(crate) fn save_quota_now(state: &StateDir, exit: &NodeExit) {
 fn save(state: &StateDir, quota: QuotaState) {
     let record = QuotaRecord { period_start: quota.period_start, used_bytes: quota.used_bytes };
     if let Err(error) = state.save_exit_quota(&record) {
-        tracing::warn!("出口的流量用量没有存下来，重启之后会少算一些：{error:#}");
+        tracing::warn!("保存出口流量用量失败，重启后统计值可能偏低：{error:#}");
     }
 }
 

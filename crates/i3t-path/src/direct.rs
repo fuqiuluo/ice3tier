@@ -7,18 +7,18 @@
 //! 连续超时或者丢得太多就判为不可用。没有可用地址时按固定的节奏重试：每次尝试向所有候选地址发几轮 PING，
 //! 并且发信令请对端同时向本端发，这就是打洞。
 //!
-//! # 别人能让它做什么
+//! # 安全性与防滥用
 //!
-//! - PING 可以被人截下来、从别的地址重放，签名照样是对的。所以只凭收到过 PING 的地址只认很短的一阵
-//!   （[`PINGED_TTL`]），本端自己的 PING 在那里得到回答才算真正验证过。
-//! - 对端的候选地址来自它自己（netmap 里上报的、信令里带来的），它可以写任何地址。没法发、不该发的地址不记
-//!   （回环、组播、广播、链路本地；本节点自己绑在回环上的测试除外），信令引出的探测最多每 [`PUNCH_ATTEMPT`] 一轮，
-//!   重试的退避照常推进，所以对端不能让本节点不停地向随便什么地址发探测。
-//! - 每个候选地址来的 PING 有自己的验签额度，伪造的 PING 花不掉别的地址的额度。
-//! - 局域网信标谁知道对端的公钥都造得出来，所以信标带来的地址只是一个线索（[`DirectPath::on_lan_sighting`]）：
-//!   它另占几个名额（[`MAX_SIGHTED`]），挤不掉别处学来的候选；一个信标最多引出一个探测，探测有额度；
-//!   重试的节奏、退避和搁置不因为它重来，也不为它发信令；别处也说到这个地址之前，它来的 PING 用不上候选地址自己的验签额度。
-//!   公网 IPv4 地址不会因为信标被当成本地网络里的，信标停了一阵之后别的地址也不再算。
+//! - PING 可能被截获并从伪造地址重放，且签名仍然有效。因此仅凭收到 PING 得知的地址仅在极短时间（[`PINGED_TTL`]）内临时采信，
+//!   需由本端发出的 PING 收到应答后方视为验证通过。
+//! - 对端候选地址由其自身上报或通过信令携带，可能包含任意地址。无法发送或不合法的地址将被过滤忽略
+//!   （回环、组播、广播、链路本地；本节点绑定回环的测试场景除外）；信令触发的探测最高每 [`PUNCH_ATTEMPT`] 执行一轮，
+//!   重试退避按常规推进，防止对端驱使本节点持续向任意地址发送探测。
+//! - 每个候选地址独立维护 PING 验签配额，伪造探测无法消耗其他地址的配额。
+//! - 任何知晓对端公钥的节点都可伪造局域网信标，因此信标提供的地址仅作为线索（[`DirectPath::on_lan_sighting`]）：
+//!   其占用独立的有限名额（[`MAX_SIGHTED`]），不会挤占其他来源学到的候选；单条信标最多触发一次受配额限制的探测；
+//!   不会重置重试节奏、退避或搁置状态，也不因此发送打洞信令；在被其他来源确认前，该地址发来的 PING 不使用候选地址独立的验签配额。
+//!   公网 IPv4 地址不会因信标被标记为本地网段地址，且信标停止一段时间后本地标记也会失效。
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
@@ -46,23 +46,22 @@ const PINGED_TTL: Duration = Duration::from_secs(15);
 /// 三轮在 600ms 里发完，这些都从它的同一个地址来。
 const CANDIDATE_VERIFIES_PER_SEC: f64 = 25.0;
 const CANDIDATE_VERIFY_BURST: f64 = 50.0;
-/// 只在局域网信标里见过的候选地址最多记多少个。对端在本节点的网段上一般只有一两个地址（每块网卡上 IPv4、IPv6 各一个）。
-/// 信标造得再多，也只在这几个名额里互相挤。
+/// 仅通过局域网信标发现的候选地址上限。对端在本节点网段上通常仅有一至两个地址（每块网卡 IPv4、IPv6 各一），
+/// 即使伪造大量信标，也仅在此配额内互相淘汰。
 const MAX_SIGHTED: usize = 4;
-/// 多久没有再看到信标，一个地址就不再算是在本地网段上看到的。信标每 10 秒一个。
+/// 信标本地网段标记的有效期（超过该时长未再收到信标则清除标记；信标每 10 秒发送一次）。
 const SIGHTING_TTL: Duration = Duration::from_secs(60);
-/// 信标引出的探测，一个对端每秒最多几个、最多攒几个。对端的每个地址每 10 秒才有一个信标。
+/// 单个对端由信标触发探测的速率上限与突发上限（对端每个地址每 10 秒仅发送一次信标）。
 const SIGHTING_PROBES_PER_SEC: f64 = 1.0;
 const SIGHTING_PROBE_BURST: f64 = 4.0;
-/// 发出去的 PING 等多久还没有回答就不再等。比一次打洞尝试长，晚到的 PONG 照样算数。
+/// 已发出 PING 的最大等待超时时间（长于单次打洞尝试，超时前迟到的 PONG 仍有效）。
 const PENDING_TTL: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 64;
-/// 丢包率按最近这么多次保活探测算。原来是 10 次，丢 3 个就下结论：真实链路上量过，一条丢包 3%～5%、成串地丢的直连，
-/// 一小时里被判成"丢包超过 20%"19 回。
+/// 丢包率统计窗口（最近若干次保活探测）。原窗口为 10 次（丢 3 次即判定失效），实测 3%～5% 突发丢包的直连每小时会被误判十余次。
 const LOSS_WINDOW: usize = 30;
-/// 窗口里丢的超过这么多个（20%）就判为不可用。不等窗口填满：丢得多的路几十秒里就够数了。
+/// 窗口内丢包超过该数量（20%）即判定直连不可用（无需等窗口填满）。
 const MAX_LOSSES: usize = LOSS_WINDOW / 5;
-/// 同一个地址上，对端的 PING 引出的反向验证最多这么频繁。重放一个旧的 PING 没法让本端发得更多。
+/// 同一地址上由对端 PING 触发反向验证的最小间隔，防止重放旧 PING 触发高频回探。
 const REVERSE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// 两条信令通道（controller、连接里）会把同一个打洞请求各送来一份，这么短的时间里的第二份不再处理。
 const REQUEST_DEDUP: Duration = Duration::from_millis(300);
@@ -79,7 +78,7 @@ pub(crate) struct Policy<'a> {
     pub(crate) initiate: bool,
     /// 可以和它互发打洞信令。任何一方只主动连接时不行。
     pub(crate) signal: bool,
-    /// 有包发给它，却有一阵没有从直连上收到它的包了。
+    /// 有数据包发往该对端，但已持续一段时间未从直连收到其数据包。
     pub(crate) silent: bool,
     /// 本节点自己的候选端点，放进信令里告诉对端。
     pub(crate) local: &'a [SocketAddr],
@@ -128,7 +127,7 @@ impl DownReason {
         }
     }
 
-    /// 给界面看的"直连上一次为什么没有成"。
+    /// 用于界面展示的最近一次直连失败原因。
     const fn failure(self) -> DirectFailureCause {
         match self {
             Self::Timeouts => DirectFailureCause::Timeouts,
@@ -164,10 +163,10 @@ struct Candidate {
     probed: Option<Instant>,
     /// 最近一次因为收到对端从这个地址来的 PING 而反过来验证它（每个地址最多每 [`REVERSE_PROBE_INTERVAL`] 一次）。
     reverse_probed: Option<Instant>,
-    /// 最近一次对端从这个地址"不请自来"地探测本端：那时本端没有往这个地址发过东西，也没有在打洞的那一轮里。
-    /// 这说明本端的地址本来就连得上，这条路不用打洞也建得起来（见 [`DirectPath::kind`]）。
+    /// 最近一次收到对端从该地址主动发来的探测（当时本端未向其发送探测，也未处于打洞轮次中）。
+    /// 这表明本端地址本身直接可达，无需 NAT 打洞即可建立直连（见 [`DirectPath::kind`]）。
     unsolicited: Option<Instant>,
-    /// 这个地址来的 PING 的验签额度。
+    /// 该地址 PING 的验签配额。
     budget: Budget,
 }
 
@@ -194,8 +193,8 @@ struct Pending {
     nonce: Nonce,
     addr: SocketAddr,
     sent: Instant,
-    /// 发这个探测的时候，正在打洞的那一轮里：刚从对端收到过打洞信令。它得到回答的话，这条直连算是打洞打通的
-    /// （除非对端先不请自来地探测过本端，见 [`Candidate::unsolicited`]）；不然就是对端的地址本来就连得上。
+    /// 发送该探测时正处于打洞协商轮次中（近期收到过对端打洞信令）。若收到应答则判定为打洞成功
+    /// （除非对端此前已主动探测到本端，见 [`Candidate::unsolicited`]）；否则判定为对端地址直接可达。
     coordinated: bool,
 }
 
@@ -261,8 +260,8 @@ enum Punch {
     Backoff { round: usize, until: Instant },
     /// 一整轮都失败了。之后候选地址有变化就立刻重来，否则到 `retry_at` 再试一次。
     Exhausted { retry_at: Instant },
-    /// 在用的地址 `addr` 丢包太多，被判为不可用。它多半一直答得上来，所以到 `until` 之前它再有回答也不用它，
-    /// 之后才再试一次；候选地址有变化照样立刻重来，别的地址这期间验证通过了照样用。
+    /// 当前直连地址 `addr` 因丢包过高被判定为不可用。由于该地址通常仍会响应探测，在 `until` 之前忽略其应答，
+    /// 过期后再重新尝试；若候选地址列表变更则立即重试，期间若其他地址验证通过也可正常启用。
     Shunned { addr: SocketAddr, until: Instant },
 }
 
@@ -278,7 +277,7 @@ pub(crate) struct DirectPath {
     signalled: Option<Instant>,
     /// 最近一次本端发打洞请求。
     requested: Option<Instant>,
-    /// 两边的公网地址相同：对端的私有地址多半和本节点在同一个局域网里。
+    /// 双方公网地址相同，表明处于同一 NAT 之后，对端的私有地址通常位于同一局域网内。
     same_nat: bool,
     /// 上一次因为信令立刻发一轮探测的时刻。
     signal_volley: Option<Instant>,
@@ -322,10 +321,10 @@ impl DirectPath {
 
     /// 在用的直连是怎么建立起来的。
     ///
-    /// `Punched` 说的是这条路要两边在打洞的那一轮里同时发才通，`Reachable` 是不用：本端的探测在打洞之前就得到了回答
-    /// （对端的地址本来就连得上），或者对端在打洞之前就探测到了本端（本端的地址本来就连得上）。两端各自按自己看到的判断，
-    /// 一边先探测到另一边时两端说的都是 `Reachable`。还会不一样的情形只有一种：打洞信令比对端的探测先到，本端已经在那一轮里
-    /// 发了探测，这时本端说 `Punched`；它只说明两边是在同一轮里碰上的，不说明谁的地址连不上。
+    /// `Punched` 表示需要双方在同一打洞轮次中并发发送探测方可连通，`Reachable` 表示无需打洞：本端探测在打洞前即获应答
+    /// （对端地址直接可达），或对端在打洞前已探测到本端（本端地址直接可达）。两端各自依据本地观测判断，
+    /// 一方率先探测到另一方时双方均判定为 `Reachable`。仅在打洞信令早于对端探测到达、且本端已在该轮次中发出探测时，
+    /// 本端会判定为 `Punched`；这仅表示双方在同轮次建立连接，不代表任何一方地址不可直达。
     pub(crate) fn kind(&self) -> Option<DirectKind> {
         let active = self.active.as_ref()?;
         Some(if self.is_lan(active.addr) {
@@ -386,13 +385,13 @@ impl DirectPath {
 
     /// 在本地网段上看到了对端的信标，来源是 `addr`。它成为一个候选地址，照样要验证过才用。返回要不要马上向它发一个探测。
     ///
-    /// 信标谁知道对端的公钥都造得出来，所以它能引起的只有这些：占信标自己的一个名额
-    /// （[`learn_sighted`](Self::learn_sighted)），引出最多一个探测（有额度），让这个地址在 [`SIGHTING_TTL`] 里算作本地网段上的。
-    /// 重试的节奏不因为它重来，也不为它发信令：局域网里不用打洞，两边各自看到对方的信标、各发一个探测就通了；
-    /// 没有通的话，这个地址也在之后每一次尝试的那几轮探测里。
+    /// 任何知晓对端公钥的节点均可构造信标，因此信标仅触发有限动作：占用独立的信标候选名额
+    /// （[`learn_sighted`](Self::learn_sighted)）、在配额内触发最多一次探测，并在 [`SIGHTING_TTL`] 内将该地址标记为本地网段地址。
+    /// 不会重置重试节奏，也不因此发送打洞信令：局域网内无需打洞，双方收到信标后各发一次探测即可连通；
+    /// 若未立即连通，该地址也会参与后续每轮重试探测。
     pub(crate) fn on_lan_sighting(&mut self, addr: SocketAddr, now: Instant, policy: &Policy<'_>) -> Option<Action> {
-        // IPv4 的信标只从私有地址发。公网 IPv4 地址不能因为一个信标就被当成不经过地址转换的：在地址转换后面的节点，
-        // 对端看到的是它的公网地址，那样一来对端的回答就再也对不上了。
+        // IPv4 信标仅从私有地址发送。公网 IPv4 地址不能因收到信标而被视为无需 NAT：位于 NAT 后的节点，
+        // 对端观测到的是其公网地址，若误标记为本地地址将导致后续应答地址校验始终不匹配。
         let ip = addr.ip().to_canonical();
         if ip.is_ipv4() && !ifaddr::is_private(ip) {
             return None;
@@ -429,8 +428,8 @@ impl DirectPath {
         self.candidates.len()
     }
 
-    /// 主动测试要试一次直连：没有可用的直连时不等退避，下一次推进就从头尝试。
-    /// 和候选地址变了时的做法一样，之前的失败记录不再算数。
+    /// 主动测试触发的直连重试：当前无可用直连时跳过退避，下次推进立即重新尝试，
+    /// 与候选地址变更处理一致，先前的失败记录随之清除。
     pub(crate) fn retry_now(&mut self) {
         self.candidates_changed();
     }
@@ -498,16 +497,16 @@ impl DirectPath {
         }
         // 信令引出的探测最多每 `PUNCH_ATTEMPT` 一轮：对端发多少信令，本节点也只按一次尝试的节奏发。
         let volley_due = self.signal_volley.is_none_or(|at| now.saturating_duration_since(at) >= PUNCH_ATTEMPT);
-        // 丢包太多、正搁着不用的那一阵里不跟着对端的信令去试：那个地址试通了也不用。对端换了地址的话，
-        // 它的探测会从新地址来，照样引出反向验证（见 `on_ping`）。
+        // 在因丢包过高而暂避该地址期间，不跟随对端信令重试，避免切回劣化地址。若对端更换了新地址，
+        // 其探测将从新地址到达并正常触发反向验证（见 `on_ping`）。
         let shunning = matches!(self.punch, Punch::Shunned { until, .. } if now < until);
         if self.active.is_none() && volley_due && !shunning {
             // 对端此刻正在向本端发探测。本端也立刻发，并把这一次尝试的节奏对齐到现在，后面两轮跟着来。
             let round = match self.punch {
                 Punch::Idle => 0,
                 Punch::Attempt { round, started, .. } if now.saturating_duration_since(started) < PUNCH_ATTEMPT => round,
-                // 上一次已经失败了（或者正好到了判为失败的时候），这是下一次：退避照常推进，
-                // 信令不会让本节点一直停在同一档上。
+                // 上一轮已失败（或已到达失败判定时刻），推进至下一轮：退避按常规递进，
+                // 防止外部信令导致本节点停留在低退避档位。
                 Punch::Attempt { round, .. } | Punch::Backoff { round, .. } => round + 1,
                 Punch::Exhausted { .. } | Punch::Shunned { .. } => PUNCH_BACKOFF.len(),
             };
@@ -524,13 +523,13 @@ impl DirectPath {
         self.learn(from, now);
         let quiet = |at: Option<Instant>| at.is_none_or(|at| now.saturating_duration_since(at) >= PENDING_TTL);
         let in_round = !quiet(self.signalled);
-        // 反向验证得到回答，靠的是对端刚从这个地址往本端发过探测。本端发过打洞请求的话，那个探测多半就是对端照着请求发的：
-        // 这样打通的路算打洞打通的，和收到过对端的信令一样（见 [`Pending::coordinated`]）。
+        // 反向验证能够获答，依赖对端刚刚从该地址向本端发起了探测。若本端近期发过打洞请求，该探测通常由请求触发，
+        // 因此所建立的连接归类为打洞成功，与收到对端信令情形一致（见 [`Pending::coordinated`]）。
         let coordinated = in_round || !quiet(self.requested);
         let in_use = self.active.as_ref().is_some_and(|active| active.addr == from);
         let shunned = self.is_shunned(from, now);
-        // 没法发、不该发的地址，或者候选记满了挤不进来的地址，不反过来验证：本端只认候选地址来的连接包，
-        // 那里验证通过了也用不上。反向验证的时刻记在候选地址上，要记的东西也就有上限。
+        // 不可发送、不合法或超出候选容量上限的地址不执行反向验证：本端仅接受候选地址的数据包，
+        // 即使验证通过也无法使用；同时将反向验证时间戳保存在候选条目中可限制状态内存上限。
         let candidate = self.candidate_mut(from)?;
         candidate.pinged = Some(now);
         if !in_round && quiet(candidate.probed) {
@@ -539,14 +538,13 @@ impl DirectPath {
         if in_use {
             return None;
         }
-        // 这个地址正因为丢包搁着不用：验证通过了也不会用，不白发。它发来的包照样认（上面记了 `pinged`）。
+        // 该地址因丢包过高正处于暂避期，无需发送反向验证（但其数据包在 `pinged` 有效期内仍被接纳）。
         if shunned {
             return None;
         }
-        // 按地址记上一次反向验证的时刻，不看在等回答的探测：回答一到那条记录就没了，两边之间通着两个地址时，
-        // 不在用的那个地址上会你一个我一个地一直互相验证下去。本端自己发起的探测也不算：它可能已经丢了
-        // （对端那时还不认识本端，或者被它的 NAT 挡掉），等它的下一轮要 300ms。这期间对端先验证通过、先拨号，
-        // 它的握手要等到本端也有路才得到应答，那条连接从一开头就把往返时间量成几百毫秒。
+        // 按地址记录上次反向验证时刻而非仅检查待应答队列：避免双方在非主用地址上循环互探。
+        // 本端先前主动发出的探测不计入限频：其可能因对端未识别本端或 NAT 拦截而丢失，
+        // 若等待 300ms 后的下一轮探测，期间对端率先建连并拨号会导致首轮握手 RTT 被拉高数百毫秒。
         if candidate.reverse_probed.is_some_and(|at| now.saturating_duration_since(at) < REVERSE_PROBE_INTERVAL) {
             return None;
         }
@@ -554,13 +552,13 @@ impl DirectPath {
         Some(self.probe(from, coordinated, now))
     }
 
-    /// 是不是向 `from` 发过带这个随机数的 PING、还在等回答。验 PONG 的签名之前先问这个，不花冤枉的计算。
+    /// 检查是否向 `from` 发送过带该随机数的 PING 且仍在等待应答（验签前预过滤，避免无效验签开销）。
     pub(crate) fn expects_pong(&self, from: SocketAddr, nonce: &Nonce) -> bool {
         self.pending.iter().any(|pending| pending.nonce == *nonce && pending.addr == from)
             || self.active.as_ref().is_some_and(|active| active.addr == from && active.train.expects(nonce))
     }
 
-    /// 从 `from` 收到了对端的 PONG（签名已经验过）。随机数对不上发往 `from` 的任何一个 PING 时不算数。
+    /// 处理来自 `from` 且已验签的 PONG。若随机数与发往 `from` 的任一待应答 PING 均不匹配，则忽略。
     pub(crate) fn on_pong(&mut self, from: SocketAddr, nonce: &Nonce, now: Instant) -> Option<Change> {
         // 探测包列里的回答只用来估丢包和延迟，也算这个地址还活着的证明。
         if let Some(active) = &mut self.active
@@ -574,8 +572,8 @@ impl DirectPath {
         let index = self.pending.iter().position(|pending| pending.nonce == *nonce && pending.addr == from)?;
         let answered = self.pending.remove(index)?;
         let sample = now.saturating_duration_since(answered.sent);
-        // 探测发出去之后，这个地址可能被别的候选挤掉了。对端签了名的回答是它最硬的证明，重新记上；
-        // 记不上（表里全是对端上报的地址）就不用它：收包只认候选地址来的。
+        // 探测发出后，该地址可能已被其他候选淘汰。对端签名的应答是最强证明，因此重新记录；
+        // 若无法写入（候选表已满且均为对端上报的地址）则放弃使用，因为收包仅接受候选表中的地址。
         self.learn(from, now);
         self.candidate_mut(from)?.proven = Some(now);
         let shunned = self.is_shunned(from, now);
@@ -592,7 +590,7 @@ impl DirectPath {
             }
             // 局域网直连无条件优先：已经在用公网地址时，局域网地址验证通过就换过去。别的情况先到先得。
             Some(active) if !ifaddr::is_private(from.ip()) || ifaddr::is_private(active.addr.ip()) => None,
-            // 丢包太多刚搁下的地址：搁下之前发出去的探测这时才答回来，不算数。
+            // 因丢包过高处于暂避期的地址：忽略其延迟返回的旧探测应答。
             None if shunned => None,
             Some(_) | None => {
                 let unsolicited = self.candidates.iter().any(|candidate| {
@@ -650,9 +648,9 @@ impl DirectPath {
                     let addr = active.addr;
                     self.active = None;
                     self.failure = Some(reason.failure());
-                    // 路是断了的话马上从头重试；只是丢包多的话它多半还能验证通过，立刻重试只会来回切，所以搁一阵再说。
-                    // 搁着的时候它有回答也不用：对端的直连多半还在，它每 5 秒一个保活 PING 引出本端的反向验证，
-                    // 真实链路上就是这样把刚判掉的直连两三秒之后又拉了回来。
+                    // 路径超时断开时立即从头重试；若仅因丢包过高判定失效，该地址通常仍可响应探测，
+                    // 立即重试易导致路由反复抖动，因此进入暂避期。暂避期间即使对端保活 PING 触发了反向验证，
+                    // 也不重新启用该地址（避免数秒后立刻切回高丢包直连）。
                     self.punch = match reason {
                         DownReason::Loss => Punch::Shunned { addr, until: now + PUNCH_IDLE_RETRY },
                         DownReason::Timeouts | DownReason::Stale => Punch::Idle,
@@ -732,9 +730,9 @@ impl DirectPath {
         Action::Ping { to, nonce }
     }
 
-    /// 能不能往 `addr` 发探测。对端可以在上报的端点和信令里写任何地址，没法发、不该发的不记。
+    /// 判断是否允许向 `addr` 发送探测。对端上报的端点与信令可能包含任意地址，不可发送或不合法的地址将被过滤。
     ///
-    /// 私有地址照样收：两个节点可能在同一个局域网里，也可能经站点之间的隧道用私有地址互通，这里分不出来。
+    /// 私有地址仍予接纳：两节点可能处于同一局域网，或通过站点间隧道以私有地址互通，此处无法区分。
     fn can_probe(&self, addr: SocketAddr) -> bool {
         let ip = addr.ip().to_canonical();
         let unusable = match ip {

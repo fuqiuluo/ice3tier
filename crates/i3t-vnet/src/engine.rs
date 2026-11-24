@@ -1,31 +1,31 @@
-//! 网卡和连接之间搬包。两个方向各一个任务：
+//! 虚拟网卡与连接层之间的数据包转发引擎。出站与入站各由一个独立异步任务驱动：
 //!
-//! **出去**（本机的程序发出、经网卡读出来的包）：
+//! **出站**（本机应用发出、从虚拟网卡读取的数据包）：
 //!
-//! 1. 不是 IPv4 的不管（网卡上没有 IPv6 的地址）；来源不是本节点的虚拟 IP 的丢掉（经这台机器转发过来的别人的包：
-//!    对端也会丢，不用白送）。
-//! 2. 目的是组播、广播的不管；不在网络地址段里、地址段里不是节点的、对端说它没有网卡的，回 ICMP"主机不可达"：
-//!    本机的程序当场知道（连接立刻失败，ping 说不可达），不白等。
-//! 3. 访问规则不允许本节点访问它时，新的会话（TCP 的第一个握手包、ping 的请求）回"被管理员禁止"，早一点失败；
-//!    别的照发，对端自己按规则收（对端可以访问本节点时，这里发的可能是给它的回包）。对端不能访问本节点时记下发给它的 UDP，
-//!    它的回包靠这个才进得来（[`crate::filter`]）。
-//! 4. 一个包是一个不保证送达的数据报，走这一对节点之间已有的那条连接；装不下时切成两片（[`crate::pieces`]）。
-//!    还没有连接时先建：建的这一会儿发出的包排在一个小队列里（每个对端最多 [`MAX_WAITING`] 个），连上了一起发出去，
-//!    第一个 ping 不丢、第一个 TCP 握手包不用等一秒重发；建不起来时给排着的包回"主机不可达"，之后 [`REFUSE_FOR`] 之内
-//!    发往它的包当场回"主机不可达"，过了再试。
+//! 1. 忽略非 IPv4 数据包（虚拟网卡未配置 IPv6 地址）；丢弃源 IP 非本节点虚拟 IP 的数据包（例如经本机转发的其他主机流量，
+//!    对端同样会丢弃，无需发送）。
+//! 2. 忽略组播与广播数据包；对不在网络网段内、目标无对应节点或对端未启用虚拟网卡的包，直接回复 ICMP“主机不可达”，
+//!    使本机应用立即感知失败而无需等待超时。
+//! 3. 若访问规则禁止本节点访问目标节点，则对新会话起始包（TCP SYN、ICMP Echo 请求）回复“被管理员禁止”以快速失败；
+//!    其余包仍正常发出并由对端按规则过滤（若允许对端访问本节点，出站包可能是回包）。若禁止对端访问本节点，则记录发往该对端的 UDP 会话，
+//!    以便放行其回包（[`crate::filter`]）。
+//! 4. 每个 IP 数据包作为不可靠数据报通过节点间现有连接发送；超出单报上限时拆分为两片传输（[`crate::pieces`]）。
+//!    尚未建立连接时自动发起建连：建连期间发往该对端的数据包暂存于小队列中（每个对端最多 [`MAX_WAITING`] 个），连上后按序发出，
+//!    避免首个 ping 丢包或首个 TCP SYN 等待重传；建连失败时向队列中的包回复“主机不可达”，并在随后 [`REFUSE_FOR`] 期间内
+//!    对发往该对端的包直接返回“主机不可达”，冷却期结束后再重新尝试。
 //!
-//! **进来**（对端发来的包）：来源必须是发来它的那个对端的虚拟 IP（连接是按公钥认证的，冒充不了别的节点），目的必须是本节点的
-//! 虚拟 IP；对端不被允许访问本节点时只放行回包。不符合的丢掉并计数（[`Counters`]），符合的原样写进网卡，剩下的全是操作系统的事。
-//! 另外几条，不管对端能不能访问本节点：
+//! **入站**（对端发来的数据包）：源地址必须与发送对端的虚拟 IP 一致（连接经公钥认证，无法伪造其他节点），目的地址必须为本节点
+//! 虚拟 IP；若访问规则不允许对端访问本节点，则仅放行本节点发起会话的回包。校验未通过的包予以丢弃并计数（[`Counters`]），
+//! 通过校验的包原样写入虚拟网卡交由操作系统协议栈处理。此外，无论访问规则如何，均强制执行以下校验：
 //!
-//! - 被切开的 IPv4 包（IP 分片）先攒齐（[`crate::fragments`]），齐了按第一片判断，让进来的几片一起写进网卡：拼不齐的片
-//!   不占内核里整台机器共用的拼片缓存，后面的片也不会绕过判断单独进来。切开的 TCP 丢掉（节点之间的 TCP 不会被切）。
-//! - ICMP 差错报文（不可达、超时、参数问题）说的必须是本节点发给这个对端的包：覆盖网里节点之间没有路由器，对端只会对
-//!   本节点发给它的包回差错报文。不核对的话，对端可以说"到某某（别的节点，甚至这台机器在别的网卡外面要连的地址）的路径 MTU
-//!   只有 552"，本机内核照着改路由缓存；也可以让本机别的 UDP 套接字收到一个"连接被拒绝"。被切开的差错报文丢掉。
-//! - ICMP 重定向丢掉：没有路由器，也就没有谁该说"换一个下一跳"。
+//! - IPv4 分片包需先在用户态收集齐所有分片（[`crate::fragments`]），收齐后依据首片执行访问控制检查，通过后再将各分片一并写入虚拟网卡：
+//!   避免不完整分片占用内核全局重组缓存，也防止后续分片绕过过滤检查。TCP 分片直接丢弃（节点间 TCP 不会发生 IP 分片）。
+//! - ICMP 差错报文（不可达、超时、参数问题）引用的原始数据包必须是本节点发往该对端的报文：覆盖网络节点间不存在路由器，对端仅可能
+//!   针对本节点发往它的包回复差错报文。若不校验，恶意对端可能伪造差错报文篡改本机路由缓存中的路径 MTU，或向无关 UDP 套接字注入错误。
+//!   分片的 ICMP 差错报文直接丢弃。
+//! - 丢弃所有 ICMP 重定向报文：覆盖网络中不存在中间路由器，不应接受路由重定向。
 //!
-//! 每个包不另外记日志：丢掉的每一种原因第一次记一行，之后每分钟最多一行，带着这段时间丢了多少。
+//! 丢包日志按原因限流：每种丢包原因首次触发时记录一次，此后每分钟最多记录一次并附带统计计数。
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -51,26 +51,26 @@ use crate::fragments::{Fragments, Gathered};
 use crate::ipv4::{Conversation, Ipv4, Malformed, TCP, Unreachable, unreachable};
 use crate::pieces::{Assembled, Reassembly};
 
-/// 连接还没建起来时，发往一个对端的包最多排多少个。几个 ping、一次 TCP 握手和 DNS 的往返绰绰有余；多出来的丢掉，
-/// 由上面的协议自己重发。
+/// 连接建立期间，发往单个对端的数据包最大等待队列长度。足以容纳若干 ping、一次 TCP 握手及 DNS 往返；超出部分丢弃，
+/// 由上层协议自行重传。
 pub const MAX_WAITING: usize = 32;
 
-/// 到一个对端的连接建不起来之后，多久之内发往它的包当场回"主机不可达"、不再去建。
+/// 到对端的连接建立失败后的拒绝冷却时长：在此期间发往该对端的数据包直接回复“主机不可达”，不再重复建连。
 pub const REFUSE_FOR: Duration = Duration::from_secs(3);
 
-/// 每秒最多回多少个"不可达"：本机的程序往一个到不了的地址猛发时，节点不跟着一个一个地回。
+/// 每秒最多回复的 ICMP 不可达报文数，防止本机应用向不可达地址高速发包时产生等量 ICMP 响应风暴。
 const ICMP_PER_SECOND: u32 = 200;
 
-/// 一次从连接层最多取多少个进来的包。
+/// 单次从连接层批量拉取入站数据包的最大数量。
 const INBOUND_BATCH: usize = 64;
 
-/// 网卡上读出来的包最长多少（网卡交出来的不会比 MTU 大；留够 IPv4 的上限）。
+/// 从虚拟网卡读取单包的缓冲区上限（实际包长不超过 MTU，按 IPv4 最大包长预留）。
 const READ_BUFFER: usize = u16::MAX as usize;
-/// 网卡上现成的包一口气最多读几个再交下去。一条跑满的流因此成批地走，别的事（建好的连接、进来的包）也轮得到。
-/// Linux 的内核一次交过来的一大块（64 KB）在默认的 MTU 下是 53 个包，一轮装得下。
+/// 单轮从虚拟网卡连续非阻塞读取的最大包数量。使高吞吐流得以批量提交连接层，同时兼顾其他事件（如建连完成、入站包）的调度公平性。
+/// Linux 内核单次分段卸载交付的 64 KB 大块在默认 MTU 下约 53 个包，单轮可完整处理。
 const OUTBOUND_BURST: usize = 64;
 
-/// 丢掉的包按原因的计数，和收发的计数。上报和本机的状态都读它。
+/// 按原因分类的丢包计数与收发流量统计，供上报与本地状态查询读取。
 #[derive(Debug, Default)]
 pub struct Counters {
     sent_packets: AtomicU64,
@@ -80,7 +80,7 @@ pub struct Counters {
     drops: [AtomicU64; Loss::COUNT],
 }
 
-/// 丢掉一个包的原因。
+/// 数据包丢弃原因分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Loss {
     BadSource,
@@ -106,18 +106,20 @@ impl Loss {
     const fn reason(self) -> &'static str {
         match self {
             Self::BadSource => {
-                "来源不对：对端发来的不是它自己的虚拟 IP，或者它的 ICMP 差错报文说的是发往别处的包；或者本机发出的不是本节点的虚拟 IP"
+                "源地址异常：对端发来的数据包源 IP 与其虚拟 IP 不符，或其 ICMP 差错报文引用的目标地址不符；或本机发出的数据包源 IP 不是本节点虚拟 IP"
             }
-            Self::BadDestination => "目的不对：对端发来的包不是给本节点的虚拟 IP 的，或者它的 ICMP 差错报文说的不是本节点发出的包",
-            Self::NotAllowed => "访问规则不允许：对端发起的新会话，或者本节点发起的、对端不让访问的；还有对端发来的 ICMP 重定向",
-            Self::Unreachable => "送不到：地址段里没有这个节点、它没有网卡、连不上，或者等连接时排不下",
-            Self::Malformed => "读不懂：不是一个完整的 IPv4 包、片拼不起来，或者是不该被切开的包（TCP、ICMP 差错报文）",
+            Self::BadDestination => {
+                "目的地址异常：对端发来的数据包目的 IP 不是本节点虚拟 IP，或其 ICMP 差错报文引用的源地址不是本节点虚拟 IP"
+            }
+            Self::NotAllowed => "访问规则拒绝：对端发起的新会话或本节点无权访问的目标会话，以及对端发来的 ICMP 重定向报文",
+            Self::Unreachable => "目标不可达：网段中无此节点、对端未启用虚拟网卡、无法建立连接，或建连等待队列已满",
+            Self::Malformed => "报文格式异常：非完整 IPv4 数据包、分片重组失败，或禁止分片的报文（TCP、ICMP 差错报文）",
         }
     }
 }
 
 impl Counters {
-    /// 这次运行以来的计数：（发出的包，字节；收进的包，字节；丢掉的）。
+    /// 获取自本次启动以来的收发及丢包计数快照。
     #[must_use]
     pub fn snapshot(&self) -> Traffic {
         let drop = |kind: Loss| self.drops[kind.index()].load(Ordering::Relaxed);
@@ -147,7 +149,7 @@ impl Counters {
     }
 }
 
-/// [`Counters::snapshot`] 的结果。
+/// [`Counters::snapshot`] 返回的流量统计快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Traffic {
     pub sent_packets: u64,
@@ -161,7 +163,7 @@ fn count(amount: usize) -> u64 {
     u64::try_from(amount).unwrap_or(u64::MAX)
 }
 
-/// 每种原因的丢包日志：第一次记一行，之后每分钟最多一行。
+/// 按丢包原因限流的日志记录器：每种原因首次出现立即记录，之后每分钟最多记录一次。
 #[derive(Debug, Default)]
 struct DropLog {
     last: [Option<(Instant, u64)>; Loss::COUNT],
@@ -180,17 +182,17 @@ impl DropLog {
             return;
         }
         let since = slot.map_or(total, |(_, logged)| total - logged);
-        tracing::info!(reason = kind.reason(), %detail, dropped = since, "虚拟网卡丢掉了包（同一个原因每分钟最多记一行）");
+        tracing::info!(reason = kind.reason(), %detail, dropped = since, "虚拟网卡丢包统计（同一原因每分钟最多记录一次）");
         *slot = Some((now, total));
     }
 }
 
-/// netmap 里引擎要的几样，netmap 换了才重算。
+/// 转发引擎所需的 netmap 索引视图，仅在 netmap 变更时重建。
 #[derive(Debug, Clone)]
 struct Index {
     own: Ipv4Addr,
     cidr: Ipv4Net,
-    /// 网络的开关：小包合起来发（[`crate::bundle`]）。
+    /// 网络级开关：是否启用小包聚合发送（[`crate::bundle`]）。
     bundle: bool,
     by_ip: HashMap<Ipv4Addr, PeerInfo>,
     by_id: HashMap<NodeId, PeerInfo>,
@@ -200,11 +202,11 @@ struct Index {
 struct PeerInfo {
     id: NodeId,
     ip: Ipv4Addr,
-    /// 它可以访问本节点。
+    /// 是否允许该对端访问本节点。
     inbound: bool,
-    /// 本节点可以访问它。
+    /// 是否允许本节点访问该对端。
     outbound: bool,
-    /// 它说它没有网卡。
+    /// 该对端是否声明未启用虚拟网卡。
     no_vnet: bool,
 }
 
@@ -230,7 +232,7 @@ impl Index {
         }
     }
 
-    /// netmap 换了的话重算。
+    /// 检测并同步最新的 netmap 变更。
     fn follow(&mut self, netmap: &mut watch::Receiver<Arc<Netmap>>) {
         if netmap.has_changed().unwrap_or(false) {
             *self = Self::of(&netmap.borrow_and_update());
@@ -238,7 +240,7 @@ impl Index {
     }
 }
 
-/// 搬包的那一部分。造好之后 [`run`](Self::run)。
+/// 虚拟网卡数据包转发引擎。构造后调用 [`run`](Self::run) 启动。
 pub struct Engine<D, P> {
     device: Arc<D>,
     packets: Arc<P>,
@@ -246,14 +248,14 @@ pub struct Engine<D, P> {
     counters: Arc<Counters>,
 }
 
-/// [`Engine::run`] 结束的原因。
+/// [`Engine::run`] 停止运行的原因。
 #[derive(Debug, thiserror::Error)]
 pub enum Stopped {
-    /// 网卡读不了了（被别人删掉了之类）：装配方该拆掉重来。
-    #[error("读不了网卡：{0}")]
+    /// 无法继续读取虚拟网卡（例如设备被外部移除）：上层管理组件应重建虚拟网卡。
+    #[error("无法从虚拟网卡读取数据：{0}")]
     Device(io::Error),
-    /// 连接层关了（节点在停）。
-    #[error("连接层关了")]
+    /// 连接层已关闭（通常因节点正在停止）。
+    #[error("连接层已关闭")]
     Closed,
 }
 
@@ -263,7 +265,7 @@ impl<D: Device, P: Packets> Engine<D, P> {
         Self { device, packets, netmap, counters }
     }
 
-    /// 两个方向一起搬，直到网卡读不了或者连接层关了。丢弃这个 future 就停。
+    /// 并发运行出站与入站转发循环，直至虚拟网卡读取失败或连接层关闭。丢弃该 future 即可停止。
     pub async fn run(self) -> Stopped {
         let replies = Arc::new(Mutex::new(Replies::default()));
         let mut outbound = Outbound {
@@ -299,7 +301,7 @@ impl<D: Device, P: Packets> Engine<D, P> {
     }
 }
 
-/// 回"不可达"的预算：每秒 [`ICMP_PER_SECOND`] 个。
+/// ICMP 不可达报文回复速率限制：每秒最多 [`ICMP_PER_SECOND`] 个。
 #[derive(Debug)]
 struct IcmpBudget {
     second: Instant,
@@ -322,7 +324,7 @@ impl IcmpBudget {
     }
 }
 
-/// 一个对端的连接正在建：排着的包。
+/// 等待目标对端连接建立期间暂存的数据帧队列。
 #[derive(Debug, Default)]
 struct Waiting {
     frames: VecDeque<Bytes>,
@@ -335,29 +337,29 @@ struct Outbound<D, S> {
     index: Index,
     counters: Arc<Counters>,
     replies: Arc<Mutex<Replies>>,
-    /// 正在建连接的对端和排着的包。
+    /// 正在建立连接的对端及其等待发送队列。
     waiting: HashMap<NodeId, Waiting>,
-    /// 连接建不起来的对端，到什么时候之前当场回"不可达"。
+    /// 建连失败对端的拒绝冷却截止时刻：在此之前发往该对端的包直接回复不可达。
     refused: HashMap<NodeId, Instant>,
-    /// 切片的包号。
+    /// 数据报分片消息序号。
     message: u16,
     icmp: IcmpBudget,
     log: DropLog,
-    /// 攒着等合成一帧的小包。
+    /// 待聚合为单帧发送的小包缓冲器。
     bundles: Bundler,
-    /// 这一轮里要回给本机程序的"不可达"：等手上的包都发出去了再写进网卡，写网卡可能要等。
+    /// 本轮待写回虚拟网卡的 ICMP 不可达报文：待本轮所有出站包提交发送后再异步写入网卡，避免阻塞出站路径。
     answers: Vec<Vec<u8>>,
 }
 
-/// 出去的方向这一轮等到了什么。
+/// 出站事件循环单轮触发的事件类型。
 enum Event {
     Read(io::Result<usize>),
     Dialed(NodeId, Result<(), OpenError>),
-    /// 攒着的小包里有等够了的。
+    /// 存在已到达发送窗口的聚合小包帧。
     BundlesDue,
 }
 
-/// 等到 `deadline`；没有的话一直等。
+/// 等待至 `deadline`；为 `None` 时永久挂起。
 async fn until(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -368,7 +370,7 @@ async fn until(deadline: Option<tokio::time::Instant>) {
 impl<D: Device, S: PacketSender> Outbound<D, S> {
     async fn run(&mut self) -> Stopped {
         let (dialed_tx, mut dialed) = mpsc::unbounded_channel::<(NodeId, Result<(), OpenError>)>();
-        // 第一个字节留给帧头：读进来的包后面直接就是一个完整的帧，不用再拷一次。
+        // 首字节预留帧头，读取完成后可直接构成完整数据帧，避免二次拷贝。
         let mut buf = vec![0u8; 1 + READ_BUFFER];
         buf[0] = PacketHeader::WHOLE_BYTE;
         loop {
@@ -381,8 +383,8 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
             let mut broken = None;
             match event {
                 Event::Read(read) => {
-                    // 网卡上紧跟着还有现成的包就接着读，一口气交下去：连接层把一样长的凑成一批发，少几次系统调用，
-                    // 同一轮里的小包合成一帧。只取现成的，不等：没有了就把手上的发掉。
+                    // 连续排空虚拟网卡上已就绪的后续数据包并批量提交连接层（减少系统调用并合并同批小包），
+                    // 仅执行非阻塞读取，无现成数据时立即结束本轮并刷新发送。
                     let mut read = Some(read);
                     let mut taken = 0;
                     while let Some(result) = read.take() {
@@ -394,7 +396,7 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                                 }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                            // 读到的东西不成一个包，网卡已经把它丢了（见 [`Device::recv`]）。
+                            // 读取的数据无法组成合法数据包且已由网卡丢弃（见 [`Device::recv`]）。
                             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
                                 self.log.note(&self.counters, Loss::Malformed, &error);
                             }
@@ -416,14 +418,14 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                     }
                 }
             }
-            // 这一轮完了：合好了、不用再等的帧交下去，连接层攒着的发出去。然后才去写网卡，那可能要等。
+            // 本轮处理完毕：提交已就绪的聚合帧并刷新连接层发送缓冲，随后再异步将 ICMP 不可达报文写回虚拟网卡。
             for (peer, frame) in self.bundles.due(tokio::time::Instant::now(), self.index.bundle && broken.is_none()) {
                 self.emit(peer, frame, &dialed_tx);
             }
             self.sender.flush();
             for answer in std::mem::take(&mut self.answers) {
                 if let Err(error) = self.device.send(&answer).await {
-                    tracing::debug!(%error, "回给本机程序的不可达写不进网卡");
+                    tracing::debug!(%error, "无法将 ICMP 不可达报文写入虚拟网卡");
                 }
             }
             if let Some(error) = broken {
@@ -432,7 +434,7 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
         }
     }
 
-    /// 本机发出的一个包，该发给 `peer`。小包、能合的时候先攒着（[`crate::bundle`]），别的照常发。
+    /// 处理待发往 `peer` 的本机出站数据包。满足条件的小包先尝试合入聚合缓冲（[`crate::bundle`]），其余按常规方式发送。
     fn offer(&mut self, peer: NodeId, frame: Bytes, dialed: &mpsc::UnboundedSender<(NodeId, Result<(), OpenError>)>) {
         let packet = &frame[PacketHeader::WHOLE_LEN..];
         if self.index.bundle && packet.len() <= SMALL_PACKET && !self.waiting.contains_key(&peer) {
@@ -445,14 +447,14 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                 return;
             }
         } else if let Some(pending) = self.bundles.take(peer) {
-            // 攒着的小包先走，顺序不变。
+            // 先发出该对端已缓存的小包，保持包序不变。
             self.emit(peer, pending, dialed);
         }
         self.send(peer, frame, dialed);
     }
 
-    /// 把合好的一帧交给连接层。只有一个包的就是普通的一帧；合着好几个的发不了时（连接没了，帧的上限刚变小），
-    /// 里面的包各走各的：该建连接的建连接，该切片的切片。
+    /// 将聚合结果提交连接层。仅含单包时以普通帧发送；若聚合帧发送失败（例如连接已断开或路径 MTU 缩小），
+    /// 则拆回逐包走常规发送流程（按需触发建连或分片）。
     fn emit(&mut self, peer: NodeId, frame: Bytes, dialed: &mpsc::UnboundedSender<(NodeId, Result<(), OpenError>)>) {
         let Ok((PacketHeader::Bundle, body)) = PacketHeader::decode(&frame) else { return self.send(peer, frame, dialed) };
         let packets = Bundled::new(body).flatten();
@@ -468,13 +470,13 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
         }
     }
 
-    /// 本机发出的一个包该发给哪个对端；不该发的在这里处理掉（丢掉、回"不可达"），返回 `None`。
+    /// 解析本机出站数据包并确定目标对端；不符合转发条件的包在此丢弃或排队回复 ICMP 不可达，返回 `None`。
     fn route(&mut self, frame: &Bytes) -> Option<NodeId> {
         self.index.follow(&mut self.netmap);
         let packet = &frame[1..];
         let ip = match Ipv4::parse(packet) {
             Ok(ip) => ip,
-            // 网卡上没有 IPv6 的地址，内核偶尔还是会发几个（邻居发现之类），不算丢包。
+            // 虚拟网卡未配置 IPv6 地址，内核偶发发出的 IPv6 报文（如邻居发现）直接忽略，不计为丢包。
             Err(Malformed::NotIpv4(_)) => return None,
             Err(error) => {
                 self.log.note(&self.counters, Loss::Malformed, &error);
@@ -507,10 +509,10 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
         None
     }
 
-    /// 丢掉一个本机发出的包，给发它的程序回一个"不可达"。
+    /// 丢弃本机发出的不可送达数据包，并按限流预算生成 ICMP 不可达报文回复本机应用。
     ///
-    /// 回的包先记着，这一轮手上的包都发出去之后才写进网卡（见 [`run`](Self::run)）：写网卡可能要等（它的队列满着的时候），
-    /// 同一阵里排在前面、交下去还没发的包不该陪着等。
+    /// 生成的回复报文先暂存，待本轮所有出站包提交并刷新后再写入虚拟网卡（见 [`run`](Self::run)），
+    /// 避免网卡写入阻塞拖累同批次中已在队列等待发送的正常数据包。
     fn unreachable(&mut self, ip: &Ipv4<'_>, code: Unreachable, kind: Loss, detail: &Ipv4Addr) {
         self.log.note(&self.counters, kind, detail);
         if self.icmp.take(Instant::now())
@@ -532,16 +534,16 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                 Self::queue(&mut waiting, frame, &self.counters, &mut self.log);
                 self.waiting.insert(peer, waiting);
                 let (sender, dialed) = (self.sender.clone(), dialed.clone());
-                tracing::debug!(%peer, "虚拟网卡有包要发给对端，和它还没有连接：先建，这一会儿的包排着");
+                tracing::debug!(%peer, "虚拟网卡存在发往对端的数据包但尚未建立连接，开始建连并暂存待发包");
                 tokio::spawn(async move {
                     let result = sender.connect(peer).await;
-                    // 引擎已经停了的话没有人收，不要紧。
+                    // 若转发引擎已停止导致接收端关闭，忽略发送错误即可。
                     let _ = dialed.send((peer, result));
                 });
             }
             Err(DatagramSendError::TooLarge { max, .. }) => self.send_pieces(peer, &frame[1..], max),
             Err(DatagramSendError::Unsupported(_)) => {
-                let detail = format!("对端 {peer} 不收数据报");
+                let detail = format!("对端 {peer} 不支持数据报传输");
                 self.log.note(&self.counters, Loss::Unreachable, &detail);
             }
         }
@@ -549,13 +551,13 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
 
     fn queue(waiting: &mut Waiting, frame: Bytes, counters: &Counters, log: &mut DropLog) {
         if waiting.frames.len() >= MAX_WAITING {
-            log.note(counters, Loss::Unreachable, &"连接还在建，排着的包满了");
+            log.note(counters, Loss::Unreachable, &"对端连接正在建立，等待发送队列已满");
             return;
         }
         waiting.frames.push_back(frame);
     }
 
-    /// 一个包装不进现在的数据报（`max` 字节）：切成两片发。
+    /// 数据包超出当前数据报上限（`max` 字节）时，将其拆分为两片发送。
     fn send_pieces(&mut self, peer: NodeId, packet: &[u8], max: usize) {
         self.message = self.message.wrapping_add(1);
         let pieces = match PacketPieces::split(self.message, packet, max) {
@@ -570,13 +572,13 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
         self.counters.sent(packet.len());
     }
 
-    /// 到 `peer` 的连接建好了（或者没建成）：把排着的包发出去，或者给它们回"不可达"。
+    /// 处理到 `peer` 的异步建连结果：成功则发送等待队列中的所有数据包，失败则回复“主机不可达”。
     fn dialed(&mut self, peer: NodeId, result: Result<(), OpenError>) {
         let Some(waiting) = self.waiting.remove(&peer) else { return };
         match result {
             Ok(()) => {
                 self.refused.remove(&peer);
-                tracing::debug!(%peer, queued = waiting.frames.len(), "和对端的连接建好了，排着的包发出去");
+                tracing::debug!(%peer, queued = waiting.frames.len(), "到对端的连接已建立，开始发送等待队列中的数据包");
                 for frame in waiting.frames {
                     let len = frame.len() - 1;
                     match self.sender.queue_packet(peer, frame.clone()) {
@@ -587,7 +589,7 @@ impl<D: Device, S: PacketSender> Outbound<D, S> {
                 }
             }
             Err(error) => {
-                tracing::info!(%peer, %error, queued = waiting.frames.len(), "虚拟网卡到对端的连接建不起来：排着的包回主机不可达，{REFUSE_FOR:?} 之内发往它的包当场回不可达");
+                tracing::info!(%peer, %error, queued = waiting.frames.len(), "虚拟网卡到对端的连接建立失败：已向等待队列返回主机不可达，{REFUSE_FOR:?} 内发往该对端的数据包将直接返回不可达");
                 self.refused.retain(|_, until| Instant::now() < *until);
                 self.refused.insert(peer, Instant::now() + REFUSE_FOR);
                 for frame in waiting.frames {
@@ -630,8 +632,8 @@ impl<D: Device, P: Packets> Inbound<D, P> {
         }
     }
 
-    /// 这一批里让进来的包一起交给网卡：同一条流首尾相接的，网卡可以合成一个大的再给内核（[`Device::send_many`]）。
-    /// 只合手上已经到了的，不为了凑大的等后面的包。
+    /// 将本批通过校验的数据包批量写入虚拟网卡：支持分段卸载的网卡可先聚合连续流再提交内核（[`Device::send_many`]）。
+    /// 仅聚合当前已到达的数据包，不额外等待后续包。
     async fn deliver(&mut self, admitted: &[Bytes]) {
         let (mut packets, mut bytes) = (admitted.len(), admitted.iter().map(Bytes::len).sum::<usize>());
         if packets == 0 {
@@ -647,7 +649,7 @@ impl<D: Device, P: Packets> Inbound<D, P> {
         self.counters.received(packets, bytes);
     }
 
-    /// 对端发来的一帧：取出里面的包（切开的拼好，合在一起的拆开），逐个核对，能写进网卡的放进 `admitted`。
+    /// 解码对端发来的数据帧（重组数据报分片或展开小包聚合帧），逐包校验并将允许放行的数据包追加至 `admitted`。
     fn admit(&mut self, datagram: Datagram, admitted: &mut Vec<Bytes>) {
         let Datagram { peer, payload } = datagram;
         match PacketHeader::decode(&payload) {
@@ -656,10 +658,10 @@ impl<D: Device, P: Packets> Inbound<D, P> {
                 match self.reassembly.accept(peer, fragment, payload.slice(PacketHeader::PIECE_LEN..), Instant::now()) {
                     Assembled::Packet(packet) => self.admit_packet(peer, packet, admitted),
                     Assembled::Waiting => {}
-                    Assembled::Broken => self.log.note(&self.counters, Loss::Malformed, &"片拼不起来"),
+                    Assembled::Broken => self.log.note(&self.counters, Loss::Malformed, &"数据报分片重组失败"),
                 }
             }
-            // 合在一帧里的几个包各是各的：一个一个地核对，哪个不合格丢哪个。帧本身坏了的话，坏的地方之前的照收。
+            // 聚合帧中的各数据包相互独立，逐一校验并仅丢弃不合格的包；若帧本身损坏，损坏位置之前已解出的包仍正常接收。
             Ok((PacketHeader::Bundle, body)) => {
                 for packet in Bundled::new(body) {
                     match packet {
@@ -672,21 +674,25 @@ impl<D: Device, P: Packets> Inbound<D, P> {
         }
     }
 
-    /// 对端 `peer` 发来的一个完整的 IP 包：核对，能写进网卡的放进 `admitted`。一个 IP 分片的包齐了的时候是好几个（它的每一片）。
+    /// 校验对端 `peer` 发来的单个 IPv4 数据包，通过后追加至 `admitted`（若为重组完成的 IP 分片包，则按序追加全部分片）。
     fn admit_packet(&mut self, peer: NodeId, packet: Bytes, admitted: &mut Vec<Bytes>) {
         let ip = match Ipv4::parse(&packet) {
             Ok(ip) => ip,
             Err(error) => return self.log.note(&self.counters, Loss::Malformed, &error),
         };
         let Some(sender) = self.index.by_id.get(&peer).copied() else {
-            return self.log.note(&self.counters, Loss::BadSource, &format!("节点 {peer} 不在 netmap 里"));
+            return self.log.note(&self.counters, Loss::BadSource, &format!("节点 {peer} 不在当前 netmap 中"));
         };
         if ip.source() != sender.ip {
-            let detail = format!("节点 {peer}（{}）发来的包写的来源是 {}", sender.ip, ip.source());
+            let detail = format!("节点 {peer}（{}）发来的数据包源 IP 为 {}", sender.ip, ip.source());
             return self.log.note(&self.counters, Loss::BadSource, &detail);
         }
         if ip.destination() != self.index.own {
-            return self.log.note(&self.counters, Loss::BadDestination, &format!("节点 {peer} 发来的包要去 {}", ip.destination()));
+            return self.log.note(
+                &self.counters,
+                Loss::BadDestination,
+                &format!("节点 {peer} 发来的数据包目的 IP 为 {}", ip.destination()),
+            );
         }
         if !ip.is_fragment() {
             if self.judge(peer, sender, &ip) {
@@ -695,20 +701,20 @@ impl<D: Device, P: Packets> Inbound<D, P> {
             return;
         }
         if ip.protocol() == TCP {
-            return self.log.note(&self.counters, Loss::Malformed, &format!("节点 {peer} 发来的 TCP 被切成了片"));
+            return self.log.note(&self.counters, Loss::Malformed, &format!("节点 {peer} 发来的 TCP 报文存在 IP 分片"));
         }
-        // 差错报文和重定向齐了也不放（见 [`Self::judge`]），第一片一到就扔，不用攒。
+        // 分片的 ICMP 差错报文与重定向报文无论如何均不放行（见 [`Self::judge`]），首片到达即直接丢弃，无需缓存重组。
         if ip.is_icmp_error() {
-            return self.log.note(&self.counters, Loss::Malformed, &format!("节点 {peer}：ICMP 差错报文被切成了片"));
+            return self.log.note(&self.counters, Loss::Malformed, &format!("节点 {peer}：ICMP 差错报文存在 IP 分片"));
         }
         if ip.is_icmp_redirect() {
-            return self.log.note(&self.counters, Loss::NotAllowed, &format!("节点 {peer} 发来一个 ICMP 重定向"));
+            return self.log.note(&self.counters, Loss::NotAllowed, &format!("节点 {peer} 发来 ICMP 重定向报文"));
         }
         match self.fragments.accept(&ip, packet.clone(), Instant::now()) {
             Gathered::Waiting => {}
-            Gathered::Broken(why) => self.log.note(&self.counters, Loss::Malformed, &format!("节点 {peer} 发来的 IP 分片拼不起来：{why}")),
+            Gathered::Broken(why) => self.log.note(&self.counters, Loss::Malformed, &format!("IP 分片重组失败（来源节点 {peer}）：{why}")),
             Gathered::Complete(pieces) => {
-                let first = Ipv4::parse(&pieces[0]).expect("攒下的片都读过");
+                let first = Ipv4::parse(&pieces[0]).expect("已缓存的分片均已通过 IPv4 解析");
                 if self.judge(peer, sender, &first) {
                     admitted.extend(pieces);
                 }
@@ -716,40 +722,40 @@ impl<D: Device, P: Packets> Inbound<D, P> {
         }
     }
 
-    /// 来源、目的都对的一个包（被切开的包是它的第一片）让不让进来；不让的记下原因。
+    /// 对源、目的地址已通过校验的数据包（或 IP 分片包的首片）执行策略与安全审查；拒绝时记录丢包原因。
     fn judge(&mut self, peer: NodeId, sender: PeerInfo, ip: &Ipv4<'_>) -> bool {
         if let Some((kind, detail)) = quote_problem(ip, self.index.own, sender.ip) {
             self.log.note(&self.counters, kind, &format!("节点 {peer}：{detail}"));
             return false;
         }
         if ip.is_icmp_redirect() {
-            self.log.note(&self.counters, Loss::NotAllowed, &format!("节点 {peer} 发来一个 ICMP 重定向"));
+            self.log.note(&self.counters, Loss::NotAllowed, &format!("节点 {peer} 发来 ICMP 重定向报文"));
             return false;
         }
         if !sender.inbound && self.replies.lock().expect("replies mutex poisoned").admit(ip, Instant::now()) == Verdict::NewConversation {
-            self.log.note(&self.counters, Loss::NotAllowed, &format!("节点 {peer} 不能访问本节点，它发来的不是回包"));
+            self.log.note(&self.counters, Loss::NotAllowed, &format!("节点 {peer} 无权访问本节点，且收到的数据包不属于回包"));
             return false;
         }
         true
     }
 }
 
-/// 对端 `sender` 发来的 ICMP 差错报文有什么不对：它说的必须是本节点（`own`）发给它的一个包。不是差错报文的没有问题。
+/// 检查对端 `sender` 发来的 ICMP 差错报文合法性：引用的原始数据包必须是由本节点（`own`）发往 `sender` 的报文。非差错报文返回 `None`。
 fn quote_problem(ip: &Ipv4<'_>, own: Ipv4Addr, sender: Ipv4Addr) -> Option<(Loss, String)> {
     if !ip.is_icmp_error() {
         return None;
     }
     if ip.is_fragment() {
-        return Some((Loss::Malformed, "ICMP 差错报文被切成了片".to_owned()));
+        return Some((Loss::Malformed, "ICMP 差错报文存在 IP 分片".to_owned()));
     }
     let Some(quoted) = ip.quoted() else {
-        return Some((Loss::Malformed, "ICMP 差错报文带回来的原包连头都不完整".to_owned()));
+        return Some((Loss::Malformed, "ICMP 差错报文引用的原始数据包 IP 头不完整".to_owned()));
     };
     if quoted.source() != own {
-        return Some((Loss::BadDestination, format!("ICMP 差错报文说的是 {} 发出的包", quoted.source())));
+        return Some((Loss::BadDestination, format!("ICMP 差错报文引用的原始数据包源地址为 {}", quoted.source())));
     }
     if quoted.destination() != sender {
-        return Some((Loss::BadSource, format!("ICMP 差错报文说的是发往 {} 的包", quoted.destination())));
+        return Some((Loss::BadSource, format!("ICMP 差错报文引用的原始数据包目的地址为 {}", quoted.destination())));
     }
     None
 }

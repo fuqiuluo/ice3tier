@@ -1,10 +1,10 @@
 //! 本进程开出去、接进来的 TCP 都通告一个压低了的最大分段长度（MSS），躲开路径 MTU 黑洞。
 //!
-//! 有的路送不到 1500 字节的包，也不回 ICMP（路径 MTU 黑洞），发的一方就不知道要把分段改小。实际网络上量到：
-//! 一台只能走 TCP 的服务器收不到 1488 字节的 IP 包，1440 字节的都收得到，网卡的 MTU 却是 1500。握手和小的消息过得去，
-//! 连接建得起来；一旦对端有一个满 1500 字节的分段要发，它就一直重发同样大小的分段（`net.ipv4.tcp_mtu_probing=0`
-//! 时内核不会自己试小的），连接卡死：控制连接 90 秒收不完一份 netmap，经 TCP 中转的连接上第一条流就卡住，
-//! lane、出口连目标也一样。所以看上去时好时坏：小消息照常，大的永远到不了。
+//! 部分路径无法传输 1500 字节的数据包且不返回 ICMP 错误（路径 MTU 黑洞），导致发送方无法得知需要缩小分段。实测发现：
+//! 某仅支持 TCP 的服务器无法接收 1488 字节的 IP 包，但可接收 1440 字节的包，而其网卡 MTU 仍为 1500。握手与小包可以正常通过，
+//! 连接也能建立；但一旦对端发送满 1500 字节的分段，就会不断以相同大小重传（`net.ipv4.tcp_mtu_probing=0`
+//! 时内核不会主动探测更小的 MTU），导致连接卡死：控制连接 90 秒无法收完一份 netmap，经 TCP 中继的连接在首条流即阻塞，
+//! lane 及出口连接目标亦然。表现为小消息正常、大数据包始终无法送达。
 //!
 //! MSS 是握手时由收的一方通告给发的一方的：在本端的 socket 上设 `TCP_MAXSEG`，对端发过来的分段就不会超过它，
 //! 对端是不是我们的程序都一样（出口连的网站、上游代理）。本端自己发的分段也不超过它。拨号的 socket 在 `connect`
@@ -17,11 +17,11 @@
 //! 平台：
 //!
 //! - Linux：上面说的都成立，两个方向都压住了。
-//! - macOS（BSD 的 TCP）：握手里通告的 MSS 只按出去的网卡的 MTU 算，socket 上设什么都改不了它（[`ADVERTISED`] 是
-//!   `false`）；握手之前设的 `TCP_MAXSEG` 大于内核给新 socket 的初始值（IPv4 是 512）时被拒绝，设上了握手时也会被
-//!   商定的值盖掉。能做的只有连接建好之后再设，压住本端自己发出去的分段（[`clamp_connected`]）。所以两头都是本程序时，
-//!   各自压住自己发的，两个方向都压住了；对端是别的程序（出口连的网站、连上来的客户端）时，从它那里过来的方向压不住，
-//!   那个方向遇到黑洞还是会卡。出去的网卡做 TSO（分段交给网卡做）时，网卡按商定的 MSS 切，连本端发的方向也压不住。
+//! - macOS（BSD TCP 栈）：握手通告的 MSS 仅根据出接口 MTU 计算，无法通过 socket 选项修改（[`ADVERTISED`] 为
+//!   `false`）；握手前设置的 `TCP_MAXSEG` 若大于新 socket 初始值（IPv4 为 512）会被拒绝，即使设置成功也会在握手时被
+//!   协商值覆盖。只能在连接建立后再设置，以限制本端出站分段大小（[`clamp_connected`]）。因此当两端均为本程序时，
+//!   双方各自限制出站方向即可覆盖双向；若对端为其他程序（出口目标站点或外部客户端），则无法限制其入站方向，
+//!   该方向遇到黑洞仍会阻塞。此外，当出接口启用 TSO（由网卡执行分段）时，网卡按协商 MSS 切分，本端出站方向同样无法限制。
 //! - Windows 只能读不能设，那里什么都不做，用系统的 MSS。
 
 use std::io;
@@ -36,7 +36,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 /// 带着 Linux 默认的时间戳选项（12 字节），一个分段的 IP 包最大是 1360 + 20 + 20 = 1400 字节：比实际网络上量到的那个黑洞
 /// 送得到的最大的包（1440 字节）小 40 字节，也放得进常见的隧道（WireGuard 1420、GRE 1476、PPPoE 1492、IPsec 多在 1400 以上），
 /// IPv6 下是 1420 字节。代价是包数：1 MB 的数据以前 725 个分段（每个 1448 字节），现在 778 个（每个 1348 字节），多 7%，
-/// 线上多出的头部不到千分之三。取 1400 时（包 1440 字节）正好卡在量到的边上，经 WireGuard 的路又放不下；
+/// 额外头部开销不足千分之三。若取 1400（整包 1440 字节），恰好处于实测边界且无法通过 WireGuard 链路；
 /// 取 IPv6 的最小 MTU 对应的 1220 要多 20% 的包，换来的只是 1280 到 1400 之间那些很少见的路。
 pub const DEFAULT: u16 = 1360;
 
@@ -60,7 +60,7 @@ pub fn get() -> Option<u16> {
 /// 这个系统上设的 MSS 会不会在握手里通告给对端，让对端发过来的分段也不超过它。只有 Linux 会，见模块文档的"平台"。
 pub const ADVERTISED: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
-/// 给一个还没有连接、还没有监听的 TCP socket 设上 MSS。设不上不是错误：用系统的 MSS，记一行 debug。
+/// 为尚未连接或监听的 TCP socket 设置 MSS。设置失败不视为错误：沿用系统默认 MSS，并记录一条 debug 日志。
 ///
 /// 只在 Linux 上有用：别的 Unix 在握手时把它盖掉（见模块文档），那里在连接建好之后由 [`clamp_connected`] 设。
 pub fn clamp<'s, S>(socket: &'s S)
@@ -71,7 +71,7 @@ where
     let socket = SockRef::from(socket);
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Err(error) = socket.set_tcp_mss(u32::from(mss)) {
-        tracing::debug!(%error, mss, "设置不了 TCP_MAXSEG，这条连接用系统的 MSS");
+        tracing::debug!(%error, mss, "设置 TCP_MAXSEG 失败，将使用系统默认 MSS");
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = (socket, mss);
@@ -80,7 +80,7 @@ where
 /// 给一条刚建好的连接（拨出去连上的、接进来的）压住本端发出去的分段。
 ///
 /// macOS 和别的 BSD 系的 Unix 上只能这样做（见模块文档）。Linux 上什么都不做：连接之前、监听之前设的已经管住了两个方向。
-/// 设不上不是错误，记一行 debug。
+/// 设置失败不视为错误，仅记录一条 debug 日志。
 pub fn clamp_connected(stream: &TcpStream) {
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     lower_after_handshake(stream);
@@ -96,11 +96,11 @@ fn lower_after_handshake(stream: &TcpStream) {
     match socket.tcp_mss() {
         Ok(current) if current > u32::from(mss) => {
             if let Err(error) = socket.set_tcp_mss(u32::from(mss)) {
-                tracing::debug!(%error, mss, current, "设置不了 TCP_MAXSEG，这条连接发出去的分段用商定的 MSS");
+                tracing::debug!(%error, mss, current, "无法设置 TCP_MAXSEG，出站分段继续使用握手协商的 MSS");
             }
         }
         Ok(_) => {}
-        Err(error) => tracing::debug!(%error, "读不出 TCP_MAXSEG，这条连接发出去的分段用商定的 MSS"),
+        Err(error) => tracing::debug!(%error, "读取 TCP_MAXSEG 失败，出站分段继续使用握手协商的 MSS"),
     }
 }
 
@@ -108,7 +108,7 @@ fn lower_after_handshake(stream: &TcpStream) {
 ///
 /// # Errors
 ///
-/// 建不了 socket，或者连不上，原样返回操作系统的错误。
+/// 创建 socket 或建立连接失败时，原样返回操作系统错误。
 pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
     let socket = new_socket(addr)?;
     clamp(&socket);
@@ -129,14 +129,14 @@ pub async fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr
     Ok((stream, from))
 }
 
-/// 连 `host`（`主机:端口`，主机可以是域名），握手里通告设好的 MSS。代替用字符串调用的 `TcpStream::connect`，做法和它一样：
-/// 解析出的地址按顺序一个个试，第一个连上的为准，都连不上时返回最后一个错误。
+/// 连接 `host`（`主机:端口`，支持域名），并在握手时通告配置的 MSS。用于替代字符串参数的 `TcpStream::connect`，行为一致：
+/// 按解析顺序依次尝试每个地址，返回首个成功的连接；若全部失败则返回最后一个错误。
 ///
 /// # Errors
 ///
-/// 解析不了，或者每个地址都连不上。
+/// 地址解析失败，或所有解析出的地址均连接失败。
 pub async fn connect_host(host: &str) -> io::Result<TcpStream> {
-    let mut last = io::Error::new(io::ErrorKind::InvalidInput, "这个名字解析不出任何地址");
+    let mut last = io::Error::new(io::ErrorKind::InvalidInput, "主机名未解析出任何地址");
     for addr in tokio::net::lookup_host(host).await? {
         match connect(addr).await {
             Ok(stream) => return Ok(stream),
@@ -152,7 +152,7 @@ pub async fn connect_host(host: &str) -> io::Result<TcpStream> {
 ///
 /// # Errors
 ///
-/// 建不了 socket、绑不上（端口被占着、地址不是本机的），原样返回操作系统的错误。
+/// 创建 socket 或绑定失败（如端口已被占用或地址不属于本机）时，原样返回操作系统错误。
 pub fn listen(addr: SocketAddr) -> io::Result<TcpListener> {
     let socket = new_socket(addr)?;
     #[cfg(unix)]
@@ -176,7 +176,7 @@ mod tests {
     use super::*;
 
     fn mss_of(stream: &TcpStream) -> u32 {
-        SockRef::from(stream).tcp_mss().expect("TCP 的 MSS 读得出来")
+        SockRef::from(stream).tcp_mss().expect("应能读取 TCP MSS")
     }
 
     #[tokio::test]
@@ -187,7 +187,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (dialled, accepted) = tokio::join!(connect(addr), accept(&listener));
         let (mut dialled, (mut accepted, _)) = (dialled.unwrap(), accepted.unwrap());
-        // 发一大块过去，确认连接照常能用，MSS 也是建立之后实际在用的那个。
+        // 发送大块数据，验证连接可正常传输且读取到的为建连后实际生效的 MSS。
         let block = vec![7u8; 256 * 1024];
         let (written, read) = tokio::join!(dialled.write_all(&block), async {
             let mut received = vec![0u8; block.len()];

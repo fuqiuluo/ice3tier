@@ -54,7 +54,7 @@ pub(crate) struct Sealed {
     pub(crate) inbound: BytesMut,
     /// TLS 解出来、还没拆成帧的明文。
     plain: BytesMut,
-    /// 不认识的帧跳过（控制 lane）还是报错（流的 lane）。
+    /// 遇到未知帧类型时选择跳过（控制 lane）还是报错（承载流的 lane）。
     allow_unknown: bool,
     /// 对端发过 close_notify。之后 TLS 不再收任何字节，这里也不再喂。
     peer_closed: bool,
@@ -92,7 +92,7 @@ impl Sealed {
         while !rest.is_empty() {
             // 绝不能给 TLS 一个空的读取源：它会把读到 0 当作对端关了连接。
             if self.tls.read_tls(&mut rest).map_err(LaneError::Io)? == 0 {
-                return Err(LaneError::Protocol("TLS 不肯再收字节"));
+                return Err(LaneError::Protocol("TLS 引擎拒绝接收更多字节"));
             }
         }
         let state = self.tls.process_new_packets().map_err(LaneError::Tls)?;

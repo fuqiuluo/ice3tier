@@ -43,7 +43,7 @@ fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("建不了 tokio 运行时：{err}");
+            eprintln!("创建 tokio 运行时失败：{err}");
             return ExitCode::from(2);
         }
     };

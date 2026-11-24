@@ -1,4 +1,4 @@
-//! 文件的大小和 SHA-256。
+//! 文件大小与 SHA-256 摘要计算。
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -7,7 +7,7 @@ use std::path::Path;
 use i3t_model::update::{Artifact, Sha256};
 use ring::digest::{Context, SHA256};
 
-/// 一个文件实际的大小和 SHA-256，用来和清单里写的比。
+/// 文件的实际大小与 SHA-256 摘要，用于与发布清单中的记录比对。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDigest {
     pub size: u64,
@@ -15,15 +15,15 @@ pub struct FileDigest {
 }
 
 impl FileDigest {
-    /// 把文件从头读一遍算出来。这是阻塞的调用，文件有几十 MB，异步代码里要放到阻塞线程上跑。
+    /// 从头读取文件并计算其大小与 SHA-256 摘要。该调用为阻塞 I/O，更新包通常为数十 MB，异步代码中应置于阻塞线程池中执行。
     ///
     /// # Errors
     ///
-    /// 文件打不开或者读不了。
+    /// 无法打开或读取文件时返回错误。
     pub fn of_file(path: &Path) -> io::Result<Self> {
         let mut hasher = Hasher(Context::new(&SHA256));
         let size = io::copy(&mut File::open(path)?, &mut hasher)?;
-        let sha256: [u8; Sha256::LEN] = hasher.0.finish().as_ref().try_into().expect("SHA-256 的结果固定是 32 字节，这是算法的定义");
+        let sha256: [u8; Sha256::LEN] = hasher.0.finish().as_ref().try_into().expect("SHA-256 摘要长度固定为 32 字节");
         Ok(Self { size, sha256: Sha256::from_bytes(sha256) })
     }
 
@@ -33,7 +33,7 @@ impl FileDigest {
     }
 }
 
-/// 让 [`io::copy`] 把读到的字节直接喂给哈希。
+/// 将 [`io::copy`] 读取的字节流式写入哈希上下文。
 struct Hasher(Context);
 
 impl Write for Hasher {

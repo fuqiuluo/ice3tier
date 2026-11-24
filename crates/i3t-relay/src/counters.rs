@@ -15,7 +15,7 @@ pub enum DropReason {
     BadCookie,
     /// AUTH 的签名不对。
     BadSignature,
-    /// cookie 对，但同一个来源（或者全体）这一阵发来的 AUTH 太多，这一个没有验签名。
+    /// cookie 验证通过，但该来源（或全局）短期内发送的 AUTH 过多，已触发限流并跳过签名验证。
     TooManyHandshakes,
     /// 来源节点没有会话，或者数据报不是从会话绑定的地方来的。
     NoSession,

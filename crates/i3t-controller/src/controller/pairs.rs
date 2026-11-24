@@ -40,7 +40,7 @@ impl Controller {
     /// 两个节点不都在这个网络里，或者是同一个节点。
     pub fn pair(&self, network: NetworkId, a: NodeId, b: NodeId) -> Result<PairView, Error> {
         if a == b {
-            return Err(Error::invalid_field("b", "same_node", "一对节点得是两个不同的节点"));
+            return Err(Error::invalid_field("b", "same_node", "节点对必须由两个不同的节点组成"));
         }
         let inner = self.lock();
         require_node(&inner.store, network, a).in_field("a")?;
@@ -56,7 +56,7 @@ impl Controller {
     /// 两个节点不都在这个网络里，或者是同一个节点。
     pub fn set_pair(&self, network: NetworkId, a: NodeId, b: NodeId, input: PairInput) -> Result<PairView, Error> {
         if a == b {
-            return Err(Error::invalid_field("b", "same_node", "一对节点得是两个不同的节点"));
+            return Err(Error::invalid_field("b", "same_node", "节点对必须由两个不同的节点组成"));
         }
         let mut inner = self.lock();
         let now = inner.clock.now();
@@ -109,7 +109,7 @@ impl Controller {
                 now,
                 Some(network),
                 action::PAIR_DELETE,
-                &format!("节点 #{a} 和 #{b}：去掉节点对设置"),
+                &format!("节点 #{a} 和 #{b}：清除节点对设置"),
                 &[LogRef::node(a), LogRef::node(b)],
                 pair_params(store, a, b, json!({}))?,
             )?;
@@ -121,7 +121,7 @@ impl Controller {
     }
 }
 
-/// 一对节点的视图。各项都是默认值的一行（比「不留默认值的行」早的版本写得进去）和没有行一样，算没有设置。
+/// 节点对视图。各项均为默认值的记录（可能由更早版本写入）与无记录等效，均视为未自定义。
 fn view(found: Option<PairSetting>, a: NodeId, b: NodeId) -> PairView {
     let setting = found.unwrap_or_else(|| PairSetting::unset(a, b));
     PairView { setting, stored: !setting.is_default() }

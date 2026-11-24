@@ -1,6 +1,6 @@
 //! TCP 中转的分帧。
 //!
-//! UDP 用不了的节点向 relay 建一条 TCP 并保持着，把本来要用 UDP 发的数据报原样装进去，
+//! 无法使用 UDP 的节点向 relay 建立并保持一条 TCP 连接，将原本经 UDP 发送的数据报原样封装写入，
 //! 每个数据报前面加 2 字节的长度（大端，不含它自己）：
 //!
 //! ```text
@@ -17,9 +17,9 @@ pub const MAX_FRAME_LEN: usize = u16::MAX as usize;
 
 const LEN_PREFIX: usize = size_of::<u16>();
 
-/// 数据报太长，装不进一帧。
+/// 数据报过长，超出单帧上限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("数据报有 {len} 字节，一帧最多装 {MAX_FRAME_LEN} 字节")]
+#[error("数据报长度为 {len} 字节，单帧上限为 {MAX_FRAME_LEN} 字节")]
 pub struct FrameTooLong {
     pub len: usize,
 }

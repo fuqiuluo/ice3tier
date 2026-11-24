@@ -1,7 +1,7 @@
 //! 自动端口映射。
 //!
-//! 节点在 NAT 后面时，请路由器把公网一侧的一个端口转到本机那个唯一的端口上。映射出来的公网地址是一个
-//! 别人直接连得上的候选端点，有了它就不用打洞。路由器支持哪种协议各不相同，三种都试，按这个顺序取第一个成的：
+//! 节点位于 NAT 之后时，请求路由器将公网侧端口转发至本机唯一监听端口。映射得到的公网地址可作为
+//! 对端直接可达的候选端点，从而无需打洞。不同路由器支持的协议各异，因此按以下顺序依次尝试并采用首个成功的协议：
 //!
 //! | 协议 | 怎么说 | 在哪里 |
 //! |---|---|---|
@@ -9,8 +9,8 @@
 //! | NAT-PMP（RFC 6886） | 同一个端口，PCP 的前身 | `natpmp` |
 //! | UPnP-IGD | SSDP 组播找到网关设备，再用 HTTP 上的 SOAP | `upnp`（协议本身用 `igd-next`） |
 //!
-//! 映射有有效期，过了一半就续；续不上就当它没了，从头再找一遍网关。节点停止时把映射删掉（[`PortMapper::shutdown`]）。
-//! 只映射 IPv4：IPv6 没有地址转换，要放行的是防火墙，那不归这里管。
+//! 映射具有租期，过半时执行续期；续期失败则视为失效，重新探测网关。节点停止时删除映射（[`PortMapper::shutdown`]）。
+//! 仅映射 IPv4：IPv6 无需地址转换，防火墙放行不在本模块职责范围内。
 //!
 //! # 不支持的网关只花几个包
 //!
@@ -21,7 +21,7 @@
 //! # 映射出来的地址可信吗
 //!
 //! 不需要可信。它只是一个候选端点，和别的候选一样要用带签名的探测验证过才会用。
-//! 局域网里有人冒充网关，最多让节点多报一个连不上的地址。
+//! 即使局域网内存在伪造网关，最多导致节点多上报一个不可达地址。
 
 mod gateway;
 mod natpmp;
@@ -86,18 +86,18 @@ struct Refused {
     code: u16,
 }
 
-/// 一次映射（或者删除）没有成。
+/// 一次映射或删除操作失败。
 #[derive(Debug, thiserror::Error)]
 enum MapError {
-    #[error("网关没有回答")]
+    #[error("网关无响应")]
     Silent,
     #[error(transparent)]
     Refused(#[from] Refused),
-    #[error("和网关通信出错：{0}")]
+    #[error("与网关通信失败：{0}")]
     Io(#[from] io::Error),
     #[error("网关没有可用的公网地址")]
     NoExternalAddress,
-    #[error("网关给的有效期是 0")]
+    #[error("网关返回的有效期为 0")]
     ZeroLifetime,
     #[error("UPnP：{0}")]
     Upnp(String),
@@ -171,7 +171,7 @@ impl Target {
     /// 默认路由是 `route` 时往哪里发：各协议都用标准的端口和地址。本机朝着网关的地址不在地址转换后面时返回 `None`。
     fn behind(route: gateway::DefaultRoute) -> Option<Self> {
         if !gateway::needs_mapping(route.local) {
-            tracing::debug!(local = %route.local, "本机朝着网关的地址不在地址转换后面，不需要端口映射");
+            tracing::debug!(local = %route.local, "默认路由本地地址不在 NAT 之后，跳过端口映射");
             return None;
         }
         let gateway = IpAddr::V4(route.gateway);
@@ -314,7 +314,7 @@ impl PortMapper {
         self.send(Command::Shutdown(done));
         // 后台任务已经没了的话 `finished` 立刻出错返回，同样不用等。
         if tokio::time::timeout(self.release_wait + SHUTDOWN_SLACK, finished).await.is_err() {
-            tracing::warn!("端口映射没有来得及删掉（后台任务正忙着探测网关），它会在有效期到了之后自己消失");
+            tracing::warn!("未能在关闭超时前删除端口映射（后台任务正忙），映射将在有效期届满后自动失效");
         }
     }
 
@@ -381,7 +381,7 @@ impl Worker {
                     active.renew_at = self.next_renewal(&active);
                     self.active = Some(active);
                 }
-                None => tracing::debug!(local = %target.local, "网关不支持 PCP、NAT-PMP、UPnP 里的任何一种，或者都不肯给映射；过一阵再试"),
+                None => tracing::debug!(local = %target.local, "网关不支持 PCP、NAT-PMP 和 UPnP，或所有协议申请均失败；将在下次间隔后重试"),
             }
         }
         self.publish();
@@ -434,7 +434,7 @@ impl Worker {
         match self.map(&via, target.local, Protocol::Udp, self.config.port).await {
             Ok(lease) => Some((via, lease)),
             Err(error) => {
-                tracing::debug!(%error, "UPnP 网关不肯给映射");
+                tracing::debug!(%error, "UPnP UDP 端口映射申请失败");
                 None
             }
         }
@@ -445,7 +445,7 @@ impl Worker {
         for via in [Via::Pcp(gateway), Via::NatPmp(gateway)] {
             match self.map(&via, target.local, Protocol::Udp, self.config.port).await {
                 Ok(lease) => return Some((via, lease)),
-                Err(error) => tracing::debug!(protocol = via.name(), %gateway, %error, "这种端口映射协议在网关上用不了"),
+                Err(error) => tracing::debug!(protocol = via.name(), %gateway, %error, "通过当前协议申请 UDP 端口映射失败"),
             }
         }
         None
@@ -519,7 +519,7 @@ impl Worker {
                 Some(lease)
             }
             Err(error) => {
-                tracing::warn!(protocol = active.via.name(), %error, "TCP 端口映射不上，下次续期时再试");
+                tracing::warn!(protocol = active.via.name(), %error, "TCP 端口映射失败，将在下次 UDP 映射续期时重试");
                 None
             }
         }
@@ -537,12 +537,12 @@ impl Worker {
         match self.map(&active.via, active.target.local, Protocol::Udp, active.udp.external.port()).await {
             Ok(lease) => {
                 if lease.external != active.udp.external {
-                    tracing::info!(protocol = active.via.name(), external = %lease.external, "映射出来的 UDP 地址变了");
+                    tracing::info!(protocol = active.via.name(), external = %lease.external, "UDP 端口映射的外部地址已变更");
                 }
                 active.udp = lease;
             }
             Err(error) => {
-                tracing::warn!(protocol = active.via.name(), %error, "端口映射续不上，当它已经没有了，重新探测网关");
+                tracing::warn!(protocol = active.via.name(), %error, "UDP 端口映射续期失败，撤下已发布地址并重新探测网关");
                 // 先把地址撤下来再去探测：探测要花几秒，这期间别人不该再拿它当候选。
                 self.publish();
                 return false;
@@ -566,7 +566,7 @@ impl Worker {
                 match self.unmap(&active.via, active.target.local, Protocol::Tcp, &lease).await {
                     Ok(()) => tracing::info!(protocol = active.via.name(), external = %lease.external, "TCP 端口映射已删除"),
                     Err(error) => {
-                        tracing::warn!(protocol = active.via.name(), %error, "TCP 端口映射没有删掉，它会在有效期到了之后自己消失")
+                        tracing::warn!(protocol = active.via.name(), %error, "删除 TCP 端口映射失败，映射将在有效期届满后自动失效")
                     }
                 }
                 active.tcp = None;
@@ -586,7 +586,7 @@ impl Worker {
                 active.renew_at = Instant::now();
                 false
             }
-            // 原来的映射在旧的网络上，从新的地址够不着也删不掉，留给有效期。公布的结果等探测完了一起换。
+            // 原映射位于旧网络中，无法从新地址访问或删除，等待其自然过期。已发布地址待重新探测完成后统一更新。
             active @ (Some(_) | None) => {
                 *active = None;
                 true
@@ -611,8 +611,8 @@ impl Worker {
         };
         match tokio::time::timeout(self.timing.release_wait, removal).await {
             Ok(Ok(())) => tracing::info!(protocol = via.name(), "端口映射已删除"),
-            Ok(Err(error)) => tracing::warn!(protocol = via.name(), %error, "端口映射没有删掉，它会在有效期到了之后自己消失"),
-            Err(_) => tracing::warn!(protocol = via.name(), "网关迟迟不确认删除端口映射，不再等；它会在有效期到了之后自己消失"),
+            Ok(Err(error)) => tracing::warn!(protocol = via.name(), %error, "删除端口映射失败，映射将在有效期届满后自动失效"),
+            Err(_) => tracing::warn!(protocol = via.name(), "等待网关确认删除端口映射超时，映射将在有效期届满后自动失效"),
         }
         self.publish();
     }

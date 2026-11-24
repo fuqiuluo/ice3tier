@@ -3,7 +3,7 @@
 //! 路是连接层的事，入口和出口都不知道，所以由装配层交进来一个能问"到这个对端现在走哪条路"的东西（[`Routes`]）。
 //! 不交时摘要里的路是"不知道"。
 //!
-//! 走 ice3proxy（lane）的流不经过这对节点的共用连接，摘要里写的仍然是共用连接的路：流层看不出一条流底下是哪一种传输。
+//! 经 ice3proxy（lane）传输的流不经过该对节点的共用连接，摘要中记录的仍是共用连接的路径：流层无法区分底层使用的传输通道。
 
 use std::fmt;
 use std::sync::Arc;
@@ -51,7 +51,7 @@ impl RouteAtStart {
         Self { peer, route: routes.current(peer).map(|current| current.route), at: Instant::now() }
     }
 
-    /// 流结束时调：开始和结束时的路，和中间换没换过。换过又换回来的也算换过：结束时的路是在流开始之后换上的。
+    /// 在流结束时调用：返回流开始与结束时的路径，以及期间是否发生过路径切换。切换后又切回原路径仍计为发生过切换：结束时的路径是在流开始后重新切回的。
     #[must_use]
     pub fn ended(self, routes: &dyn Routes) -> RouteSpan {
         let now = routes.current(self.peer);
@@ -71,8 +71,8 @@ pub struct RouteSpan {
 }
 
 impl RouteSpan {
-    /// 写进日志的样子：`直连 203.0.113.7:20330`、`经 hk-1 → la-1`、`不可达`，不知道是 `?`。relay 的名字从 `netmap` 里找
-    /// （[`Netmap::node_name`]，和 `i3t routes`、`i3t ping` 一样），找不到的写 `#编号`。
+    /// 日志展示格式：`直连 203.0.113.7:20330`、`经 hk-1 → la-1`、`不可达`，未知时为 `?`。relay 名称从 `netmap` 中查找
+    /// （[`Netmap::node_name`]，与 `i3t routes`、`i3t ping` 保持一致），未找到时显示 `#编号`。
     #[must_use]
     pub fn start_label<'a>(&'a self, netmap: &'a Netmap) -> RouteLabel<'a> {
         RouteLabel { route: self.start.as_ref(), netmap }

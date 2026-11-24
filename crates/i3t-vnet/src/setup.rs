@@ -1,17 +1,16 @@
-//! 装、拆两条防火墙规则，去掉崩溃留下的；Linux 上让 systemd-resolved 把网络的域名交给本节点的名字服务。
+//! 防火墙规则的安装、卸载与异常遗留项清理；并在 Linux 上将虚拟网络域名配置至 systemd-resolved。
 //!
-//! 规矩：
+//! 设计原则：
 //!
-//! - 每条规则各自装：一条装不上（内核不认、没有权限）不妨碍另一条和网卡，状态里说清楚哪条为什么（[`RuleState::Failed`]）。
-//! - 开箱即用，不要求装哪个程序。Linux 上防冒充有 `nft` 用 nftables 的表，没有就用 `iptables` 在 `raw` 表里加一条，
-//!   两个都没有才装不上；放行的那条没有 `iptables` 时用不着（[`RuleState::NotNeeded`]），不算失败。
-//! - 不会多出一份。Linux 的表整张换（一个 nft 事务）；放行的那条正好一条、排在链的第一条，raw 表里防冒充的正好两条、排在链的
-//!   第一、二条，不是的话（崩溃留下的、地址段变了的、被别人挤到了后面的、以前的版本只有一条的）全删掉再插。表装上了，
-//!   以前（还没有 `nft` 时）加的 raw 规则拆掉。
-//!   Windows 的规则按名字先删再加，在同一段脚本里。
-//! - 只动认得出是自己的东西（见 [`crate::plan`]）。拆的时候每一样各自拆，一样失败不妨碍别的；没有那个程序、链所在的表不在时，
-//!   那一类东西本来就没有，不算失败（[`CommandError::means_absent`]）。
-//! - 崩溃留下的、它的网卡已经不在了的规则（这台机器上没有在跑的节点用着它），下次启动或者关着启动时拆掉（[`remove_leftovers`]）。
+//! - 规则独立安装：单条规则失败（如内核不支持或权限不足）不影响另一条规则及虚拟网卡本身，并在状态中明确记录原因（[`RuleState::Failed`]）。
+//! - 零额外依赖：Linux 防伪造规则优先使用 `nft`（nftables 表），不可用时自动回退至 `iptables` `raw` 表，仅当二者均不可用时失败；
+//!   入站放行规则在无 `iptables` 时标记为无需安装（[`RuleState::NotNeeded`]），不视为失败。
+//! - 幂等无重复：Linux nftables 表通过单次事务整表替换；`INPUT` 链放行规则始终唯一且位于第 1 条，`raw` 表防伪造规则始终为第 1、2 条，
+//!   若存在残留、网段变化、顺序偏移或旧版单条规则则全部清除后重建；成功安装 nftables 表后会自动清理此前遗留的 `raw` 表规则。
+//!   Windows 规则在同一脚本内按名称先删后建。
+//! - 严格限定自有范围（见 [`crate::plan`]）：清理时各项独立执行，单项失败不阻断其余项；对应程序或内核表不存在时视为无残留，
+//!   不作为失败返回（[`CommandError::means_absent`]）。
+//! - 孤立遗留清理：异常崩溃遗留且对应虚拟网卡已不存在（无运行中节点使用）的规则，会在下次启动时自动清除（[`remove_leftovers`]）。
 
 use std::net::Ipv4Addr;
 use std::thread;
@@ -25,7 +24,7 @@ use crate::machine::{CommandError, Machine, Program};
 use crate::plan::{Plan, linux, windows};
 use crate::survey::{AcceptRule, GuardRule, Survey};
 
-/// 一个程序的失败写成状态里的原因。
+/// 将外部命令错误转换为上报状态用的结构化原因。
 #[must_use]
 pub fn cause(error: CommandError) -> VnetCause {
     match error {
@@ -43,7 +42,7 @@ fn state(result: Result<(), CommandError>) -> RuleState {
     }
 }
 
-/// 在 `platform` 上按 `plan` 装上两条规则（本机的开关打开着时才调用）。
+/// 按 `plan` 在目标平台 `platform` 上安装防火墙规则（仅在防火墙开关启用时调用）。
 pub fn install_firewall(machine: &mut impl Machine, platform: Platform, plan: &Plan) -> Firewall {
     match platform {
         Platform::Linux => {
@@ -51,8 +50,8 @@ pub fn install_firewall(machine: &mut impl Machine, platform: Platform, plan: &P
             let guard = match machine.run(Program::Nft, &args(&["-f", "-"]), Some(&linux::guard_script(&plan.device, plan.own, plan.cidr)))
             {
                 Ok(_) => {
-                    // 表装上了：还没有 nft 时加的那条 raw 规则拆掉。读不了 raw 表（没有 iptables、内核里没有这张表、没有权限）时
-                    // 那里也就没有拆得了的；拆不掉也不要紧，它和表管的是同一件事。表照样算装上了。
+                    // nftables 表已生效：清理此前无 nft 时添加的 raw 表防伪造规则。若无法读取 raw 表（如缺少 iptables、
+                    // 内核无 raw 表模块或权限不足）则跳过；即便清理失败也不影响已生效的 nftables 表。
                     if let Ok(found) = &survey.guard_rules {
                         for rule in found.iter().filter(|rule| rule.device == plan.device) {
                             let _stale = delete_guard_rule(machine, rule);
@@ -78,11 +77,11 @@ pub fn install_firewall(machine: &mut impl Machine, platform: Platform, plan: &P
     }
 }
 
-/// 拆掉 `device` 的规则：放行的那条，防冒充的表和 raw 规则（哪种都可能在：`nft` 可能是后来装上的）。返回第一个失败（多半是没有权限）。
+/// 卸载指定虚拟网卡 `device` 关联的防火墙规则（包括放行规则、nftables 防伪造表及可能遗留的 `raw` 表规则），返回首个错误（通常为权限不足）。
 ///
 /// # Errors
 ///
-/// 某一条拆不掉，或者读不了现在有哪些。别的照样拆了。没有那个程序、链所在的表不在不算：那一类东西本来就没有。
+/// 若任一规则查询或删除失败则返回首个错误，其余规则仍会继续清理。对应程序或表不存在时视为无残留，不返回错误。
 pub fn remove_firewall(machine: &mut impl Machine, platform: Platform, device: &str) -> Result<(), CommandError> {
     match platform {
         Platform::Linux => {
@@ -97,12 +96,12 @@ pub fn remove_firewall(machine: &mut impl Machine, platform: Platform, device: &
     }
 }
 
-/// 拆掉崩溃留下的规则：Linux 上是网卡已经不在了的那些（`present` 是这台机器上现在有的网卡的名字：在的网卡有节点程序用着，
-/// 它的规则不归这里管）；Windows 上网卡的名字是固定的，`present` 里没有它时它的那条就是留下的。返回拆了几样。
+/// 清理异常崩溃遗留的孤立防火墙规则：Linux 清理对应虚拟网卡已不在 `present` 列表中的规则（仍在运行的网卡规则保持不变）；
+/// Windows 网卡名固定，当 `present` 不包含该网卡时清理其同名规则。返回实际清理的条目数。
 ///
 /// # Errors
 ///
-/// 读不了或者拆不掉（Linux 上别的项照样拆了）。没有那个程序、链所在的表不在不算：那一类东西本来就没有。
+/// 查询或删除失败时返回错误（Linux 上其余项仍会继续清理）。对应程序或表不存在时视为无残留，不返回错误。
 pub fn remove_leftovers(machine: &mut impl Machine, platform: Platform, present: &[String]) -> Result<usize, CommandError> {
     match platform {
         Platform::Linux => {
@@ -128,7 +127,7 @@ pub fn remove_leftovers(machine: &mut impl Machine, platform: Platform, present:
     }
 }
 
-/// Linux 上放行的那条正好一条、排在 INPUT 的第一条；不是的话（崩溃留下的、被别人挤到了后面的）全删掉再插一条。
+/// 确保 Linux `INPUT` 链仅存在一条自有放行规则且位于第 1 位；若存在重复或位置偏移则先全部删除再插入首条。
 fn install_accept(machine: &mut impl Machine, device: &str, found: &[AcceptRule]) -> Result<(), CommandError> {
     let ours: Vec<usize> = found.iter().filter(|rule| rule.device == device).map(|rule| rule.position).collect();
     if ours == [1] {
@@ -140,12 +139,11 @@ fn install_accept(machine: &mut impl Machine, device: &str, found: &[AcceptRule]
     machine.run(Program::Iptables, &linux::insert_accept(device), None).map(drop)
 }
 
-/// 没有 `nft` 时的防冒充：`raw` 表 PREROUTING 链的第一、二条正好是这块网卡的、地址段和虚拟 IP 是现在的那两条（按来源的在前，
-/// 按目的的在后）；不是的话（崩溃留下的、地址段或者虚拟 IP 变了的、被别人挤到了后面的、以前的版本只有按来源的一条）这块网卡的
-/// 全删掉再插。
-/// `found` 是读回来的这条链。
+/// 无 `nft` 时的防伪造规则安装：确保 `raw` 表 `PREROUTING` 链第 1、2 条严格匹配当前网卡、网段与虚拟 IP
+/// （源地址规则在前，目的地址规则在后）；否则先清理该网卡的所有旧规则再重新插入。
+/// `found` 为预先探测的当前链规则。
 ///
-/// 两个程序都没有时说缺 `nft`：装上它就是本来的做法，状态里写的是要装 nftables。
+/// 当 `nft` 与 `iptables` 均缺失时报告缺少 `nft`（首选方案为 nftables）。
 fn install_raw_guard(machine: &mut impl Machine, plan: &Plan, found: Result<Vec<GuardRule>, CommandError>) -> Result<(), CommandError> {
     let found = found.map_err(|error| match error {
         CommandError::Missing(_) => CommandError::Missing(Program::Nft),
@@ -168,7 +166,7 @@ fn install_raw_guard(machine: &mut impl Machine, plan: &Plan, found: Result<Vec<
     Ok(())
 }
 
-/// 拆掉读回来的一项里 `pick` 挑出来的每一样，返回拆了几样。要读的东西根本不在（没有那个程序、链所在的表不在）时一样也没有。
+/// 对探测结果中满足 `pick` 条件的每一项调用 `remove` 清理，返回清理数量。若目标程序或表不存在则视为 0 项。
 fn remove_each<T>(
     found: Result<Vec<T>, CommandError>,
     pick: impl Fn(&T) -> bool,
@@ -181,22 +179,22 @@ fn remove_each<T>(
     found.iter().filter(|thing| pick(thing)).try_fold(0, |removed, thing| remove(thing).map(|()| removed + 1))
 }
 
-/// 拆掉 Linux 上自己的一张表。
+/// 删除指定的 Linux nftables 表。
 fn remove_table(machine: &mut impl Machine, name: &str) -> Result<(), CommandError> {
     machine.run(Program::Nft, &args(&["-f", "-"]), Some(&linux::remove_table_script(name))).map(drop)
 }
 
-/// 删一条 Linux 上自己的放行规则。规则已经不在了不算错。
+/// 删除 Linux `INPUT` 链中的自有放行规则；规则已不存在时不视为错误。
 fn delete_accept(machine: &mut impl Machine, device: &str) -> Result<(), CommandError> {
     delete_iptables_rule(machine, &linux::delete_accept(device))
 }
 
-/// 删一条 Linux 上自己的防冒充规则，按读回来的样子。规则已经不在了不算错。
+/// 按探测到的原样规则删除 Linux `raw` 表防伪造规则；规则已不存在时不视为错误。
 fn delete_guard_rule(machine: &mut impl Machine, rule: &GuardRule) -> Result<(), CommandError> {
     delete_iptables_rule(machine, &linux::delete_guard(&rule.rule))
 }
 
-/// 删一条 iptables 规则：已经不在了（别人删了，同样的两条删第二遍）不算错。
+/// 删除单条 iptables 规则；若规则已被提前移除则忽略对应错误。
 fn delete_iptables_rule(machine: &mut impl Machine, args: &[String]) -> Result<(), CommandError> {
     match machine.run(Program::Iptables, args, None) {
         Err(error) if !error.says("does a matching rule exist") && !error.says("bad rule") => Err(error),
@@ -204,21 +202,22 @@ fn delete_iptables_rule(machine: &mut impl Machine, args: &[String]) -> Result<(
     }
 }
 
-/// 删 Windows 上这个名字的规则。没有这条规则不算错（脚本自己这样写的）。
+/// 删除 Windows 上对应网卡的防火墙规则；规则不存在时不视为错误（由脚本保证）。
 fn delete_windows_rule(machine: &mut impl Machine, device: &str) -> Result<(), CommandError> {
     machine.run(Program::PowerShell, &windows::invocation(&windows::remove_script(device)), None).map(drop)
 }
 
-/// systemd-resolved 刚知道一块新网卡要一点时间，这期间说"不认识这块网卡"。最多等这么多次、每次这么久。
+/// systemd-resolved 感知新建虚拟网卡需要短暂延迟，期间会返回 "not known"；此处为最大重试次数与间隔。
 const LINK_KNOWN_TRIES: u32 = 20;
 const LINK_KNOWN_PAUSE: Duration = Duration::from_millis(100);
 
-/// Linux：让 systemd-resolved 只把 `domain` 下面的名字发给 `server`（本节点虚拟 IP 上的名字服务），挂在网卡 `device` 上：
-/// 这块网卡不是默认的 DNS 路线，别的名字照旧由原来的服务器解析，本节点不会变成这台机器的解析器。
+/// Linux：配置 systemd-resolved 将 `domain` 下的 DNS 查询经虚拟网卡 `device` 路由至本节点名称服务 `server`：
+/// 明确关闭该网卡的默认 DNS 路由，其他域名继续沿用系统原有解析器。
 ///
-/// 设置只在内存里，网卡删掉就没了，不写任何文件。没有 systemd-resolved 时是 [`NameService::NoResolver`]：名字用 `i3t hosts`。
+/// 该配置仅存于内存，不修改磁盘文件，虚拟网卡销毁后自动清除。系统无可用 systemd-resolved 时返回 [`NameService::NoResolver`]，
+/// 用户可改用 `i3t hosts`。
 pub fn configure_resolver(machine: &mut impl Machine, device: &str, domain: &str, server: Ipv4Addr) -> NameService {
-    // 先定路由域、再说"不是默认路线"，最后才给服务器：有了服务器的那一刻，这块网卡就只收这个域名的查询。
+    // 按序配置路由域、禁用默认路由，最后再指定 DNS 服务器：确保生效瞬间该接口仅承接目标域名的查询。
     let steps = [
         args(&["domain", device, &format!("~{domain}")]),
         args(&["default-route", device, "false"]),
@@ -235,7 +234,7 @@ pub fn configure_resolver(machine: &mut impl Machine, device: &str, domain: &str
                 }
                 Err(error) if resolver_absent(&error) => return NameService::NoResolver,
                 Err(error) => {
-                    // 做了一半的设置撤掉：太旧的 systemd-resolved（没有 default-route）会把这块网卡当成默认路线。
+                    // 回滚已完成的部分配置：较旧版本 systemd-resolved 不支持 default-route，可能将该网卡误设为默认 DNS 路由。
                     let _undone = machine.run(Program::Resolvectl, &args(&["revert", device]), None);
                     return NameService::Failed { cause: cause(error) };
                 }
@@ -245,7 +244,7 @@ pub fn configure_resolver(machine: &mut impl Machine, device: &str, domain: &str
     NameService::Resolved
 }
 
-/// 这个失败说明机器上没有可用的 systemd-resolved，而不是它拒绝了。
+/// 判断错误是否表明系统未运行或未安装 systemd-resolved（而非权限拒绝等配置失败）。
 fn resolver_absent(error: &CommandError) -> bool {
     matches!(error, CommandError::Missing(_))
         || ["connect to bus", "not found", "could not activate", "no such file", "not running", "connection refused"]

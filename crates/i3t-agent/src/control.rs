@@ -3,15 +3,15 @@
 //! 节点用它做这些事：第一次加入时注册（[`enroll`]）；收 netmap 并确认；定期上报；转发信令；
 //! 收更新的指令、取更新包（[`Packages`]）；回答"到某个对端现在怎么走"和"手上的骨干矩阵"的查询；
 //! 收主动测试的指令、送回测试的结果。
-//! 连接断了就带退避地重连，这期间节点按手上最后一份 netmap 照常工作。
-//! 被吊销，或者 controller 明说不认这个节点（`Rejected`）时，不再重连。controller 说它自己出了错（`TryLater`）时
-//! 照常带退避地重连：那不是不认这个节点。
+//! 连接断开后带退避重连，重连期间节点按本地最后一份 netmap 继续运行。
+//! 被吊销或 controller 明确拒绝本节点（`Rejected`）时不再重连；controller 返回自身临时故障（`TryLater`）时
+//! 仍带退避重连，这不代表节点身份被拒绝。
 //!
 //! 上报里的路由表：每次连上之后的第一次上报是完整的，之后只带变化的条目（延迟的小幅波动不算变化）。
 //! 每条路的细节（[`Report::route_kinds`]）跟着它的条目走：条目要报的时候细节也报，细节变了条目也重报。
 //! 这件事在这里做，因为只有这里知道一条连接从哪里开始。
 //!
-//! 收到解析不了的一帧（多半是更新版本的 controller 才有的消息）就跳过，连接接着用。
+//! 无法解析的帧会被跳过，连接仍可使用。常见原因是 controller 发送了当前版本无法识别的消息。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ use crate::texts::{CONNECT_ZH, Connect, texts};
 pub const ALPN: &[u8] = b"i3t-ctl/1";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// 信令是尽力而为的：排队超过这个数说明另一头处理不过来，新的直接丢掉，发起方会重试。
+/// 信令采用尽力而为投递：队列积压超过此上限说明消费端无法及时处理，新信令直接丢弃，由发起方重试。
 const SIGNAL_QUEUE: usize = 64;
 /// controller 的更新指令最多排这么多条。它们是一条顶替一条的，正常情况下只有一条在排。
 const ORDER_QUEUE: usize = 8;
@@ -65,7 +65,7 @@ const ATTEMPT_SLACK_SECS: u64 = 2;
 ///
 /// # Errors
 ///
-/// 连不上 controller、controller 的公钥不对、令牌被拒绝，或者回答不符合协议。
+/// 无法连接 controller、controller 公钥不匹配、令牌被拒绝，或应答不符合协议。
 pub async fn enroll(controller: &ControllerInfo, key: &NodeKey, secret: &str, hello: Hello) -> anyhow::Result<Netmap> {
     let said = texts();
     let mut stream = connect(controller, key, &said.connect).await?;
@@ -91,14 +91,14 @@ pub async fn enroll(controller: &ControllerInfo, key: &NodeKey, secret: &str, he
     }
 }
 
-/// 和 controller 握一次手就断开，不报到：新程序的自检用它确认"这台机器上的这个程序连得上 controller"。
+/// 与 controller 完成一次握手后即断开，不上报身份：新版本自检用于确认当前程序能够连接 controller。
 ///
-/// 握手是双向认证的 TLS：本节点按公钥认 controller，controller 收下本节点的证书。之后不发 `Hello`，直接正常关闭，
-/// 并等 controller 也关闭。不报到是因为这时旧程序还连着：报到的话 controller 会以为节点重连了，把旧程序的连接挤掉。
+/// 握手采用双向认证的 TLS：本节点按公钥校验 controller，controller 验证本节点证书。随后不发送 `Hello`，直接正常关闭，
+/// 并等待 controller 关闭连接。不上报身份是因为此时旧进程仍在线：上报身份会导致 controller 判定节点重连并断开旧连接。
 ///
 /// # Errors
 ///
-/// 连不上 controller、controller 的公钥不对，或者 controller 拒绝了这次握手。
+/// 无法连接 controller、controller 公钥不匹配，或 controller 拒绝了本次握手。
 pub async fn probe(controller: &ControllerInfo, key: &NodeKey) -> anyhow::Result<()> {
     let said = texts();
     let mut stream = connect(controller, key, &said.connect).await?;
@@ -124,10 +124,10 @@ pub enum UpdateCommand {
     Cancel,
 }
 
-/// 经长连接从 controller 取更新包。可以克隆，带进别的任务里用。
+/// 经长连接从 controller 拉取更新包。可克隆后在多个任务中使用。
 ///
-/// 链路的任何问题（没连上、断了、controller 迟迟不回答）都报成"被打断"，下载的一方过一会儿从同一个位置再要；
-/// 只有 controller 明说给不了的才是"给不了"。
+/// 链路异常（未连接、连接断开、等待 controller 应答超时）均报告为“已中断”，下载方稍后从同一偏移继续请求；
+/// 仅当 controller 明确返回不可用时才报告为不可用。
 #[derive(Debug, Clone)]
 pub struct Packages {
     requests: mpsc::Sender<Request>,
@@ -139,11 +139,11 @@ impl PackageSource for Packages {
         let chunk =
             Chunk { version: request.version.clone(), platform: request.platform.clone(), offset: request.offset, len: request.len };
         let interrupted = |reason: &str| SourceError::Interrupted(reason.to_owned());
-        self.requests.send(Request::Chunk { chunk, reply }).await.map_err(|_| interrupted("和 controller 的长连接已经停止"))?;
+        self.requests.send(Request::Chunk { chunk, reply }).await.map_err(|_| interrupted("与 controller 的长连接已停止"))?;
         match timeout(CHUNK_TIMEOUT, answer).await {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Err(interrupted("和 controller 的连接断了")),
-            Err(_) => Err(interrupted("controller 迟迟没有给这一段")),
+            Ok(Err(_)) => Err(interrupted("与 controller 的连接已断开")),
+            Err(_) => Err(interrupted("等待 controller 返回更新包分段超时")),
         }
     }
 }
@@ -171,14 +171,14 @@ enum Request {
 }
 
 impl Request {
-    /// 没有连着 controller，这件事现在做不了：取包的会过一会儿从同一个位置再要，等上报写出去的不用再等。
+    /// 当前未连接 controller，无法立即处理请求：拉取分段的调用方稍后从同一位置重试，等待上报写出的调用方不再等待。
     fn turn_away(self) {
         match self {
             Self::Chunk { reply, .. } => {
-                // 要的人不等了也无妨。
-                let _gone = reply.send(Err(SourceError::Interrupted("还没有连上 controller".to_owned())));
+                // 调用方已放弃等待时忽略发送失败。
+                let _gone = reply.send(Err(SourceError::Interrupted("尚未连接 controller".to_owned())));
             }
-            // 丢掉 `written`：等的人看到的是"没有写出去"。
+            // 丢弃 `written`，通知等待方本次上报未写出。
             Self::Report { .. } => {}
         }
     }
@@ -187,12 +187,12 @@ impl Request {
 /// 这条长连接现在的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
-    /// 还没连上，或者断了正在重连。
+    /// 尚未连接，或断开后正在重连。
     Offline,
     Online,
     /// controller 吊销了这个节点。不再重连。
     Revoked,
-    /// controller 不认这个节点（例如它被删除时本节点不在线）。不再重连，要重新加入。
+    /// controller 拒绝了本节点（例如节点被删除时本节点处于离线状态）。停止重连，需重新加入网络。
     Rejected,
 }
 
@@ -231,7 +231,7 @@ impl Default for Timing {
 pub struct LinkSetup {
     pub controller: ControllerInfo,
     pub key: Arc<NodeKey>,
-    /// 启动时手上的 netmap（来自注册，或者上次存下来的）。
+    /// 启动时持有的初始 netmap（来自注册或本地持久化副本）。
     pub initial: Arc<Netmap>,
     /// 当前的自我介绍。本地声明变了就往里放一个新值，长连接会把它发给 controller。
     pub hello: watch::Receiver<Hello>,
@@ -246,7 +246,7 @@ pub struct LinkSetup {
     pub report_now: Arc<Notify>,
     /// controller 的主动测试指令交给它。在长连接的任务里调用，不能阻塞。
     pub tests: Box<dyn Fn(TestMessage) + Send + Sync>,
-    /// 主动测试的结果从这里取出来送给 controller。没有连着的时候留在队列里，连上之后再送（controller 不认的会丢掉）。
+    /// 主动测试结果从此通道取出并发送给 controller。离线期间暂存在队列中，重连后继续发送（controller 不识别的条目会被丢弃）。
     pub test_reports: mpsc::Receiver<TestReport>,
     /// controller 的出口测试交给它：编号、主机、端口。在长连接的任务里调用，不能阻塞。
     pub exit_tests: Box<dyn Fn(u64, String, u16) + Send + Sync>,
@@ -389,7 +389,7 @@ impl Worker {
                     return;
                 }
                 Ok(Ended::Rejected(reason)) => {
-                    tracing::warn!(%reason, "controller 不认这个节点，不再连接；要重新加入网络");
+                    tracing::warn!(%reason, "本节点接入请求被 controller 拒绝，已停止重连。请重新加入网络。");
                     self.state.send_replace(LinkState::Rejected);
                     return;
                 }
@@ -404,7 +404,7 @@ impl Worker {
         }
     }
 
-    /// 没连着的时候等 `pause`。这期间来的请求不排着等下一条连接，马上告诉对方做不了。
+    /// 未连接期间等待 `pause`。期间收到的请求不排队等待下次连接，立即通知调用方当前不可处理。
     async fn idle(&mut self, pause: Duration) {
         let resume = tokio::time::sleep(pause);
         tokio::pin!(resume);
@@ -416,7 +416,7 @@ impl Worker {
         }
     }
 
-    /// 连 controller。连上之前来的请求同样马上告诉对方做不了：连接可能要等到超时才知道连不上。
+    /// 连接 controller。连接建立前收到的请求同样立即通知调用方当前不可处理，避免阻塞至连接超时。
     async fn connect(&mut self) -> anyhow::Result<TlsStream<TcpStream>> {
         // 长连接出的错只进日志，日志是中文的。
         let connecting = connect(&self.setup.controller, &self.setup.key, &CONNECT_ZH);
@@ -463,8 +463,8 @@ impl Worker {
                         }
                         ToNode::Revoked => return Ok(Ended::Revoked),
                         ToNode::Rejected { reason, .. } => return Ok(Ended::Rejected(reason)),
-                        // controller 自己出了错，不是不认这个节点：当作连接断了，带退避地重连。
-                        ToNode::TryLater { reason } => bail!("controller 这一次接待不了本节点，稍后重连：{reason}"),
+                        // controller 返回自身临时故障，并非拒绝本节点：按连接断开处理，带退避重连。
+                        ToNode::TryLater { reason } => bail!("controller 暂时无法处理本节点接入请求，稍后重连：{reason}"),
                         ToNode::Heartbeat => {}
                         ToNode::Update { manifest, timing } => self.pass_on(UpdateCommand::Update { manifest, timing }),
                         ToNode::UpdateCancel => self.pass_on(UpdateCommand::Cancel),
@@ -534,13 +534,13 @@ impl Worker {
 
     fn pass_on(&self, command: UpdateCommand) {
         if self.orders.try_send(command).is_err() {
-            tracing::warn!("没有人在处理更新的指示（或者积压太多），丢掉一条");
+            tracing::warn!("更新指令未处理或队列已满，已丢弃一条更新指令");
         }
     }
 
     fn apply(&self, netmap: Netmap) {
         if let Err(err) = self.setup.state.save_netmap(&netmap) {
-            // 存不下来不影响这次运行，只是下次启动拿不到这一版。
+            // 持久化失败不影响本次运行，仅导致下次启动时无法加载该版本。
             tracing::warn!("保存 netmap 失败：{err:#}");
         }
         tracing::info!(version = netmap.version, peers = netmap.peers.len(), relays = netmap.relays.len(), "应用新的 netmap");
@@ -549,9 +549,9 @@ impl Worker {
 }
 
 impl Session {
-    /// 记下一个在等回答的取包请求，返回给它编的号。
+    /// 登记一个等待应答的更新包分段请求，返回其请求编号。
     fn expect(&mut self, reply: oneshot::Sender<Result<Vec<u8>, SourceError>>) -> u64 {
-        // 要的人等不及走了的，顺手清掉。
+        // 清理调用方已放弃等待的请求。
         self.chunks.retain(|_, reply| !reply.is_closed());
         self.next_request += 1;
         self.chunks.insert(self.next_request, reply);
@@ -560,9 +560,9 @@ impl Session {
 
     fn answer(&mut self, request: u64, outcome: Result<Vec<u8>, SourceError>) {
         match self.chunks.remove(&request) {
-            // 要的人不等了也无妨。
+            // 调用方已放弃等待时忽略发送失败。
             Some(reply) => drop(reply.send(outcome)),
-            None => tracing::debug!(request, "controller 回答了一个没有人在等的取包请求"),
+            None => tracing::debug!(request, "收到无对应等待方的更新包分段应答，已忽略"),
         }
     }
 
@@ -645,8 +645,8 @@ fn kind_differs(before: &ReportedRoute, now_kind: Option<&RouteKind>, now: Insta
 
 /// 一条连接上的读取任务，以及它读出来的消息。
 ///
-/// 丢弃它时任务必须立刻停：任务平时停在"等对端发数据"上，握着连接的读半边。
-/// 不停的话会话结束了连接也关不掉，controller 那边看不到这个节点已经断开。
+/// 丢弃时任务必须立刻中止：任务常态阻塞在等待对端数据上并持有连接读半部，
+/// 若不及时中止，会话结束后连接无法关闭，controller 侧将无法感知节点已断开。
 struct Reader {
     messages: mpsc::Receiver<anyhow::Result<ToNode>>,
     task: JoinHandle<()>,
@@ -658,9 +658,9 @@ impl Drop for Reader {
     }
 }
 
-/// 把完整的消息一条条放进队列。连接结束或出错时放进一个错误然后退出。
+/// 将完整消息逐条送入队列。连接结束或出错时发送错误并退出。
 ///
-/// 帧是完整的、只是内容解析不了的时候不算出错：多半是更新版本的 controller 才有的消息，跳过它接着读。
+/// 完整帧但内容无法解析时不视为连接错误：常见原因是 controller 发送了新版本消息，跳过该帧继续读取。
 fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(mut reader: R) -> Reader {
     let (tx, messages) = mpsc::channel(16);
     let task = tokio::spawn(async move {
@@ -669,7 +669,7 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(mut reader: R) -> Reader 
                 Ok(Some(frame)) => match serde_json::from_slice(&frame) {
                     Ok(message) => Ok(message),
                     Err(err) => {
-                        tracing::debug!("忽略 controller 发来的一条解析不了的消息：{err}");
+                        tracing::debug!("无法解析 controller 消息，已忽略：{err}");
                         continue;
                     }
                 },
@@ -706,7 +706,7 @@ async fn connect(controller: &ControllerInfo, key: &NodeKey, said: &Connect) -> 
 pub async fn write_message<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, message: &T) -> anyhow::Result<()> {
     let body = serde_json::to_vec(message).context("序列化消息")?;
     ensure!(body.len() <= MAX_FRAME_LEN, "消息有 {} 字节，超过上限 {MAX_FRAME_LEN}", body.len());
-    let len = u32::try_from(body.len()).context("消息长度放不进 4 个字节")?;
+    let len = u32::try_from(body.len()).context("消息长度超出 4 字节表示范围")?;
     let mut frame = Vec::with_capacity(size_of::<u32>() + body.len());
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&body);
@@ -729,7 +729,7 @@ pub async fn read_message<R: AsyncRead + Unpin, T: DeserializeOwned>(reader: &mu
 /// 读一帧的内容，不解析。对端在两帧之间正常关闭连接时返回 `None`。
 async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
     let len = match reader.read_u32().await {
-        Ok(len) => usize::try_from(len).context("消息长度超出了这台机器的地址范围")?,
+        Ok(len) => usize::try_from(len).context("消息长度超出当前平台地址空间范围")?,
         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(err).context("读消息长度"),
     };

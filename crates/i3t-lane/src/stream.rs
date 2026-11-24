@@ -7,16 +7,16 @@
 //! - sealed：两个方向一直在 TLS 里，数据是 DATA 帧，正常结束是 close_notify 加 FIN。没有 close_notify 的 FIN 是截断，按异常结束算。
 //! - passthrough：每个方向在自己的 SWITCH 所在的记录之后离开 TLS。接受方在 REPLY 之后、确认可以不再加密时调
 //!   [`LaneSend::end_header`] 发出它的（流层是在目标的 TLS 1.3 ServerHello 之后）；发起方收到它时回一个，自己的方向跟着离开
-//!   （[`Mode::Mutual`]）。接受方不发，两个方向就一直留在 TLS 里，对端照样读得懂：目标回的是 HelloRetryRequest、TLS 1.2
-//!   或者根本不是 TLS 时，客户端接下来发的（第二个 ClientHello、客户端证书、明文）都还加密（issue #34）。
-//!   离开之后是用户的原始字节，FIN 就是结束，RST 或者出错就是异常结束。
+//!   （[`Mode::Mutual`]）。若接受方未发送，双向保持在 TLS 内，对端仍可正常解析：当目标返回 HelloRetryRequest、TLS 1.2
+//!   或非 TLS 响应时，客户端后续发送的数据（第二个 ClientHello、客户端证书、明文）仍受加密保护（issue #34）。
+//!   退出 TLS 后传输用户原始字节，以 FIN 表示正常结束，以 RST 或错误表示异常结束。
 //!
-//! 对端是没升级的节点（lane 谈定的是 `i3t-lane/1`）时，本端发起的流一律 sealed：那边不认"等 SWITCH"。
+//! 对端为未升级节点（lane 协商版本为 `i3t-lane/1`）时，本端发起的流一律采用 sealed 模式：对端不支持等待 SWITCH。
 //! 那边发起的 passthrough 流照旧：它的方向在 OPENING 所在的记录之后就离开 TLS（[`Mode::Early`]），只有接受方发 SWITCH。
 //!
 //! 流层的头（OPEN、REPLY）决定连谁、连上了没有，只能来自认证过的对端，所以它们必须完整地在 TLS 里：
-//! 收的一方读完对端的头（[`RecvStream::end_header`]）之前，接收方向只交出 TLS 里收到的字节；对端的方向离开了 TLS、
-//! 头却还没读完时读出错（对端不守协议），不会拿后面未经认证的原始字节去凑。
+//! 接收方在读完对端流头（[`RecvStream::end_header`]）前，仅交付 TLS 内收到的字节；若对端在流头尚未读完时便退出 TLS，
+//! 读取将报错（对端违反协议），不会将后续未经认证的原始字节拼入流头。
 //!
 //! # 异常结束
 //!
@@ -26,12 +26,12 @@
 //! |---|---|
 //! | [`SendStream::reset`]，这个方向还在 TLS 里 | ABORT 帧（带原因码），随后 FIN；两个方向都丢弃之后等对端关掉再关，那时发 RST |
 //! | [`SendStream::reset`]，这个方向已经是原始字节 | RST（Linux 上立刻发，别处在关闭时） |
-//! | [`RecvStream::stop`]，本端的发送方向还在 TLS 里 | STOP 帧（带原因码），对端之后的写出错；lane 不断，本端的发送照常 |
+//! | [`RecvStream::stop`]，本端发送方向仍在 TLS 内 | STOP 帧（带原因码），对端后续写入失败；lane 不断开，本端发送继续 |
 //! | [`RecvStream::stop`]，本端的发送方向已经不在 TLS 里 | RST |
 //! | 没有 `shutdown` 就丢弃发送方向 | 同 `reset` |
 //!
 //! lane 从开流起就设成"关闭时发 RST"，只有两个方向都正常结束才改回去，所以任务被取消、进程退出也一样。
-//! macOS 上是在发送方向正常结束、发 FIN 时就改回去：那里两个方向都关了之后改不了（见 `i3t_underlay::tcp_reset`）。
+//! macOS 上会在发送方向正常关闭、发送 FIN 时即恢复正常关闭：该平台在双向关闭后无法再修改 `SO_LINGER`（见 `i3t_underlay::tcp_reset`）。
 //! 收到的 RST 在读写时是一个不带原因码的连接错误（分不清是对端重置了流，还是路上断了），ABORT 帧是带原因码的
 //! [`StreamAborted::Reset`]，STOP 帧让本端之后的写返回 [`StreamAborted::Stopped`]。
 //!
@@ -129,7 +129,7 @@ impl Shared {
 
     fn check_revoked(&self, wait: &mut RevocationWait, cx: &mut Context<'_>) -> io::Result<()> {
         if self.is_revoked() || wait.as_mut().poll(cx).is_ready() {
-            return Err(io::Error::new(io::ErrorKind::ConnectionReset, "对端的 lane 授权已经吊销"));
+            return Err(io::Error::new(io::ErrorKind::ConnectionReset, "对端 lane 授权已吊销"));
         }
         Ok(())
     }
@@ -155,9 +155,9 @@ enum SendState {
 enum RecvState {
     /// 在 TLS 里，里面是收到了、还没交出去的数据。
     Sealed(Bytes),
-    /// 对端的方向已经离开 TLS，本端还没读完对端的头（[`RecvStream::end_header`]）。`sealed` 是 TLS 里收到、还没交出去的最后一点，
-    /// `raw` 是那之后已经从 socket 读进来的原始字节。这时只交出 `sealed`：它读完了头还没完，就是对端不守协议，
-    /// 不能拿未经认证的原始字节去凑对端的头。头读完时并成 [`RecvState::Raw`]。
+    /// 对端发送方向已退出 TLS，本端尚未读完对端流头（[`RecvStream::end_header`]）。`sealed` 为 TLS 内已收到但尚未交付的尾部字节，
+    /// `raw` 为其后已从 socket 读入的原始字节。此时仅交付 `sealed`：若 `sealed` 耗尽而流头仍未结束，则属于对端违反协议，
+    /// 不能使用未经认证的原始字节补全流头。流头读完后合并为 [`RecvState::Raw`]。
     Leaving {
         sealed: Bytes,
         raw: Bytes,
@@ -184,8 +184,8 @@ impl Failure {
     fn to_io(&self) -> io::Error {
         match self {
             Self::Reset(code) => StreamAborted::Reset(*code).into(),
-            Self::Protocol(what) => io::Error::new(io::ErrorKind::InvalidData, format!("lane 上的对端不守协议：{what}")),
-            Self::Truncated => io::Error::new(io::ErrorKind::UnexpectedEof, "lane 在 close_notify 之前就结束了：数据被截断"),
+            Self::Protocol(what) => io::Error::new(io::ErrorKind::InvalidData, format!("lane 对端违反协议：{what}")),
+            Self::Truncated => io::Error::new(io::ErrorKind::UnexpectedEof, "lane 在收到 close_notify 前关闭，数据被截断"),
             Self::Io(kind, message) => io::Error::new(*kind, message.clone()),
         }
     }
@@ -209,7 +209,7 @@ struct State {
     out: BytesMut,
     send: SendState,
     recv: RecvState,
-    /// 本端读完了对端的头（[`RecvStream::end_header`]，或者交出了原始的接收方向）：之后接收方向离开 TLS 时可以接着读原始字节。
+    /// 本端已读完对端流头（已调用 [`RecvStream::end_header`] 或移交原始接收方向）：此后接收方向离开 TLS 时可继续读取原始字节。
     header_read: bool,
     /// 对端叫停了本端的发送（STOP），或者异常结束了整条流（ABORT）：本端之后的写都返回它。
     send_refused: Option<StreamAborted>,
@@ -223,7 +223,7 @@ struct State {
     /// 本端用 ABORT 帧重置了发送方向，这个帧已经全部交给了内核：关闭之前要等对端读到它（[`close_after_abort`]）。
     abort_sent: bool,
     heard_from_peer: bool,
-    /// 往 socket 写的时候出过错：连接已经断了，多半是对端重置了。Linux 上一次重置只报一次错，被写拿走之后读只看到 EOF，
+    /// 向 socket 写入时曾发生错误：连接已断开，通常由对端重置引起。Linux 上一次重置仅上报一次错误，若被写操作消费则读操作只会看到 EOF，
     /// 所以记在这里：之后读到 EOF 时按它异常结束，不当作对端正常结束了（见 [`State::drain_now`]）。
     write_failed: Option<Failure>,
 }
@@ -242,7 +242,7 @@ impl LaneRecv {
     }
 
     /// 这个方向已经离开 TLS 时，把它交出去，让调用方直接读 socket（见 [`RawRead`]）。还在 TLS 里、已经结束或者已经交出去时返回 `None`；
-    /// 本端还有待发的密文没交给内核（比如刚回应了对端的 SWITCH）、或者写的时候已经发现连接断了，也返回 `None`，调用方照常读。
+    /// 若本端仍有待发密文尚未写入内核（如刚响应对端 SWITCH），或写操作已检测到连接断开，同样返回 `None`，由调用方继续正常读取。
     /// 不等待；要等对端的切换用 [`RecvStream::wait_raw`]。
     ///
     /// 交出去之后这个 [`LaneRecv`] 不再能读，丢弃它也不会叫停流。
@@ -320,7 +320,7 @@ pub(crate) fn initiate(lane: Lane, book: Book, revoked: watch::Receiver<bool>) -
 /// 对端在一条 lane 上开过来的流：它的 OPENING 已经读到了，`header` 是里面流的头。
 ///
 /// [`Mode::Early`] 时 OPENING 所在的记录之后就是原始字节，调用方已经确认这条记录在这个帧的末尾结束。
-/// 流层的 OPEN 只能从 `header` 里读，读完之前不接着读后面的原始字节（[`RecvState::Leaving`]）。
+/// 流层的 OPEN 只能从 `header` 中读取，在流头读完前不会继续读取后续原始字节（[`RecvState::Leaving`]）。
 pub(crate) fn respond(lane: Lane, mode: Mode, header: &[u8], book: Book, revoked: watch::Receiver<bool>) -> (LaneSend, LaneRecv) {
     let Lane { socket, mut sealed, out, peer, version, .. } = lane;
     socket::rst_on_close(&socket);
@@ -372,7 +372,7 @@ impl State {
         match (&mut self.send, self.role) {
             (SendState::Header(header), Role::Initiator) => {
                 let header = Bytes::from(std::mem::take(header));
-                // 没升级的接受方不认"等 SWITCH"，passthrough 在那里只能是 OPENING 之后马上离开 TLS：不那样做，见 [`Mode::Early`]。
+                // 未升级的接受方不支持等待 SWITCH，其 passthrough 只能在 OPENING 后立即离开 TLS；本端不再采用该模式，见 [`Mode::Early`]。
                 let mode = match (payload, self.version) {
                     (Payload::Passthrough, Version::V2) => Mode::Mutual,
                     (Payload::Passthrough, Version::V1) | (Payload::Sealed, _) => Mode::Sealed,
@@ -408,11 +408,11 @@ impl State {
         self.mode == Some(Mode::Mutual) && (self.role == Role::Initiator || self.switched)
     }
 
-    /// 本端读完了对端的头：之后可以从 TLS 里收到的字节接着读原始字节。
+    /// 本端已读完对端流头：此后可从 TLS 缓冲字节无缝衔接读取后续原始字节。
     ///
-    /// 发起方这时如果已经收到接受方的 SWITCH（接受方看过目标的回答、先切换了），回一个 SWITCH，自己的方向跟着离开 TLS。
-    /// 要等头读完：接受方在 REPLY 还没完的时候就切换是不守协议，那时不跟，这个方向留在 TLS 里，重置时还能用 ABORT 带上原因码。
-    /// 已经在结束、已经重置的方向也不用跟。回应排在待发的密文里，调用方随后送出（[`push`]）。
+    /// 发起方此时若已收到接受方的 SWITCH（接受方检查目标响应后先期切换），则回发 SWITCH，使本端发送方向同步退出 TLS。
+    /// 必须等待流头读完：接受方在 REPLY 尚未结束时切换属于违反协议，此时不跟随切换，发送方向保持在 TLS 内，以便重置时通过 ABORT 携带原因码。
+    /// 已处于关闭或重置流程的方向亦不跟随切换。回应帧排入待发密文缓冲区，由调用方随后写出（[`push`]）。
     fn finish_header(&mut self) {
         self.header_read = true;
         if let RecvState::Leaving { sealed, raw } = &mut self.recv {
@@ -440,7 +440,7 @@ impl State {
 
     /// 尽量把待发的密文交给内核，不等待。全部交完返回 `true`。
     ///
-    /// 写出错时记下来（[`State::write_failed`]）：这里的写有时是读的那一侧顺手做的（回应对端的 SWITCH），或者在后台，
+    /// 写入出错时记录原因（[`State::write_failed`]）：此处写入有时由读侧顺带触发（响应对端 SWITCH）或在后台执行，
     /// 错误没有人接，读的那一侧却要靠它知道连接是被重置的。
     fn drain_now(&mut self, socket: &TcpStream) -> io::Result<bool> {
         while !self.out.is_empty() {
@@ -521,7 +521,7 @@ impl State {
             }
             Ok(Next::Frame(Frame::Switch)) => {
                 if !self.expects_switch() || !at_boundary {
-                    return Poll::Ready(Err(self.fail_recv(Failure::Protocol("不该出现的 SWITCH".to_owned()))));
+                    return Poll::Ready(Err(self.fail_recv(Failure::Protocol("非预期的 SWITCH 帧".to_owned()))));
                 }
                 self.heard(socket);
                 let leftover = self.sealed.as_mut().map(Sealed::take_inbound).unwrap_or_default();
@@ -544,7 +544,7 @@ impl State {
                 return Poll::Ready(Err(self.fail_recv(Failure::Reset(StreamCode(code)))));
             }
             Ok(Next::Frame(other)) => {
-                return Poll::Ready(Err(self.fail_recv(Failure::Protocol(format!("流上不该出现的帧 {other:?}")))));
+                return Poll::Ready(Err(self.fail_recv(Failure::Protocol(format!("流上收到非预期帧 {other:?}")))));
             }
             Ok(Next::Closed) => {
                 self.heard(socket);
@@ -587,7 +587,7 @@ fn compact(leftover: &[u8]) -> Bytes {
     if leftover.is_empty() { Bytes::new() } else { Bytes::copy_from_slice(leftover) }
 }
 
-/// 读 socket 读不到东西时怎么办。
+/// 读取 socket 遇到 `WouldBlock` 时的处理策略。
 enum Read<'a, 'b> {
     /// 登记这个任务，等 socket 可读。
     Wait(&'a mut Context<'b>),
@@ -611,7 +611,7 @@ fn push(shared: &Arc<Shared>, state: &mut State) {
             }
         }
         // 写出错时连接已经坏了：下一次读写会看到错误，这里不用做什么。
-        Err(error) => tracing::debug!(peer = %shared.peer, %error, "lane 的密文没有写出去"),
+        Err(error) => tracing::debug!(peer = %shared.peer, %error, "lane 密文发送失败"),
     }
 }
 
@@ -653,8 +653,8 @@ impl AsyncRead for LaneRecv {
             match &mut state.recv {
                 RecvState::Failed(failure) => return Poll::Ready(Err(failure.to_io())),
                 RecvState::Eof => return Poll::Ready(Ok(())),
-                RecvState::Stopped => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "这个方向已经叫停"))),
-                RecvState::Handed => return Poll::Ready(Err(io::Error::other("这个方向已经交给调用方直接读"))),
+                RecvState::Stopped => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "当前接收方向已中止"))),
+                RecvState::Handed => return Poll::Ready(Err(io::Error::other("当前接收方向已移交调用方直接读取"))),
                 RecvState::Sealed(data) if !data.is_empty() => {
                     let len = take_into(data, buf);
                     shared.book.add(|tally| &tally.sealed_bytes, len);
@@ -667,7 +667,7 @@ impl AsyncRead for LaneRecv {
                 }
                 // 本端还在读对端的头，TLS 里的字节却已经读完了：头没有完整地在 TLS 里。
                 RecvState::Leaving { .. } => {
-                    return Poll::Ready(Err(state.fail_recv(Failure::Protocol("流的头还没完，对端的方向就离开了 TLS".to_owned()))));
+                    return Poll::Ready(Err(state.fail_recv(Failure::Protocol("流头尚未完整，对端发送方向即离开 TLS".to_owned()))));
                 }
                 RecvState::Raw(pending) if !pending.is_empty() => {
                     let len = take_into(pending, buf);
@@ -723,7 +723,7 @@ impl AsyncWrite for LaneSend {
                         header.extend_from_slice(data);
                         return Poll::Ready(Ok(data.len()));
                     }
-                    // 头不会这么长：按 sealed 结束它，后面的照常作为数据发。
+                    // 流头不会超过该上限：按 sealed 模式结束流头，后续字节作为普通数据发送。
                     state.end_header(Payload::Sealed);
                 }
                 SendState::Sealed => {
@@ -755,10 +755,10 @@ impl AsyncWrite for LaneSend {
                     }
                 }
                 SendState::Closing | SendState::Finished => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "这个方向已经正常结束")));
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "当前发送方向已正常关闭")));
                 }
-                SendState::Aborted => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "这个方向已经重置"))),
-                SendState::Handed => return Poll::Ready(Err(io::Error::other("这个方向已经交给调用方直接写"))),
+                SendState::Aborted => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "当前发送方向已重置"))),
+                SendState::Handed => return Poll::Ready(Err(io::Error::other("当前发送方向已移交调用方直接写入"))),
             }
         }
     }
@@ -799,8 +799,8 @@ impl AsyncWrite for LaneSend {
                     return Poll::Ready(Ok(()));
                 }
                 SendState::Finished => return Poll::Ready(Ok(())),
-                SendState::Aborted => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "这个方向已经重置"))),
-                SendState::Handed => return Poll::Ready(Err(io::Error::other("这个方向已经交给调用方直接写"))),
+                SendState::Aborted => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "当前发送方向已重置"))),
+                SendState::Handed => return Poll::Ready(Err(io::Error::other("当前发送方向已移交调用方直接写入"))),
             }
         }
     }
@@ -898,10 +898,10 @@ impl RecvStream for LaneRecv {
         }
     }
 
-    /// 等到知道这个方向接下来是什么：离开了 TLS（对端发了 SWITCH，或者没升级的发起方选了 passthrough）就交出来，和
-    /// [`take_raw`](Self::take_raw) 一样；接下来是 TLS 里的数据、或者这个方向结束了、出错了，返回 `None`，调用方照常读。
+    /// 等待确定接收方向的后续模式：若已离开 TLS（对端发送 SWITCH，或未升级的发起方选择了 passthrough），则与
+    /// [`take_raw`](Self::take_raw) 相同交出原始句柄；若后续仍为 TLS 数据、或该方向已结束/出错，则返回 `None`，由调用方继续正常读取。
     ///
-    /// 发起方读完 REPLY 之后用它：接受方紧接着发 SWITCH，但它可能还在路上。收到时发起方的发送方向也跟着切换（见
+    /// 发起方在读完 REPLY 后调用该方法：接受方紧随其后发送 SWITCH，可能仍在传输途中。收到后发起方发送方向也会随之切换（见
     /// [`LaneSend::end_header`]）。接受方在它自己的 SWITCH 之后用它等发起方的回应。
     async fn wait_raw(&mut self) -> Option<RawRead> {
         // 一直加密的流，哪个方向都不会离开 TLS：直接返回，不去推进 TLS、也不再为 `take_raw` 拿一次锁。
@@ -1025,7 +1025,7 @@ fn close_after_abort(shared: &Arc<Shared>) {
     let socket = Arc::clone(&shared.socket);
     let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
     if let Err(error) = socket::shutdown_write(&socket) {
-        tracing::debug!(%error, "ABORT 之后发不了 FIN，对端读完 ABORT 之后要等关闭时的 RST");
+        tracing::debug!(%error, "发送 ABORT 后关闭写半部（FIN）失败，对端读取 ABORT 后将等待关闭时的 RST");
     }
     drop(runtime.spawn(async move {
         let _ = tokio::time::timeout(LINGER_AFTER_STOP, discard(&socket)).await;

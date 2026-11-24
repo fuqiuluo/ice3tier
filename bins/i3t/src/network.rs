@@ -1,7 +1,7 @@
 //! 虚拟网卡在本机的几个命令：`i3t network status`、`i3t network cleanup`、`i3t set network|firewall off` 之后的清理、`i3t hosts`。
 //!
-//! 装、拆都是运行着的节点做的（`i3t_agent::vnet`）；这里只读系统里有什么，以及节点没在运行时把上次留下的规则拆掉。
-//! hosts 文件里 `i3t hosts --apply` 写的那一段不随虚拟网卡拆掉：那是管理员写进去的文件，只有 `i3t hosts --remove` 去掉它。
+//! 虚拟网卡的创建与移除由运行中的节点负责（`i3t_agent::vnet`）；本模块仅查询系统当前状态，并在节点未运行时清理残留防火墙规则。
+//! `i3t hosts --apply` 写入 hosts 文件的条目区块不会随虚拟网卡一并移除，需由管理员显式运行 `i3t hosts --remove` 移除。
 
 use std::fs;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn hosts_file() -> PathBuf {
     }
 }
 
-/// `i3t network cleanup`：拆掉崩溃或被强制终止后留下的防火墙规则（以及旧版透明访问的残留）。
+/// `i3t network cleanup`：清理节点崩溃或被强制终止后残留的防火墙规则（及旧版透明访问残留项）。
 ///
 /// 在跑的节点程序的网卡还存在，它的规则不动。systemd 单元的 `ExecStopPost` 也会调用它。
 pub(crate) fn cleanup() -> anyhow::Result<()> {
@@ -47,7 +47,7 @@ pub(crate) fn cleanup() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 在 `machine` 上拆掉 `present` 之外的孤儿规则和旧版透明访问残留，返回拆掉的条数。
+/// 在 `machine` 上清理不属于 `present` 的孤立规则及旧版透明访问残留项，返回已清理的条目数。
 fn cleanup_with(machine: &mut impl Machine, platform: Platform, present: &[String]) -> Result<usize, CommandError> {
     let mut first_error = None;
     let mut removed = match setup::remove_leftovers(machine, platform, present) {
@@ -79,8 +79,8 @@ fn cleanup_with(machine: &mut impl Machine, platform: Platform, present: &[Strin
     }
 }
 
-/// `i3t set network off` 或者 `i3t set firewall off` 写好配置文件之后：节点没在运行时拆掉上次留下的规则。
-/// 节点在运行时由它在停下的时候拆；它再起来时看到关着也会拆。
+/// 在 `i3t set network off` 或 `i3t set firewall off` 写入配置后执行：若节点未运行，立即清理残留规则。
+/// 若节点正在运行，则由其在停止时或下次启动检测到开关关闭时清理。
 pub(crate) fn after_switch_off(running: bool) {
     if running || missing_privilege().is_some() {
         return;
@@ -102,7 +102,7 @@ pub(crate) fn after_switch_off(running: bool) {
     names_left_behind();
 }
 
-/// hosts 文件里还有 `i3t hosts --apply` 写的那一段时说一句，指出去掉它的命令。读不了这个文件就不说。
+/// 检测到 `i3t hosts --apply` 写入的完整区块时，提示移除命令。读取 `hosts` 文件失败时跳过检查。
 fn names_left_behind() {
     let path = hosts_file();
     if fs::read_to_string(&path).is_ok_and(|hosts| remove_hosts_block(&hosts).is_some()) {
@@ -110,7 +110,7 @@ fn names_left_behind() {
     }
 }
 
-/// `i3t network status`：运行着的节点说的状态，和系统里属于虚拟网卡的每一样东西。
+/// `i3t network status` 显示运行中节点报告的虚拟网卡状态，以及在本机检测到的相关资源。
 pub(crate) fn status(state: &StateDir, live: Option<&LiveStatus>) {
     let t = &texts().network;
     let lang = i3t_lang::current();
@@ -142,7 +142,7 @@ pub(crate) fn status(state: &StateDir, live: Option<&LiveStatus>) {
         }
     }
     let guard_note = guard_note(&survey);
-    // 读不了的项也要列出来：那时说"什么都没装"不一定是真的。缺了程序时说的话（用不着、缺哪个）也一样列出来。
+    // 列出读取失败的检查项及原因。缺少工具时，说明规则无需安装或指出需要安装的工具。
     let noted = guard_note.is_some() || survey.accept.is_err();
     if let Some(note) = guard_note {
         fields.add(t.guard_rule, note);
@@ -153,7 +153,7 @@ pub(crate) fn status(state: &StateDir, live: Option<&LiveStatus>) {
                 fields.add(t.accept_rule, (t.accept_at)(&rule.device, rule.position));
             }
         }
-        // 没有 iptables 就没有 ufw 这类防火墙经它填的 INPUT 链要抢在前面：节点不加这一条，不是加不上。
+        // 未安装 iptables 时不存在 ufw 等经其注入的 INPUT 链规则需要前置放行，因此节点无需添加此规则，并非添加失败。
         Err(CommandError::Missing(Program::Iptables)) => fields.add(t.accept_rule, t.accept_not_needed),
         Err(error) => fields.add(t.accept_rule, unreadable(error)),
     }
@@ -176,10 +176,10 @@ pub(crate) fn status(state: &StateDir, live: Option<&LiveStatus>) {
     }
 }
 
-/// 防冒充那一项在表和 raw 规则之外还要说的话。
+/// 防冒充检查项除已安装的 nftables 表与 raw 规则外的补充说明。
 ///
-/// 有 nft 时防冒充是那张表，raw 表里只会有换成表之前留下的，读不了也不用说。没有 nft 时防冒充是 raw 表里的规则：
-/// 两个程序都没有就说缺 nft（和节点的状态说的一样，装上它就行）；raw 表里没有（或者内核里没有这张表）就说两样都没有。
+/// 存在 nft 时防冒充规则位于对应的 nftables 表中，raw 表仅可能含迁移前残留项，因此 raw 表不可读时无需提示。
+/// 无 nft 时回退检查 raw 表规则：若 nft 与 iptables 均缺失则提示缺少 nft（与节点状态保持一致）；若 raw 表无对应规则或内核无 raw 表则说明均未安装。
 fn guard_note(survey: &Survey) -> Option<String> {
     let t = &texts().network;
     match (&survey.tables, &survey.guard_rules) {
@@ -191,8 +191,7 @@ fn guard_note(survey: &Survey) -> Option<String> {
     }
 }
 
-/// 一个命令为什么失败：程序自己的原话；没有这个程序时按代码写。
-/// 一样东西读不出来时写什么。系统里没有那个程序时只说它没有：那不是权限的事。
+/// 格式化检查项读取失败时的提示文本。若系统未安装对应工具则直接说明工具缺失，不归因于权限不足。
 fn unreadable(error: &CommandError) -> String {
     match error {
         CommandError::Missing(_) => said(error),
@@ -209,7 +208,7 @@ fn said(error: &CommandError) -> String {
     }
 }
 
-/// `i3t hosts`：按最后一份 netmap 写出 hosts 文件的那一段；写进去时只换上次写的那一段，去掉时只去掉那一段，别的字节不动。
+/// 根据最近保存的 `netmap` 生成 hosts 条目区块。应用时替换完整的旧区块或追加新区块，移除时仅处理完整区块。
 pub(crate) fn hosts(state: &StateDir, action: HostsAction) -> anyhow::Result<()> {
     let t = &texts().network;
     let path = hosts_file();

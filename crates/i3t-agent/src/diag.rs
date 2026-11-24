@@ -1,10 +1,10 @@
 //! 主动测试在节点里的部分：收 controller 的指令，按自己的规矩决定做不做，发起方量、接受方配合，各自上报。
 //!
-//! 节点自己守的规矩（controller 被攻破时也不能让节点做它本来不肯做的事）：
+//! 节点本地约束（即使 controller 被攻破，也不允许节点执行本地禁止的操作）：
 //!
-//! - **只做 controller 让做的。** 测试探测只回答打开着的测试（路径层），测量流只接受指令里那个对端、在时间窗里、
-//!   指令里要了吞吐的测试开来的。对端自己开不了测试。
-//! - **路径限制照旧。** 只经 relay 的节点不参加直连的测试项（不试直连、不回答直连的探测），不向对端暴露地址；
+//! - **只执行 controller 下发的测试。** 仅响应已开启测试的探测（路径层），测量流仅接受指令指定的对端、在时间窗内、
+//!   且指令包含吞吐项的测试连接。对端无法自行发起测试。
+//! - **遵循路径限制。** 仅经 relay 的节点不参与直连测试项（不尝试直连、不响应直连探测），不向对端暴露地址；
 //!   只用直连的节点不测经 relay 的路径。
 //! - **本机的开关。** 配置文件里关掉了吞吐测试（`[tests] throughput = false`）就一律拒绝测量流。
 //! - **上限在本机。** 同时最多 [`MAX_TESTS`] 个测试；和同一个对端的测试至少隔 [`MIN_INTERVAL`]，吞吐至少隔 [`THROUGHPUT_INTERVAL`]；
@@ -60,7 +60,7 @@ const MAX_PROBES: u32 = TRAIN_PROBES * 5;
 /// 测量流一次一条，前一条收尾时和后一条会重叠一下，所以不是一。
 const EXEMPT_STREAMS: usize = 4;
 /// 同一个测试的上一条测量流还占着"正在测"时，新来的一条最多等它多久（见 [`Diag::admit_after_previous`]）。
-/// 要等的只是那条流的任务跑完最后几步，忙的机器上也就几十毫秒。
+/// 等待的仅是前一条流任务执行收尾步骤，高负载主机上通常也仅需数十毫秒。
 const PREVIOUS_STREAM_WAIT: Duration = Duration::from_secs(1);
 
 /// 一个节点上的主动测试。
@@ -141,17 +141,17 @@ impl Diag {
 
     fn report(&self, report: TestReport) {
         if self.reports.try_send(report).is_err() {
-            tracing::warn!("主动测试的结果没有送出去：和 controller 的连接忙不过来");
+            tracing::warn!("主动测试结果发送失败：与 controller 的上报通道已满或已关闭");
         }
     }
 
-    /// controller 的测试指令。按本机的规矩决定做不做，做的话在后台进行，不在这里等。
+    /// controller 的测试指令。按本机约束决定是否执行，若执行则在后台运行，不在此阻塞。
     pub(crate) fn order(self: &Arc<Self>, order: TestOrder) {
         let (test, peer, role) = (order.test, order.peer, order.role);
         match self.admit(&order) {
             Ok(()) => {}
             Err(problem) => {
-                tracing::info!(test, %peer, ?role, code = ?problem.code, "不做这个主动测试");
+                tracing::info!(test, %peer, ?role, code = ?problem.code, "已拒绝执行主动测试");
                 return self.report(TestReport { test, role: Some(role), last: true, refused: Some(problem), ..TestReport::default() });
             }
         }
@@ -223,7 +223,7 @@ impl Diag {
             TestRole::Initiator => {
                 session.task.abort();
                 state.tests.remove(&test);
-                tracing::info!(test, "controller 结束了这个测试，停下");
+                tracing::info!(test, "controller 已结束该主动测试，停止执行");
             }
             TestRole::Responder => {
                 if let Some(end) = session.end.take() {

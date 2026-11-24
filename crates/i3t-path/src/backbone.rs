@@ -1,12 +1,12 @@
 //! relay 和 relay 之间走 TCP 的骨干连接。
 //!
 //! 骨干上的一条连接是两个会话：本节点在对方 relay 上的，对方在本节点 relay 上的。UDP 通的时候两个会话各走各的 UDP，和以前一样。
-//! 两个 relay 之间的 UDP 有一个方向不通时，两个会话都放进**同一条** TCP：一方拨号（路径层到 relay 的 TCP，[`crate::tcp`]），
-//! 在上面照常建自己的会话；另一方的 relay 接进这条 TCP、认出拨号的是 netmap 里的 relay 之后告诉本节点的路径层（[`BackboneInbox`]），
-//! 路径层就在这条 TCP 上反过来建自己的会话。所以一对 relay 之间最多一条 TCP，连不进来的那一方拨出去也一样成。
+//! 当两个 relay 之间的 UDP 存在单向不通时，双方会话复用**同一条** TCP 连接：一方主动拨号（路径层到 relay 的 TCP，[`crate::tcp`]）
+//! 并按常规建立自身会话；另一方的 relay 接受连接并识别出拨号方为 netmap 中的 relay 后通知本地路径层（[`BackboneInbox`]），
+//! 路径层随即可在同一条 TCP 上反向建立会话。因此一对 relay 间至多维持一条 TCP 连接，即使无法被直连的一方主动拨出亦可互通。
 //!
-//! 谁拨号、什么时候改走 TCP、什么时候回到 UDP，见 [`crate::relays`] 里 `RelayLink` 的骨干部分。回到 UDP 时两边的两个"半个证据"
-//! 在接受的一方碰头：对方经 UDP 发来的 AUTH 说明它的 UDP 到得了本节点，本节点自己最近经 UDP 问到过它说明反过来也通。
+//! 拨号方选择、切换至 TCP 及回切至 UDP 的规则见 [`crate::relays`] 中 `RelayLink` 的骨干逻辑。回切 UDP 需要双方双向可达证据
+//! 在接收方汇合：对端经 UDP 发来的 AUTH 证明其 UDP 可达本节点，本节点近期经 UDP 收到其响应证明反向亦可达。
 //! 路径层把走着 TCP 的那几段和这样的证据记在 [`Gates`] 里，relay 验过一个经 UDP 来的 AUTH 之后问它（[`BackboneInbox::admits_udp`]）。
 //!
 //! 帧在两头怎么分：
@@ -81,9 +81,9 @@ impl BackboneInbox {
 
     /// relay `relay` 经 UDP 发来的 AUTH（cookie、限速、签名都已经核对过）能不能把它在本节点的 relay 上的会话搬到 UDP 上。
     ///
-    /// 骨干上到它的这一段走着 TCP 时，只有本节点最近经 UDP 问到过它（它回答了本节点的 INIT），或者本节点到它的 UDP 会话通着，才能搬：
-    /// 一边的会话搬到 UDP、另一边还在 TCP 上的时候，这一段什么都转不过去，只有一个方向的 UDP 通的话会这样一直断着
-    /// （见 `crate::relays` 的骨干部分）。别的时候都能，和以前一样。不能的时候 relay 不建会话、不回答，调用 [`knocked`](Self::knocked)。
+    /// 当对应骨干链路使用 TCP 时，仅在本节点近期经 UDP 收到过对端响应（响应本节点 INIT）或本节点至对端的 UDP 会话已就绪时才允许迁移：
+    /// 若仅一端会话迁回 UDP 而另一端仍在 TCP，该段将无法转发任何流量；若仅单向 UDP 可达，链路会持续中断
+    /// （详见 `crate::relays` 的骨干部分）。其余情况均允许迁移。拒绝时 relay 不建立会话、不回应，并调用 [`knocked`](Self::knocked)。
     ///
     /// # Panics
     ///
@@ -93,15 +93,15 @@ impl BackboneInbox {
         self.gates.admits(relay, now)
     }
 
-    /// relay `relay` 经 UDP 发来的 AUTH 被 [`admits_udp`](Self::admits_udp) 挡下了：它的 UDP 到得了本节点。
-    /// 路径层马上自己经 UDP 去试一次（两次之间至少隔一会儿），本节点的 UDP 也到得了它的话，它下一个 AUTH 就能搬过来。
+    /// 来自 `relay` 的 UDP AUTH 被 [`admits_udp`](Self::admits_udp) 拦截，说明对端 UDP 可达本节点。
+    /// 路径层将立即主动发起一次 UDP 探测（受最小间隔限制）；若本节点 UDP 也可达对端，其下一次 AUTH 即可顺利迁移。
     pub fn knocked(&self, relay: NodeId) {
         self.send(relay, Ctrl::Knock { relay });
     }
 
     fn send(&self, relay: NodeId, message: Ctrl) {
         if self.ctrl.try_send(message).is_err() {
-            tracing::debug!(%relay, "控制任务忙不过来，丢掉骨干上的一件事");
+            tracing::debug!(%relay, "骨干事件入队失败，已丢弃");
         }
     }
 }
@@ -109,9 +109,9 @@ impl BackboneInbox {
 /// 骨干上走着 TCP 的一段，本节点的 relay 让不让对方经 UDP 把会话搬过来（见 [`BackboneInbox::admits_udp`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gate {
-    /// 本节点的 UDP 最近到得了它：这个时刻之前让。
+    /// 近期已确认本节点 UDP 可达对端，在该时刻之前允许迁移。
     OpenUntil(Instant),
-    /// 不知道本节点的 UDP 到不到得了它：不让。
+    /// 尚未确认本节点 UDP 可达对端，暂不允许迁移。
     Closed,
 }
 

@@ -29,7 +29,7 @@ use crate::users::Users;
 
 /// 一个中转帧最长多少字节。再长的不是正常节点发的。
 const MAX_RELAYED_LEN: usize = RouteHeader::MAX_LEN + MAX_CONN_PACKET_LEN as usize;
-/// 多久清理一次过期的会话。TCP 监听不起来时也是隔这么久再试。
+/// 过期会话清理周期；TCP 监听启动失败时也按此间隔重试。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 目的就是本节点的中转帧交给谁。参数是来源节点和去掉中转头之后的包。
@@ -51,8 +51,8 @@ type LocalDelivery = Box<dyn Fn(NodeId, Bytes) + Send + Sync>;
 ///
 /// 两个 relay 之间 UDP 不通时，两个会话在同一条 TCP 上（[`i3t_path::backbone`]）：对方拨进来的，由这里的 TCP 监听接住，
 /// 上面属于路径层的帧交给 [`set_backbone_inbox`](Self::set_backbone_inbox) 给的入口；本节点的路径层拨出去的，
-/// 对方在上面建会话、要转发的帧由路径层交进来（[`handle_leg_frame`](Self::handle_leg_frame)）。骨干上的一段走着 TCP 时，
-/// 对方经 UDP 来的 AUTH 要那个入口同意才把它的会话搬到 UDP 上（[`BackboneInbox::admits_udp`]），不同意时不回答，只告诉路径层。
+/// 对方在上面建会话、要转发的帧由路径层交进来（[`handle_leg_frame`](Self::handle_leg_frame)）。骨干链路使用 TCP 时，
+/// 对方经 UDP 发来的 AUTH 须经该入口批准（[`BackboneInbox::admits_udp`]）才可将所属会话迁移至 UDP；未批准时不予回应，仅通知路径层。
 ///
 /// # 下线
 ///
@@ -91,7 +91,7 @@ pub(crate) struct Inner {
     row_seq: AtomicU64,
     /// 同一个 TCP 端口上别的协议（ice3proxy）：开头字节认出来是它的连接交给这里。没有设时 TCP 端口上只有中转。
     pub(crate) tcp_handoff: RwLock<Option<TcpHandoff>>,
-    /// 别的 relay 拨进来的骨干 TCP 上归路径层的帧交给谁。没有设时这些帧丢掉，对方的会话照常。
+    /// 接收来自其他 relay 拨入的骨干 TCP 中归属路径层的帧。未设置时丢弃此类帧，不影响对端会话。
     inbox: OnceLock<BackboneInbox>,
 }
 
@@ -196,12 +196,12 @@ impl Relay {
         Self { inner, maintenance }
     }
 
-    /// 同一个 TCP 端口上还接 ice3proxy（lane）：开头是 TLS 握手记录（`0x16`）的连接交给 `handoff`，
-    /// 别的照常当作中转。`handoff` 不能阻塞。
+    /// 在同一 TCP 端口复用 ice3proxy（lane）：首字节为 TLS 握手记录（`0x16`）的连接移交给 `handoff`，
+    /// 其余连接仍按中继连接处理。`handoff` 不得阻塞。
     ///
-    /// 没有设的时候（没有为任何对端打开 ice3proxy）连接一接受就按中转处理，和原来完全一样；设了之后每条连接先等它的第一个字节
-    /// （最多 [`leg::CLASSIFY_TIMEOUT`]），这段时间里同一来源、以及全部来源还没认出来的连接数另有上限。
-    /// 认出来是中转的连接之后照常受中转的全部限制。
+    /// 未设置时（未对任何对端开启 ice3proxy），接受的连接直接按中继处理；设置后每条连接先等待首字节
+    /// （最长 [`leg::CLASSIFY_TIMEOUT`]），期间对单来源及全局未分类连接数另有限制。
+    /// 识别为中继的连接后续仍受全部中继限制约束。
     ///
     /// # Panics
     ///
@@ -270,7 +270,7 @@ impl Relay {
             Binding::Udp(destination) => self.inner.port.send_or_drop(&Transmit { destination, contents, segment_size, ecn }),
             Binding::Tcp { sender, .. } => {
                 let stride = segment_size.unwrap_or(contents.len()).max(1);
-                // 队列满了也接着试后面的：中间可能正好腾出了位置。
+                // 队列已满时仍继续尝试后续数据报，期间可能已有空位释放。
                 let mut all_sent = true;
                 for datagram in contents.chunks(stride) {
                     all_sent &= sender.try_send(Bytes::copy_from_slice(datagram));
@@ -283,7 +283,7 @@ impl Relay {
     /// 目的就是本节点的中转帧交给谁（路径层的入口）。只能设一次，再设没有效果。
     pub fn set_local_delivery(&self, deliver: impl Fn(NodeId, Bytes) + Send + Sync + 'static) {
         if self.inner.local.set(Box::new(deliver)).is_err() {
-            tracing::warn!("relay 的本地投递入口已经设过了，忽略这一次");
+            tracing::warn!("relay 本地投递入口已设置，忽略重复设置");
         }
     }
 
@@ -325,7 +325,7 @@ impl Relay {
     /// 只能设一次，再设没有效果。
     pub fn set_backbone_inbox(&self, inbox: BackboneInbox) {
         if self.inner.inbox.set(inbox).is_err() {
-            tracing::warn!("relay 的骨干入口已经设过了，忽略这一次");
+            tracing::warn!("relay 骨干收件箱已设置，忽略重复设置");
         }
     }
 
@@ -363,7 +363,7 @@ impl Relay {
         }
     }
 
-    /// 本节点即将下线（关机、升级）：立刻通知所有会话，让它们把路径和挂靠换到别处。之后照常转发，直到进程退出。
+    /// 本节点即将下线（关机、升级）：立即通知所有会话迁移路径与挂靠，随后继续正常转发直至进程退出。
     ///
     /// 节点停下之前调用一次；多调用几次也只通知一次。
     pub fn announce_shutdown(&self) {
@@ -420,7 +420,7 @@ impl i3t_path::LocalRelay for Relay {
 impl Drop for Relay {
     fn drop(&mut self) {
         // 没有人显式通知过的话，这里是最后的机会。发通知只是几次不等待的 UDP 发送。
-        self.inner.announce_shutdown("relay 被丢弃");
+        self.inner.announce_shutdown("relay 实例已释放");
         self.maintenance.abort();
         // 让还开着的 TCP 中转腿自己结束。
         self.inner.enabled.send_replace(false);
@@ -456,7 +456,7 @@ impl Inner {
         let role = netmap.me.relay.as_ref();
         if role.is_none() && self.read().enabled {
             // 被停用：趁会话还在，先告诉它们。
-            self.announce_shutdown("本节点在 netmap 里不再是 relay");
+            self.announce_shutdown("netmap 中本节点不再承担 relay 角色");
         }
         let mut state = self.write();
         state.me = netmap.me.id;
@@ -473,13 +473,13 @@ impl Inner {
                 self.draining.store(false, Ordering::Relaxed);
                 tracing::info!(clients = state.clients.len(), relays = state.relays.len(), "本节点启用为 relay");
             } else {
-                tracing::info!(sessions = state.sessions.len(), "本节点不再是 relay，全部中转会话关闭");
+                tracing::info!(sessions = state.sessions.len(), "本节点不再承担 relay 角色，已关闭全部中继会话");
                 state.sessions.clear();
             }
         }
         let State { clients, sessions, .. } = &mut *state;
         for node in sessions.retain_clients(|node| clients.get(&node).copied()) {
-            tracing::info!(%node, "节点不在允许的名单里了，或者换了公钥：它的中转会话关闭");
+            tracing::info!(%node, "节点已移出允许列表或公钥已变更，关闭其中继会话");
         }
         let bandwidth_mbps = role.and_then(|role| role.bandwidth_mbps);
         if state.bandwidth_mbps != bandwidth_mbps {
@@ -554,13 +554,13 @@ impl Inner {
             return;
         }
         let sessions = self.read().sessions.len();
-        tracing::info!(sessions, why, "relay 即将下线，通知所有会话换到别处");
+        tracing::info!(sessions, why, "relay 即将下线，已通知所有会话迁移");
         self.publish_row(&[]);
     }
 
     fn sweep(&self, now: Instant) {
         for node in self.write().sessions.sweep(now) {
-            tracing::info!(%node, "中转会话过期：{} 秒没有收到保活", SESSION_TTL.as_secs());
+            tracing::info!(%node, "中继会话过期：超过 {} 秒未收到保活", SESSION_TTL.as_secs());
         }
         self.refusals.lock().expect("relay refusal mutex poisoned").sweep(now);
         self.keepalive_refusals.lock().expect("relay refusal mutex poisoned").sweep(now);
@@ -570,7 +570,7 @@ impl Inner {
     /// 一条 TCP 断了，绑定在它上面的会话跟着关闭。
     pub(crate) fn close_tcp(&self, conn: TcpConn) {
         for node in self.write().sessions.close_tcp(conn) {
-            tracing::info!(%node, "TCP 中转断开，中转会话关闭");
+            tracing::info!(%node, "TCP 中继连接已断开，关闭对应中继会话");
         }
     }
 
@@ -590,7 +590,7 @@ impl Inner {
     /// 接进来的第 `conn` 条 TCP 上的一帧，这条 TCP 是在上面握手成功的 `neighbour` 的。`neighbour` 是别的 relay、它的会话现在就在
     /// 这条 TCP 上的话，这条 TCP 是骨干上的一段，属于本节点自己的那些帧在这里处理：本节点在对方那里的会话的应答和矩阵行交给路径层；
     /// 对方送给本节点的包交给连接层（它替来源节点担保，和 UDP 上 relay 的地址来的包一样）。
-    /// 返回这一帧是不是就此处理完了；别的（对方的握手和保活、要往下转的包）照常由 relay 处理。
+    /// 返回该帧是否已处理完毕；其余帧（对端的握手、保活及待转发数据包）继续按常规由 relay 处理。
     ///
     /// 会话在不在，每一帧都在这里现看：一条 TCP 等下一帧可以等很久，这期间那个 relay 可能已经被去掉、换了公钥，
     /// 或者把会话搬到了别处，它在这条 TCP 上说的话就不再作数。
@@ -626,7 +626,7 @@ impl Inner {
         }
     }
 
-    /// 交给路径层的骨干收件箱。路径层还没接上收件箱时丢掉：这帧本来就是给它的，别人也用不上。
+    /// 投递至路径层的骨干收件箱。若路径层尚未注册收件箱则直接丢弃，该帧无其他消费者。
     fn deliver_to_inbox(&self, neighbour: NodeId, conn: u64, frame: &Bytes) {
         if let Some(inbox) = self.inbox.get() {
             inbox.frame(neighbour, conn, frame.clone());
@@ -654,7 +654,7 @@ impl Inner {
                 self.reply(source, &addr_query::answer(&query, source.addr));
                 None
             }
-            // 别的都不归 relay 管，或者解析不了：丢掉，不回应。
+            // 其余类型不由 relay 处理或解析失败：静默丢弃，不作回应。
             Ok(
                 Datagram::Session(_)
                 | Datagram::Conn(_)
@@ -678,7 +678,7 @@ impl Inner {
             Frame::Init(init) => {
                 if !self.read().clients.contains_key(&init.node) {
                     self.counters.dropped(DropReason::UnknownClient, 1);
-                    tracing::debug!(node = %init.node, from = %source.addr, "握手被忽略：节点不在允许的名单里");
+                    tracing::debug!(node = %init.node, from = %source.addr, "忽略握手请求：节点不在允许列表中");
                     return None;
                 }
                 let cookie = self.cookies.issue(source.addr, init.node, now);
@@ -705,8 +705,8 @@ impl Inner {
 
     /// AUTH：先验 cookie（便宜，证明来源地址是真的），再按来源限速，再验签名（贵），都过了才建会话。
     ///
-    /// 别的 relay 经 UDP 来的，还要路径层同意它把会话搬到 UDP 上（[`BackboneInbox::admits_udp`]）：骨干上到它的那一段走着 TCP、
-    /// 本节点又不知道自己的 UDP 到不到得了它时不建会话、不回答，只告诉路径层它敲了门。
+    /// 来自其他 relay 的 UDP AUTH 还需路径层同意将会话迁移至 UDP（[`BackboneInbox::admits_udp`]）：当骨干链路使用 TCP
+    /// 且本节点尚未确认自身 UDP 可达对端时，不建立会话也不回应，仅通知路径层触发探测。
     fn authenticate(&self, source: &Source<'_>, auth: &Auth, now: Instant) -> Option<NodeId> {
         let key = self.check_auth(source, auth, now)?;
         self.open_session(source, auth, key, now)
@@ -724,24 +724,24 @@ impl Inner {
         };
         let Some(client_key) = client_key else {
             self.counters.dropped(DropReason::UnknownClient, 1);
-            tracing::debug!(%node, from = %source.addr, "握手被忽略：节点不在允许的名单里");
+            tracing::debug!(%node, from = %source.addr, "忽略握手请求：节点不在允许列表中");
             return None;
         };
         if !self.cookies.verify(&auth.cookie, source.addr, node, now) {
             self.counters.dropped(DropReason::BadCookie, 1);
-            tracing::debug!(%node, from = %source.addr, "握手被忽略：cookie 不是发给这个地址的，或者已经过期");
+            tracing::debug!(%node, from = %source.addr, "忽略握手请求：cookie 与来源地址不匹配或已过期");
             return None;
         }
         if !self.handshakes.lock().expect("relay handshake mutex poisoned").allow(source.addr.ip(), now) {
             self.counters.dropped(DropReason::TooManyHandshakes, 1);
-            tracing::debug!(%node, from = %source.addr, "握手被忽略：这个来源这一阵发来的 AUTH 太多，不再为它验签名");
+            tracing::debug!(%node, from = %source.addr, "忽略握手请求：该来源短期内发送 AUTH 过于频繁，已触发限流并跳过验签");
             return None;
         }
         let message = Auth::signed_message(me, node, &auth.nonce, &auth.cookie);
         if i3t_crypto::verify(&client_key, Auth::PURPOSE, &message, &Signature::from_bytes(auth.signature)).is_err() {
             self.counters.dropped(DropReason::BadSignature, 1);
             // 不用 warn：拿到 cookie 的人可以照着限速不停地发，每次一条 warn 就是刷屏。计数器里看得到。
-            tracing::debug!(%node, from = %source.addr, "握手被忽略：签名不对");
+            tracing::debug!(%node, from = %source.addr, "忽略握手请求：签名验证失败");
             return None;
         }
         if neighbour
@@ -753,7 +753,7 @@ impl Inner {
             tracing::debug!(
                 %node,
                 from = %source.addr,
-                "握手先搁下：骨干上到这个 relay 的一段走着 TCP，本节点还不知道自己的 UDP 到不到得了它，不把它的会话搬到 UDP 上；请路径层自己经 UDP 试一次"
+                "暂不接受该 UDP 握手：骨干链路当前使用 TCP 且尚未确认本节点 UDP 可达对端，暂不迁移会话，已通知路径层发起 UDP 探测"
             );
             inbox.knocked(node);
             return None;
@@ -764,7 +764,7 @@ impl Inner {
     /// 握手的后一半：给签名照 `key` 验过的 AUTH（[`check_auth`](Self::check_auth)）建会话、回 OK。
     ///
     /// 验签名的那段时间里 netmap 可能变了，所以拿着写锁再看一次：relay 还启用着，这个节点在名单里的公钥还是 `key`。
-    /// 节点被去掉了，或者换了公钥（那签名就是照一把已经不作数的公钥验的），都不建会话。
+    /// 若节点已被移除或公钥已轮换（说明先前验签所用的公钥已失效），则拒绝建立会话。
     fn open_session(&self, source: &Source<'_>, auth: &Auth, key: PublicKey, now: Instant) -> Option<NodeId> {
         let node = auth.node;
         let me = {
@@ -973,7 +973,7 @@ impl Inner {
         if request_len < Refused::LEN || !limiter.lock().expect("relay refusal mutex poisoned").allow(source.addr, now) {
             return;
         }
-        tracing::debug!(from = %source.addr, node = %refused.node, reason = ?refused.reason, "拒绝转发，回一个错误帧");
+        tracing::debug!(from = %source.addr, node = %refused.node, reason = ?refused.reason, "拒绝转发，已返回错误帧");
         self.reply(source, &refused.to_bytes_echoing(&echo));
     }
 }
@@ -1015,7 +1015,7 @@ async fn maintain(inner: Arc<Inner>, mut netmap: watch::Receiver<Arc<Netmap>>) {
             listener = None;
             listen_failed = false;
         } else if listener.as_ref().is_none_or(JoinHandle::is_finished) {
-            // 绑不上（端口被别的程序占着）时，下一轮（一秒之后）再试。
+            // 端口绑定失败（如被其他进程占用）时，在下一轮（1 秒后）重试。
             match leg::listen(&inner) {
                 Ok(task) => {
                     listener = Some(task);
@@ -1024,7 +1024,7 @@ async fn maintain(inner: Arc<Inner>, mut netmap: watch::Receiver<Arc<Netmap>>) {
                 Err(error) if !listen_failed => {
                     listen_failed = true;
                     let addr = inner.port.local_addr();
-                    tracing::warn!(%addr, %error, "relay 监听不了 TCP，UDP 用不了的节点暂时连不上来；会一直重试");
+                    tracing::warn!(%addr, %error, "relay 无法启动 TCP 监听，依赖 TCP 的节点暂时无法连接。系统将继续重试。");
                 }
                 Err(_) => {}
             }

@@ -53,13 +53,13 @@ const NOT_INCLUDED_PAGE: &str = r#"<!doctype html>
 </style>
 </head>
 <body>
-<h1>这个 controller 没有带 WebUI</h1>
-<p>controller 在正常运行，管理 API 在 <code>/api/v1</code> 下面，命令行 <code>i3tctl</code> 可以照常使用。只是这次构建的程序里没有包含 Web 界面。</p>
-<p>要用 Web 界面，任选一种：</p>
+<h1>当前 controller 没有带 WebUI</h1>
+<p>controller 正在正常运行，管理 API 位于 <code>/api/v1</code>，命令行工具 <code>i3tctl</code> 可正常使用。当前构建的程序未内嵌 Web 界面。</p>
+<p>如需使用 Web 界面，可任选以下方式之一：</p>
 <ul>
-<li>换成项目发布的 <code>i3t-controller</code>，它自带 Web 界面；</li>
-<li>自己构建：先在源码的 <code>web/</code> 目录里构建出 <code>web/dist</code>，再重新编译 <code>i3t-controller</code>；</li>
-<li>已经有一份构建好的界面文件：启动时加上 <code>--static-dir &lt;目录&gt;</code>。</li>
+<li>使用项目发布的 <code>i3t-controller</code>（已内置 Web 界面）；</li>
+<li>自行构建：先在源码的 <code>web/</code> 目录下构建出 <code>web/dist</code>，再重新编译 <code>i3t-controller</code>；</li>
+<li>若已有构建好的静态文件目录，启动时传入 <code>--static-dir &lt;目录&gt;</code>。</li>
 </ul>
 </body>
 </html>

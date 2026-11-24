@@ -40,11 +40,11 @@ impl Control {
 
     pub(super) fn open_test(&mut self, spec: &TestSpec, now: Instant) {
         if !self.peers.contains_key(&spec.peer) {
-            tracing::info!(test = spec.test, peer = %spec.peer, "不打开主动测试：对端不在 netmap 里");
+            tracing::info!(test = spec.test, peer = %spec.peer, "未开启主动测试：对端不在 netmap 中");
             return;
         }
         let window = Window::new(spec, now);
-        tracing::info!(test = spec.test, peer = %spec.peer, window_secs = window.until.saturating_duration_since(now).as_secs(), relays = ?spec.relays, "打开主动测试的时间窗");
+        tracing::info!(test = spec.test, peer = %spec.peer, window_secs = window.until.saturating_duration_since(now).as_secs(), relays = ?spec.relays, "已开启主动测试时间窗");
         self.windows.insert(spec.test, window);
         self.sync_open_tests();
     }
@@ -53,7 +53,7 @@ impl Control {
         if self.windows.remove(&test).is_none() {
             return;
         }
-        tracing::info!(test, why, "关闭主动测试的时间窗");
+        tracing::info!(test, why, "已关闭主动测试时间窗");
         self.sync_open_tests();
         // 测试没了，它的探测包列也就到此为止：已经发出去的照样算，没发的不发了。
         let now = Instant::now();
@@ -72,12 +72,12 @@ impl Control {
         *self.shared.open_tests.write().expect("open tests lock poisoned") = open;
     }
 
-    /// 定时要做的：过了时间窗的测试关掉；带头的一方测试期间把对端算作活跃的（找路、探测直连、为它保持中转会话都照常进行）；
-    /// 直连尝试有结果了就回答。
+    /// 定期推进主动测试状态：关闭到期时间窗；发起方在测试期间将对端保持为活跃状态（常规寻路、直连探测与中转会话维持正常进行）；
+    /// 直连尝试得出结果后即刻返回应答。
     pub(super) fn poll_tests(&mut self, now: Instant) {
         let expired: Vec<TestId> = self.windows.iter().filter(|(_, window)| !window.is_open(now)).map(|(test, _)| *test).collect();
         for test in expired {
-            self.close_test(test, "时间窗到了");
+            self.close_test(test, "时间窗到期");
         }
         let clock = &self.shared.clock;
         for window in self.windows.values().filter(|window| window.side == Side::Lead) {
@@ -93,7 +93,7 @@ impl Control {
             };
             if let Some(established) = peer.direct.established_at().filter(|_| peer.direct.active().is_some()) {
                 let elapsed = established.saturating_duration_since(attempt.started);
-                tracing::info!(peer = %attempt.peer, elapsed_ms = elapsed.as_millis(), kind = ?peer.direct.kind(), "主动测试的直连尝试成功");
+                tracing::info!(peer = %attempt.peer, elapsed_ms = elapsed.as_millis(), kind = ?peer.direct.kind(), "主动测试直连尝试成功");
                 let result = DirectAttempt {
                     ok: true,
                     already: false,
@@ -107,7 +107,7 @@ impl Control {
                 let _waiting = attempt.reply.send(result);
             } else if now >= attempt.deadline || attempt.reply.is_closed() {
                 let failure = self.direct_failure(peer, now);
-                tracing::info!(peer = %attempt.peer, ?failure, "主动测试的直连尝试没有成功");
+                tracing::info!(peer = %attempt.peer, ?failure, "主动测试直连尝试失败");
                 let _waiting = attempt.reply.send(self.failed_attempt(Some(peer), failure));
             } else {
                 if attempt.side == Side::Lead {
@@ -160,7 +160,7 @@ impl Control {
     /// 跟随时只是等着看对端的尝试有没有让直连通起来（见 [`Side`]）。
     pub(super) fn attempt_direct(&mut self, id: NodeId, side: Side, limit: Duration, reply: oneshot::Sender<DirectAttempt>, now: Instant) {
         if !self.allow_direct {
-            tracing::info!(peer = %id, "不做直连尝试：本节点的路径限制是只经 relay");
+            tracing::info!(peer = %id, "跳过直连尝试：本节点路径策略为仅经 relay");
             let _waiting = reply.send(self.failed_attempt(None, DirectFailure::RelayOnly));
             return;
         }
@@ -183,16 +183,16 @@ impl Control {
                 candidates: peer.direct.candidate_count(),
             };
             let result = DirectAttempt { udp: self.udp_state(now), ..result };
-            tracing::info!(peer = %id, kind = ?result.kind, "主动测试的直连尝试：已经有可用的直连");
+            tracing::info!(peer = %id, kind = ?result.kind, "主动测试直连尝试：当前已有可用直连");
             let _waiting = reply.send(result);
             return;
         }
         match side {
             Side::Lead => {
-                tracing::info!(peer = %id, limit_ms = limit.as_millis(), "主动测试：现在就试一次直连，不等退避");
+                tracing::info!(peer = %id, limit_ms = limit.as_millis(), "主动测试：立即发起直连尝试，跳过退避等待");
                 peer.direct.retry_now();
             }
-            Side::Follow => tracing::info!(peer = %id, limit_ms = limit.as_millis(), "主动测试：等对端来试直连"),
+            Side::Follow => tracing::info!(peer = %id, limit_ms = limit.as_millis(), "主动测试：等待对端发起直连尝试"),
         }
         self.attempts.push(Attempt { peer: id, side, started: now, deadline: now + limit, reply });
     }
@@ -200,7 +200,7 @@ impl Control {
     pub(super) fn pin(&mut self, id: NodeId, pin: Pin, now: Instant) {
         let Some(peer) = self.peers.get_mut(&id) else { return };
         let pin = Pin { until: pin.until.min(now + MAX_PIN), ..pin };
-        tracing::info!(peer = %id, path = ?pin.path, secs = pin.until.saturating_duration_since(now).as_secs_f32(), "主动测试暂时固定到对端的路");
+        tracing::info!(peer = %id, path = ?pin.path, secs = pin.until.saturating_duration_since(now).as_secs_f32(), "主动测试已临时固定到对端的路由");
         peer.pin = Some(pin);
     }
 
@@ -212,7 +212,7 @@ impl Control {
         }
     }
 
-    /// 发给 `id` 的测试探测走 `path` 时此刻的收发做法；走不了是 `None`。
+    /// 解析向 `id` 沿 `path` 发送测试探测所使用的转发目标；当前不可达时返回 `None`。
     fn test_hop(&self, id: NodeId, path: TestPath, now: Instant) -> Option<Hop> {
         let peer = self.peers.get(&id)?;
         match path {
@@ -221,7 +221,7 @@ impl Control {
         }
     }
 
-    /// 对端的测试探测：便宜的检查都过了才验签名，然后从同一条路径倒着回答。
+    /// 处理对端的测试探测：先执行低开销校验再验签，随后沿反向路径返回应答。
     pub(super) fn on_test_ping(&mut self, from: SocketAddr, ping: &TestPing, at: Instant, relayed: bool, now: Instant) {
         if ping.dst != self.shared.me {
             return;
@@ -229,17 +229,17 @@ impl Control {
         let path = TestPath::from_relays(ping.path);
         let Some(window) = self.windows.get(&ping.test) else { return };
         if let Err(why) = window.screen(ping.src, ping.seq, path, now) {
-            tracing::debug!(test = ping.test, peer = %ping.src, seq = ping.seq, why, "不回答这个测试探测");
+            tracing::debug!(test = ping.test, peer = %ping.src, seq = ping.seq, why, "忽略该测试探测");
             return;
         }
-        // 说是直连的探测必须是直连来的，反过来也一样；本节点不建立直连时不回答直连的探测，免得把地址告诉对端。
+        // 声明为直连的探测必须经直连到达，反之亦然；本节点未启用直连时不响应直连探测，避免暴露地址。
         if (path == TestPath::Direct) == relayed || (path == TestPath::Direct && !self.allow_direct) {
-            tracing::debug!(test = ping.test, peer = %ping.src, relayed, "不回答这个测试探测：它来的路和它说的对不上，或者本节点不建立直连");
+            tracing::debug!(test = ping.test, peer = %ping.src, relayed, "忽略该测试探测：实际到达路径与声明路径不一致，或本节点未启用直连");
             return;
         }
         let Some(peer) = self.peers.get(&ping.src) else { return };
         if i3t_crypto::verify(&peer.key, TestPing::PURPOSE, &ping.signed_message(), &Signature::from_bytes(ping.signature)).is_err() {
-            tracing::debug!(test = ping.test, peer = %ping.src, "测试探测的签名不对，丢弃");
+            tracing::debug!(test = ping.test, peer = %ping.src, "测试探测签名校验失败，已丢弃");
             return;
         }
         let hop = match path {
@@ -263,12 +263,12 @@ impl Control {
         let bytes = pong.to_bytes();
         match hop {
             Some(hop) => send_frame_via(&self.shared, ping.src, &hop, &bytes),
-            // 倒过来的路径走不了：从本节点自己现在的路回答，回答里说明了。
+            // 反向路径当前不可达：改沿本节点当前路由返回应答，并在应答字段中标记。
             None => peer.slot.send_frame(&self.shared, &bytes),
         }
     }
 
-    /// 本节点的一列探测得到了回答。
+    /// 处理本节点测试探测包列的应答。
     pub(super) fn on_test_pong(&mut self, pong: &TestPong, at: Instant) {
         if pong.dst != self.shared.me {
             return;
@@ -277,7 +277,7 @@ impl Control {
         let Some(index) = self.trains[train].index_of(pong.seq) else { return };
         let Some(peer) = self.peers.get(&pong.src) else { return };
         if i3t_crypto::verify(&peer.key, TestPong::PURPOSE, &pong.signed_message(), &Signature::from_bytes(pong.signature)).is_err() {
-            tracing::debug!(test = pong.test, peer = %pong.src, "测试探测的回答签名不对，丢弃");
+            tracing::debug!(test = pong.test, peer = %pong.src, "测试探测应答签名校验失败，已丢弃");
             return;
         }
         let held = Duration::from_micros(u64::from(pong.held_us));
@@ -299,7 +299,7 @@ impl Control {
             None
         };
         if let Some(error) = refused {
-            tracing::info!(test = spec.test, peer = %spec.peer, path = ?spec.path, %error, "不发这列测试探测");
+            tracing::info!(test = spec.test, peer = %spec.peer, path = ?spec.path, %error, "拒绝发送测试探测包列");
             let _waiting = reply.send(Err(error));
             return;
         }
@@ -318,19 +318,19 @@ impl Control {
             .and_then(|peer| peer.direct.active())
             .map(|(addr, _)| addr)
             .filter(|_| spec.path == TestPath::Direct);
-        tracing::info!(test = spec.test, peer = %spec.peer, path = ?spec.path, count = train.spec.count, interval_ms = train.spec.interval.as_millis(), "开始发一列测试探测");
+        tracing::info!(test = spec.test, peer = %spec.peer, path = ?spec.path, count = train.spec.count, interval_ms = train.spec.interval.as_millis(), "开始发送测试探测包列");
         self.trains.push(train);
         self.poll_trains(now);
     }
 
-    /// 发到点了的测试探测，回答等完了的列交出结果。
+    /// 发送到达计划时刻的测试探测，并汇总已完成包列的测试报告。
     pub(super) fn poll_trains(&mut self, now: Instant) {
         let mut trains = std::mem::take(&mut self.trains);
         for train in &mut trains {
             while let Some((index, _)) = train.next_due().filter(|(_, due)| *due <= now) {
                 let seq = train.first_seq.saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
                 let (test, peer, path) = (train.spec.test, train.spec.peer, train.spec.path);
-                // 发的时候走不了（路刚断）也记成发过了：它算作丢失，这正是测试要量的。
+                // 即使发送时刻路径刚断开而不可达，也记录为已发送：由此计入丢包，以反映测试期间的真实中断。
                 if let Some(hop) = self.test_hop(peer, path, now) {
                     let mut ping = TestPing { src: self.shared.me, dst: peer, test, seq, path: path.relays(), signature: [0; 64] };
                     ping.signature = *self.key.sign(TestPing::PURPOSE, &ping.signed_message()).as_bytes();
@@ -354,7 +354,7 @@ impl Control {
                     sent = summary.sent,
                     answered = summary.answered,
                     avg_us = summary.avg_us,
-                    "一列测试探测结束"
+                    "测试探测包列完成"
                 );
                 if let Some(reply) = train.reply.take() {
                     let _waiting = reply.send(Ok(report));
@@ -454,7 +454,7 @@ impl Control {
             });
         }
         if list.last() == Some(&me) {
-            // 本节点自己的 relay：这一段是对端挂在它上面的那个会话，测量值和选路用的是同一个（见 `View::local_leg`）。
+            // 本节点自身 relay：该段为对端挂靠于本节点上的会话，测量值与选路共享同一来源（见 `View::local_leg`）。
             let leg = self.view(&[], now).local_leg(id, peer);
             hops.push(leg.map_or_else(
                 || unknown(me, id),
@@ -492,7 +492,7 @@ impl Control {
 /// 代价最低的候选比现在的路便宜得够选路器换过去（[`routing::beats_by_margin`]）就是它，不够就还是现在的路，
 /// 并带上那条更便宜的。现在的路不在候选里（没有路、断了）时选路器立刻换到最低的，不看差距。
 ///
-/// 只看差距：连续几个评估窗口、换路之后的停留期、刚重连的 relay 要等的那一段是时间上的条件，一次快照里看不出来。
+/// 仅比较代价差距：连续评估窗口数、切换后停留期以及刚重连 relay 的稳定等待期属于时间维度条件，单次快照中无法体现。
 fn lowest_cost_choice(candidates: &[Candidate], current: Option<&Candidate>) -> ModeChoice {
     let chosen = |candidate: &Candidate, reason| ModeChoice {
         route: candidate.path.to_route(),

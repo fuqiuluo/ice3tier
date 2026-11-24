@@ -114,7 +114,7 @@ impl AsyncWrite for SendHalf {
         match pin!(this.inner.stopped()).poll(cx) {
             Poll::Ready(Ok(Some(code))) => return Poll::Ready(Err(StreamAborted::Stopped(code_of(code)).into())),
             Poll::Ready(Err(error)) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("连接断开了：{error}"))));
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("连接已断开：{error}"))));
             }
             Poll::Ready(Ok(None)) | Poll::Pending => {}
         }
@@ -176,8 +176,8 @@ impl contract::RecvStream for RecvHalf {
 fn write_error(error: WriteError) -> io::Error {
     match error {
         WriteError::Stopped(code) => StreamAborted::Stopped(code_of(code)).into(),
-        WriteError::ConnectionLost(reason) => io::Error::new(io::ErrorKind::ConnectionAborted, format!("连接断开了：{reason}")),
-        WriteError::ClosedStream => io::Error::new(io::ErrorKind::NotConnected, "这个方向已经结束或者重置过了"),
+        WriteError::ConnectionLost(reason) => io::Error::new(io::ErrorKind::ConnectionAborted, format!("连接已断开：{reason}")),
+        WriteError::ClosedStream => io::Error::new(io::ErrorKind::NotConnected, "当前发送方向已关闭或重置"),
         WriteError::ZeroRttRejected => io::Error::other("对端拒绝了提前发送的数据"),
     }
 }
@@ -185,8 +185,8 @@ fn write_error(error: WriteError) -> io::Error {
 fn read_error(error: ReadError) -> io::Error {
     match error {
         ReadError::Reset(code) => StreamAborted::Reset(code_of(code)).into(),
-        ReadError::ConnectionLost(reason) => io::Error::new(io::ErrorKind::ConnectionAborted, format!("连接断开了：{reason}")),
-        ReadError::ClosedStream => io::Error::new(io::ErrorKind::NotConnected, "这个方向已经叫停过了"),
+        ReadError::ConnectionLost(reason) => io::Error::new(io::ErrorKind::ConnectionAborted, format!("连接已断开：{reason}")),
+        ReadError::ClosedStream => io::Error::new(io::ErrorKind::NotConnected, "当前接收方向已中止"),
         ReadError::IllegalOrderedRead => io::Error::other("流的读取方式前后不一致"),
         ReadError::ZeroRttRejected => io::Error::other("对端拒绝了提前发送的数据"),
     }

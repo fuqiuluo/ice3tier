@@ -23,7 +23,7 @@ pub struct JoinOptions {
 ///
 /// # Errors
 ///
-/// 令牌不对、状态目录写不了、连不上 controller 或者 controller 拒绝。
+/// 令牌无效、状态目录不可写、无法连接 controller，或 controller 拒绝注册。
 pub async fn join(state: &StateDir, token: &str, options: JoinOptions, program: &Program) -> anyhow::Result<Netmap> {
     // 令牌解析的细节（模型里的原话）对使用者没有用：说清楚它不是令牌、令牌从哪里来就够了。
     let token: EnrollToken = token.parse().map_err(|_| anyhow!(crate::texts::texts().not_a_token))?;

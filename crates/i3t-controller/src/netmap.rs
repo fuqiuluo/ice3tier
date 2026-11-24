@@ -46,7 +46,7 @@ impl Undialable {
 
 /// 算 netmap 要用的、存储里没有的事：controller 从节点的连接和上报里知道的。
 pub trait NodeFacts {
-    /// 认定这个节点用不了 UDP，写进别的节点的 netmap 里它那一项（[`Peer::no_udp`]）。
+    /// 该节点被判定为不可用 UDP，写入其他节点 netmap 中对应的对端项（[`Peer::no_udp`]）。
     fn has_no_udp(&self, node: NodeId) -> bool;
 }
 
@@ -79,7 +79,7 @@ fn ordered(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
 
 /// controller 从节点的上报里知道的、和虚拟网卡有关的事。和 [`NodeFacts`] 分开放，因为它们由不同的部分记着。
 pub trait VnetFacts {
-    /// 这个节点说它没有装虚拟网卡（或者它是不懂虚拟网卡的旧版本），写进别的节点的 netmap（[`Netmap::no_vnet`]）。
+    /// 该节点上报未安装虚拟网卡（或为不支持虚拟网卡的旧版本），写入其他节点的 netmap（[`Netmap::no_vnet`]）。
     fn lacks_vnet(&self, node: NodeId) -> bool;
 }
 
@@ -247,7 +247,7 @@ impl NetworkView {
             .collect();
 
         let other_nodes = || self.nodes.values().filter(|node| node.id != id);
-        // relay 的地址是 controller 找出来的，UDP 和 TCP 是同一组：节点自己挑连得上的那个。
+        // relay 的地址由 controller 自动收集，UDP 和 TCP 共用同一组地址，由节点自行选择可连通的地址。
         let relay_list = other_nodes()
             .filter(|node| node.relay.is_some())
             .map(|node| {
@@ -295,7 +295,7 @@ impl NetworkView {
                 proxies,
                 forwards,
                 forward_targets,
-                // 固定的 relay 里已经不是 relay 的那些不下发：节点连不上它们，只会白等。
+                // 过滤掉固定 relay 列表中已不再具备 relay 角色的节点：节点无法连接这些地址，下发只会导致无效等待。
                 pinned_relays: me.pinned_relays.iter().copied().filter(|relay| *relay != id && relays.contains(relay)).collect(),
                 profile: me.profile,
                 shared_relays,

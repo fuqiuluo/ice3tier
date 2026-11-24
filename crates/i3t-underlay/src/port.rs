@@ -131,15 +131,15 @@ pub struct UdpPort {
     send_error_logged: Throttle,
 }
 
-/// 内核不肯发一个数据报的原因，按怎么对待分的类。
+/// 内核拒绝发送数据报的错误分类，用于决定后续处理方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendFailure {
     /// 发送缓冲区满了：等可写之后再发。
     Busy,
     /// 比出去的那块网卡的 MTU 大。连接层探测路径 MTU 时发的大包会这样，是预料之中的。
     TooLong,
-    /// 从这台机器到不了那个地址。最常见的是本机没有 IPv6，而对端公布的地址里有 IPv6：
-    /// 这是正常的状态，和发到一个不通的地址没有区别，不该是一条警告。
+    /// 目标地址从本机不可达。常见场景为本机无 IPv6 连接但对端发布了 IPv6 地址：
+    /// 这属于正常情况，与发往不可达地址无异，不应记录为警告。
     Unreachable,
     Other,
 }
@@ -194,7 +194,7 @@ impl UdpPort {
             let dual = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), addr.port());
             match Self::bind_socket(dual, DualStack::Required) {
                 Ok(port) => return Ok(port),
-                Err(error) => tracing::debug!(%error, "绑不成双栈的 UDP 端口，只用 IPv4"),
+                Err(error) => tracing::debug!(%error, "无法绑定双栈 UDP 端口，回退为仅 IPv4"),
             }
         }
         Self::bind_socket(addr, DualStack::Preferred)
@@ -207,8 +207,8 @@ impl UdpPort {
             match (socket.set_only_v6(false), dual_stack) {
                 (Ok(()), _) => {}
                 (Err(error), DualStack::Required) => return Err(error),
-                // 调用方点名要的就是 IPv6 的地址：改不了就只用 IPv6，不算错。
-                (Err(error), DualStack::Preferred) => tracing::debug!(%error, "这个系统上 IPv6 的 socket 不能同时收发 IPv4"),
+                // 调用方明确指定了 IPv6 地址：无法开启双栈时仅使用 IPv6，不视为错误。
+                (Err(error), DualStack::Preferred) => tracing::debug!(%error, "当前系统不支持通过 IPv6 socket 同时收发 IPv4"),
             }
         }
         socket.set_nonblocking(true)?;
@@ -241,7 +241,7 @@ impl UdpPort {
         self.local
     }
 
-    /// 本端口上别人可能连得上的地址：绑定在具体地址上时就是它；绑定在未指定地址上时是本机各个网卡的地址配上端口。
+    /// 本端口对外可能可达的候选地址：绑定在具体地址时返回该地址；绑定在未指定地址时返回各本机网络接口地址与端口的组合。
     #[must_use]
     pub fn local_candidates(&self) -> Vec<SocketAddr> {
         let port = self.local.port();
@@ -256,7 +256,7 @@ impl UdpPort {
     ///
     /// # Errors
     ///
-    /// 只会返回 [`io::ErrorKind::WouldBlock`]：现在发不了，等 [`writable`](Self::writable) 之后再试。
+    /// 仅返回 [`io::ErrorKind::WouldBlock`]：发送缓冲区暂不可写，需等待 [`writable`](Self::writable) 后重试。
     /// 别的发送错误（目的不可达、包太大等）只记日志：UDP 本来就会丢包，上面的协议自己会重传。
     pub fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         let Some(transmit) = self.outgoing(transmit) else { return Ok(()) };
@@ -273,11 +273,11 @@ impl UdpPort {
         self.hand_to_kernel(&transmit).is_ok()
     }
 
-    /// 交给内核发。只把"现在发不了"（[`io::ErrorKind::WouldBlock`]）报给调用方；别的错误在这里记一笔就算了，
-    /// 包当作丢了：UDP 本来就会丢包，上面的协议自己会重传。
+    /// 交由内核发送。仅将 [`io::ErrorKind::WouldBlock`] 返回给调用方；其余错误在此记录日志并视同丢包：
+    /// UDP 本身不保证可靠交付，由上层协议负责重传。
     ///
-    /// 不用底层库自带的那一层错误处理：它把所有的错误都记成警告，"从这台机器到不了那个地址"也在里面，
-    /// 于是没有 IPv6 的机器只要有一个对端公布了 IPv6 地址，日志里就每分钟一条警告。
+    /// 不使用底层库自带的错误处理：其会将所有错误（包括目标地址不可达）记为警告，
+    /// 导致无 IPv6 的主机在存在公布 IPv6 地址的对端时每分钟产生一条警告日志。
     fn hand_to_kernel(&self, transmit: &quinn_udp::Transmit<'_>) -> io::Result<()> {
         let Err(error) = self.state.try_send((&self.io).into(), transmit) else { return Ok(()) };
         let destination = SocketAddr::new(transmit.destination.ip().to_canonical(), transmit.destination.port());
@@ -286,12 +286,12 @@ impl UdpPort {
             SendFailure::TooLong => {}
             SendFailure::Unreachable => {
                 if self.unreachable_logged.ready(Instant::now()) {
-                    tracing::debug!(%destination, %error, "从这台机器到不了这个地址，发给它的包丢掉");
+                    tracing::debug!(%destination, %error, "目标地址不可达，已丢弃 UDP 数据报");
                 }
             }
             SendFailure::Other => {
                 if self.send_error_logged.ready(Instant::now()) {
-                    tracing::warn!(%destination, len = transmit.contents.len(), segment_size = ?transmit.segment_size, %error, "UDP 发送出错，包丢掉");
+                    tracing::warn!(%destination, len = transmit.contents.len(), segment_size = ?transmit.segment_size, %error, "UDP 数据报发送失败，已丢弃");
                 }
             }
         }
@@ -302,16 +302,16 @@ impl UdpPort {
     pub fn send_datagram(&self, datagram: &[u8], destination: SocketAddr) {
         let transmit = Transmit { destination, contents: datagram, segment_size: None, ecn: None };
         if !self.send_or_drop(&transmit) {
-            tracing::trace!(%destination, "一个数据报没有发出去");
+            tracing::trace!(%destination, "UDP 数据报未发送");
         }
     }
 
-    /// 过滤器放行、地址族也发得出去时，换成底层库要的形式。
+    /// 在过滤器放行且地址族匹配时，转换为底层库所需的发送结构。
     fn outgoing<'a>(&self, transmit: &Transmit<'a>) -> Option<quinn_udp::Transmit<'a>> {
         if !self.passes(Direction::Outbound, transmit.destination, transmit.segments().next().unwrap_or_default()) {
             return None;
         }
-        // 这个 socket 发不出去的地址族：丢掉，和发到一个不通的地址没有区别。
+        // 当前 socket 不支持该地址族：直接丢弃，与发往不可达地址的处理一致。
         let destination = self.wire_destination(transmit.destination)?;
         Some(quinn_udp::Transmit {
             destination,
@@ -413,7 +413,7 @@ impl UdpPort {
         filter.as_ref().is_none_or(|filter| filter(direction, peer, datagram))
     }
 
-    /// 把目的地址换成这个 socket 发得出去的形式；发不出去时返回 `None`。
+    /// 将目标地址转换为当前 socket 支持的地址形式；不支持该地址族时返回 `None`。
     fn wire_destination(&self, destination: SocketAddr) -> Option<SocketAddr> {
         match (self.local, destination.ip().to_canonical()) {
             (SocketAddr::V6(_), IpAddr::V4(ip)) => Some(SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), destination.port())),

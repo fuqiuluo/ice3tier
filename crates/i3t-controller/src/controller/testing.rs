@@ -37,7 +37,7 @@ pub(crate) struct Member {
     pub(crate) orders: Vec<(SignedManifest, UpdateTiming)>,
     /// 收到了几次撤回。
     pub(crate) cancels: usize,
-    /// 对取包请求的回答：编号，和数据或者给不了的原因。
+    /// 对更新包请求的应答：请求编号，以及片段数据或无法提供的原因。
     pub(crate) chunks: Vec<(u64, Result<Vec<u8>, String>)>,
     /// 收到的路由查询：编号和问的对端。
     pub(crate) queries: Vec<(u64, NodeId)>,

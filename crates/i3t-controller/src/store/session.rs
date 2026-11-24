@@ -7,11 +7,11 @@
 //! 这样 [`Store`](super::Store) 的方法在哪里调用都行：普通线程、`spawn_blocking` 的线程，或者异步任务里
 //! （和读写本地文件一样，会占住那条线程一小会儿）。
 //!
-//! 等都有期限：连不上（包括连上了端口、对面却不答话）等到 [`connect_limit`]，一条语句等回答等到
-//! [`RESPONSE_TIMEOUT`]。调用方是拿着 controller 的锁在等的，没有期限的话，一个不答话的数据库就能把它卡死。
+//! 所有等待均有超时限制：建连超时（包括端口已连上但对端无响应）上限为 [`connect_limit`]，单条语句等待响应的上限为
+//! [`RESPONSE_TIMEOUT`]。调用方持有 controller 锁进行等待，若无超时限制，无响应的数据库会导致整个 controller 阻塞。
 //!
-//! 丢掉 [`Session`] 就是关连接：`Client` 没了，`Connection` 向数据库说完再见就结束，那条线程跟着退出。
-//! 有请求还没等到回答时也关得掉，只是不再等那个回答（见 [`drive`]）。
+//! 丢弃 [`Session`] 即关闭连接：`Client` 释放后，`Connection` 向数据库发送终止消息并结束，驱动线程随之退出。
+//! 即使仍有请求尚未收到响应也可关闭连接，只是不再继续等待该响应（见 [`drive`]）。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -34,23 +34,23 @@ use super::StoreError;
 /// 一条语句的参数，按 `$1`、`$2` 的顺序。
 pub(super) type Params<'a> = &'a [&'a (dyn ToSql + Sync)];
 
-/// 一条语句发出去之后等回答最多等这么久。平时的语句都是毫秒级的，等锁也有它自己更短的期限
-/// （[`LOCK_TIMEOUT`](super::LOCK_TIMEOUT)）：等到这么久只会是数据库或者中间的网络不答话了。
-/// 过了就当这条连接坏了，换一条新的。
+/// 单条语句发出后等待响应的超时上限。常规语句耗时在毫秒级，等锁也有更短的独立超时
+/// （[`LOCK_TIMEOUT`](super::LOCK_TIMEOUT)）；等待至此时长只可能是数据库或中间网络无响应。
+/// 超时后视为该连接已失效，后续将建立新连接替换。
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 连接串里没有写超时的话，连一个地址最多等这么久。
+/// 连接串未指定超时时，连接单个地址的默认超时时长。
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 等驱动线程交回连接比 [`connect_limit`] 多等的一点：正常情况下它自己会在期限到时说没连上。
+/// 等待驱动线程交回连接时在 [`connect_limit`] 基础上额外预留的余量：正常情况下驱动线程会在超时到达时自行报告连接失败。
 const HANDOVER_MARGIN: Duration = Duration::from_secs(5);
 
-/// [`Session`] 被丢掉之后，连接向数据库说再见最多给这么久。平时那是一眨眼的事。
+/// [`Session`] 被丢弃后，连接向数据库发送终止消息并优雅关闭的最长等待时间。正常情况下可瞬间完成。
 const GOODBYE: Duration = Duration::from_secs(1);
 
-/// 整个建连最多花多久：找地址、连上、认证，都算在里面。`tokio-postgres` 自己的 `connect_timeout` 只管连上端口
-/// 那一步，对面接了连接却不答话时它一直等。连接串里写了几个主机就给几份；主机可以写名字（`host`）、
-/// 写地址（`hostaddr`）或者两样都写，个数是多的那一样。
+/// 整个建连流程的总超时上限：包含地址解析、建连与认证。`tokio-postgres` 自带的 `connect_timeout` 仅覆盖端口连接
+/// 阶段，对端接受连接却无响应时会持续阻塞。连接串中指定了几个主机便分配几份配额；主机可通过主机名（`host`）、
+/// IP 地址（`hostaddr`）或两者同时指定，主机数取两者中的较大值。
 pub(super) fn connect_limit(config: &Config) -> Duration {
     let each = config.get_connect_timeout().copied().unwrap_or(CONNECT_TIMEOUT);
     let hosts = config.get_hosts().len().max(config.get_hostaddrs().len());
@@ -71,7 +71,7 @@ pub(super) struct Session {
 }
 
 impl Session {
-    /// 连上数据库。连不上、密码不对之类的错在这里报出来。
+    /// 连接数据库。连接失败、认证失败等错误均在此处返回。
     pub(super) fn connect(config: &Config) -> Result<Self, StoreError> {
         let limit = connect_limit(config);
         let (sender, receiver) = mpsc::channel();
@@ -109,7 +109,7 @@ impl Session {
             Ok(client) => client?,
             Err(mpsc::RecvTimeoutError::Timeout) => return Err(StoreError::ConnectTimedOut(limit)),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(StoreError::Driver(io::Error::other("照看数据库连接的线程没有回音就退出了")));
+                return Err(StoreError::Driver(io::Error::other("数据库驱动线程异常退出，未返回连接结果")));
             }
         };
         Ok(Self {
@@ -148,7 +148,7 @@ impl Session {
                 }
                 Err(StoreError::Postgres(error))
             }
-            // 请求发到一半就不等了，这条连接上的对话已经对不上：只能换一条。
+            // 请求中途放弃等待，该连接上的协议状态已无法同步，只能新建连接替换。
             None => {
                 self.broken.set(true);
                 Err(StoreError::Unresponsive(limit))
@@ -201,9 +201,9 @@ impl Session {
 
 /// 照看一条连接（读写它的套接字），到它结束为止。
 ///
-/// 平时它是这样结束的：`Client` 被丢掉，连接向数据库说完再见，自己结束。但只要还有请求没等到回答，连接就接着等；
-/// 数据库不答话（[`Session`] 正是因为这个才被丢掉的），它会一直等下去，套接字开着，数据库那边没做完的事务和它的锁也都留着。
-/// 所以 `Session` 没了之后只再给它 [`GOODBYE`] 这么久，过了就把连接丢掉：套接字随之关上，数据库由此知道对面走了。
+/// 正常情况下，当 `Client` 被丢弃后，连接会向数据库发送终止消息并自行结束；但若仍有请求未收到响应，连接会持续等待。
+/// 若数据库无响应（[`Session`] 正是因此被丢弃），连接将长期保持套接字打开，数据库侧未完成的事务及其持有的锁也会随之滞留。
+/// 因此在 `Session` 被丢弃后仅额外等待 [`GOODBYE`]，超时即丢弃连接以关闭套接字，促使数据库感知对端断开。
 async fn drive(connection: impl Future<Output = Result<(), tokio_postgres::Error>>, dropped: oneshot::Receiver<Infallible>) {
     let mut connection = pin!(connection);
     let ended = tokio::select! {
@@ -213,8 +213,8 @@ async fn drive(connection: impl Future<Output = Result<(), tokio_postgres::Error
     };
     match ended {
         Some(Ok(())) => {}
-        Some(Err(error)) => tracing::warn!(%error, "和数据库的连接断了"),
-        None => tracing::warn!("数据库一直不回答，不等它了：直接关掉这条连接"),
+        Some(Err(error)) => tracing::warn!(%error, "数据库连接已断开"),
+        None => tracing::warn!("数据库长期无响应，放弃等待并关闭连接"),
     }
 }
 

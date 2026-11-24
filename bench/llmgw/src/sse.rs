@@ -88,7 +88,7 @@ impl Parser {
                 self.has_data = true;
             }
             "id" => self.id = Some(value.to_owned()),
-            // retry 和不认识的字段按规范忽略。
+            // 按规范忽略 retry 及未知字段。
             _ => {}
         }
     }

@@ -104,7 +104,7 @@ impl Controller {
             let params = update_params(&before, &node, &groups);
             let detail = describe_update(&before, &node, &groups);
             store.log_refs(now, Some(network.id), action::NODE_UPDATE, &detail, &[LogRef::node(id)], params)?;
-            // 要重算哪些节点也在这里读：提交之后再读的话，读不出来时改动已经生效，却没人去重算。
+            // 需要重算的节点集合也在此事务内读取：若提交后再读取，一旦读取失败会导致变更已生效但无人触发重算。
             // relay 的名字写在全网每个节点的 netmap 里（这时是 `None`：全网都要重算，不用读）；别的改动只影响 netmap 里有它的节点。
             // 端口转发目标的开关只管指向它的转发：两端的节点（监听节点不一定在它的 netmap 里，比如访问规则不允许时）。
             let listeners = if node.relay.is_some() && before.name != node.name {
@@ -117,14 +117,14 @@ impl Controller {
             };
             Ok::<_, Error>((before, node, groups, listeners))
         })?;
-        // 日志在提交之后再打：没提交的话什么都没有改。
+        // 事务提交后再记录日志：若未提交则未发生任何状态变更。
         if after.forward_target != before.forward_target {
             let state = if after.forward_target { "打开" } else { "关闭" };
-            tracing::info!(node = %id, name = %after.name, "管理员{state}了它作为端口转发目标的开关");
+            tracing::info!(node = %id, name = %after.name, "管理员已{state}节点的端口转发目标开关");
         }
         if after.auto_update != before.auto_update {
             let state = if after.auto_update { "打开" } else { "关闭" };
-            tracing::info!(node = %id, name = %after.name, "管理员{state}了这个节点的自动更新");
+            tracing::info!(node = %id, name = %after.name, "管理员已{state}节点的自动更新");
         }
         let seeds = match listeners {
             None => Seeds::All,
@@ -137,7 +137,7 @@ impl Controller {
             Some(_) => inner.holders_and(id),
         };
         let refreshed = inner.refresh(network.id, seeds, None);
-        // 开关关掉时撤回还没换上去的自动更新，打开时轮到它；和全局的开关一样。重算没成也要做：开关已经改了。
+        // 关闭自动更新时撤回尚未执行的自动更新指令，开启时将其纳入调度，与全局开关行为一致；即使重算失败也需执行，因为开关变更已提交。
         let rolled = if after.auto_update == before.auto_update { Ok(()) } else { inner.roll_out() };
         self.wake_if_needed(&inner);
         first_failure(refreshed, rolled)?;
@@ -146,8 +146,8 @@ impl Controller {
 
     /// 把节点启用为 relay，或者改它的 relay 设置。
     ///
-    /// 不要地址：relay 的地址由 controller 自己找出来。也不查谁连得上它：谁连得上它，它就是谁的 relay，
-    /// 一个现在还没有任何已知地址的节点照样可以启用，地址等它连上来就有了。
+    /// 无需手动指定地址：relay 地址由 controller 自动收集。也不预先要求连通性校验：能否作为中继取决于各节点自身到它的连通性，
+    /// 当前尚无任何已知地址的节点也可启用，待其上线后将自动补全地址。
     ///
     /// # Errors
     ///
@@ -227,7 +227,7 @@ impl Controller {
             Affects::Holders => inner.holders_and(id),
         };
         let refreshed = inner.refresh(network.id, seeds, None);
-        // relay 的更新要排队，是不是 relay 变了，该轮到谁也跟着变。重算没成也要做：能力已经改了。
+        // relay 更新需串行排队，节点是否作为 relay 变更会影响轮次分配；即使 netmap 重算失败也需推进更新，因为能力变更已生效。
         let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
         first_failure(refreshed, rolled)?;
@@ -265,7 +265,7 @@ impl Controller {
         inner.send(id, ToNode::Revoked);
         inner.forget_node(id);
         let refreshed = inner.refresh(network, Seeds::All, None);
-        // 它占着 relay 的更新轮次的话，轮到下一个。重算没成也要做：它已经删掉了。
+        // 若被删节点正占用 relay 更新轮次，则推进至下一个 relay；即使 netmap 重算失败也需执行，因为节点已被删除。
         let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
         first_failure(refreshed, rolled)
@@ -282,7 +282,7 @@ impl Controller {
     /// 两个节点不都在这个网络里，或者 `predecessor` 还在线。
     pub fn succeed(&self, network: NetworkId, id: NodeId, predecessor: NodeId) -> Result<Node, Error> {
         if id == predecessor {
-            return Err(Error::invalid_field("predecessor", "same_node", "节点不能继任它自己"));
+            return Err(Error::invalid_field("predecessor", "same_node", "节点不能继任自身"));
         }
         let mut inner = self.lock();
         let network = inner.require_network(network)?;
@@ -315,7 +315,7 @@ impl Controller {
         tracing::info!(node = %id, %predecessor, name = %node.name, "节点继任");
         inner.forget_node(predecessor);
         let refreshed = inner.refresh(network.id, Seeds::All, None);
-        // 继任者可能接过了关掉的自动更新：撤回已经给它的自动更新。重算没成也要做：继任已经生效了。
+        // 继任者可能继承了关闭的自动更新开关，需撤回已下发的自动更新；即使 netmap 重算失败也需执行，因为继任已生效。
         let rolled = inner.roll_out();
         self.wake_if_needed(&inner);
         first_failure(refreshed, rolled)?;
@@ -397,7 +397,7 @@ pub(super) fn allocate_address(store: &Store, network: &NetworkRecord, now: Time
 /// 再删掉 `old`。
 pub(super) fn inherit(store: &Store, network: NetworkId, old: &NodeRecord, successor: &NodeRecord) -> Result<(), Error> {
     store.repoint_node(old.id, successor.id)?;
-    // 让出了名字和地址的那一行已经读不出来，先删掉它，后面才能再遍历这个网络的节点。
+    // 已让出名称与虚拟 IP 的原节点记录此时处于占位状态无法正常读取，需先删除它，后续才可遍历该网络中的节点。
     store.delete_node(old.id)?;
     unpin_everywhere(store, network, old.id)?;
     // 端口转发的目标是管理员的开关，和分组一样随身份交给继任者：继承来的转发照旧生效，外部配置不用改。
@@ -440,7 +440,7 @@ fn check_pinned_relays(store: &Store, node: &NodeRecord, pinned: &[NodeId]) -> R
 
 fn check_relay_settings(settings: RelaySettings) -> Result<RelaySettings, Error> {
     if settings.bandwidth_mbps == Some(0) {
-        return Err(Error::invalid_field("bandwidth_mbps", "zero", "带宽上限不能是 0；不限制就不要填"));
+        return Err(Error::invalid_field("bandwidth_mbps", "zero", "带宽上限不能为 0；若不限制请留空"));
     }
     Ok(settings)
 }
@@ -448,13 +448,13 @@ fn check_relay_settings(settings: RelaySettings) -> Result<RelaySettings, Error>
 fn check_exit_settings(mut settings: ExitRole) -> Result<ExitRole, Error> {
     if let Some(ports) = &mut settings.ports {
         if ports.contains(&0) {
-            return Err(Error::invalid_field("ports", "zero", "端口不能是 0"));
+            return Err(Error::invalid_field("ports", "zero", "端口不能为 0"));
         }
         ports.sort_unstable();
         ports.dedup();
     }
     if settings.upstream_socks5.is_some_and(|address| !is_connectable(&address)) {
-        return Err(Error::invalid_field("upstream_socks5", "not_connectable", "上游代理的地址不是一个能连上的地址"));
+        return Err(Error::invalid_field("upstream_socks5", "not_connectable", "上游代理地址不是有效的可连接地址"));
     }
     Ok(settings)
 }

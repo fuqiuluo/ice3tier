@@ -67,20 +67,20 @@ impl Store {
             JsonValue::Object(params) => params,
             other => {
                 // 调用方写错了。不为一条记录的参数让整个操作失败：记下原话，参数留空。
-                debug_assert!(false, "操作记录的参数要是一个 JSON 对象，{action} 给的是 {other}");
-                tracing::error!(action, params = %other, "操作记录的参数不是一个 JSON 对象，不记参数");
+                debug_assert!(false, "操作记录的参数必须为 JSON 对象，{action} 传入了 {other}");
+                tracing::error!(action, params = %other, "操作记录的参数不是 JSON 对象，已忽略参数");
                 Map::new()
             }
         };
-        // 说明里会带着外面来的话（节点报的更新失败的原因、管理员填的发布源）：里面的 NUL 存不进文本列，去掉它，
-        // 不让整条记录、连同它所在的那次操作一起失败。`params` 是 JSON，另有同样的处理。
+        // 说明文本可能包含外部输入（如节点上报的更新失败原因、管理员填写的发布源）：文本列不支持 NUL 字符，此处过滤 NUL
+        // 以避免整条记录及所在事务失败。`params` 为 JSONB，已单独做相同处理。
         let (action, detail) = (without_nul(action), without_nul(detail));
         self.execute(
             "INSERT INTO oplog (at, network_id, action, detail, refs, params) VALUES ($1, $2, $3, $4, $5, $6)",
             &[&Unsigned(at), &network.map(SqlNetwork), &action, &detail, &Json(refs), &Json(&params)],
         )?;
         // 按条数删，不按编号算：编号是序列发的，撤销了的事务也占着号，编号差了一万不等于有一万条。
-        // 不到 KEEP 条时里面那一句找不到第 KEEP + 1 新的，什么都不删。
+        // 记录数不足 KEEP 条时，子查询无结果，不执行任何删除。
         self.execute("DELETE FROM oplog WHERE id <= (SELECT id FROM oplog ORDER BY id DESC OFFSET $1 LIMIT 1)", &[&Int(KEEP)])?;
         Ok(())
     }
@@ -100,7 +100,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn oplog_filtered(&self, filter: &LogFilter) -> Result<Vec<LogEntry>, StoreError> {
-        // 每个条件的参数接着往下编号：放进 `values` 之后，它的长度就是这个参数的编号。
+        // 各过滤条件的参数序号依次递增：追加到 `values` 后，当前长度即对应参数占位符编号。
         let mut conditions: Vec<String> = Vec::new();
         let mut values: Vec<Box<dyn ToSql + Sync>> = Vec::new();
         if let Some(before) = filter.before {

@@ -2,7 +2,7 @@
 //!
 //! 每个节点用自己的节点密钥自签一张证书。校验对端时不看证书链、有效期和名字，只做两件事：
 //!
-//! 1. 取出证书里的公钥，和期望的公钥比对（拨出的一方），或者问调用方认不认（接受的一方）；
+//! 1. 提取证书中的公钥，与期望公钥比对（拨号方），或询问调用方是否信任该公钥（接受方）；
 //! 2. 验证握手签名，证明对端确实持有这把公钥对应的私钥。
 //!
 //! 所以证书只是公钥的容器，信任来自 netmap 里登记的公钥。
@@ -55,7 +55,7 @@ fn client_config_for(identity: &Identity, expected: PublicKey, alpn: &[u8], ciph
     Ok(config)
 }
 
-/// 接受一方的配置：对端必须出示证书，`is_allowed` 决定认不认它的公钥。
+/// 接受方配置：对端必须出示证书，由 `is_allowed` 决定是否信任其公钥。
 ///
 /// `is_allowed` 在每次握手时调用，所以它可以去查会变的东西（例如当前的 netmap）。
 /// 握手完成之后用 [`peer_key`] 取出对端的公钥，就知道连进来的是谁。
@@ -128,7 +128,7 @@ impl std::fmt::Debug for Identity {
 ///
 /// # Errors
 ///
-/// 证书解析不了，或者里面的公钥不是 Ed25519。
+/// 对端证书解析失败，或无法从证书中提取 Ed25519 公钥。
 pub fn peer_key(end_entity: &CertificateDer<'_>) -> Result<PublicKey, TlsError> {
     let certificate = ParsedCertificate::try_from(end_entity).map_err(|_| TlsError::BadCertificate)?;
     let spki = certificate.subject_public_key_info();
@@ -139,9 +139,9 @@ pub fn peer_key(end_entity: &CertificateDer<'_>) -> Result<PublicKey, TlsError> 
 
 /// 优先用哪一种加密。
 ///
-/// CPU 有 AES 指令时 AES-GCM 最省：本机实验环境里（有 AES 和向量指令的 x86）满速传输每 GB 0.67 秒 CPU，ChaCha20-Poly1305 是 1.02 秒，
-/// 吞吐也低三分之一。没有 AES 指令的 CPU（不少 ARM 板子）上 AES-GCM 要用软件慢慢算，ChaCha20 快得多，
-/// 这一点本机量不了，是这类 CPU 上的通行做法。所以按 CPU 能力选，不分性能档位。
+/// CPU 支持硬件 AES 指令时，AES-GCM 开销更低：本机实验环境（含 AES 与向量指令的 x86）下，满速传输每 GB 消耗 0.67 秒 CPU，
+/// ChaCha20-Poly1305 为 1.02 秒，吞吐也低三分之一。缺乏硬件 AES 指令的 CPU（如部分 ARM 设备）上，AES-GCM 需软件计算，ChaCha20 性能明显更高；
+/// 该差异无法在本机直接测量，属于此类 CPU 上的通行做法，因此按 CPU 能力选择，不分性能档位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cipher {
     AesGcm,
@@ -178,8 +178,8 @@ fn aes_in_hardware() -> bool {
 /// 两种 AES 里 AES-128-GCM 在前，主要是握手快。握手里的密钥派生和摘要用套件配的哈希：AES-128-GCM 配 SHA-256，AES-256-GCM 配 SHA-384，
 /// 常见 CPU 上 SHA-384 比 SHA-256 慢得多（ring 在 x86 上只给 SHA-256 用了专门指令）。本机实验环境里（Intel 大小核）一次双向认证的握手，
 /// 大核上快约 8%，小核上快约一倍。数据面差得不多：单看加解密，AES-128 少四轮，1360 字节的包快 13%～25%，满速传输每 GB 的 CPU 只省百分之几。
-/// 密钥交换 X25519 和节点密钥 Ed25519 都是 128 位强度，AES-256 多出的强度用不上。
-/// 旧版本把 AES-256-GCM 排在前面：三个套件两边都有，握手照样成；有 AES 指令的服务端照客户端的顺序挑，所以旧版本拨进来时还是 AES-256。
+/// 密钥交换 X25519 与节点密钥 Ed25519 均为 128 位安全强度，AES-256 额外提供的强度无实际收益。
+/// 旧版本将 AES-256-GCM 排在首位：两端均支持这三个套件，握手可正常完成；支持硬件 AES 指令的服务端遵循客户端偏好顺序，因此旧版本接入时仍协商为 AES-256。
 fn provider(cipher: Cipher) -> Arc<CryptoProvider> {
     use rustls::crypto::ring::cipher_suite::{TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256};
     let mut provider = ring::default_provider();
@@ -252,7 +252,7 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
-/// 接受一方问"认不认这把公钥"的回调。
+/// 接受方校验对端公钥是否受信任的回调。
 type IsAllowed = dyn Fn(&PublicKey) -> bool + Send + Sync;
 
 struct AllowedClients {
@@ -305,13 +305,13 @@ impl ClientCertVerifier for AllowedClients {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
-    #[error("用节点密钥签证书失败：{0}")]
+    #[error("使用节点密钥签发证书失败：{0}")]
     Certificate(#[from] rcgen::Error),
-    #[error("TLS 配置不被接受：{0}")]
+    #[error("TLS 配置无效：{0}")]
     Config(#[from] rustls::Error),
-    #[error("对端的证书解析不了")]
+    #[error("对端证书解析失败")]
     BadCertificate,
-    #[error("对端证书里的公钥不是 Ed25519")]
+    #[error("对端证书中的公钥不是 Ed25519")]
     NotEd25519,
 }
 

@@ -20,7 +20,7 @@ pub(super) struct Ssdp {
     pub(super) to: SocketAddr,
     /// 有值时只认这个地址上的设备。正常使用时是默认网关：替本机做地址转换的是它，别的设备上的映射没有用。
     pub(super) only: Option<IpAddr>,
-    /// 设备描述里的地址除了回答搜索的那个地址之外还允许哪些。`igd-next` 默认不认回环地址，测试里的假网关要放行。
+    /// 除响应搜索的地址外，设备描述中额外允许的地址列表。`igd-next` 默认拒绝回环地址，测试中的模拟网关需显式放行。
     pub(super) trusted: Vec<IpAddr>,
 }
 
@@ -58,20 +58,20 @@ pub(super) async fn search(local: Ipv4Addr, ssdp: &Ssdp, timing: &Timing) -> Opt
         options.allowed_gateway_ips.clone_from(&ssdp.trusted);
         match search_gateway(options).await {
             Ok(gateway) if ssdp.only.is_none_or(|only| only == gateway.addr.ip()) => return Some(Igd { gateway }),
-            Ok(gateway) => tracing::debug!(device = %gateway.addr, "回答 UPnP 搜索的设备不是默认网关，不用它"),
-            Err(error) => tracing::debug!(%error, "UPnP 搜索没有找到网关设备"),
+            Ok(gateway) => tracing::debug!(device = %gateway.addr, "响应 UPnP 搜索的设备非默认网关，已忽略"),
+            Err(error) => tracing::debug!(%error, "UPnP 搜索未发现网关设备"),
         }
     }
     None
 }
 
 impl Igd {
-    /// 把外部端口 `external_port` 映射到 `local`。这个端口被别的机器占着时改让网关挑一个。
+    /// 将外部端口 `external_port` 映射到 `local`。若该端口已被其他主机占用，则由网关自动分配。
     pub(super) async fn map(&self, kind: Protocol, local: SocketAddrV4, external_port: u16, wait: Duration) -> Result<Lease, MapError> {
         let within = |what: &'static str| MapError::Upnp(format!("{what}超时"));
         let ip = tokio::time::timeout(wait, self.gateway.get_external_ip())
             .await
-            .map_err(|_| within("问公网地址"))?
+            .map_err(|_| within("查询公网地址"))?
             .map_err(|error| MapError::Upnp(error.to_string()))?;
         if ip.is_unspecified() {
             return Err(MapError::NoExternalAddress);

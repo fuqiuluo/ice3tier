@@ -156,34 +156,34 @@ fn check(store: &Store, network: NetworkId, replacing: Option<&ForwardRecord>, m
     if config.enabled && !already_enabled && !target.forward_target {
         return Err(Error::ForwardTargetOff(target.name).in_field("target_node"));
     }
-    // 端口写 0 是让监听节点自己挑一个空闲的端口（挑定之后重启不变，挑的是哪个看它的上报）。
+    // 端口填 0 表示由监听节点自动分配空闲端口（确定后重启保持不变，实际端口以节点上报为准）。
     // 虚拟 IP 上的转发不占操作系统的端口，没有"空闲的端口"可挑，要写明。
     if config.bind.port() == 0 && config.bind.ip() == IpAddr::V4(listener.virtual_ip) {
-        return Err(Error::invalid_field("bind", "zero_port", "监听在虚拟 IP 上的端口转发要写明端口，不能是 0"));
+        return Err(Error::invalid_field("bind", "zero_port", "监听在虚拟 IP 上的端口转发必须显式指定端口，不能为 0"));
     }
     // PROXY protocol 的头是给 TCP 的服务读的：v1 没有 UDP 的写法，v2 的要加在每个报文前面，认它的 UDP 服务几乎没有。
     if config.proxy_protocol.is_some() && config.protocol == ForwardProtocol::Udp {
-        return Err(Error::invalid_field("proxy_protocol", "tcp_only", "PROXY protocol 只用在 TCP 的端口转发上"));
+        return Err(Error::invalid_field("proxy_protocol", "tcp_only", "PROXY protocol 仅适用于 TCP 端口转发"));
     }
     if !is_connectable(&config.target_addr) {
         return Err(Error::invalid_field(
             "target_addr",
             "not_connectable",
-            format!("目标地址 {} 不是一个能连上的地址", config.target_addr),
+            format!("目标地址 {} 不是有效的可连接地址", config.target_addr),
         ));
     }
-    // 目标节点不会去连的地址（它自己也查）不收：配上了也只是一条不通的转发。只查启用的：停用的不下发，
-    // 以前配下的这种转发因此可以原地停用，再启用时照样过不了这一条。
+    // 拒绝目标节点不会连接的地址（节点侧同样会校验）：允许配置也只会产生不可用的转发。仅对启用状态校验（停用项不下发），
+    // 以便历史遗留配置可原地停用，重新启用时仍受此校验限制。
     let cidr = store.network(network)?.ok_or(Error::NotFound(Entity::Network))?.cidr;
     if let Some(undialable) = Undialable::of(cidr, config.target_addr).filter(|_| config.enabled) {
         let (what, message) = match undialable {
             Undialable::CloudMetadata => {
-                ("cloud_metadata", format!("目标地址 {} 是云平台发凭据的地址（实例元数据），端口转发不能指向它", config.target_addr))
+                ("cloud_metadata", format!("目标地址 {} 为云平台实例元数据地址，禁止作为端口转发目标", config.target_addr))
             }
             Undialable::Overlay => (
                 "overlay_address",
                 format!(
-                    "目标地址 {} 在网络的虚拟地址段 {cidr} 里：这里填目标节点自己去连的地址（回环或者它所在的局域网）",
+                    "目标地址 {} 位于网络虚拟地址段 {cidr} 内：此处应填写目标节点本地可直连的地址（回环或所在局域网地址）",
                     config.target_addr
                 ),
             ),

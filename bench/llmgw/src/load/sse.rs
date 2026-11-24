@@ -102,7 +102,7 @@ impl Body {
             return Ok(());
         }
         if event.name.as_deref() == Some("end") {
-            let end: EndEvent<'_> = serde_json::from_str(&event.data).map_err(|err| format!("end 事件解析不了：{err}"))?;
+            let end: EndEvent<'_> = serde_json::from_str(&event.data).map_err(|err| format!("无法解析 end 事件：{err}"))?;
             if end.count != self.chain.count() || parse_hex(&end.h) != Some(self.chain.hash()) {
                 return Err(format!(
                     "上游说发了 {} 个事件（哈希 {}），收到并验过的是 {} 个（哈希 {}）",
@@ -119,7 +119,7 @@ impl Body {
             return Ok(());
         }
         let token: TokenEvent<'_> =
-            serde_json::from_str(&event.data).map_err(|err| format!("事件解析不了：{err}；内容 {:?}", truncate(&event.data)))?;
+            serde_json::from_str(&event.data).map_err(|err| format!("无法解析事件：{err}；内容 {:?}", truncate(&event.data)))?;
         let stamp = Stamp { seq: token.seq, t_ns: token.t, hash: parse_hex(&token.h).unwrap_or_default() };
         self.chain.check(stamp, token.delta.as_bytes()).map_err(|err| err.to_string())?;
         self.fresh.push(stamp);
@@ -193,7 +193,7 @@ async fn refused(conn: &mut Conn, head: &ResponseHead, mut body: Vec<u8>) -> Str
         body.extend_from_slice(&chunk[..read]);
     }
     let text = String::from_utf8_lossy(&body).into_owned();
-    let outcome = if text.contains("坏了") { Outcome::Corrupt } else { Outcome::HttpError };
+    let outcome = if text.contains("损坏") { Outcome::Corrupt } else { Outcome::HttpError };
     StreamEnd::new(outcome, format!("HTTP {} {}：{}", head.status, head.reason, truncate(&text)))
 }
 

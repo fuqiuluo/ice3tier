@@ -1,14 +1,14 @@
-//! 虚拟网卡在节点里的接法：默认打开，按本机配置装上，跟着 netmap 走，节点停下时拆掉。
+//! 虚拟网卡在节点中的集成：默认启用，按本机配置初始化，随 netmap 动态更新，节点停止时清理。
 //!
 //! 网卡、搬包、防火墙规则、认出自己的东西都在 `i3t_vnet` 里；这里只管什么时候做：
 //!
-//! - 启动时：本机开着就装（Linux、Windows、macOS）。装不上（没有权限、没有驱动、地址段和本机的网络重叠……）就不装，
-//!   状态里用代码说为什么（[`VnetState::Failed`]），代理和端口转发照常。关着的话，有权限时把上次（崩溃、被杀掉）留下的规则拆掉。
+//! - 启动时：若本机启用则尝试初始化（Linux、Windows、macOS）。初始化失败（缺少权限、缺少驱动、地址段与本机网络重叠等）时放弃安装，
+//!   通过状态原因码说明原因（[`VnetState::Failed`]），代理和端口转发不受影响。若关闭且具备权限，则清理上次（崩溃或被强制终止）残留的规则。
 //! - netmap 变了：对端、访问规则变了引擎自己跟着（每个包按当前的 netmap 判断），什么都不用重装；本节点的虚拟 IP 或者网络的地址段
 //!   变了整个重装；域名变了重设名字（Linux 上的 systemd-resolved）。
-//! - 装着（或者因为重叠、网卡坏了没装）的时候每 [`RECHECK`] 再查一次地址段和本机的网络重不重叠：后来才有的地址（DHCP 换了地址、
-//!   VPN 连上）重叠了就当场拆掉；重叠没了再装上。查不清的那一次什么也不改。
-//! - 停下时全部拆掉。进程被杀掉时网卡和它的地址、路由随进程没了（不是持久的）；留下的防火墙规则下次启动时被认出来、换掉或者拆掉。
+//! - 已安装（或因重叠、网卡异常而未安装）期间每 [`RECHECK`] 重新检查一次地址段与本机网络是否重叠：新增地址（如 DHCP 变更或
+//!   VPN 连接）发生重叠时立即清理虚拟网卡；重叠解除后重新初始化。单次检查失败时保持现状不变。
+//! - 停止时执行完整清理。进程被强制终止时，非持久化的网卡及其地址和路由会随进程释放；残留防火墙规则将在下次启动时被识别并替换或清理。
 //!
 //! 系统命令是阻塞的，放在阻塞线程里执行：低占用档位的运行时只有一个工作线程，不能让它等。
 
@@ -77,9 +77,9 @@ impl Vnet {
         let (status_tx, status) = watch::channel(Status::of(VnetState::Off));
         let task = if !network.enabled {
             // 防火墙的开关也关着时一条规则也不碰，留下的由 `i3t set firewall off` 那一下拆。
-            network.firewall.then(|| tokio::spawn(clean_leftovers("虚拟网卡关着")))
+            network.firewall.then(|| tokio::spawn(clean_leftovers("虚拟网卡已关闭")))
         } else if Platform::CURRENT == Platform::Other {
-            tracing::info!("这个平台上还没有虚拟网卡，代理和端口转发照常");
+            tracing::info!("当前平台不支持虚拟网卡，仍可使用代理和端口转发");
             status_tx.send_replace(Status::of(VnetState::Unsupported));
             None
         } else {
@@ -112,17 +112,17 @@ impl Vnet {
         }
     }
 
-    /// 拆掉装进系统里的东西，等拆完。再调用什么也不做。
+    /// 清理已安装的系统资源并等待完成。重复调用不产生副作用。
     pub(crate) async fn stop(&self) {
         if let Some(stop) = self.stop.lock().expect("vnet stop mutex poisoned").take() {
-            // 任务已经结束（关着、这个平台上没有）时没有人收，不要紧。
+            // 任务已结束（如已关闭或当前平台不支持）时无接收方，忽略发送失败。
             let _ = stop.send(());
         }
         let task = self.task.lock().expect("vnet task mutex poisoned").take();
         if let Some(task) = task
             && let Err(error) = task.await
         {
-            tracing::error!(%error, "虚拟网卡的任务没有正常结束，系统里可能留着它的防火墙规则，下次启动时会拆掉");
+            tracing::error!(%error, "虚拟网卡任务异常结束，系统中可能残留防火墙规则，将在下次启动时清理");
         }
     }
 }
@@ -138,7 +138,7 @@ pub fn present_devices() -> Vec<String> {
     if_addrs::get_if_addrs().map(|interfaces| interfaces.into_iter().map(|interface| interface.name).collect()).unwrap_or_default()
 }
 
-/// 关着（或者装不上）的时候，把上次留下的防火墙规则和以前的透明访问留下的东西拆掉。没有权限时什么都不做：那样的节点也装不了它们。
+/// 在虚拟网卡关闭（或初始化失败）时，清理上次残留的防火墙规则与原透明访问残留配置。权限不足时直接跳过（无权限节点也不会安装这些资源）。
 async fn clean_leftovers(why: &'static str) {
     if missing_privilege().is_some() {
         return;
@@ -147,13 +147,13 @@ async fn clean_leftovers(why: &'static str) {
     let removed = blocking(move |shell| setup::remove_leftovers(shell, Platform::CURRENT, &present)).await;
     match removed {
         Ok(0) => {}
-        Ok(count) => tracing::info!(count, why, "拆掉了上次留下的虚拟网卡的防火墙规则"),
-        Err(error) => tracing::debug!(%error, "看不清有没有上次留下的防火墙规则"),
+        Ok(count) => tracing::info!(count, why, "已清理上次残留的虚拟网卡防火墙规则"),
+        Err(error) => tracing::debug!(%error, "检查上次残留的虚拟网卡防火墙规则失败"),
     }
     remove_legacy().await;
 }
 
-/// 以前的透明访问（Linux）被杀掉时留下的东西：它们会让虚拟网卡不通，拆掉。
+/// 清理原透明访问（Linux）进程异常终止后残留的配置：这些残留会导致虚拟网卡不可达。
 async fn remove_legacy() {
     if Platform::CURRENT != Platform::Linux {
         return;
@@ -164,10 +164,10 @@ async fn remove_legacy() {
     })
     .await;
     match removed {
-        Ok(found) if !found.is_empty() => tracing::info!(?found, "拆掉了以前的透明访问留下的规则、路由和网卡"),
+        Ok(found) if !found.is_empty() => tracing::info!(?found, "已清理原透明访问残留的防火墙规则、路由和网卡"),
         Ok(_) => {}
         // 没有 nft 或者 ip 的机器上本来就没有过透明访问。
-        Err(error) => tracing::debug!(%error, "看不清有没有以前的透明访问留下的东西"),
+        Err(error) => tracing::debug!(%error, "检查原透明访问残留配置失败"),
     }
 }
 
@@ -206,10 +206,10 @@ impl Shape {
     }
 }
 
-/// 装上、跟着 netmap 改、隔一阵再查地址段的重叠、收到停止就拆掉。
+/// 虚拟网卡主循环：初始化、响应 netmap 变更、定期检查地址段重叠，并在收到停止信号时清理。
 async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: oneshot::Receiver<()>) {
     if !parts.firewall {
-        tracing::info!("虚拟网卡的防火墙开关关着：程序一条防火墙规则也不碰");
+        tracing::info!("虚拟网卡防火墙规则管理已关闭，程序不会修改任何防火墙规则");
     }
     remove_legacy().await;
     let mut netmap = parts.netmap.clone();
@@ -226,10 +226,10 @@ async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: onesho
                 Some(session)
             }
             Err(cause) => {
-                tracing::warn!(?cause, "虚拟网卡装不上，系统里什么都没有留下；代理和端口转发照常可用");
+                tracing::warn!(?cause, "虚拟网卡初始化失败，代理和端口转发仍可用");
                 status.send_replace(Status::of(VnetState::Failed { cause }));
                 if parts.firewall {
-                    clean_leftovers("虚拟网卡装不上").await;
+                    clean_leftovers("虚拟网卡初始化失败").await;
                 }
                 None
             }
@@ -255,12 +255,12 @@ async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: onesho
                     }
                     let next = Arc::clone(&netmap.borrow_and_update());
                     if next.me.virtual_ip != current.me.virtual_ip || next.network.cidr != current.network.cidr {
-                        tracing::info!("本节点的虚拟 IP 或者网络的地址段变了，虚拟网卡整个重装");
+                        tracing::info!("本节点虚拟 IP 或网络地址段已变更，将重新初始化虚拟网卡");
                         break true;
                     }
                     let (was, now) = (parts.shape(&current), parts.shape(&next));
                     if was != now {
-                        tracing::info!(?was, ?now, "网络给虚拟网卡定的 MTU 或者分段卸载的开关变了，虚拟网卡整个重装");
+                        tracing::info!(?was, ?now, "网络虚拟网卡 MTU 或分片卸载配置已变更，将重新初始化虚拟网卡");
                         break true;
                     }
                     if let Some(session) = session.as_mut()
@@ -276,7 +276,7 @@ async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: onesho
                         Ok(Stopped::Closed) => break false,
                         Err(error) => error.to_string(),
                     };
-                    tracing::warn!(%detail, "虚拟网卡读不了了（被别的程序删掉了？），拆掉，隔一阵再装");
+                    tracing::warn!(%detail, "虚拟网卡运行异常，将先清理资源，再尝试重新初始化");
                     engine = None;
                     if let Some(session) = session.take() {
                         session.close(None).await;
@@ -289,7 +289,7 @@ async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: onesho
                     match blocking(move |shell| overlap::find(shell, Platform::CURRENT, cidr, own.as_deref())).await {
                         Ok(Some(with)) => {
                             if let Some(installed) = session.take() {
-                                tracing::warn!(%with, "网络的地址段和本机后来进的一个网络重叠了，虚拟网卡当场拆掉，免得把这台机器从那个网络上切下来；重叠没了再装上");
+                                tracing::warn!(%with, "虚拟网络地址段与本机新增网络重叠，立即停用并清理虚拟网卡以避免影响本机网络通信；重叠解除后将重新初始化");
                                 installed.close(engine.take()).await;
                             }
                             let failed = Status::of(VnetState::Failed { cause: VnetCause::RangeInUse { with } });
@@ -302,11 +302,11 @@ async fn supervise(parts: Parts, status: watch::Sender<Status>, mut stop: onesho
                             });
                         }
                         Ok(None) if session.is_none() => {
-                            tracing::info!("重叠的网络没了（或者网卡可以再试了），虚拟网卡再装上");
+                            tracing::info!("地址段重叠已解除（或可重试初始化虚拟网卡），将重新初始化虚拟网卡");
                             break true;
                         }
                         Ok(None) => {}
-                        Err(error) => tracing::debug!(%error, "查不清地址段和本机的网络重不重叠，这一次什么也不改"),
+                        Err(error) => tracing::debug!(%error, "检查地址段是否与本机网络重叠失败，本次保持当前状态不变"),
                     }
                 }
             }
@@ -347,7 +347,7 @@ impl Session {
             return Err(VnetCause::NoPermission { missing: vec![missing.to_owned()] });
         }
         let (own, cidr) = (netmap.me.virtual_ip, netmap.network.cidr);
-        // Windows 上网卡的名字是固定的：万一上次的适配器还在（带着本节点的地址），它是自己的，接着用，不算重叠。
+        // Windows 平台虚拟网卡名称固定：若上次残留适配器仍存在（携带本节点地址），属于本节点自身设备，可复用而不视为地址段重叠。
         let ours = (platform == Platform::Windows).then_some(i3t_vnet::device::WINDOWS_NAME);
         match blocking(move |shell| overlap::find(shell, platform, cidr, ours)).await {
             Ok(Some(with)) => return Err(VnetCause::RangeInUse { with }),
@@ -369,7 +369,7 @@ impl Session {
             let present = present_devices();
             let leftovers = blocking(move |shell| setup::remove_leftovers(shell, platform, &present)).await;
             if let Ok(removed @ 1..) = leftovers {
-                tracing::info!(removed, "拆掉了上次留下、网卡已经不在了的防火墙规则");
+                tracing::info!(removed, "已清理上次残留且对应网卡已不存在的防火墙规则");
             }
             let firewall = blocking({
                 let plan = plan.clone();
@@ -389,9 +389,9 @@ impl Session {
         Ok((session, engine))
     }
 
-    /// 网络的域名变了：重设名字（名字服务答的名字本来就跟着 netmap）。
+    /// 网络域名变更后重新配置系统解析器（内置 DNS 服务自动跟随最新 netmap）。
     async fn rename(&mut self, domain: &str) {
-        tracing::info!(domain, "网络的域名变了，重设名字");
+        tracing::info!(domain, "网络域名已变更，正在重新配置名称解析");
         self.domain = domain.to_owned();
         let names = configure_resolver(&self.device_name, domain, self.plan.own).await;
         if let VnetState::Installed { names: current, .. } = &mut self.status.state {
@@ -399,7 +399,7 @@ impl Session {
         }
     }
 
-    /// 拆掉：停止搬包（`engine`，已经停了的是 `None`）和名字服务，撤掉名字的设置和防火墙规则，丢掉网卡（连同它的地址和路由）。
+    /// 清理虚拟网卡：停止数据转发（`engine`，已停止时为 `None`）与 DNS 服务，撤销解析器配置与防火墙规则，并释放网卡（连同其地址和路由）。
     async fn close(self, engine: Option<JoinHandle<Stopped>>) {
         if let Some(engine) = &engine {
             engine.abort();
@@ -410,16 +410,16 @@ impl Session {
         let (platform, device) = (Platform::CURRENT, self.device_name.clone());
         if platform == Platform::Linux {
             let device = device.clone();
-            // 网卡一删，systemd-resolved 就忘了它上面的设置；先撤一下只是更干净，撤不了不要紧。
+            // 网卡释放后 systemd-resolved 会自动清除其配置；提前撤销仅用于保持状态整洁，失败可忽略。
             let _reverted = blocking(move |shell| shell.run(Program::Resolvectl, &["revert".to_owned(), device], None)).await;
         }
         if self.firewall {
             match blocking(move |shell| setup::remove_firewall(shell, platform, &device)).await {
                 Ok(()) => {}
-                Err(error) => tracing::warn!(%error, "虚拟网卡的防火墙规则没有全部拆掉，下次启动时会拆掉"),
+                Err(error) => tracing::warn!(%error, "虚拟网卡防火墙规则未完全清理，将在下次启动时继续清理"),
             }
         }
-        // 名字服务的 socket 真的关掉之后，才把它从"程序自己的监听"里撤掉。
+        // 等待 DNS 服务的 socket 真正关闭后，再将其从自有监听表中注销。
         if let Some(NameResponder { task, _claim }) = self.names {
             // 任务是被取消的，它的结果只会是"已取消"。
             let _ = task.await;
@@ -428,47 +428,47 @@ impl Session {
         if let Some(engine) = engine {
             let _stopped = engine.await;
         }
-        tracing::info!(device = self.device_name, "虚拟网卡拆掉了");
+        tracing::info!(device = self.device_name, "虚拟网卡已清理");
     }
 }
 
-/// 防火墙规则装得怎么样，各记一行。
+/// 记录各条防火墙规则的安装结果。
 fn log_firewall(firewall: &Firewall) {
     for (rule, state) in [("accept", &firewall.accept), ("guard", &firewall.guard)] {
         match state {
-            RuleState::On => tracing::info!(rule, "虚拟网卡的防火墙规则装上了"),
+            RuleState::On => tracing::info!(rule, "虚拟网卡防火墙规则已安装"),
             RuleState::Failed { cause } => {
-                tracing::warn!(rule, ?cause, "虚拟网卡的防火墙规则装不上，网卡照常；这一条管的事由这台机器自己的防火墙定")
+                tracing::warn!(rule, ?cause, "虚拟网卡防火墙规则安装失败。虚拟网卡仍可用，相关流量由本机防火墙规则处理。")
             }
-            RuleState::Unsupported => tracing::info!(rule, "这个平台上程序不加这条防火墙规则"),
-            RuleState::NotNeeded => tracing::info!(rule, "这台机器上不需要这条防火墙规则"),
+            RuleState::Unsupported => tracing::info!(rule, "当前平台不安装该防火墙规则"),
+            RuleState::NotNeeded => tracing::info!(rule, "当前主机无需安装该防火墙规则"),
             RuleState::Off | RuleState::Unknown => {}
         }
     }
 }
 
-/// 网卡建不起来的原因写成状态里的代码。
+/// 将虚拟网卡创建或运行故障转换为上报状态的原因码。
 fn device_cause(error: DeviceError) -> VnetCause {
     match error {
         DeviceError::NoPermission { missing, .. } => VnetCause::NoPermission { missing: vec![missing] },
         DeviceError::NoDevice { detail } => VnetCause::NoDevice { detail },
         DeviceError::DriverMissing { path } => VnetCause::DriverMissing { path: path.display().to_string() },
         DeviceError::Failed(error) => VnetCause::DeviceFailed { detail: error.to_string() },
-        DeviceError::Unsupported => VnetCause::DeviceFailed { detail: "这个平台上还没有虚拟网卡".to_owned() },
+        DeviceError::Unsupported => VnetCause::DeviceFailed { detail: "当前平台暂不支持虚拟网卡功能".to_owned() },
     }
 }
 
-/// 开名字服务（本节点虚拟 IP 的 53 端口），Linux 上再让 systemd-resolved 把网络的域名交给它。
-/// Windows 和 macOS 上不碰系统的解析器，名字用 `i3t hosts`。
+/// 启动内置 DNS 服务（本节点虚拟 IP 的 53 端口），Linux 上同时配置 systemd-resolved 将网络域名转发至该服务。
+/// Windows 和 macOS 上不修改系统解析器，可通过 `i3t hosts` 配置名称解析。
 async fn start_names(parts: &Parts, own: Ipv4Addr, device: &str, domain: &str) -> (NameService, Option<NameResponder>) {
     let address = SocketAddr::from((own, i3t_vnet::DNS_PORT));
-    // 先登记再绑：绑上的那一刻起它就在答查询，出口得在那之前就知道这个地址不能从本机去连。绑不上时登记随凭据撤销。
-    // 名字服务每装一次网卡只开这一次，绑不上不重试，所以不会反复登记。
+    // 先登记再绑定：绑定后即开始响应查询，出口必须在此之前知晓该地址不可从本机访问。绑定失败时登记随凭据自动撤销。
+    // 每次初始化虚拟网卡仅尝试启动一次 DNS 服务，绑定失败不重试，不会重复登记。
     let claim = parts.own_listeners.claim(OwnListener { protocol: ForwardProtocol::Udp, local: address, forward: None });
     let socket = match UdpSocket::bind(address).await {
         Ok(socket) => socket,
         Err(error) => {
-            tracing::warn!(%address, %error, "名字服务开不起来，按虚拟 IP 访问照常可用");
+            tracing::warn!(%address, %error, "DNS 服务启动失败，仍可通过虚拟 IP 访问");
             return (NameService::Failed { cause: bind_cause(address, &error) }, None);
         }
     };
@@ -484,16 +484,16 @@ async fn configure_resolver(device: &str, domain: &str, own: Ipv4Addr) -> NameSe
     let service = blocking(move |shell| setup::configure_resolver(shell, &device, &domain, own)).await;
     match &service {
         NameService::NoResolver => {
-            tracing::info!("这台机器没有在跑 systemd-resolved：名字要写进 hosts 文件（i3t hosts），按虚拟 IP 访问照常可用");
+            tracing::info!("systemd-resolved 不可用。可通过 hosts 文件配置名称解析（i3t hosts），也可直接使用虚拟 IP 访问。");
         }
-        NameService::Failed { cause } => tracing::warn!(?cause, "systemd-resolved 不接受设置，名字解析不了，按虚拟 IP 访问照常可用"),
+        NameService::Failed { cause } => tracing::warn!(?cause, "配置 systemd-resolved 失败，名称解析不可用，仍可通过虚拟 IP 访问"),
         NameService::Resolved | NameService::Unknown => {}
     }
     service
 }
 
-/// 回答名字的查询，用节点现在看到的网络：本节点能访问的对端和自己。只答本机来的查询（来源是回环或者本节点自己的虚拟 IP）：
-/// 别的节点经网卡也到得了这个端口，它们不该从这里知道本节点能访问哪些节点。
+/// 响应基于当前 netmap 的名称查询（包含本节点可访问的对端与本节点自身）。仅响应本机查询（源地址为回环或本节点虚拟 IP）：
+/// 其他节点经虚拟网卡也能访问该端口，不应允许其借此探测本节点可访问的对端列表。
 async fn answer_names(socket: UdpSocket, netmap: watch::Receiver<Arc<Netmap>>, own: Ipv4Addr) {
     let mut buf = vec![0; 1500];
     let mut cached: Option<(u64, Names)> = None;
@@ -501,12 +501,12 @@ async fn answer_names(socket: UdpSocket, netmap: watch::Receiver<Arc<Netmap>>, o
         let (len, from) = match socket.recv_from(&mut buf).await {
             Ok(received) => received,
             Err(error) => {
-                tracing::debug!(%error, "名字服务收报文出错");
+                tracing::debug!(%error, "DNS 服务接收报文失败");
                 continue;
             }
         };
         if !(from.ip().is_loopback() || from.ip() == std::net::IpAddr::V4(own)) {
-            tracing::debug!(%from, "名字服务不回答别的机器来的查询");
+            tracing::debug!(%from, "DNS 服务已忽略来自非本机地址的查询");
             continue;
         }
         let current = Arc::clone(&netmap.borrow());
@@ -517,7 +517,7 @@ async fn answer_names(socket: UdpSocket, netmap: watch::Receiver<Arc<Netmap>>, o
         if let Some(answer) = names.answer(&buf[..len])
             && let Err(error) = socket.send_to(&answer, from).await
         {
-            tracing::debug!(%error, %from, "名字服务的应答发不出去");
+            tracing::debug!(%error, %from, "发送 DNS 应答失败");
         }
     }
 }
@@ -537,8 +537,8 @@ fn bind_cause(address: SocketAddr, error: &io::Error) -> VnetCause {
     }
 }
 
-/// 本机的命令（`i3t network status`）要的：这台机器上像是本程序建的网卡和它们的 IPv4 地址。`cidr` 是网络的地址段（知道的话）：
-/// macOS 的 utun 看不出是谁建的，地址在地址段里的才算。
+/// 供本机命令（`i3t network status`）查询当前主机上疑似由本程序创建的网卡及其 IPv4 地址。`cidr` 为虚拟网络地址段（若已知）：
+/// macOS 的 utun 无法区分创建者，仅匹配地址落在虚拟网络地址段内的接口。
 #[must_use]
 pub fn devices(cidr: Option<Ipv4Net>) -> Vec<(String, Ipv4Net)> {
     let Ok(interfaces) = if_addrs::get_if_addrs() else { return Vec::new() };

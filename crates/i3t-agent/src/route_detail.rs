@@ -15,8 +15,8 @@ use i3t_model::control::{self, PathCandidate, PathDetail, PathSegment, Route, Ro
 use i3t_proto::NodeId;
 use i3t_proto::backbone::RelayState;
 
-/// 现在这条路的细节：直连是怎么建立的，或者经 relay 时第一段走的是 UDP 还是 TCP；以及直连在哪一步，不管走不走它。
-/// 路由层对每个对端都说得出直连在哪一步，所以每个对端都有。
+/// 当前路径详情：直连建立方式，或经 relay 时首段使用的传输协议（UDP/TCP）；以及当前直连阶段状态（无论当前是否走直连）。
+/// 路由层可为每个对端提供直连状态，因此每个对端均有此字段。
 pub(crate) fn kind(report: &PathReport) -> RouteKind {
     let (direct, relay_leg) = (direct_kind(report), report.relay_leg.map(leg_transport));
     let alternative =
@@ -139,7 +139,7 @@ fn segment(leg: &LegReport) -> PathSegment {
     }
 }
 
-/// 毫秒换成微秒，四舍五入。借 `Duration` 来换，不用 `as`：负数和不是数的值得 0，大得放不下的封顶。
+/// 将毫秒转换为微秒并四舍五入。借助 `Duration` 换算而非使用 `as`：负数和 NaN 返回 0，超出范围时饱和为最大值。
 pub(crate) fn micros(ms: f64) -> u32 {
     match Duration::try_from_secs_f64(ms / 1000.0) {
         Ok(duration) => u32::try_from(rounded_thousandths(duration)).unwrap_or(u32::MAX),

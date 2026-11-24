@@ -53,11 +53,11 @@ pub(crate) fn configure(stream: &TcpStream) -> io::Result<()> {
     limit_unsent(&socket)
 }
 
-/// 设 `TCP_USER_TIMEOUT`。只有 Linux 有；设不上只是死连接发现得慢一些，所以不报错。
+/// 设置 `TCP_USER_TIMEOUT`。仅 Linux 与 Android 支持；设置失败仅导致失效连接检测变慢，因此不返回错误。
 pub(crate) fn set_user_timeout(stream: &TcpStream, timeout: Duration) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Err(error) = SockRef::from(stream).set_tcp_user_timeout(Some(timeout)) {
-        tracing::debug!(%error, "设置不了 TCP_USER_TIMEOUT");
+        tracing::debug!(%error, "设置 TCP_USER_TIMEOUT 失败");
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = (stream, timeout);
@@ -79,14 +79,14 @@ fn limit_unsent(_socket: &SockRef<'_>) -> io::Result<()> {
 /// 中途出错、任务被取消、进程退出，对端看到的都是重置，被截断的数据不会看起来像正常结束。
 pub(crate) fn rst_on_close(stream: &TcpStream) {
     if let Err(error) = stream.set_zero_linger() {
-        tracing::warn!(%error, "设置不了 SO_LINGER，lane 中途断开时对端可能看到正常结束");
+        tracing::warn!(%error, "设置 SO_LINGER 失败，lane 中途断开时对端可能视为正常关闭");
     }
 }
 
 /// 两个方向都正常结束了：关闭时按正常的 FIN 走。本端写的一半要已经用 [`finish_write`] 关掉。
 pub(crate) fn graceful_close(stream: &TcpStream) {
     if let Err(error) = i3t_underlay::tcp_reset::graceful_close(stream) {
-        tracing::debug!(%error, "恢复不了 SO_LINGER，正常结束的 lane 会以 RST 关闭");
+        tracing::debug!(%error, "禁用 SO_LINGER 失败，关闭 lane 时可能发送 RST");
     }
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn reset_now(stream: &TcpStream) {
     rst_on_close(stream);
     #[cfg(target_os = "linux")]
     if let Err(error) = rustix::net::connect_unspec(stream) {
-        tracing::debug!(%error, "立刻重置 lane 失败，等它被关闭时再发 RST");
+        tracing::debug!(%error, "立即重置 lane 失败，将在连接关闭时发送 RST");
     }
 }
 

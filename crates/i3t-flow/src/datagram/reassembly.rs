@@ -46,7 +46,7 @@ pub(crate) struct Reassembler {
 impl Reassembler {
     /// 收下一片。它把一个报文补齐了的话，返回完整的内容。
     ///
-    /// 重复的片被忽略；和同一个报文之前的片对不上（片数不一样）的片被丢掉；
+    /// 重复分片会被忽略；与同一报文已有分片总数不一致的分片会被丢弃；
     /// 拼起来会超过 [`MAX_DATAGRAM_BODY_LEN`] 的报文整个扔掉。
     pub(crate) fn push(&mut self, context: u32, fragment: Fragment, piece: Bytes, now: Instant) -> Option<Bytes> {
         self.expire(now);

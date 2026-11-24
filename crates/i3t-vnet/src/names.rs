@@ -1,52 +1,52 @@
-//! 名字：`<节点>.<网络的域名>` 解析成节点的虚拟 IP。
+//! 名称解析：将 `<节点名>.<网络域名>` 解析为对应节点的虚拟 IP。
 //!
-//! 两种用法，答的都是节点现在看到的网络（netmap 里本节点能访问的对端，加上自己）：
+//! 提供两种使用方式，数据均来源于节点当前的网络视图（netmap 中本节点可访问的对端及自身）：
 //!
-//! - **名字服务**（[`Names::answer`]）：一个只认网络自己的域名的 DNS 应答者，听在本节点虚拟 IP 的 53 端口上，
-//!   systemd-resolved 只把这个域名下的查询发给它。域名之外的名字一律回 REFUSED：它不是这台机器的解析器。
-//! - **hosts 文件**（[`hosts_block`]、[`replace_hosts_block`]、[`remove_hosts_block`]）：没有 systemd-resolved 的机器用
-//!   `i3t hosts` 打印或者写进 `/etc/hosts` 的一段，前后有标记，再写一次只换这一段，`i3t hosts --remove` 只去掉这一段。
+//! - **内置 DNS 服务**（[`Names::answer`]）：仅响应本网络域名的权威 DNS 应答器，监听在本节点虚拟 IP 的 53 端口，
+//!   由 systemd-resolved 仅将本网络域名的查询路由至此。其他域名一律返回 `REFUSED`，不充当主机通用递归解析器。
+//! - **hosts 区块管理**（[`hosts_block`]、[`replace_hosts_block`]、[`remove_hosts_block`]）：在无 systemd-resolved 的主机上，
+//!   由 `i3t hosts` 生成或写入带起止标记的 `/etc/hosts` 条目区块；重复写入仅更新该区块，`i3t hosts --remove` 仅移除该区块。
 //!
-//! 只有全名（`nas.home.i3t`）；短名字（`nas`）可能是局域网里的另一台机器，不去抢。
+//! 仅支持完整域名（如 `nas.home.i3t`），不解析短主机名（如 `nas`），避免与局域网内同名主机冲突。
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::net::Ipv4Addr;
 use std::ops::Range;
 
-/// 回答里的 TTL。名字可以改、对端可以增减，所以不长。
+/// DNS 应答记录的 TTL（秒）。节点名称与拓扑可能动态变更，因此保持较短值。
 const TTL_SECS: u32 = 30;
 
-/// DNS 的记录类型和类。
+/// DNS 记录类型与查询类常量。
 const TYPE_A: u16 = 1;
 const TYPE_ANY: u16 = 255;
 const CLASS_IN: u16 = 1;
 
-/// 应答码（RFC 1035 §4.1.1）。
+/// DNS 响应码（RFC 1035 §4.1.1）。
 const NOERROR: u8 = 0;
 const FORMERR: u8 = 1;
 const NXDOMAIN: u8 = 3;
 const NOTIMP: u8 = 4;
 const REFUSED: u8 = 5;
 
-/// 一个网络里的名字：域名，和域名下每个节点的地址。
+/// 单个虚拟网络内的域名及节点地址映射表。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Names {
-    /// 小写，没有结尾的点。
+    /// 规范化后的网络域名（小写，无末尾点号）。
     domain: String,
-    /// 节点名（小写）到虚拟 IP。
+    /// 小写节点名到虚拟 IP 的有序映射。
     nodes: BTreeMap<String, Ipv4Addr>,
 }
 
 impl Names {
-    /// `domain` 是网络的域名（`home.i3t`），`nodes` 是（节点名，虚拟 IP）。名字不分大小写。
+    /// 使用网络域名 `domain`（如 `home.i3t`）及 `(节点名, 虚拟 IP)` 列表构造映射表；名称不区分大小写。
     #[must_use]
     pub fn new(domain: &str, nodes: impl IntoIterator<Item = (String, Ipv4Addr)>) -> Self {
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         Self { domain, nodes: nodes.into_iter().map(|(name, ip)| (name.to_ascii_lowercase(), ip)).collect() }
     }
 
-    /// 有几个名字。
+    /// 返回当前表中的节点名称数量。
     #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -57,31 +57,31 @@ impl Names {
         self.nodes.is_empty()
     }
 
-    /// 全名（`nas.home.i3t`，可以带结尾的点，不分大小写）对应的地址。不是这个网络里的名字时是 `None`。
+    /// 按完整域名（如 `nas.home.i3t`，可带末尾点号、不区分大小写）查询虚拟 IP；不属于本网络或未找到时返回 `None`。
     #[must_use]
     pub fn lookup(&self, name: &str) -> Option<Ipv4Addr> {
         let short = self.short(name)?;
         self.nodes.get(&short).copied()
     }
 
-    /// 全名里节点名那一段。名字不在这个域名下，或者节点名不是一段（`a.b.home.i3t`）时是 `None`。
+    /// 提取完整域名中的单级节点名标签。域名不归属当前网络，或包含多级子域（如 `a.b.home.i3t`）时返回 `None`。
     fn short(&self, name: &str) -> Option<String> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         let short = name.strip_suffix(&self.domain)?.strip_suffix('.')?;
         (!short.is_empty() && !short.contains('.')).then(|| short.to_owned())
     }
 
-    /// 名字在这个域名下（包括域名本身）。
+    /// 判断 `name` 是否位于当前网络域名范围内（含网络域名本身）。
     fn covers(&self, name: &str) -> bool {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         name == self.domain || name.strip_suffix(&self.domain).is_some_and(|rest| rest.ends_with('.'))
     }
 
-    /// 回答一个 DNS 查询（UDP 报文的内容）。读不懂、不像一个查询的报文返回 `None`：不回答，像没收到一样。
+    /// 处理单个 DNS 查询报文（UDP 负载）。报文无法解析或非查询类型（如响应报文）时返回 `None`（静默忽略）。
     ///
-    /// - 网络的域名下、有这个节点：A 记录；问别的类型（AAAA 之类）时没有记录（NOERROR，空的回答）。
-    /// - 网络的域名下、没有这个节点：NXDOMAIN。
-    /// - 别的名字：REFUSED。
+    /// - 属于当前网络域名且存在对应节点：返回 A 记录；查询其他记录类型（如 AAAA）时返回 `NOERROR` 空应答。
+    /// - 属于当前网络域名但不存在对应节点：返回 `NXDOMAIN`。
+    /// - 域外名称：返回 `REFUSED`。
     #[must_use]
     pub fn answer(&self, query: &[u8]) -> Option<Vec<u8>> {
         let header = query.get(..12)?;
@@ -104,7 +104,7 @@ impl Names {
             return Some(reply(query, flags, REFUSED, echoed, None));
         }
         let address = self.lookup(&name);
-        // 域名本身存在（只是没有地址）；域名下别的名字都是没有这个节点。
+        // 域名本身视为存在（但无 A 记录）；域名下未匹配到节点的其他名称均返回 NXDOMAIN。
         let code = if address.is_some() || name_is_domain(&name, &self.domain) { NOERROR } else { NXDOMAIN };
         let record = address.filter(|_| class == CLASS_IN && (kind == TYPE_A || kind == TYPE_ANY));
         Some(reply(query, flags, code, echoed, record))
@@ -119,11 +119,11 @@ struct Question {
     name: String,
     kind: u16,
     class: u16,
-    /// 问题部分在报文里占多少字节。
+    /// Question 段在报文中所占的字节长度。
     len: usize,
 }
 
-/// 读问题部分：名字（一串标签，问题里不会有压缩指针）、类型、类。
+/// 解析 DNS Question 段（域名标签序列、记录类型与查询类；Question 中不应出现压缩指针）。
 fn question(bytes: &[u8]) -> Option<Question> {
     let mut at = 0;
     let mut labels: Vec<String> = Vec::new();
@@ -133,7 +133,7 @@ fn question(bytes: &[u8]) -> Option<Question> {
         if len == 0 {
             break;
         }
-        // 0xc0 开头的是压缩指针，问题里不该出现；0x40、0x80 是没有定义的标签类型。
+        // 高两位非零表示压缩指针（0xc0）或未定义标签类型（0x40、0x80），在 Question 中均非法。
         if len > 63 {
             return None;
         }
@@ -150,7 +150,7 @@ fn question(bytes: &[u8]) -> Option<Question> {
     })
 }
 
-/// 写应答：编号、操作码和"要求递归"照抄，标上"是应答""权威"，不说"可以递归"。`question` 原样带回去。
+/// 构造 DNS 响应报文：复制事务 ID、操作码与 RD 标志，置 QR 与 AA（权威应答）位、清 RA 位，并原样回显 `question`。
 fn reply(query: &[u8], flags: u16, code: u8, question: &[u8], address: Option<Ipv4Addr>) -> Vec<u8> {
     let flags = 0x8000 | (flags & 0x7800) | 0x0400 | (flags & 0x0100) | u16::from(code);
     let mut out = Vec::with_capacity(12 + question.len() + 16);
@@ -161,7 +161,7 @@ fn reply(query: &[u8], flags: u16, code: u8, question: &[u8], address: Option<Ip
     out.extend_from_slice(&[0, 0, 0, 0]);
     out.extend_from_slice(question);
     if let Some(address) = address {
-        // 名字用指针指回问题里的那个（偏移 12）。
+        // Answer 名称使用压缩指针指向 Question 起始位置（偏移 12）。
         out.extend_from_slice(&[0xc0, 0x0c]);
         out.extend_from_slice(&TYPE_A.to_be_bytes());
         out.extend_from_slice(&CLASS_IN.to_be_bytes());
@@ -172,11 +172,11 @@ fn reply(query: &[u8], flags: u16, code: u8, question: &[u8], address: Option<Ip
     out
 }
 
-/// `/etc/hosts` 里那一段的开头和结尾。
+/// `/etc/hosts` 中由本程序管理的条目区块起止标记。
 pub const HOSTS_BEGIN: &str = "# BEGIN ice3tier (i3t hosts)";
 pub const HOSTS_END: &str = "# END ice3tier";
 
-/// `/etc/hosts` 里的一段名字必须只含合法主机名字符，防止异常或被篡改的 `netmap.json` 注入换行、空白或注释。
+/// `/etc/hosts` 条目名称必须仅含合法主机名字符，防止异常或被篡改的 `netmap.json` 注入换行、空白或注释。
 fn is_safe_hosts_label(label: &str) -> bool {
     !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
@@ -185,7 +185,7 @@ fn is_safe_hosts_domain(domain: &str) -> bool {
     !domain.is_empty() && domain.split('.').all(is_safe_hosts_label)
 }
 
-/// `/etc/hosts` 的一段：每个节点一行，`<虚拟 IP>\t<全名>`，按名字排。前后带标记。
+/// 生成带起止标记的 `/etc/hosts` 条目区块：每行格式为 `<虚拟 IP>\t<完整域名>`，按节点名升序排列。
 #[must_use]
 pub fn hosts_block(names: &Names) -> String {
     let mut block = format!("{HOSTS_BEGIN}\n");
@@ -201,8 +201,8 @@ pub fn hosts_block(names: &Names) -> String {
     block
 }
 
-/// 上次写的那一段在 `hosts` 里占的字节：从开头标记那一行的行首，到结尾标记那一行的换行符之后。
-/// 有开头没有结尾的不算：不知道它到哪里为止，就一个字也不动。
+/// 查找 `hosts` 中由起止标记界定的条目区块字节范围（从起始标记行首至结束标记行末换行符之后）。
+/// 缺少结束标记时返回 `None`，表示未找到完整的条目区块。
 fn hosts_block_span(hosts: &str) -> Option<Range<usize>> {
     let mut lines = hosts.split_inclusive('\n').scan(0, |offset, line| {
         let start = *offset;
@@ -214,7 +214,7 @@ fn hosts_block_span(hosts: &str) -> Option<Range<usize>> {
     Some(begin..end)
 }
 
-/// 把 `hosts`（`/etc/hosts` 原来的内容）里上次写的那一段换成 `block`；没有的话加在最后。别的字节一个也不动。
+/// 仅替换 `hosts` 中有完整起止标记的条目区块。未找到完整区块时，在文件末尾追加 `block`。
 #[must_use]
 pub fn replace_hosts_block(hosts: &str, block: &str) -> String {
     match hosts_block_span(hosts) {
@@ -224,7 +224,7 @@ pub fn replace_hosts_block(hosts: &str, block: &str) -> String {
     }
 }
 
-/// `hosts` 里去掉上次写的那一段之后的样子，别的字节一个也不动；没有那一段时是 `None`。
+/// 仅移除 `hosts` 中有完整起止标记的条目区块。未找到完整区块时返回 `None`。
 #[must_use]
 pub fn remove_hosts_block(hosts: &str) -> Option<String> {
     let span = hosts_block_span(hosts)?;

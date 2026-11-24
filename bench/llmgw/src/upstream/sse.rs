@@ -16,7 +16,7 @@ use crate::{chunked, sse};
 
 /// 请求体最多多大。真实的提示词到 1 MB 左右。
 const MAX_BODY: usize = 64 * 1024 * 1024;
-/// 读请求体最多等多久：慢的路上传 1 MB 也用不了这么久。
+/// 读取请求体的超时时间：即使在低速链路上上传 1 MB 也远短于此值。
 const BODY_TIMEOUT: Duration = Duration::from_secs(600);
 /// 一次写最多攒多少事件。速率是 0（发得越快越好）或者落后于计划时，几个事件合成一次写。
 const MAX_WRITE: usize = 16 * 1024;
@@ -27,7 +27,7 @@ where
 {
     let Some(len) = head.header("content-length").and_then(|value| value.parse::<usize>().ok()).filter(|&len| len <= MAX_BODY) else {
         counters.bad.fetch_add(1, Ordering::Relaxed);
-        return respond(&mut stream, 400, "要有 Content-Length，最大 64 MB").await;
+        return respond(&mut stream, 400, "缺少有效的 Content-Length 请求头（最大 64 MB）").await;
     };
     if body.len() < len {
         let have = body.len();
@@ -40,14 +40,14 @@ where
         Ok(request) => request,
         Err(err) => {
             counters.bad.fetch_add(1, Ordering::Relaxed);
-            return respond(&mut stream, 400, &format!("请求体不是要的 JSON：{err}")).await;
+            return respond(&mut stream, 400, &format!("无法解析请求体 JSON：{err}")).await;
         }
     };
     drop(body);
     if parse_hex(&request.prompt_hash) != Some(Fnv::of(request.prompt.as_bytes())) {
         counters.bad.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(stream = %request.stream, bytes = request.prompt.len(), "提示词和它的哈希对不上：请求体在路上坏了");
-        return respond(&mut stream, 400, "提示词和 prompt_hash 对不上：请求体在路上坏了").await;
+        tracing::warn!(stream = %request.stream, bytes = request.prompt.len(), "提示词与哈希不匹配：请求体可能已损坏");
+        return respond(&mut stream, 400, "提示词与 prompt_hash 不匹配：请求体可能已损坏").await;
     }
 
     let _active = Gauge::new(&counters.sse_active);

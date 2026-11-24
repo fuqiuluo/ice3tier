@@ -115,7 +115,7 @@ fn a_manifest_signed_with_another_key_is_refused() {
     // 连清单都没有验过，所以状态里说不出是哪个版本。
     let status = updater.status().borrow().clone();
     let UpdateStatus::Failed { version: None, kind: FailureKind::NotInstalled, reason, cause } = status else { panic!("{status:?}") };
-    assert_eq!(reason, "不装这份清单：清单的签名不是任何一把受信任的发布公钥签的");
+    assert_eq!(reason, "已拒绝该发布清单：发布清单签名验证失败：签名与受信任的发布公钥不匹配");
     assert_eq!(cause, Some(UpdateCause::BadSignature));
 }
 
@@ -449,7 +449,7 @@ exit 0"#;
             UpdateStatus::Failed {
                 version: Some(version(NEW)),
                 kind: FailureKind::VersionRejected,
-                reason: "版本 0.2.0 的自检没有通过：退出码 3：读不了 config.toml".to_owned(),
+                reason: "版本 0.2.0 自检失败：退出码 3：读不了 config.toml".to_owned(),
                 cause: Some(UpdateCause::SelfCheck { exit_code: Some(3), output: "读不了 config.toml".to_owned() }),
             }
         );
@@ -495,7 +495,7 @@ exit 0"#;
         old.update(&release.signed, UpdateTiming::Idle, &release.source, &mut flows).await.unwrap_err();
         let failures = old.failures().unwrap();
         assert_eq!(failures.len(), 1);
-        assert_eq!((&failures[0].version, failures[0].reason.as_str()), (&version(NEW), "自检没有通过：退出码 3：读不了 config.toml"));
+        assert_eq!((&failures[0].version, failures[0].reason.as_str()), (&version(NEW), "自检失败：退出码 3：读不了 config.toml"));
 
         // 自动更新再来，连包都不取。重启之后也一样。
         let asked = release.source.offsets().len();
@@ -528,7 +528,7 @@ exit 0"#;
         let Startup::RolledBack(rolled_back) = fourth.startup().unwrap() else { panic!("第四次启动应该换回旧程序") };
         assert_eq!(rolled_back.failed, version(NEW));
         assert_eq!(rolled_back.restart, RestartRequired { version: version(OLD) });
-        assert_eq!(rolled_back.reason, "新程序启动了 3 次都没有连上 controller");
+        assert_eq!(rolled_back.reason, "新版本已启动 3 次仍未能连接 controller");
         assert_eq!(node.running_program(), fake_program(OLD, "exit 0"));
         assert_eq!(node.bin(), ["i3t"]);
         assert!(matches!(&*fourth.status().borrow(), UpdateStatus::Failed { kind: FailureKind::VersionRejected, .. }));
@@ -563,7 +563,7 @@ exit 0"#;
         file.save(&state).unwrap();
 
         let Startup::RolledBack(rolled_back) = node.process(NEW).startup().unwrap() else { panic!("过了期限应该换回旧程序") };
-        assert_eq!(rolled_back.reason, "新程序换上去 5 分钟还没有连上 controller");
+        assert_eq!(rolled_back.reason, "新版本安装超过 5 分钟仍未连接 controller");
         assert_eq!(node.running_program(), fake_program(OLD, "exit 0"));
         assert_eq!(node.process(OLD).failures().unwrap()[0].version, version(NEW));
     }

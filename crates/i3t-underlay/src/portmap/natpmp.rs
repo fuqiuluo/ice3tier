@@ -9,8 +9,8 @@
 //!
 //! 整数都是大端，有效期的单位是秒。删除映射是"外部端口和有效期都填 0"的映射请求。
 //!
-//! 这个协议没有随机数：回答靠操作码和内部端口对上请求。请求是从一个只和网关通信的 socket 发的，
-//! 不在路径上的人插不进来。
+//! 该协议不含随机数，响应通过操作码和内部端口与请求匹配。请求通过仅与网关通信的已连接 socket 发送，
+//! 路径外主机无法注入伪造响应。
 
 use std::net::Ipv4Addr;
 
@@ -46,13 +46,13 @@ pub(super) const fn map_request(protocol: Protocol, internal_port: u16, external
     [VERSION, map_opcode(protocol), 0, 0, i0, i1, e0, e1, l0, l1, l2, l3]
 }
 
-/// 回答开头共同的部分：版本、操作码、结果码。操作码对不上 `opcode` 的请求时返回 `None`。
+/// 解析响应公共头部（版本、操作码、结果码）。操作码与请求 `opcode` 不匹配时返回 `None`。
 fn reply_head(datagram: &[u8], opcode: u8) -> Option<(u16, &[u8])> {
     let (&[VERSION, op, hi, lo], rest) = datagram.split_first_chunk::<4>()? else { return None };
     (op == REPLY_BIT | opcode).then(|| (u16::from_be_bytes([hi, lo]), rest))
 }
 
-/// 这个数据报是不是"问公网地址"的回答。不是时返回 `None`，调用方接着等。
+/// 判断数据报是否为公网地址查询的响应。不匹配时返回 `None`，由调用方继续等待。
 pub(super) fn parse_address_reply(datagram: &[u8]) -> Option<Result<Ipv4Addr, Refused>> {
     let (code, rest) = reply_head(datagram, OP_ADDRESS)?;
     if code != 0 {
@@ -62,7 +62,7 @@ pub(super) fn parse_address_reply(datagram: &[u8]) -> Option<Result<Ipv4Addr, Re
     Some(Ok(Ipv4Addr::new(a, b, c, d)))
 }
 
-/// 这个数据报是不是对 `protocol`、`internal_port` 这个映射请求的回答。不是时返回 `None`，调用方接着等。
+/// 判断数据报是否为指定 `protocol` 与 `internal_port` 映射请求的响应。不匹配时返回 `None`，由调用方继续等待。
 pub(super) fn parse_map_reply(datagram: &[u8], protocol: Protocol, internal_port: u16) -> Option<Result<Granted, Refused>> {
     let (code, rest) = reply_head(datagram, map_opcode(protocol))?;
     if code != 0 {

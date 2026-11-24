@@ -104,7 +104,7 @@ struct PunchPeerArgs {
 struct RelayArgs {
     #[arg(long)]
     udp: SocketAddr,
-    /// 给 UDP 用不了的节点挂靠用的 TCP 端口
+    /// 供无法使用 UDP 的节点接入的 TCP 端口
     #[arg(long)]
     tcp: Option<SocketAddr>,
     /// 目的节点不在本 relay 上时转给谁，写成 `节点编号=地址`，可以给多个
@@ -631,7 +631,7 @@ async fn run_quic(args: &RunArgs) -> anyhow::Result<RunReport> {
             Outcome::Mixed { bulk: bulk?, echo: echo? }
         }
         Workload::Llm => Outcome::Llm { llm: workload::run_llm(&connector, load.llm()).await? },
-        Workload::Setup => bail!("setup 负载在前面已经处理，走不到这里"),
+        Workload::Setup => bail!("setup 负载已在前序分支处理，不应到达此处"),
     };
 
     let stats = connection.stats();
@@ -656,7 +656,7 @@ async fn measure_quic_setup(endpoint: &Endpoint, peer: NodeId, rounds: u32) -> a
         let connector = Connector::Quic(connection.clone());
         let first_echo = workload::first_echo_ns(&connector).await?;
         let handshake_and_echo = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        // first_echo 只是握手之后那一段；整段时间才是"第一次访问"的耗时。
+        // first_echo 仅包含握手后的阶段；总时长才代表"第一次访问"的耗时。
         new_connection.record_ns(handshake_and_echo.max(first_echo));
         new_stream.record_ns(workload::first_echo_ns(&connector).await?);
         connection.close(0u32.into(), b"round done");

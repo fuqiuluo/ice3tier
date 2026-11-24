@@ -159,7 +159,7 @@ impl Proc {
     }
 }
 
-/// 本进程到现在为止的 CPU 时间和内存峰值；读不到时是 `None`。
+/// 当前进程累计的 CPU 时间和内存峰值；无法读取时返回 `None`。
 pub fn own_usage() -> Option<(f64, f64)> {
     let pid = std::process::id();
     let cpu = Proc::read(pid)?.cpu_s;

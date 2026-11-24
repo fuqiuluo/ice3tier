@@ -1,8 +1,8 @@
 //! 重算 netmap 并发给节点。
 //!
 //! 入口是 [`Inner::refresh`]：给它一批"内容可能变了"的节点，它重算这些节点的 netmap，内容真的变了才加版本号、才下发。
-//! 访问关系的变更按 [`crate::sync`] 里说的顺序生效，所以一次调用可能只走完第一步，剩下的等节点确认之后由
-//! [`Inner::flush_due`] 接着做。
+//! 访问关系的变更按 [`crate::sync`] 定义的顺序生效，因此单次调用可能仅完成第一步，后续步骤待节点确认后由
+//! [`Inner::flush_due`] 继续推进。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -19,9 +19,9 @@ use crate::netmap::{NetworkView, Relation};
 use crate::secret;
 use crate::sync::NodeSync;
 
-/// 延后的重算失败之后多久再试。
+/// 延迟重算失败后的重试间隔。
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-/// 别的节点的上报引起的重算，一个节点有一阵没有这样的重算了时，等这么久就做：同一刻到的几份上报合成一次。
+/// 由其他节点上报触发的重算：当目标节点近期未触发此类重算时，等待该时长后执行，以便合并同一时刻到达的多份上报。
 const REPORT_LEAD: Duration = Duration::from_millis(50);
 
 /// 一次重算从哪些节点开始。和它们的访问关系有变化的对端会被自动带上。
@@ -37,11 +37,11 @@ impl Seeds {
     }
 }
 
-/// 一次重算没有全做成。没做成的节点已经排上了重试。
+/// 一次重算未能全部完成，失败节点已加入重试队列。
 pub(crate) struct Unfinished {
-    /// 头一个错误；整个数据库都写不进去时是那一个。
+    /// 首个错误；若整个数据库不可写，则记录该全局错误。
     pub(crate) error: Error,
-    /// 做成了的节点：netmap 算好了、记下了，该发的也发了。
+    /// 已完成的节点：netmap 已重算、持久化并完成必要下发。
     pub(crate) done: BTreeSet<NodeId>,
 }
 
@@ -68,13 +68,13 @@ impl Inner {
     /// 重算 `seeds` 和被它们牵连的节点的 netmap，内容变了的下发。
     /// `force` 指定的节点即使内容没变也发一份：它刚连上来，不知道它手上是哪一版。
     ///
-    /// 一个节点没做成不耽误别的。没做成的节点已经排上了重试，后台任务也叫醒了，
-    /// 调用方把错误交回去就行，不用自己再排。
+    /// 单个节点失败不阻塞其余节点：失败节点已排入重试队列并唤醒后台任务，
+    /// 调用方直接返回错误即可，无需重复安排重试。
     pub(crate) fn refresh(&mut self, network: NetworkId, seeds: Seeds, force: Option<NodeId>) -> Result<(), Error> {
         self.refresh_reporting(network, seeds, force).map_err(|unfinished| unfinished.error)
     }
 
-    /// 和 [`Self::refresh`] 一样，没有全做成时把哪些节点做成了也交回去。
+    /// 与 [`Self::refresh`] 相同，但在部分失败时会同时返回已成功完成的节点集合。
     pub(crate) fn refresh_reporting(&mut self, network: NetworkId, seeds: Seeds, force: Option<NodeId>) -> Result<(), Unfinished> {
         let view = match NetworkView::load(&self.store, network) {
             Ok(Some(view)) => view,
@@ -82,7 +82,7 @@ impl Inner {
             Err(err) => {
                 let nodes = match seeds {
                     Seeds::Nodes(nodes) => nodes,
-                    // 网络读不出来，说不出"全部"是哪些：排上在线的。不在线的回来时拿到的本来就是那时的内容。
+                    // 无法读取网络信息时无法确定全量节点列表：仅将当前在线节点排入重试，离线节点重新上线时会自动获取最新内容。
                     Seeds::All => self.live.iter().filter(|(_, live)| live.network == network).map(|(node, _)| *node).collect(),
                 };
                 if err.is_database_wide() {
@@ -109,33 +109,33 @@ impl Inner {
                 Ok(()) => {
                     done.insert(node);
                 }
-                // 整个数据库都写不进去：别的节点也是一样的结果，不往下试。
+                // 整个数据库不可写：其余节点也会遭遇相同错误，不再继续尝试。
                 Err(err) if err.is_database_wide() => {
                     failed.extend(batch.range(node..).copied());
                     error = Some(err);
                     self.back_off();
                     break;
                 }
-                // 只是这一个节点没做成，不耽误同一批里别的：各算各的，看到的是同一套"谁在等谁确认"。
-                // 不然一个一直记不下来的节点会把排在它后面的都挡住，比如等它停下来才能不认它的目的端。
+                // 仅当前节点失败，不阻塞同批次其他节点：各节点基于同一套确认等待视图独立计算。
+                // 否则单个持续持久化失败的节点会阻塞其后的节点（例如等待其停用后才能撤销许可的目的端）。
                 //
-                // 它那一行（或者整张表）被别的连接占着、等到了期限时也是这样。等的那一阵 controller 的锁是拿着的，
-                // 可是等多久由存储管着：等满一次之后的一小段时间里它不再等（见 `Store` 的"等多久"），被占着的马上失败、
-                // 排回队列，没被占着的照常写。所以这里不让整个后台的重算退避：那样的话，前台只要一秒里不止一次碰上
-                // 被占着的那个节点，别的网络到了期的重算就一直轮不到。
+                // 当该节点所在行（或整张表）被其他连接持锁并触发锁超时时同样如此。等待锁期间持有 controller 锁，
+                // 但等待时长由存储层控制：触发一次锁超时后，在随后的保护窗口内不再等锁（见 `Store` 文档），被锁项立即失败并
+                // 放回队列，未受影响项正常写入。因此此处不让整个后台重算退避，否则前台每秒多次命中被锁节点时，
+                // 其他网络已到期的重算将长期得不到执行。
                 Err(err) => {
                     failed.insert(node);
                     error.get_or_insert(err);
                 }
             }
         }
-        // `reconcile` 已经替没做成的登记了等待，不重试的话它们要到下一次碰巧有别的变化才会拿到新的 netmap。
+        // `reconcile` 已为失败节点登记了确认等待；若不安排重试，这些节点要等到后续恰好出现其他变更时才能收到新版 netmap。
         self.retry_later(network, failed);
         error.map_or(Ok(()), |error| Err(Unfinished { error, done }))
     }
 
-    /// 这些节点的重算没做成：过一会儿再试，并且叫醒后台任务，让它到点来做。做成之前它们算"还在重试"。
-    /// 一个节点都没有时（都做成了；或者要重算整个网络，网络读不出来，又没有谁在线）没有排上谁，就不叫。
+    /// 这些节点的重算未能完成：安排延迟重试并唤醒后台任务。在重试成功前标记为「重试中」。
+    /// 若节点集合为空（全部完成，或全网重算时网络读取失败且无在线节点），则不安排也不唤醒。
     fn retry_later(&mut self, network: NetworkId, nodes: impl IntoIterator<Item = NodeId>) {
         let nodes: BTreeSet<NodeId> = nodes.into_iter().collect();
         if nodes.is_empty() {
@@ -150,8 +150,8 @@ impl Inner {
         self.wake.notify_one();
     }
 
-    /// 整个数据库刚读写不了：后台的重算过一会儿再碰它，见 [`Inner::flush_after`]。
-    /// 只是某一行、某张表被占着（等锁到了期限）不算：那由存储自己限着，见 [`Self::refresh_reporting`]。
+    /// 整个数据库刚出现读写失败：令后台重算短暂退避，见 [`Inner::flush_after`]。
+    /// 仅单行或单表被锁（触发锁超时）不进入退避：该场景由存储层自行限流，见 [`Self::refresh_reporting`]。
     pub(crate) fn back_off(&mut self) {
         self.flush_after = Some(Instant::now() + RETRY_DELAY);
     }
@@ -163,7 +163,7 @@ impl Inner {
     ///
     /// 返回过多久再来问：数据库那边还没做完的时候。
     pub(crate) fn settle_commits(&mut self, now: Instant) -> Result<Option<Instant>, Error> {
-        // 整个数据库刚读写不了，还没到再试的时候：`flush_due` 会说什么时候再来。
+        // 整个数据库刚发生读写失败，尚处于退避期：由 `flush_due` 返回下次重试时刻。
         if self.flush_after.is_some_and(|after| now < after) {
             return Ok(None);
         }
@@ -178,7 +178,7 @@ impl Inner {
         let settled = self.store.settle_commits()?;
         self.out_of_step |= settled.committed;
         if self.out_of_step {
-            tracing::warn!("有一次提交当时不知道结果，现在查到它算了数：照数据库现在的样子重算各个网络");
+            tracing::warn!("检测到先前结果未明的事务已提交，将按当前数据库状态重算各网络");
             self.catch_up_with_store()?;
             self.out_of_step = false;
         }
@@ -195,7 +195,7 @@ impl Inner {
         }
         let gone: BTreeSet<NodeId> = self.sync.keys().chain(self.live.keys()).filter(|node| !known.contains(node)).copied().collect();
         for node in gone {
-            tracing::info!(%node, "节点已经不在数据库里了：吊销它");
+            tracing::info!(%node, "节点已不存在于数据库中，正在吊销");
             self.send(node, ToNode::Revoked);
             self.forget_node(node);
         }
@@ -203,10 +203,10 @@ impl Inner {
         for network in networks {
             match self.refresh(network.id, Seeds::All, None) {
                 Ok(()) => {}
-                // 整个数据库又读写不了了：剩下的网络也是一样的结果，下次从头再来。
+                // 整个数据库再次不可读写：其余网络也会遭遇相同错误，留待下次从头重试。
                 Err(error) if error.is_database_wide() => return Err(error),
-                // 没做成的节点 `refresh` 自己排了重试，不用为它们从头再来。
-                Err(error) => tracing::warn!(network = %network.id, %error, "照数据库重算网络没有全做成，没做成的节点稍后再试"),
+                // 未完成的节点已由 `refresh` 加入重试队列，无需整体重做。
+                Err(error) => tracing::warn!(network = %network.id, %error, "按数据库状态重算网络未全部完成，失败节点将稍后重试"),
             }
         }
         self.roll_out()
@@ -250,7 +250,7 @@ impl Inner {
                     batch.insert(from);
                 }
             }
-            // 撤销：发起端先停。发起端不在线时没有可等的，目的端这一轮就不认它。
+            // 撤销：发起端先停用出向访问。若发起端不在线则无需等待，目的端本轮即可移除许可。
             (false, _, true) => {
                 let online = self.is_online(from);
                 self.sync.entry(from).or_default().begin_undialing(to, online, now);
@@ -259,7 +259,7 @@ impl Inner {
                     batch.insert(to);
                 }
             }
-            // 发起端已经停了：它确认过，目的端才不认它。
+            // 发起端已停用出向访问：待其确认后，目的端才移除入向许可。
             (false, true, false) => {
                 if !self.sync.get(&from).is_some_and(|sync| sync.may_still_dial(to)) {
                     batch.insert(to);
@@ -293,8 +293,8 @@ impl Inner {
         let changed = sync.state.digest != Some(digest);
         let version = sync.state.version + u64::from(changed);
         if changed {
-            // 新的版本号先记进存储，记下了才算数。记不下来时这里什么都没动，调用方过一会儿重试，算出来的还是"内容变了"。
-            // 反过来先改这里的话，重试时摘要已经对得上，这一版就既记不下来也发不出去。
+            // 新版本号须先持久化至存储才视为生效。写入失败时内存状态不变，后续重试时仍能检测到内容变更；
+            // 若先修改内存状态，重试时会因摘要一致而跳过写入与下发。
             self.store.set_node_netmap(id, version, &digest)?;
             sync.state.version = version;
             sync.state.digest = Some(digest);
@@ -308,7 +308,7 @@ impl Inner {
             tracing::debug!(node = %id, version, peers = netmap.peers.len(), relays = netmap.relays.len(), "下发 netmap");
             if self.send(id, ToNode::Snapshot(Box::new(netmap))) {
                 self.counters.snapshots_sent += 1;
-                // 发出去了就是发出去了，先记在这里：节点的确认要拿它来对。存储里的记不下来只是旧一些，下一次发的时候补上。
+                // 消息已进入发送队列，先更新内存中的已发送版本号以匹配后续节点确认；存储写入失败仅导致持久化值滞后，下次下发时会补写。
                 let sync = self.sync.entry(id).or_default();
                 sync.state.sent = version;
                 self.store.set_node_sent(id, version)?;
@@ -325,8 +325,8 @@ impl Inner {
         let Some(live) = self.live.get(&node) else { return false };
         let reason = match live.outbox.try_send(message) {
             Ok(()) => return true,
-            Err(TrySendError::Full(_)) => "它的发送队列满了，说明它不读",
-            Err(TrySendError::Closed(_)) => "它的连接已经结束",
+            Err(TrySendError::Full(_)) => "节点发送队列已满（对端未及时读取）",
+            Err(TrySendError::Closed(_)) => "节点连接已关闭",
         };
         tracing::warn!(%node, reason, "断开节点");
         self.drop_session(node);
@@ -354,12 +354,12 @@ impl Inner {
         self.defer(network, released, self.timing.ack_coalesce);
     }
 
-    /// 别的节点的上报（端点、挂靠、连得上哪些 relay）引起的重算：每个节点两次这样的重算至少隔 `report_coalesce`，
-    /// 可是离上一次已经够久时，这一次只等 [`REPORT_LEAD`]。
+    /// 由其他节点上报（端点、挂靠、relay 可达性）触发的重算：同一节点两次此类重算至少间隔 `report_coalesce`，
+    /// 但若距上次已超出间隔，则本次仅等待 [`REPORT_LEAD`]。
     ///
-    /// 这样两个节点刚上线时，对端的挂靠信息不用等满一个 `report_coalesce` 才到（经 relay 的第一个请求原来要多等将近一秒）；
-    /// 许多节点同时挂上来时，每个节点照旧最多每 `report_coalesce` 收到一份因此重算的 netmap，不会一阵阵地发。
-    /// 已经排着、并且不比这更晚的重算照旧，这次的变化跟着它一起算（重算读的是那时存储里的东西）。
+    /// 这样两节点刚上线时，对端挂靠信息无需等满整个 `report_coalesce` 即可送达（避免首条经 relay 请求多等待近一秒）；
+    /// 大量节点同时上线时，单个节点仍最多每 `report_coalesce` 收到一次上报触发的 netmap，避免突发高频推送。
+    /// 若已存在不晚于本次时刻的待执行重算，则沿用原计划，本次变更随其一并计算（重算时读取届时的存储内容）。
     pub(crate) fn defer_report(&mut self, network: NetworkId, nodes: impl IntoIterator<Item = NodeId>) {
         let now = Instant::now();
         let window = self.timing.report_coalesce;
@@ -380,7 +380,7 @@ impl Inner {
         }
     }
 
-    /// 过 `delay` 之后重算这些节点。已经排着的取较早的时间，所以不断有新的变化也推迟不了它。
+    /// 延迟 `delay` 后重算指定节点。若节点已在队列中则取较早的计划时刻，避免持续变更无限推迟重算。
     pub(crate) fn defer(&mut self, network: NetworkId, nodes: impl IntoIterator<Item = NodeId>, delay: Duration) {
         let due = Instant::now() + delay;
         for node in nodes {
@@ -390,7 +390,7 @@ impl Inner {
 
     /// 重算到期的节点，出的错记进 `failures`。返回剩下的里面最早的到期时间。
     pub(crate) fn flush_due(&mut self, now: Instant, failures: &mut Failures) -> Option<Instant> {
-        // 整个数据库刚读写不了，还没到再试的时候：到期的先放着，不碰数据库。
+        // 整个数据库刚发生读写失败，尚处于退避期：暂不处理到期任务，避免访问数据库。
         if let Some(after) = self.flush_after.filter(|after| now < *after) {
             return Some(after);
         }
@@ -404,7 +404,7 @@ impl Inner {
         });
         let mut due = due.into_iter();
         for (network, nodes) in due.by_ref() {
-            // 一个网络失败不耽误别的网络；没做成的 `refresh` 自己放回了队列，过一会儿再试。
+            // 单个网络失败不阻塞其他网络；未完成的节点由 `refresh` 重新放回队列等待重试。
             let refreshed = self.refresh(network, Seeds::Nodes(nodes), None);
             let database_wide = refreshed.as_ref().is_err_and(Error::is_database_wide);
             failures.keep(refreshed);
@@ -412,7 +412,7 @@ impl Inner {
                 break;
             }
         }
-        // 整个数据库都读写不了时，剩下的网络不去试（见 `refresh_reporting`），放回队列等下一次。
+        // 整个数据库不可读写时跳过剩余网络（见 `refresh_reporting`），放回队列留待下次重试。
         for (network, nodes) in due {
             self.retry_later(network, nodes);
         }
@@ -424,7 +424,7 @@ impl Inner {
     /// 在线的节点太久不确认时不再等它，免得它卡住别的节点。
     ///
     /// 每一项等待从登记的那一刻算起，满了 `ack_timeout` 就不再等。这期间节点收到多少份 netmap、换了多少次连接都不算：
-    /// 不然一个不回话的节点只要不停地重连，或者不停地让自己的 netmap 变一变，就能让一次撤销一直生效不了。
+    /// 否则无响应节点只需持续重连或频繁触发自身 netmap 变更，即可使撤销操作永久无法生效。
     pub(crate) fn give_up_on_slow_acks(&mut self, now: Instant) {
         let timeout = self.timing.ack_timeout;
         let mut given_up = Vec::new();
@@ -432,7 +432,7 @@ impl Inner {
             let Some(sync) = self.sync.get_mut(node) else { continue };
             let peers = sync.give_up_waiting(now, timeout);
             if !peers.is_empty() {
-                tracing::warn!(%node, ?timeout, ?peers, "节点迟迟不确认新的 netmap，不再等它");
+                tracing::warn!(%node, ?timeout, ?peers, "节点超时未确认新 netmap，停止等待");
                 given_up.push((live.network, peers));
             }
         }

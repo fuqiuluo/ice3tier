@@ -132,7 +132,7 @@ impl<S: SendStream, R: RecvStream, T: DatagramSender> Request<S, R, T> {
         Self { peer, open, send, recv, mux, transport }
     }
 
-    /// 要建立这个上下文的节点。它来自连接的握手，伪造不了。
+    /// 请求建立该上下文的节点，来源经连接握手认证，不可伪造。
     #[must_use]
     pub fn peer(&self) -> NodeId {
         self.peer
@@ -210,7 +210,7 @@ impl<S: SendStream, R: RecvStream, T: DatagramSender> Context<S, R, T> {
 
     /// 等对端发来的下一个数据报。可以放在 `select!` 里：被取消时不会丢数据报。
     ///
-    /// 内容解析不了的数据报被跳过。上下文结束之后，已经到了的数据报先交完。
+    /// 无法解析内容的数据报会被跳过。上下文结束后，已到达的数据报仍会先交付完毕。
     ///
     /// # Errors
     ///
@@ -222,7 +222,7 @@ impl<S: SendStream, R: RecvStream, T: DatagramSender> Context<S, R, T> {
                 Some(body) = self.registration.recv() => match Target::decode(&body) {
                     Ok(Decoded::Complete { value: target, len }) => return Ok(Received { target, payload: body.slice(len..) }),
                     Ok(Decoded::Incomplete { .. }) | Err(_) => {
-                        tracing::debug!(peer = %self.sender.peer, "丢掉一个数据报：内容开头不是一个合法的目标");
+                        tracing::debug!(peer = %self.sender.peer, "丢弃数据报：载荷开头不是有效的目标地址");
                     }
                 },
                 end = stream_end(&mut self.recv) => return Err(end),
@@ -233,7 +233,7 @@ impl<S: SendStream, R: RecvStream, T: DatagramSender> Context<S, R, T> {
     /// 正常结束这个上下文。对端的 [`recv`](Self::recv) 报告 [`ContextEnd::Finished`]。
     pub async fn close(mut self) {
         if let Err(error) = self.send.shutdown().await {
-            tracing::debug!(peer = %self.sender.peer, %error, "结束数据报上下文时流已经不在了");
+            tracing::debug!(peer = %self.sender.peer, %error, "关闭数据报上下文时流已断开");
         }
     }
 
@@ -336,12 +336,12 @@ impl<T: DatagramSender> ContextSender<T> {
     }
 }
 
-/// 一个数据报没有发出去的原因。
+/// 数据报发送失败的原因。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SendError {
-    #[error("这个数据报发不了")]
+    #[error("数据报无法分片发送")]
     Split(#[from] SplitError),
-    #[error("连接没有收下这个数据报")]
+    #[error("连接未能发送数据报")]
     Transport(#[from] DatagramSendError),
 }

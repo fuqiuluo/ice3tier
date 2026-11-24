@@ -63,7 +63,7 @@ impl Control {
     pub(super) fn on_relay_frame(&mut self, from: SocketAddr, frame: &session::Frame, now: Instant) {
         let relays_at = self.relays_at(from);
         if relays_at.is_empty() {
-            tracing::trace!(%from, "中转会话帧不是从 netmap 里的 relay 地址来的，丢弃");
+            tracing::trace!(%from, "中转会话帧来源不属于 netmap 中的 relay 地址，已丢弃");
             return;
         }
         // 交给有这个地址的每一个 relay：只有在等这个随机数的那个会认它（OK 还要验签名）。
@@ -75,12 +75,12 @@ impl Control {
             entry.link.on_udp_frame(from, frame, now, who, &mut wire);
         }
         self.sync_relay_targets();
-        // CHALLENGE 带来了"本节点的 UDP 到得了它"，OK 让骨干回到了 UDP：马上告诉本节点的 relay，对方的 AUTH 随时会到。
+        // CHALLENGE 提供了本节点 UDP 可达证据，OK 将骨干切回 UDP：立即更新本节点 relay 门控，以便接收对端随后发来的 AUTH。
         self.sync_gates();
     }
 
     pub(super) fn on_relay_refusal(&mut self, from: SocketAddr, refused: &Refused, echo: &Echo, now: Instant) {
-        // 正在用这个地址的 relay 有的话只给它；没有的话给每一个（回显对不上的不算数，见 `RelayLink::on_udp_refusal`）。
+        // 若已有 relay 正在使用该地址则仅投递给它；否则投递给所有匹配的候选 relay（回显不匹配者会被忽略，见 `RelayLink::on_udp_refusal`）。
         let mut relays_at = self.relays_at(from);
         if let Some(&first) = relays_at.first()
             && self.relays.get(&first).is_some_and(|entry| entry.link.udp_target() == Some(from))
@@ -167,7 +167,7 @@ impl Control {
         match event {
             Accepted::Opened { addr, sender } => {
                 if self.relays.contains_key(&relay) && borrowed.is_none() {
-                    tracing::debug!(%relay, %addr, conn, "这个 relay 拨进来的 TCP 上建好了它的会话，可以借来走骨干");
+                    tracing::debug!(%relay, %addr, conn, "该 relay 拨入的 TCP 连接已建立会话，可供骨干链路复用");
                     self.inbound.insert(relay, InboundLeg { accepted: conn, addr, sender });
                 }
             }
@@ -192,14 +192,14 @@ impl Control {
         match complaint {
             Complaint::PeerUnattached(peer) => self.mark_unattached(relay, peer, now),
             Complaint::RouteUnavailable(next) => {
-                // 只认本节点正在用的多级路径：第一段就是 `relay`，下一个是 `next`（`next` 是它自己时表示它不肯转发多级路径）。
-                // 所以这张表的大小有上限，也就是 relay 两两组合的数目。
+                // 仅采信与本节点当前多级路径匹配的报告：首跳为 `relay` 且下一跳为 `next`（若 `next == relay` 表示其拒绝转发多级路径）。
+                // 由此限制该表上限不超过 relay 两两组合数。
                 let on_route = |peer: &PeerState| {
                     matches!(peer.route, RouteKey::Relay { path, .. }
                         if path.first() == relay && path.as_slice().len() > 1 && (next == relay || path.as_slice().get(1) == Some(&next)))
                 };
                 if !self.peers.values().any(on_route) {
-                    tracing::debug!(%relay, %next, "relay 说多级路径走不下去，但本节点没有在走这一段，不理");
+                    tracing::debug!(%relay, %next, "relay 报告多级路径不可达，但本节点当前未使用该段，已忽略");
                     return;
                 }
                 let until = now + UNATTACHED_HOLD;
@@ -207,7 +207,7 @@ impl Control {
                     held.2 = until;
                     return;
                 }
-                tracing::info!(%relay, %next, "relay 说多级路径走不下去，这一段先不用");
+                tracing::info!(%relay, %next, "relay 报告多级路径不可达，暂停使用该骨干链路");
                 self.broken.push((relay, next, until));
                 for peer in self.peers.values_mut().filter(|peer| on_route(peer)) {
                     peer.hint = Some(RouteHint::RelayPathBroken);
@@ -247,15 +247,15 @@ impl Control {
             }
             let notice = match state {
                 RelayState::Draining => {
-                    tracing::info!(relay = %id, "relay 通知即将下线：有别的路可走的话，经它的路径和到它的挂靠马上换到别处");
+                    tracing::info!(relay = %id, "relay 通知即将下线，若有其他可用路径将立即迁移相关路由与挂靠");
                     Some(RouteHint::RelayDraining)
                 }
                 RelayState::Overloaded => {
-                    tracing::info!(relay = %id, "relay 通知过载：有别的 relay 可走的话先改走别的，等它恢复");
+                    tracing::info!(relay = %id, "relay 通知过载，若有其他可用 relay 将暂时切换并等待恢复");
                     Some(RouteHint::RelayOverloaded)
                 }
                 RelayState::Serving => {
-                    tracing::info!(relay = %id, "relay 可以正常使用了");
+                    tracing::info!(relay = %id, "relay 已恢复正常服务");
                     None
                 }
             };
@@ -270,14 +270,14 @@ impl Control {
         }
     }
 
-    /// 重新考虑挂靠哪几个 relay。
+    /// 重新评估挂靠的 relay 集合。
     pub(super) fn review_attachments(&mut self, now: Instant) {
         if self.attach_reviewed.is_some_and(|at| now.saturating_duration_since(at) < ATTACH_REVIEW) {
             return;
         }
         self.attach_reviewed = Some(now);
-        // 按 netmap 里的顺序列出来：延迟还没测出来的时候就按这个顺序用。通知过即将下线或者过载的 relay 当作"连不上"：
-        // 有别的可换就换掉，没有就留着（只有它一个的时候，等它回来比没有 relay 强）。
+        // 按 netmap 顺序列出候选：延迟尚未测出时按该顺序使用。将已通知即将下线或过载的 relay 视为不可用：
+        // 若存在替代者则立即替换，否则保留（仅剩唯一 relay 时继续保留以等待恢复）。
         let standings: Vec<Standing> = self
             .netmap
             .relays
@@ -291,7 +291,7 @@ impl Control {
             .collect();
         let chosen =
             if self.allow_relay { relays::choose_attached(&self.attached, &standings, &self.netmap.me.pinned_relays) } else { Vec::new() };
-        // controller 为了让别的节点到得了本节点而要它另外挂靠的。本节点连不上的照样留着试：连不上的结果会报上去，controller 再换一个。
+        // controller 为保障其他节点可达本节点而下发的额外共享 relay。即使当前无法连接也保留尝试，以便将失败结果上报给 controller 进行调整。
         let shared: Vec<NodeId> = if self.allow_relay {
             let extra = self.netmap.me.shared_relays.iter().copied();
             extra.filter(|id| self.relays.contains_key(id) && !chosen.contains(id)).take(MAX_SHARED_RELAYS).collect()
@@ -299,7 +299,7 @@ impl Control {
             Vec::new()
         };
         if shared != self.shared_relays {
-            tracing::info!(from = ?self.shared_relays, to = ?shared, "另外挂靠的 relay 变了：controller 要本节点挂上去，好让连不上本节点那几个 relay 的对端也到得了");
+            tracing::info!(from = ?self.shared_relays, to = ?shared, "额外挂靠的共享 relay 已变更（按 controller 下发配置，用于保障无法连接本节点常规 relay 的对端可达）");
             self.shared_relays = shared;
         }
         if chosen != self.attached {
@@ -309,11 +309,11 @@ impl Control {
             } else if !self.netmap.me.pinned_relays.is_empty() {
                 "管理员固定了挂靠的 relay"
             } else if self.attached.iter().any(avoided) {
-                "原来挂靠的 relay 通知即将下线或者过载"
+                "原挂靠的 relay 通知即将下线或过载"
             } else {
                 "按到各个 relay 的延迟选择"
             };
-            tracing::info!(from = ?self.attached, to = ?chosen, reason, "挂靠的 relay 变了");
+            tracing::info!(from = ?self.attached, to = ?chosen, reason, "挂靠的 relay 列表已变更");
             self.attached = chosen;
         }
     }
@@ -337,7 +337,7 @@ impl Control {
             wanted.extend(nearest.into_iter().take(ENTRY_RELAYS).map(|(_, id)| id));
         }
         if serving {
-            // 本节点是 relay：和别的 relay 连得上的都保持会话，这就是骨干。
+            // 本节点作为 relay：与其他可达 relay 保持会话以构成骨干网络。
             wanted.extend(self.relays.keys().copied());
         }
         if self.allow_relay {
@@ -352,7 +352,7 @@ impl Control {
         let who = Identity { me: shared.me, key };
         let local = shared.local_relay.get().filter(|_| serving);
         for (id, entry) in relays.iter_mut() {
-            // 本节点是 relay：这一段也是骨干，它在本节点的 relay 上有没有会话、有没有拨进来，决定这一段走 UDP 还是 TCP。
+            // 本节点作为 relay 时，该段亦属骨干链路：根据对端在本节点 relay 上的会话及入站 TCP 情况决定走 UDP 或 TCP。
             let backbone = local.map(|local| Backbone { theirs: local.session_leg(*id), offered: inbound.get(id).map(|leg| leg.accepted) });
             let mut wire = LinkWire { shared, slot: &entry.slot, legs, inbound, next_conn };
             let want = wanted.contains(id);
@@ -360,7 +360,7 @@ impl Control {
             // 延迟优先模式下，会话在用的 relay 都可能是候选路径的第一段：定期发探测包列，丢包率才估得出来。
             entry.link.set_training(lowest_cost && want);
             if want != entry.link.is_wanted() {
-                tracing::debug!(relay = %id, want, "是否和这个 relay 保持中转会话变了");
+                tracing::debug!(relay = %id, want, "与该 relay 的中转会话保持状态已变更");
                 entry.link.set_wanted(want, now, &mut wire);
             }
             let urgent = table::unanswered(&shared.clock, &entry.slot.last_tx, &entry.slot.last_rx);
@@ -370,10 +370,10 @@ impl Control {
         self.sync_gates();
     }
 
-    /// 用一次会话去试一个 UDP 询问没有回答的 relay（见 [`PROBE_AGAIN`]），返回现在正在试的那个。
+    /// 通过一次临时会话检测对 UDP 探测无响应的 relay（见 [`PROBE_AGAIN`]），返回当前正在检测的目标。
     ///
-    /// 每分钟的询问只走 UDP：问不到的 relay 也许只有 TCP 连得上。用会话试一次（UDP 和 TCP 一起），结果就是三种之一，
-    /// 报给 controller 的"连得上哪些 relay"才说得准。试完就放手，同一时刻只试一个。
+    /// 每分钟的常规探测仅使用 UDP，无响应的 relay 可能仅支持 TCP 可达。通过会话（并发尝试 UDP 与 TCP）检测一次后即可确定准确结果，
+    /// 从而向 controller 上报精确的可达状态。检测完成后即释放会话，同一时刻仅检测一个。
     pub(super) fn probe(&mut self, now: Instant, wanted: &HashSet<NodeId>) -> Option<NodeId> {
         if let Some((relay, started)) = self.probing {
             let finished = self.relays.get(&relay).is_none_or(|entry| {
@@ -384,7 +384,7 @@ impl Control {
                 return Some(relay);
             }
             let outcome = self.relays.get(&relay).and_then(|entry| entry.link.last_try(now)).map(|(outcome, _)| outcome);
-            tracing::debug!(%relay, ?outcome, "UDP 询问没有回答的 relay 用会话试过了");
+            tracing::debug!(%relay, ?outcome, "已完成对 UDP 探测无响应 relay 的会话可达性检测");
             self.probing = None;
         }
         if !self.allow_relay {
@@ -397,7 +397,7 @@ impl Control {
             .filter(|(id, entry)| !wanted.contains(id) && entry.link.survey_silent(now) && due(entry))
             .min_by_key(|(id, entry)| (entry.link.last_try(now).map(|(_, at)| at), **id))?;
         let relay = *relay;
-        tracing::debug!(%relay, "这个 relay 的 UDP 询问没有回答：用会话（UDP 和 TCP 一起）试一次");
+        tracing::debug!(%relay, "该 relay 的 UDP 探测无响应，开始发起 UDP/TCP 会话可达性检测");
         self.probing = Some((relay, now));
         Some(relay)
     }

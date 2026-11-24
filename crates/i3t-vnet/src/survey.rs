@@ -1,7 +1,7 @@
-//! 读回系统里现在有的、属于虚拟网卡的防火墙规则。
+//! 探测系统中当前存在的、归属于虚拟网卡的自有防火墙配置。
 //!
-//! 装之前先读一遍：崩溃留下的规则要认出来换掉，不能多出一份。`i3t network status` 也是读的这一份。
-//! 读的是 `nft -j` 的 JSON 和 `iptables -S` 的文字（Linux），PowerShell 数出来的规则数（Windows），不认识的东西一律不管。
+//! 安装前先探测，用于识别并替换异常崩溃遗留的规则，避免产生重复项；`i3t network status` 也依赖此结果。
+//! Linux 解析 `nft -j` 的 JSON 与 `iptables -S` 的文本输出，Windows 解析 PowerShell 统计的规则数；非自有规则一律忽略。
 
 use ipnet::Ipv4Net;
 use serde_json::Value;
@@ -11,43 +11,43 @@ use crate::machine::{CommandError, Machine, Program};
 use crate::plan::{linux, windows};
 use crate::{COMMENT, is_device_name};
 
-/// 读回来的样子。每一项各自读，一项读不了（比如普通用户读不了防火墙规则、内核里没有 `raw` 表）不妨碍别的项。
+/// 系统防火墙现状探测结果。各项独立查询，单项读取失败（如普通用户无权读取规则或内核无 `raw` 表）不影响其余项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Survey {
-    /// 自己的防冒充的表（Linux，有 `nft` 时装的：表名就是网卡名），按名字排。
+    /// 自有防伪造 nftables 表列表（Linux 启用 `nft` 时安装，表名即网卡名），按字典序排列。
     pub tables: Result<Vec<String>, CommandError>,
-    /// 自己的放行规则，按在链里的先后。
+    /// 自有入站放行规则列表，按链中顺序排列。
     pub accept: Result<Vec<AcceptRule>, CommandError>,
-    /// 自己的防冒充的规则（Linux，没有 `nft` 时装的：`raw` 表的 PREROUTING 链里），按在链里的先后。
+    /// 自有 `raw` 表 `PREROUTING` 链防伪造规则列表（Linux 无 `nft` 时安装），按链中顺序排列。
     pub guard_rules: Result<Vec<GuardRule>, CommandError>,
 }
 
-/// 一条自己的放行规则。
+/// 单条自有入站放行规则。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptRule {
-    /// 管的是哪块网卡。
+    /// 规则关联的虚拟网卡名称。
     pub device: String,
-    /// Linux：在 INPUT 链里排第几（从 1 数）。Windows 上没有先后，是 1。
+    /// Linux：在 `INPUT` 链中的位置序号（从 1 开始）；Windows 不区分顺序，固定为 1。
     pub position: usize,
 }
 
-/// 一条自己的防冒充的规则（Linux 上 `raw` 表的 PREROUTING 链里）。每块网卡两条：一条按来源（`-s`），一条按目的（`-d`）。
+/// 单条自有防伪造规则（Linux `raw` 表 `PREROUTING` 链）。每块网卡对应两条：按源网段（`-s`）与按目的地址（`-d`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardRule {
-    /// 管的是哪块网卡（规则里的 `! -i <网卡>`）。
+    /// 规则关联的虚拟网卡名称（来自 `! -i <网卡>`）。
     pub device: String,
-    /// 在 PREROUTING 链里排第几（从 1 数）。
+    /// 在 `PREROUTING` 链中的位置序号（从 1 开始）。
     pub position: usize,
-    /// 丢掉的来源地址段（`-s`）。没有或者读不出来时是 `None`：这样的规则也是自己的，装的时候按需要换掉。
+    /// 拦截的源网段（`-s`）。缺失或无法解析时为 `None`；此类自有规则会在安装时按需替换。
     pub range: Option<Ipv4Net>,
-    /// 丢掉的目的地址（`-d`，目的是本节点虚拟 IP 的那一条，`/32`）。
+    /// 拦截的目的地址（`-d`，即本节点虚拟 IP `/32`）。
     pub destination: Option<Ipv4Net>,
-    /// `iptables -S` 写出来的那一行去掉 `-A PREROUTING `：删的时候原样交回去（[`linux::delete_guard`]）。
+    /// `iptables -S` 输出行去掉 `-A PREROUTING ` 后的原文，删除时原样回传（[`linux::delete_guard`]）。
     pub rule: String,
 }
 
 impl Survey {
-    /// 在 `platform` 上读一遍。`device` 是 Windows 上的网卡名（规则的名字由它来，Linux 上按注释找全部的）。
+    /// 在目标平台 `platform` 上执行一次完整探测。`device` 用于 Windows 构造规则名（Linux 按自有注释全局扫描）。
     pub fn take(machine: &mut impl Machine, platform: Platform, device: &str) -> Self {
         match platform {
             Platform::Linux => {
@@ -62,7 +62,7 @@ impl Survey {
                     machine.run(Program::PowerShell, &windows::invocation(&windows::count_script(device)), None).and_then(|text| {
                         let count = text.trim().parse::<usize>().map_err(|_| CommandError::Io {
                             program: Program::PowerShell,
-                            detail: format!("数规则时输出了看不懂的东西：{}", text.trim()),
+                            detail: format!("无法解析防火墙规则计数输出：{}", text.trim()),
                         })?;
                         Ok((0..count).map(|_| AcceptRule { device: device.to_owned(), position: 1 }).collect())
                     });
@@ -72,23 +72,23 @@ impl Survey {
         }
     }
 
-    /// 读到了至少一样自己的东西。读不了的项不算。
+    /// 判断是否探测到至少一项自有防火墙配置。读取失败的项不计入。
     #[must_use]
     pub fn found_any(&self) -> bool {
         self.counts().into_iter().any(|count| count.is_some_and(|count| count > 0))
     }
 
-    /// 自己的东西一样都没有了。读不了的项不算"没有"。
+    /// 判断所有自有防火墙配置是否均已清空。读取失败的项不视为“无残留”。
     ///
-    /// 要读的东西根本不在（[`CommandError::means_absent`]）的项算"没有"：没有 `nft` 就建不了自己的表，没有 `iptables`
-    /// 就加不了自己的规则，内核里没有 `raw` 表，里面也就没有规则。装好表之后才卸掉 `nft` 的话，表还在内核里，可这台机器上
-    /// 也没有东西拆得掉它了（拆的时候同样当作没有）；它丢的只是冒充虚拟 IP 的包，留着不碍事，重启就没了。
+    /// 若错误表明对应程序或表本身不存在（[`CommandError::means_absent`]），则该项按 0 计：未安装 `nft` 不会创建自有表，
+    /// 未安装 `iptables` 或内核无 `raw` 表则不会存在相应规则。若安装表后再卸载 `nft`，虽表仍存于内核但主机已无工具可删除
+    /// （卸载流程同样视为已清空），且其仅拦截伪造虚拟 IP 的入站包，系统重启后即自动清除。
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.counts().into_iter().all(|count| count == Some(0))
     }
 
-    /// 每一项里有几样自己的东西。读不了的项是 `None`，要读的东西根本不在的项是 0。
+    /// 汇总三类配置的自有条目数量。读取失败为 `None`，程序或表不存在时为 `Some(0)`。
     fn counts(&self) -> [Option<usize>; 3] {
         [count(&self.tables), count(&self.accept), count(&self.guard_rules)]
     }
@@ -101,10 +101,10 @@ fn count<T>(item: &Result<Vec<T>, CommandError>) -> Option<usize> {
     }
 }
 
-/// `nft -j list tables ip` 的输出里自己的表：名字是网卡名的样子。以前的透明访问的表叫 `i3t`（没有编号），不在这里，见 [`crate::legacy`]。
+/// 从 `nft -j list tables ip` 输出中提取自有表名（匹配虚拟网卡命名规则）。旧版透明访问表 `i3t`（无数字编号）不在此列，见 [`crate::legacy`]。
 fn parse_tables(json: &str) -> Result<Vec<String>, CommandError> {
     let value: Value = serde_json::from_str(json)
-        .map_err(|error| CommandError::Io { program: Program::Nft, detail: format!("读不懂 nft 的输出：{error}") })?;
+        .map_err(|error| CommandError::Io { program: Program::Nft, detail: format!("无法解析 nft 命令输出：{error}") })?;
     let objects = value.get("nftables").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     let mut names: Vec<String> = objects
         .iter()
@@ -116,15 +116,15 @@ fn parse_tables(json: &str) -> Result<Vec<String>, CommandError> {
     Ok(names)
 }
 
-/// `nft -j list tables ip` 的输出里有没有叫 `name` 的表。
+/// 检查 `nft -j list tables ip` 输出中是否存在指定名称 `name` 的表。
 pub(crate) fn has_table(json: &str, name: &str) -> Result<bool, CommandError> {
     let value: Value = serde_json::from_str(json)
-        .map_err(|error| CommandError::Io { program: Program::Nft, detail: format!("读不懂 nft 的输出：{error}") })?;
+        .map_err(|error| CommandError::Io { program: Program::Nft, detail: format!("无法解析 nft 命令输出：{error}") })?;
     let objects = value.get("nftables").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     Ok(objects.iter().any(|object| object.get("table").and_then(|table| table.get("name")).and_then(Value::as_str) == Some(name)))
 }
 
-/// `iptables -S INPUT` 的输出里自己的规则：`-A INPUT` 开头、注释是 [`COMMENT`]、放行、管的是一块像是自己建的网卡。
+/// 从 `iptables -S INPUT` 输出中筛选自有放行规则：以 `-A INPUT` 开头、注释为 [`COMMENT`]、动作为 `ACCEPT` 且接口符合虚拟网卡命名。
 fn parse_input(text: &str) -> Vec<AcceptRule> {
     Listed::all(text, "INPUT")
         .filter(|rule| rule.is_ours("ACCEPT"))
@@ -135,8 +135,8 @@ fn parse_input(text: &str) -> Vec<AcceptRule> {
         .collect()
 }
 
-/// `iptables -t raw -S PREROUTING` 的输出里自己的规则：`-A PREROUTING` 开头、注释是 [`COMMENT`]、丢掉、
-/// 管的是不从一块像是自己建的网卡进来的包（`! -i <网卡>`）。地址段不在认的条件里：网络的地址段会变，旧的那条也是自己的。
+/// 从 `iptables -t raw -S PREROUTING` 输出中筛选自有防伪造规则：以 `-A PREROUTING` 开头、注释为 [`COMMENT`]、动作为 `DROP`
+/// 且匹配 `! -i <虚拟网卡>`。不限定源网段，确保网段变更后遗留的旧规则仍可被识别清理。
 fn parse_raw_prerouting(text: &str) -> Vec<GuardRule> {
     Listed::all(text, "PREROUTING")
         .filter(|rule| rule.is_ours("DROP"))
@@ -149,18 +149,18 @@ fn parse_raw_prerouting(text: &str) -> Vec<GuardRule> {
         .collect()
 }
 
-/// `iptables -S <链>` 写出来的一条规则。
+/// 解析后的单条 `iptables -S <链>` 规则。
 struct Listed<'a> {
-    /// 在链里排第几（从 1 数）。
+    /// 在链中的 1-based 序号。
     position: usize,
-    /// 那一行去掉 `-A <链> `。
+    /// 原始行去掉 `-A <链> ` 后的文本。
     text: &'a str,
-    /// 拆开的词，引号去掉了（[`linux::split_listed`]）：带空格的注释是一个词，认不错。
+    /// 去除引号并拆分后的参数词列表（[`linux::split_listed`]），确保带空格的注释作为单个完整词精确匹配。
     words: Vec<String>,
 }
 
 impl<'a> Listed<'a> {
-    /// `iptables -S <chain>` 的输出里这条链的规则，按先后。`-P`（默认策略）那一行不是规则，不占位置。
+    /// 按序遍历 `iptables -S <chain>` 输出中的规则行；默认策略行（`-P`）不计入位置序号。
     fn all(output: &'a str, chain: &str) -> impl Iterator<Item = Self> {
         let prefix = format!("-A {chain} ");
         output.lines().filter_map(move |line| line.strip_prefix(prefix.as_str())).enumerate().map(|(index, text)| Self {
@@ -170,17 +170,17 @@ impl<'a> Listed<'a> {
         })
     }
 
-    /// `flag` 后面的那个词。
+    /// 返回紧跟在 `flag` 后的参数值。
     fn after(&self, flag: &str) -> Option<&str> {
         self.words.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].as_str())
     }
 
-    /// 前面是 `!` 的 `flag` 后面的那个词：`! -i i3t0` 里的 `i3t0`。
+    /// 返回紧跟在 `! <flag>` 后的参数值（例如 `! -i i3t0` 中的 `i3t0`）。
     fn after_negated(&self, flag: &str) -> Option<&str> {
         self.words.windows(3).find(|three| three[0] == "!" && three[1] == flag).map(|three| three[2].as_str())
     }
 
-    /// 注释是 [`COMMENT`]、目标是 `target`：程序自己加的那一类。
+    /// 判断注释是否为 [`COMMENT`] 且跳转目标匹配 `target`。
     fn is_ours(&self, target: &str) -> bool {
         self.after("--comment") == Some(COMMENT) && self.after("-j") == Some(target)
     }

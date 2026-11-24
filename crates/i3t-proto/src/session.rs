@@ -26,16 +26,16 @@
 //! 这几条是格式本身保证的，不靠实现自觉：
 //!
 //! - **应答不比请求大。** INIT、AUTH、PING 都带填充，比它们各自的应答长；ERROR 比任何能引出它的帧都短。
-//!   所以伪造来源地址的人拿 relay 放大不了流量。比规定长度短的请求一律不认。
+//!   因此伪造来源地址无法利用 relay 放大流量。长度短于规定值的请求一律拒绝。
 //! - **来源地址得到证明之前，relay 不记状态，也不验签名。** CHALLENGE 里的 cookie 是 relay 用只有自己知道的密钥
 //!   对"来源地址 + 节点编号 + 时间片"算出来的，算完就忘。AUTH 把 cookie 带回来，relay 重算一遍对得上，
 //!   才说明对方确实收得到发往这个地址的包，这之后才去验签名、建会话。
-//! - CHALLENGE 和 PONG 把请求里的随机数抄回去，不在路径上的人伪造不了。OK 带 relay 的签名。
+//! - CHALLENGE 与 PONG 原样回显请求中的随机数，路径外的攻击者无法伪造。OK 附带 relay 的签名。
 //! - ERROR 不比引出它的请求长：比 [`Refused::LEN`] 短的请求，relay 不回 ERROR。
 //!
 //! # ERROR 的回显
 //!
-//! ERROR 会让节点拆掉会话或者换路，伪造来源地址的人又很容易冒充 relay 发它。所以 ERROR 回显 8 个字节，
+//! ERROR 会触发节点拆除会话或切换路径，而伪造来源地址很容易冒充 relay 发送 ERROR。因此 ERROR 回显 8 字节，
 //! 节点只认回显对得上的（[`Echo`]）：
 //!
 //! | 原因 | 引出它的请求 | 回显 |
@@ -45,8 +45,8 @@
 //! | [`RefusalReason::PeerUnattached`]、[`RefusalReason::RouteUnavailable`] | 中转帧 | 这个会话握手时节点给的随机数（AUTH 里的那个） |
 //!
 //! 后两种只发给拥有会话的那个来源，所以 relay 回显的是只有它们两个知道的东西。中转帧引出的 `NoSession` 发给的是没有会话的来源，
-//! relay 手上没有可以回显的秘密，节点也没法核对一个连接包的开头，所以它只是个提示：节点立刻发一个保活 PING，
-//! relay 对这个 PING 的回答（PONG，或者回显它的随机数的 ERROR）才算数。
+//! relay 侧没有可供回显的共享秘密，节点也无法核对连接包开头，因此该 ERROR 仅作提示：节点应立即发送保活 PING，
+//! 仅 relay 对该 PING 的应答（PONG 或回显其随机数的 ERROR）才作为有效依据。
 //!
 //! # 签的是什么
 //!
@@ -57,7 +57,7 @@
 //! | AUTH | 节点 | [`Auth::PURPOSE`] | [`Auth::signed_message`]：relay 编号、节点编号、随机数、cookie |
 //! | OK | relay | [`Accepted::PURPOSE`] | [`Accepted::signed_message`]：relay 编号、节点编号、随机数、有效期、地址 |
 //!
-//! 帧的类型里 `0x02`～`0x07` 是握手和保活。ERROR 排在地址查询之后的 `0x0c`：这一段只有六个值，放不下第七种帧。
+//! 帧类型中 `0x02`～`0x07` 用于握手与保活。ERROR 排在地址查询之后的 `0x0c`：该区间仅有六个值，无法容纳第七种帧。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -124,7 +124,7 @@ pub(crate) fn take_addr(bytes: &[u8]) -> Option<(SocketAddr, &[u8])> {
     Some((SocketAddr::new(ip.to_canonical(), u16::from_be_bytes(port)), rest))
 }
 
-/// 请求帧开头共同的部分：类型、节点编号、随机数。`kind` 对不上或者长度不够 `min_len` 时返回 `None`。
+/// 请求帧开头的公共部分：类型、节点编号、随机数。`kind` 不匹配或长度小于 `min_len` 时返回 `None`。
 fn parse_request_head(datagram: &[u8], kind: u8, min_len: usize) -> Option<(NodeId, Nonce, &[u8])> {
     if datagram.len() < min_len {
         return None;
@@ -164,7 +164,7 @@ impl Init {
         bytes
     }
 
-    /// 不是一个完整的 INIT 时返回 `None`。比 [`Init::LEN`] 短的不认，否则应答就可能比请求大。
+    /// 非完整 INIT 时返回 `None`。长度小于 [`Init::LEN`] 的一律拒绝，避免应答大于请求。
     #[must_use]
     pub fn parse(datagram: &[u8]) -> Option<Self> {
         let (node, nonce, _padding) = parse_request_head(datagram, KIND_INIT, Self::LEN)?;
@@ -324,7 +324,7 @@ impl Ping {
         bytes
     }
 
-    /// 不是一个完整的 PING 时返回 `None`。比 [`Ping::LEN`] 短的不认。
+    /// 非完整 PING 时返回 `None`。长度小于 [`Ping::LEN`] 的一律拒绝。
     #[must_use]
     pub fn parse(datagram: &[u8]) -> Option<Self> {
         let (node, nonce, _padding) = parse_request_head(datagram, KIND_PING, Self::LEN)?;
@@ -371,7 +371,7 @@ pub enum RefusalReason {
     NoSession,
     /// 要转发的包的目的节点在这个 relay 上没有会话。帧里的节点编号是目的节点。收到的节点应该换一个 relay。
     PeerUnattached,
-    /// 多级中转的包没法按它写的路径往下送：下一个 relay 和这个 relay 之间没有骨干连接（帧里的节点编号是下一个 relay），
+    /// 多级中转数据包无法按指定路径继续转发：当前 relay 与下一跳 relay 之间无骨干连接（帧中节点编号为下一跳 relay），
     /// 或者路径比网络允许的级数长（帧里的节点编号是这个 relay 自己）。只有路径上的第一个 relay 会回这个，
     /// 后面的 relay 不知道来源节点在哪里。收到的节点应该换一条路径。
     RouteUnavailable,
@@ -424,7 +424,7 @@ impl Refused {
         self.to_bytes_echoing(&[0; ECHO_LEN])
     }
 
-    /// 不是一个完整的 ERROR，或者原因码不认识时返回 `None`。回显的字节用 [`echo`](Self::echo) 取。
+    /// 非完整 ERROR 或原因码未知时返回 `None`。回显字节可通过 [`echo`](Self::echo) 获取。
     #[must_use]
     pub fn parse(datagram: &[u8]) -> Option<Self> {
         let (&[KIND_ERROR, code, n0, n1, n2, n3], _echo) = Self::split(datagram)? else { return None };
@@ -503,7 +503,7 @@ const _: () = {
     assert!(Challenge::LEN <= Init::LEN);
     assert!(Accepted::MAX_LEN <= Auth::LEN);
     assert!(Pong::MAX_LEN <= Ping::LEN);
-    // ERROR 由 PING 或者一个中转帧引出。中转帧可以比 ERROR 短，relay 不回答那样的帧。
+    // ERROR 由 PING 或中转帧触发。中转帧长度可能短于 ERROR，relay 不会对此类短帧回复 ERROR。
     assert!(Refused::LEN <= Ping::LEN);
     // 填充之前的内容装得进规定的长度。
     assert!(REQUEST_HEAD_LEN <= Init::LEN && REQUEST_HEAD_LEN <= Ping::LEN);

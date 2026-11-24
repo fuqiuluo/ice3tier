@@ -1,25 +1,26 @@
-//! 发的一方把同一时刻要发给同一个对端的几个小包合成一帧（[`PacketHeader::Bundle`]）。
+//! 发送端小包聚合：将短时间内发往同一对端的多个小包合并为单个聚合帧（[`PacketHeader::Bundle`]）。
 //!
-//! # 为什么
+//! # 背景
 //!
-//! 一条下载在回程方向上全是小包：TCP 的确认，五六十个字节一个，每收到两个数据包就有一个。一个包一个地发，回程的包数是
-//! 数据方向的一半。线路按包数限速的方向上（实测有一条每秒只放行一千两百多个包），这些小包先把额度用完，下载就卡在那里，
-//! 同一个方向上别的包（ping、路径层的探测）也跟着丢。二十来个确认装得进一个包：合起来发，回程的包数少到几分之一。
+//! 下载流量在回程方向会产生大量小包（如 50–60 字节的 TCP ACK，每收到两个数据包发送一次）。若逐包发送，
+//! 回程包速率将达到数据方向的一半。在按包速率（PPS）限速的链路上，大量小包会耗尽额度导致吞吐受阻，
+//! 并波及同方向的其他数据包（如 ping 与路径探测包）。将数十个确认包合并发送可将回程包数降低至原来的几分之一。
 //!
-//! # 什么时候合，等不等
+//! # 聚合与等待策略
 //!
-//! 只合小包（不超过 [`SMALL_PACKET`] 字节）。大包不等也不合，照旧走；有大包要发给同一个对端时，攒着的小包先走，顺序不变。
+//! 仅聚合小包（长度不超过 [`SMALL_PACKET`] 字节）。大包不等待也不聚合，按原方式直接发送；
+//! 若发往同一对端时存在已缓存小包，则先发出已缓存帧以保持数据包顺序。
 //!
-//! - 同一轮从网卡上读出来的小包本来就同时在手上：合成一帧，这一轮读完就发，一点不等。
-//! - 小包来得稀的时候（离上一个 [`DENSE_GAP`] 以上：ping、游戏的包），到了就发，和不合的时候一样。
-//! - 小包来得密的时候（离上一个不到 [`DENSE_GAP`]：一条跑着的下载的确认），攒到一帧装满或者 [`WINDOW`] 到了再发。
-//!   一个小包因此最多多等一两毫秒。
+//! - 同一轮从虚拟网卡批量读取的小包直接合并为一帧，本轮读取结束后立即发送，不额外等待。
+//! - 稀疏小包（与上一小包间隔不少于 [`DENSE_GAP`]，如 ping 或游戏数据包）到达后立即发送，不引入额外延迟。
+//! - 密集小包（与上一小包间隔小于 [`DENSE_GAP`]，如持续下载的 TCP ACK）会缓存至装满一帧或到达 [`WINDOW`] 时限后发出，
+//!   单个小包最多额外等待 1–2 毫秒。
 //!
-//! 等要靠定时器。有的系统上定时器粗得多（Windows 默认十几毫秒一跳），那里说等一毫秒会等上十几毫秒。所以每次被定时器叫醒
-//! 都看晚了多少：接连几次晚得多，就一阵子不再等（[`COARSE_PAUSE`]），只合同时在手上的。
+//! 聚合等待依赖定时器。部分平台默认定时器粒度较粗（如 Windows 默认约 15 毫秒），等待 1 毫秒可能实际延迟十余毫秒。
+//! 因此每次定时器唤醒都会检查延迟幅度：若连续多次严重延迟，则在 [`COARSE_PAUSE`] 期间暂停等待，仅合并同批读取的数据包。
 //!
-//! 合不合由连接层说了算（[`i3t_conn::contract::PacketSender::bundle_capacity`]）：对端握手时说过认识这种帧，而且到它是直连。
-//! 这里只管攒和什么时候放。
+//! 是否允许聚合由连接层决定（[`i3t_conn::contract::PacketSender::bundle_capacity`]）：需满足对端握手声明支持聚合帧且当前为直连路径。
+//! 本模块仅负责小包缓存与发送时机判定。
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -29,64 +30,64 @@ use i3t_proto::NodeId;
 use i3t_proto::flow::{Bundled, PacketHeader};
 use tokio::time::Instant;
 
-/// 不超过这么多字节的 IP 包算小包。TCP 的确认（带时间戳和几段 SACK 也不到一百字节）、DNS 的问答、游戏的状态包都在里面。
+/// 小包长度上限（字节）。涵盖 TCP ACK（含时间戳与若干 SACK 块仍不足 100 字节）、DNS 查询/应答及常见游戏状态包。
 pub(crate) const SMALL_PACKET: usize = 256;
-/// 一个小包离上一个不到这么久，就算来得密。
+/// 判定小包为密集到达的最大时间间隔。
 const DENSE_GAP: Duration = Duration::from_millis(2);
-/// 来得密的时候，一帧从放进第一个包起最多攒这么久。定时器的刻度是一毫秒，实际是一到两毫秒。
+/// 密集到达时单帧自首包入队起的最长等待窗口。受 1 毫秒定时器刻度影响，实际延迟约为 1–2 毫秒。
 const WINDOW: Duration = Duration::from_millis(1);
-/// 定时器比说好的晚这么多，算一次"晚得多"。
+/// 判定为定时器严重延迟的超出阈值。
 const LATE: Duration = Duration::from_millis(4);
-/// 接连几次晚得多，就认定这里的定时器粗。忙的时候偶尔晚一次不算。
+/// 判定当前平台定时器粒度过粗所需的连续严重延迟次数（偶发系统繁忙不触发）。
 const LATE_STREAK: u8 = 3;
-/// 认定定时器粗之后，这么久不再让包等。过后再试，系统的定时器是可以变细的。
+/// 判定定时器粒度过粗后暂停等待的时长。到期后会重新尝试，以适应系统定时器精度动态变化。
 const COARSE_PAUSE: Duration = Duration::from_secs(10);
-/// 连接层说过"这个对端现在合不了"之后，这么久不再问：经 relay 的路上每个小包都去问一遍不值得。
+/// 连接层表示某对端当前不支持聚合后，暂缓重复查询的冷却时间，避免经 relay 转发时每个小包反复查询。
 const ASK_AGAIN: Duration = Duration::from_millis(200);
-/// 记着的对端超过这么多个时，把很久没有小包的清掉。
+/// 触发清理空闲对端槽位的条目数阈值。
 const SLOTS_BEFORE_PRUNE: usize = 64;
-/// 多久没有小包的对端可以清掉。
+/// 空闲对端槽位被清理前的无小包持续时长。
 const IDLE_SLOT: Duration = Duration::from_secs(30);
 
-/// [`Bundler::push`] 的结果。
+/// [`Bundler::push`] 的返回结果。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Pushed {
-    /// 这时该先发出去的一帧：这个对端原来攒着的那一帧装不下新来的包了。
+    /// 需要先行发出的已满聚合帧（因该对端原有缓冲帧无法继续容纳新包）。
     pub(crate) emit: Option<Bytes>,
-    /// 这个包放进去了没有。没有的话调用方照常单独发它（在 `emit` 之后）。
+    /// 当前数据包是否已被吸收进聚合缓冲；若为 `false`，调用方应在发出 `emit` 后按普通单包发送。
     pub(crate) taken: bool,
 }
 
-/// 各个对端名下攒着的小包。
+/// 各对端待聚合的小包状态表。
 #[derive(Debug, Default)]
 pub(crate) struct Bundler {
     peers: HashMap<NodeId, Slot>,
-    /// 有几个对端名下正攒着东西。大多数时候是 0，那时什么都不用看。
+    /// 当前存在未发出聚合帧的对端数量。为 0 时可快速跳过遍历。
     pending: usize,
     late_streak: u8,
-    /// 认定定时器粗了：到这个时刻之前不让包等。
+    /// 定时器过粗冷却截止时刻：在此之前暂停小包聚合等待。
     coarse_until: Option<Instant>,
 }
 
 #[derive(Debug)]
 struct Slot {
-    /// 最近一个小包是什么时候来的。
+    /// 上一个小包的到达时刻。
     last_small: Instant,
-    /// 连接层说过合不了：到这个时刻之前不再问。
+    /// 连接层拒绝聚合后的查询冷却截止时刻：在此之前不再重复查询容量。
     refused_until: Option<Instant>,
-    /// 正攒着的一帧：头和放进去的包。空着是没有在攒。
+    /// 正在构建的聚合帧缓冲区（含帧头与已追加的数据包）；为空表示当前无待发帧。
     frame: Vec<u8>,
     packets: usize,
-    /// 这一帧最长多少字节。
+    /// 当前聚合帧的最大字节容量。
     capacity: usize,
-    /// 攒着的第一个包是什么时候来的。
+    /// 当前缓冲帧中首个小包的入队时刻。
     since: Instant,
-    /// 开始攒这一帧的时候小包来得密：可以等一会儿再发。
+    /// 起始构建当前帧时是否处于密集到达模式：为 `true` 时允许短暂等待。
     dense: bool,
 }
 
 impl Slot {
-    /// 把攒着的做成一帧交出去。只有一个包的就是普通的一帧，线上和不合的时候一模一样。
+    /// 封装并返回当前缓存的数据帧。若仅包含一个数据包，则编码为普通单包帧以保持线格式一致。
     fn finish(&mut self) -> Bytes {
         let frame = if self.packets == 1 {
             let packet = &self.frame[PacketHeader::BUNDLE_LEN + Bundled::PREFIX_LEN..];
@@ -104,15 +105,15 @@ impl Slot {
 }
 
 impl Bundler {
-    /// 发给 `peer` 的一个小包（不超过 [`SMALL_PACKET`] 字节的 IP 包）来了：放进它名下那一帧。
+    /// 将发往 `peer` 的小包（长度不超过 [`SMALL_PACKET`] 的 IP 包）尝试加入其聚合缓冲帧。
     ///
-    /// `capacity` 去问连接层现在能不能合、一帧最长多少（只在要新开一帧的时候问）。
+    /// 仅在需要新建缓冲帧时调用 `capacity` 查询连接层是否允许聚合及单帧上限。
     pub(crate) fn push(&mut self, peer: NodeId, packet: &[u8], capacity: impl FnOnce() -> Option<usize>, now: Instant) -> Pushed {
         if self.peers.len() > SLOTS_BEFORE_PRUNE {
             self.peers.retain(|_, slot| !slot.frame.is_empty() || now.saturating_duration_since(slot.last_small) < IDLE_SLOT);
         }
         let slot = self.peers.entry(peer).or_insert_with(|| Slot {
-            // 头一个小包：之前没有，不算密。
+            // 首个小包无前驱参考，不视为密集到达。
             last_small: now.checked_sub(DENSE_GAP).unwrap_or(now),
             refused_until: None,
             frame: Vec::new(),
@@ -130,7 +131,7 @@ impl Bundler {
                 slot.packets += 1;
                 return Pushed { emit: None, taken: true };
             }
-            // 装不下了：原来那一帧该走了，这个包另起一帧。
+            // 当前缓冲帧剩余空间不足：先输出已有帧，再为当前数据包开启新帧。
             emit = Some(slot.finish());
             self.pending -= 1;
         }
@@ -144,7 +145,7 @@ impl Bundler {
         slot.refused_until = None;
         PacketHeader::Bundle.encode(&mut slot.frame);
         if Bundled::push(&mut slot.frame, packet).is_err() {
-            // 空的包：进不来这里（调用方只交 IP 包），进来了也不留半截。
+            // 正常情况下调用方只传入非空 IP 包；此处做防御性清理，避免残留不完整帧头。
             slot.frame.clear();
             return Pushed { emit, taken: false };
         }
@@ -153,7 +154,7 @@ impl Bundler {
         Pushed { emit, taken: true }
     }
 
-    /// 取走 `peer` 名下攒着的那一帧：有不合的包（大包）要发给它，攒着的先走，顺序不变。
+    /// 取出 `peer` 当前缓存的聚合帧：当有不参与聚合的大包发往同一对端时，先发出已缓存小包以保序。
     pub(crate) fn take(&mut self, peer: NodeId) -> Option<Bytes> {
         if self.pending == 0 {
             return None;
@@ -163,8 +164,8 @@ impl Bundler {
         Some(slot.finish())
     }
 
-    /// 这一轮读完了：现在该发的各帧。`hold` 是让不让包等（网络的开关开着）；不让的话攒着的全交出来。
-    /// 留下的都是还在等的，[`deadline`](Self::deadline) 是它们里最早到点的时刻。
+    /// 取出本轮读取结束后已到达发送条件的聚合帧。`hold` 表示是否允许密集小包继续等待（受网络开关控制）；
+    /// 为 `false` 时立即返回所有缓存帧。剩余仍在等待的帧中最早到期时刻可通过 [`deadline`](Self::deadline) 获取。
     pub(crate) fn due(&mut self, now: Instant, hold: bool) -> Vec<(NodeId, Bytes)> {
         if self.pending == 0 {
             return Vec::new();
@@ -181,7 +182,7 @@ impl Bundler {
         due
     }
 
-    /// 还在等的各帧里最早什么时候到点；没有在等的是 `None`。
+    /// 返回仍在等待的聚合帧中最早的截止时刻；无等待帧时返回 `None`。
     pub(crate) fn deadline(&self) -> Option<Instant> {
         if self.pending == 0 {
             return None;
@@ -189,7 +190,7 @@ impl Bundler {
         self.peers.values().filter(|slot| !slot.frame.is_empty()).map(|slot| slot.since + WINDOW).min()
     }
 
-    /// 定时器把调用方叫醒了，说好的时刻是 `deadline`。晚得多的次数接连够了，就认定这里的定时器粗，一阵子不再让包等。
+    /// 在聚合定时器唤醒后记录实际延迟（预期唤醒时刻为 `deadline`）。若连续多次严重延迟，则判定当前系统定时器粒度过粗并暂时停用等待。
     pub(crate) fn woke(&mut self, deadline: Instant, now: Instant) {
         if now.saturating_duration_since(deadline) < LATE {
             self.late_streak = 0;
@@ -199,7 +200,7 @@ impl Bundler {
         if self.late_streak >= LATE_STREAK {
             self.late_streak = 0;
             self.coarse_until = Some(now + COARSE_PAUSE);
-            tracing::debug!(late = ?now.saturating_duration_since(deadline), "定时器比说好的晚得多：一阵子不让小包等，只合同时在手上的");
+            tracing::debug!(late = ?now.saturating_duration_since(deadline), "定时器唤醒严重延迟，将暂时停止小包聚合等待，仅合并同批读取的数据包");
         }
     }
 }

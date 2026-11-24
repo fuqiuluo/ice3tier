@@ -2,14 +2,14 @@
 //!
 //! 这里只有状态和算法，收发都在控制任务里（[`crate::control`]）。几条规矩：
 //!
-//! - **只回答知道的测试。** 一个测试由装配的一方按 controller 的指令打开（[`crate::Paths::open_test`]），带着对端、
-//!   截止时刻和探测个数的上限。时间窗之外、别的对端、超过上限、重复的序号，一律不回答；签名在这些便宜的检查之后才验。
-//!   所以对端自己开不了测试，被攻破的 controller 也只能在节点自己的上限之内让它回答。
-//! - **探测走指定的路径。** 发的一方把路径写在探测里（[`i3t_proto::probe::TestPing`]），回答的一方从同一条路径倒着回，
-//!   量到的是这条路径两个方向的往返；回答不了时从它自己的路回，并在回答里说明。
-//! - **固定路有期限。** 吞吐要让这一对节点之间的连接真的走在被测的路径上，所以把到对端的路暂时固定住
-//!   （[`crate::Paths::pin`]）。固定有上限 [`MAX_PIN`]，到期由控制任务自己解除；拿着它的一方丢掉它（包括任务被取消、panic）
-//!   时马上解除。解除之后路回到选路规则给的那一条，选路自己的状态（迟滞、停留期、会话的稳定期）在固定期间照常推进，不受影响。
+//! - **仅响应已知测试。** 测试由装配方按 controller 指令开启（[`crate::Paths::open_test`]），并指定对端、
+//!   截止时间与响应探测数上限。超出时间窗、非目标对端、超出上限或重复序号的请求一律忽略，签名验证仅在这些低开销校验通过后执行。
+//!   因此对端无法自行开启测试，即使 controller 被攻破也只能在节点本地上限内触发响应。
+//! - **探测沿指定路径传输。** 发起方在探测帧中携带路径（[`i3t_proto::probe::TestPing`]），响应方优先沿逆向路径返回，
+//!   以测量该路径双向 RTT；若逆向路径不可用，则通过本节点当前路由返回并在响应中注明。
+//! - **路径固定有时限。** 吞吐测试需确保连接实际经过被测路径，因此临时固定到对端的路由
+//!   （[`crate::Paths::pin`]）。固定时长受 [`MAX_PIN`] 限制，到期后由控制任务自动解除；持有者释放句柄（含任务取消或 panic）
+//!   时也会立即解除。解除后恢复为选路策略决定的路由，选路内部状态（迟滞、停留期、会话稳定期）在固定期间继续正常推进。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -94,8 +94,8 @@ impl TestPath {
 
 /// 本节点在测试里带头还是跟随。
 ///
-/// 两端同时去试直连的话，谁先发出探测全看时机：一个本来就连得上的地址会被当成打洞打通的，打洞打通的也可能被当成本来就连得上的。
-/// 所以由发起方带头（马上开始尝试、测试期间把对端当作活跃的），接受方只跟随：照常回答探测和打洞信令，自己不主动去试。
+/// 若两端同时发起直连探测，先发次序取决于时机，会导致直达地址被误判为打洞成功，或反之。
+/// 因此由发起方主导（立即尝试并在测试期间将对端视为活跃），接收方仅跟随：正常响应探测与打洞信令，不主动发起探测。
 /// 平时有流量时也是一方先发包、另一方跟着，这样量到的就是平时会发生的事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
@@ -126,7 +126,7 @@ pub(crate) struct Window {
     pub(crate) until: Instant,
     pub(crate) max_probes: u32,
     pub(crate) relays: Vec<NodeId>,
-    /// 已经回答过的探测个数，和回答过的序号：重放的探测不回答第二次。
+    /// 已响应的探测总数及序号集合，用于去重并避免重复响应重放探测。
     answered: u32,
     seen: HashSet<u32>,
     /// 对端经各条路径发来的探测，每条收到了几个。
@@ -166,19 +166,19 @@ impl Window {
     /// 便宜的检查，在验签名之前做：时间窗、对端、个数、序号。
     pub(crate) fn screen(&self, from: NodeId, seq: u32, path: TestPath, now: Instant) -> Result<(), &'static str> {
         if !self.is_open(now) {
-            return Err("测试的时间窗已经过了");
+            return Err("测试时间窗已过期");
         }
         if from != self.peer {
-            return Err("不是这个测试的对端发来的");
+            return Err("来源节点非该测试的目标对端");
         }
         if self.answered >= self.max_probes {
-            return Err("这个测试回答过的探测到了上限");
+            return Err("该测试已达到最大响应探测数上限");
         }
         if self.seen.contains(&seq) {
-            return Err("这个序号已经回答过");
+            return Err("该探测序号已响应");
         }
         if !self.paths.iter().any(|(known, _)| *known == path) && self.paths.len() >= MAX_TEST_PATHS {
-            return Err("这个测试的路径太多");
+            return Err("该测试的路径数量已达上限");
         }
         Ok(())
     }
@@ -186,7 +186,7 @@ impl Window {
     /// 签名验过了：记下这个探测，返回它所在路径上收到的个数。调用前要先过 [`screen`](Self::screen)。
     pub(crate) fn admit(&mut self, seq: u32, path: TestPath) -> Admission {
         if !self.seen.insert(seq) {
-            return Admission::Refuse("这个序号已经回答过");
+            return Admission::Refuse("该探测序号已响应");
         }
         self.answered += 1;
         let received = match self.paths.iter_mut().find(|(known, _)| *known == path) {
@@ -237,7 +237,7 @@ pub struct TrainReport {
     pub interval: Duration,
     /// 从第一个探测发出到等完最后一个回答。
     pub duration: Duration,
-    /// 经 relay 时，本节点到第一个 relay 的那一段在开始时走的是 UDP 还是 TCP。
+    /// 经 relay 传输时，测试开始阶段本节点至首个 relay 所使用的传输协议（UDP 或 TCP）。
     pub relay_leg: Option<RelayLeg>,
     /// 直连时用的对端地址。
     pub peer_addr: Option<std::net::SocketAddr>,
@@ -246,17 +246,17 @@ pub struct TrainReport {
 /// 一列探测为什么没有发成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrainError {
-    #[error("对端不在 netmap 里")]
+    #[error("对端不在 netmap 中")]
     NotPeer,
-    #[error("这个测试没有打开，或者已经过了时间窗")]
+    #[error("测试未开启或时间窗已过期")]
     NoWindow,
-    #[error("现在走不了这条路径：没有验证过的直连，或者到第一个 relay 没有会话")]
+    #[error("当前路径不可用：缺少已验证的直连，或与首个 relay 尚未建立会话")]
     Unreachable,
     #[error("本节点不建立直连")]
     DirectDisabled,
     #[error("本节点不使用 relay")]
     RelayDisabled,
-    #[error("路径层已经停了")]
+    #[error("路径层已停止")]
     Stopped,
 }
 
@@ -272,7 +272,7 @@ pub struct LatencySummary {
     pub jitter_us: Option<u32>,
     /// 往返的丢包，千分之几。
     pub loss_permille: u16,
-    /// 去程和回程各自的丢包，千分之几：按对端说它收到了几个分出来。对端一个都没回答时分不出来，是 `None`。
+    /// 去程与回程各自丢包率（千分比），依据对端回报的接收计数拆分；若无任何响应则无法区分，返回 `None`。
     pub loss_up_permille: Option<u16>,
     pub loss_down_permille: Option<u16>,
 }
@@ -461,11 +461,11 @@ pub struct DirectAttempt {
     pub kind: Option<DirectKind>,
     /// 从开始尝试到验证通过。
     pub elapsed: Option<Duration>,
-    /// 没有成功时，本节点这一侧看到的原因。
+    /// 尝试失败时本节点侧记录的失败原因。
     pub failure: Option<DirectFailure>,
     /// 本节点的 UDP 通不通：到某个 relay 走的是 UDP 就是通的，到 relay 都只能走 TCP 就是不通的，没有 relay 时不知道。
     pub udp: Option<bool>,
-    /// 本节点映射出来的端口是不是随对端变化（这时多半打不了洞）。
+    /// 本节点 NAT 映射端口是否随对端地址变化（若为真通常无法完成 UDP 打洞）。
     pub mapping_varies: Option<bool>,
     /// 尝试时手上有几个对端的候选地址。
     pub candidates: usize,
@@ -484,7 +484,7 @@ pub enum DirectFailure {
     NoCandidates,
     /// 本节点的 UDP 不通。
     UdpUnavailable,
-    /// 本节点映射出来的端口随对端变化，打不了洞。
+    /// 本节点 NAT 映射端口随对端变化（对称型 NAT），无法完成打洞。
     MappingVaries,
     /// 试过了，在时限之内没有得到回答。
     Timeout,
@@ -546,7 +546,7 @@ pub enum ChoiceReason {
     OwnRelay,
     /// 对端挂靠的 relay（按对端报的延迟排第一个能用的）。
     PeerRelay,
-    /// 默认模式：没有一个 relay 两端都用得上，经候选里代价最低的一串 relay。
+    /// 默认模式：两端无共同可达的单个 relay，改经候选中代价最低的多级 relay 路径。
     NoSharedRelay,
     /// 延迟优先：候选里代价最低的。
     LowestCost,
@@ -600,16 +600,16 @@ mod tests {
     fn a_window_answers_only_its_peer_inside_its_time_and_count_and_never_the_same_sequence_twice() {
         let now = Instant::now();
         let mut window = Window::new(&spec(Duration::from_secs(10), 3), now);
-        assert_eq!(window.screen(node(3), 1, TestPath::Direct, now), Err("不是这个测试的对端发来的"));
+        assert_eq!(window.screen(node(3), 1, TestPath::Direct, now), Err("来源节点非该测试的目标对端"));
         assert_eq!(window.screen(node(2), 1, TestPath::Direct, now), Ok(()));
         assert_eq!(window.admit(1, TestPath::Direct), Admission::Answer { received: 1 });
-        assert_eq!(window.screen(node(2), 1, TestPath::Direct, now), Err("这个序号已经回答过"), "重放的探测不回答第二次");
-        assert_eq!(window.admit(1, TestPath::Direct), Admission::Refuse("这个序号已经回答过"));
+        assert_eq!(window.screen(node(2), 1, TestPath::Direct, now), Err("该探测序号已响应"), "重放的探测不回答第二次");
+        assert_eq!(window.admit(1, TestPath::Direct), Admission::Refuse("该探测序号已响应"));
         assert_eq!(window.admit(2, TestPath::Direct), Admission::Answer { received: 2 });
         let relayed = TestPath::Relays(RelayPath::new(&[node(9)]).unwrap());
         assert_eq!(window.admit(3, relayed), Admission::Answer { received: 1 }, "每条路径各自数");
-        assert_eq!(window.screen(node(2), 4, TestPath::Direct, now), Err("这个测试回答过的探测到了上限"));
-        assert_eq!(window.screen(node(2), 9, TestPath::Direct, now + Duration::from_secs(10)), Err("测试的时间窗已经过了"));
+        assert_eq!(window.screen(node(2), 4, TestPath::Direct, now), Err("该测试已达到最大响应探测数上限"));
+        assert_eq!(window.screen(node(2), 9, TestPath::Direct, now + Duration::from_secs(10)), Err("测试时间窗已过期"));
     }
 
     #[test]
@@ -630,7 +630,7 @@ mod tests {
             window.admit(seq, path);
         }
         let one_more = TestPath::Relays(RelayPath::new(&[node(99)]).unwrap());
-        assert_eq!(window.screen(node(2), 50, one_more, now), Err("这个测试的路径太多"));
+        assert_eq!(window.screen(node(2), 50, one_more, now), Err("该测试的路径数量已达上限"));
         assert_eq!(window.screen(node(2), 50, TestPath::Relays(RelayPath::new(&[node(10)]).unwrap()), now), Ok(()), "已经有的路径照样收");
     }
 

@@ -10,10 +10,10 @@
 //!
 //! 出口没有带宽上限：搬运多快只看两端和路上。relay 的带宽上限是另一回事，在 relay 那边（`i3t-relay`）。
 //!
-//! 账期按 UTC 算：每个月 `quota_reset_day` 号的 0 点开始一个新的账期。配额没有配的时候也照样记本账期的用量，
-//! 这样中途配上配额时，本账期已经用掉的也算数。
+//! 账期按 UTC 计算：每月 `quota_reset_day` 日 0 点开启新账期。未配置配额时仍会统计本账期用量，
+//! 以便中途启用配额时，本账期已消耗的流量计入统计。
 //!
-//! 配额的用量要跨重启保留：[`QuotaState`] 由装配层定期存下来，启动时交回来（[`crate::Exit::with_quota_state`]）。
+//! 配额用量需跨重启持久化：[`QuotaState`] 由装配层定期保存，启动时通过 [`crate::Exit::with_quota_state`] 恢复。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -109,7 +109,7 @@ impl Quota {
 
     fn configure(&mut self, limit: Option<u64>, reset_day: u8) {
         if (self.limit, self.reset_day) != (limit, reset_day) {
-            tracing::info!(?limit, reset_day, "出口的配额设置变了");
+            tracing::info!(?limit, reset_day, "出口配额配置已变更");
         }
         self.limit = limit;
         self.reset_day = reset_day;
@@ -120,7 +120,7 @@ impl Quota {
         let current = Period::containing(now, self.reset_day);
         if self.period.is_none_or(|period| period.start != current.start) {
             if self.used > 0 {
-                tracing::info!(used = self.used, start = current.start, "出口进入新的账期，用量从零算");
+                tracing::info!(used = self.used, start = current.start, "出口进入新账期，用量计数已归零");
             }
             self.used = 0;
         }
@@ -134,7 +134,7 @@ impl Quota {
         self.limit.is_some_and(|limit| self.used >= limit)
     }
 
-    /// 记下 `bytes` 字节。记上之后超过了配额返回 `false`：这一段不该再送出去。
+    /// 记录 `bytes` 字节流量。计入后若超出配额则返回 `false`，表示该段数据不应继续发送。
     fn charge(&mut self, bytes: u64, now: u64) -> bool {
         self.roll(now);
         self.used = self.used.saturating_add(bytes);
@@ -170,7 +170,7 @@ struct ConnectBudget {
 impl ConnectBudget {
     fn configure(&mut self, per_minute: Option<u32>) {
         if self.per_minute != per_minute {
-            tracing::info!(?per_minute, "出口的建连预算变了");
+            tracing::info!(?per_minute, "出口建连预算配置已变更");
             self.per_minute = per_minute;
             self.buckets.clear();
         }
@@ -243,7 +243,7 @@ impl Limits {
     fn charge_stream(&self, len: usize) -> Result<(), Reason> {
         // usize 不会比 u64 宽，这里不会截断。
         if !self.quota.lock().expect("quota mutex poisoned").charge(len as u64, wall_clock()) {
-            tracing::info!("出口本账期的配额用完了，断开正在搬运的流");
+            tracing::info!("出口本账期流量配额已耗尽，正在断开当前流");
             return Err(Reason::LimitReached);
         }
         Ok(())

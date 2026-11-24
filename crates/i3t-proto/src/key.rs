@@ -43,9 +43,9 @@ impl fmt::Debug for PublicKey {
 /// 一段文本不是合法的公钥。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidPublicKey {
-    #[error("公钥不是合法的 base64url：{0}")]
+    #[error("公钥不是有效的 base64url：{0}")]
     Encoding(#[from] base64::DecodeError),
-    #[error("公钥应该是 {expected} 字节，解出来是 {actual} 字节", expected = PublicKey::LEN)]
+    #[error("公钥长度应为 {expected} 字节，解码后实际为 {actual} 字节", expected = PublicKey::LEN)]
     Length { actual: usize },
 }
 

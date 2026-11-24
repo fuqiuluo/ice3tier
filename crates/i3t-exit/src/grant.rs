@@ -57,7 +57,7 @@ impl Grant {
             },
             Self::Lan => match &netmap.me.exit {
                 None => Some("本节点不再是出口"),
-                Some(ExitRole { lan: false, .. }) => Some("出口关掉了「允许访问本机局域网」"),
+                Some(ExitRole { lan: false, .. }) => Some("出口已关闭「允许访问本机局域网」"),
                 Some(ExitRole { lan: true, .. }) => None,
             },
             Self::NodeService => None,
@@ -68,10 +68,10 @@ impl Grant {
                         forward.id == id && forward.protocol == protocol && forward.bind == bind && forward.target == target
                     });
                 let Some(forward) = current.filter(|forward| faces_the_mesh(netmap, forward.bind)) else {
-                    return Some("这条端口转发被删掉或者改了");
+                    return Some("该端口转发已删除或已变更");
                 };
                 if check_allow_list(initiator, forward).is_err() {
-                    Some("发起节点不再在这条端口转发的来源白名单里")
+                    Some("发起节点已不在该端口转发的来源白名单中")
                 } else if target == netmap.me.id {
                     let points_to = netmap
                         .me
@@ -79,7 +79,7 @@ impl Grant {
                         .iter()
                         .find(|entry| entry.id == id && entry.listener == netmap.me.id && entry.protocol == protocol)
                         .map(|entry| entry.addr);
-                    (points_to != addr).then_some("这条端口转发指向的地址被删掉或者改了")
+                    (points_to != addr).then_some("该端口转发指向的目标地址已删除或已变更")
                 } else {
                     (!netmap.peer(target).is_some_and(|target| target.outbound))
                         .then_some("访问规则不再允许本节点访问这条端口转发的目标节点")
@@ -91,7 +91,7 @@ impl Grant {
                     .forward_targets
                     .iter()
                     .any(|entry| entry.id == id && entry.listener == peer && entry.protocol == protocol && entry.addr == addr);
-                (!listed).then_some("这条端口转发被删掉或者改了")
+                (!listed).then_some("该端口转发已删除或已变更")
             }
         }
     }

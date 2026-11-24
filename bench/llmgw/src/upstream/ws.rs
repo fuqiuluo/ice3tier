@@ -189,7 +189,7 @@ impl SessionState {
         }
     }
 
-    /// 处理客户端的一条消息。返回要立刻回给客户端的文本；验不过时返回原因，会话就此结束。
+    /// 处理客户端发送的一条消息。返回需立即回复客户端的文本；校验失败时返回原因并终止会话。
     fn on_message(&mut self, message: Message) -> Result<Option<String>, String> {
         match message {
             Message::Text(text) => match serde_json::from_str::<WsText>(&text) {
@@ -198,7 +198,7 @@ impl SessionState {
                         return Err(format!("第 {turn} 轮开始的时候上一轮还没有完"));
                     }
                     if parse_hex(&prompt_hash) != Some(Fnv::of(prompt.as_bytes())) {
-                        return Err(format!("第 {turn} 轮的提示词（{} 字节）和它的哈希对不上：消息在路上坏了", prompt.len()));
+                        return Err(format!("第 {turn} 轮提示词（{} 字节）与哈希不匹配：消息可能已损坏", prompt.len()));
                     }
                     let until = Instant::now() + Duration::from_millis(self.session.answer.think_ms);
                     self.phase = Phase::Thinking { turn, until };
@@ -219,8 +219,8 @@ impl SessionState {
                     };
                     Ok(Some(serde_json::to_string(&synced).expect("消息总能编成 JSON")))
                 }
-                Ok(other) => Err(format!("客户端不该发这种消息：{other:?}")),
-                Err(err) => Err(format!("客户端的消息不是要的 JSON：{err}")),
+                Ok(other) => Err(format!("收到意外的客户端消息类型：{other:?}")),
+                Err(err) => Err(format!("无法解析客户端消息 JSON：{err}")),
             },
             Message::Binary(frame) => {
                 let (stamp, payload) =
@@ -231,7 +231,7 @@ impl SessionState {
                 self.pongs += 1;
                 Ok(None)
             }
-            // ping 由库自动回 pong；close 在 `run` 里先处理掉了，到不了这里。
+            // ping 由底层库自动回复 pong；close 已在 `run` 中处理，不会到达此处。
             Message::Ping(_) | Message::Close(_) | Message::Frame(_) => Ok(None),
         }
     }

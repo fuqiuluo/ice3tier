@@ -23,7 +23,7 @@ const OVERLOAD_CLEAR: f64 = 0.8;
 /// 最多分别记多少个来源节点的用量。正常情况下就是会话的个数；更多的（多级中转里别的 relay 带来的来源）不单独算，只受总的上限。
 const MAX_SENDERS: usize = 1024;
 
-/// 令牌桶：按配置的带宽放行字节，超出的丢掉。relay 不排队，所以没有"等一会儿再发"。
+/// 令牌桶：按配置的带宽放行数据，超出限额的直接丢弃。relay 不做排队，不延迟发送。
 ///
 /// 带宽在来源节点之间公平地分：这一秒和上一秒里有包要转发的来源节点有 n 个，每个的公平份额就是上限的 n 分之一。
 /// 没人争的时候谁都可以用满（只有一个来源时没有份额的限制，几个来源时空着的额度也照样放行）；
@@ -133,7 +133,7 @@ impl Bandwidth {
         let wanted = u32::try_from(bytes).map_or(f64::INFINITY, f64::from);
         self.roll(now);
         if !self.senders.contains_key(&src) && self.senders.len() >= MAX_SENDERS {
-            // 记不下了：这个来源不单独算份额，它要的全部算进负载。
+            // 来源计数表已满：不再为该来源单独分配份额，其请求流量全部计入总负载。
             self.slice_bytes += wanted.min(self.capacity);
             return self.take(wanted);
         }
@@ -213,8 +213,8 @@ impl Bucket {
 /// 同一个 NAT 后面的几个节点同时重连也够用。
 const HANDSHAKES_PER_SOURCE: f64 = 5.0;
 const HANDSHAKE_BURST_PER_SOURCE: f64 = 10.0;
-/// 全体来源加起来每秒最多验多少个。一次验签几十微秒，这个数把握手占的时间封在收包时间的百分之一左右；
-/// relay 重启之后挂靠它的节点一起重连（各自带一点随机的延迟），个人用的网络里也远到不了这个数。
+/// 全局每秒最大验签次数。单次验签耗时数十微秒，该上限将握手验签耗时控制在收包路径的 1% 左右；
+/// 即使 relay 重启后所有挂靠节点同时带随机抖动重连，个人网络规模下也远不会触及此上限。
 const HANDSHAKES_TOTAL: f64 = 200.0;
 /// 最多分别记多少个来源。满了之后新来源只受总数的限制，直到旧的攒满额度被忘掉。
 const MAX_HANDSHAKE_SOURCES: usize = 4096;

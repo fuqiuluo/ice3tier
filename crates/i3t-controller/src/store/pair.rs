@@ -16,7 +16,7 @@ fn from_row(row: &Row) -> Read<PairSetting> {
         a: row.try_get::<_, SqlNode>("node_a")?.0,
         b: row.try_get::<_, SqlNode>("node_b")?.0,
         keep_alive: row.try_get("keep_alive")?,
-        // 只有本程序写这一列；读到不认识的值（比本程序新的版本写的）按没有设置（节点的默认）。
+        // 该列仅由本程序写入；若读到未知枚举值（可能由更高版本写入），按未配置处理（使用节点默认拥塞控制）。
         congestion: congestion.and_then(|text| text.parse().ok()),
     })
 }

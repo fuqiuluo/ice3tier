@@ -53,9 +53,9 @@ type SignalHook = Arc<dyn Fn(NodeId, &Signal) + Send + Sync>;
 pub enum UdpSeen {
     /// 直连：两个节点之间没有别人，整条路都是 UDP。
     WholePath,
-    /// 经 relay，本节点这一段走 UDP。对端那一段走什么，本节点看不见。
+    /// 经 relay 转发，本节点到 relay 段走 UDP；对端到 relay 段的传输方式本节点不可见。
     OwnLeg,
-    /// 经 relay，本节点这一段走 TCP。
+    /// 经 relay 转发，本节点到 relay 段走 TCP。
     NoUdp,
 }
 
@@ -89,7 +89,7 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// 端口绑不上，或者建不出 QUIC 的配置（节点密钥有问题）。
+    /// UDP 端口绑定失败，或 QUIC 配置构建失败（如节点密钥无效）。
     pub fn bind(config: EndpointConfig) -> Result<Self, EndpointError> {
         Self::bind_with(config, PacketTransport::from_env())
     }
@@ -98,7 +98,7 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// 端口绑不上，或者建不出 QUIC 的配置（节点密钥有问题）。
+    /// UDP 端口绑定失败，或 QUIC 配置构建失败（如节点密钥无效）。
     pub fn bind_with(config: EndpointConfig, packets: PacketTransport) -> Result<Self, EndpointError> {
         let EndpointConfig { key, bind, netmap, addr_servers } = config;
         let me = netmap.borrow().me.id;
@@ -109,7 +109,7 @@ impl Endpoint {
         let relay = Arc::new(Relay::new(Arc::clone(&key), Arc::clone(&port), netmap.clone()));
         paths.set_local_relay(Arc::clone(&relay) as Arc<dyn i3t_path::LocalRelay>);
         relay.set_backbone_inbox(paths.backbone_inbox());
-        // relay 只拿路径层的弱引用：路径层已经拿着 relay 了，两边都是强引用的话谁也释放不掉。
+        // relay 仅持有路径层的弱引用，避免与路径层持有的 relay 强引用形成循环引用导致无法释放。
         let weak_paths = Arc::downgrade(&paths);
         relay.set_local_delivery(move |src, packet| {
             if let Some(paths) = weak_paths.upgrade() {
@@ -117,7 +117,7 @@ impl Endpoint {
             }
         });
 
-        // 接受连接时认不认对端的公钥，每次握手都按当时的 netmap 来。
+        // 接受连接时按每次握手时的当前 netmap 校验对端公钥是否受信任。
         let allowed = netmap.clone();
         let server = quic::server(&key, move |key| allowed.borrow().peers.iter().any(|peer| peer.key == *key), packets)?;
 
@@ -159,13 +159,13 @@ impl Endpoint {
     /// 窗口对之后建立的连接生效，两个方向（本端拨出的、对端连进来的）都是；已有的连接保持原样。空闲回收的时间立刻生效。
     pub fn tune(&self, tuning: Tuning) {
         self.manager.tune(tuning);
-        tracing::info!(?tuning, "连接层的档位设置换了");
+        tracing::info!(?tuning, "连接层性能档位配置已更新");
     }
 
-    /// controller 现在连不连得上。装配方在长连接的状态变化时告诉它；从没告诉过时当作连得上。
+    /// 更新 controller 的在线状态。装配层在长连接状态变化时调用；未曾通知时默认视为在线。
     ///
-    /// 连不上、到某个对端又没有经 relay 的路时，到它的空闲连接先不回收：关掉之后打洞的信令无路可走，连接建不回来。
-    /// 连上之后下一次检查（一秒之内）照常回收。
+    /// 当 controller 不可达且到某对端无经 relay 路径时，暂缓回收其空闲连接，避免关闭后因打洞信令无路可走而无法重建。
+    /// 恢复在线后，下一次周期检查（1 秒内）将恢复正常回收。
     pub fn set_controller_online(&self, online: bool) {
         self.manager.set_controller_online(online);
     }
@@ -266,9 +266,9 @@ impl Endpoint {
         self.paths.subscribe()
     }
 
-    /// 到 `peer` 的共用连接现在走的路上，本节点看得见多少 UDP（见 [`UdpSeen`]）：直连时整条路都是；经 relay 时只看得见
-    /// 本节点这一段；本节点自己就是 relay 时，看对端在本节点上的中转会话是不是 UDP 的。
-    /// 没有路（对端不在 netmap 里、还没有路、或者到不了）时是 `None`：没有路不等于"没有 UDP 的路"，不能拿它决定去拨 ice3proxy。
+    /// 返回到 `peer` 的共用连接当前路径上本节点可见的 UDP 使用情况（见 [`UdpSeen`]）：直连时整条路径为 UDP；经 relay 时仅可见
+    /// 本节点到 relay 段；本节点自身作为 relay 时，检查对端在本节点上的中转会话是否为 UDP。
+    /// 无可用路径（对端不在 netmap、尚未选路或不可达）时返回 `None`：无路径不代表“无 UDP 路径”，不能据此决定启用 ice3proxy。
     ///
     /// "UDP 不通时才用 ice3proxy"按它来判断。
     #[must_use]
@@ -328,7 +328,7 @@ impl Endpoint {
     }
 
     /// 本节点启用为 relay 时，它在 UDP 端口的同一个端口号上听 TCP。开头是 TLS 握手记录的连接（ice3proxy）交给 `handoff`，
-    /// 别的照常当作中转。`None` 时那个端口上只有中转。见 [`i3t_relay::Relay::set_tcp_handoff`]。
+    /// 其余连接仍按中转处理。为 `None` 时该端口仅提供中转服务。见 [`i3t_relay::Relay::set_tcp_handoff`]。
     pub fn set_lane_handoff(&self, handoff: Option<i3t_relay::TcpHandoff>) {
         self.relay.set_tcp_handoff(handoff);
     }
@@ -367,7 +367,7 @@ impl Endpoint {
             tokio::time::sleep(RELAY_LEAVE_GRACE).await;
         }
         self.manager.close().await;
-        // 路径层最后收：它要撤掉在路由器上自动申请的端口映射。
+        // 最后关闭路径层，以便清理向路由器自动申请的端口映射。
         self.paths.shutdown().await;
     }
 }
@@ -468,7 +468,7 @@ impl DatagramInbox {
 pub enum EndpointError {
     #[error("绑定 UDP {addr} 失败")]
     Bind { addr: SocketAddr, source: io::Error },
-    #[error("建不出连接层的配置")]
+    #[error("构建连接层配置失败")]
     Config(#[from] QuicConfigError),
     #[error("启动连接层失败")]
     Quic(#[source] io::Error),

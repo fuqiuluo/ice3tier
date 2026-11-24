@@ -1,10 +1,10 @@
 //! 异常结束一条 TCP 连接：关闭时发 RST 而不是 FIN，并且让对端认这个 RST。以及设成这样的连接怎样正常结束（最后一节）。
 //!
-//! RST 的序号是本端下一个要发的字节。对端只认序号正好对得上的 RST（RFC 5961），对不上的不理，回一个"挑战 ACK"。
-//! Linux 拿它和自己下一个要收的字节比，本端发出去的它都收到了就对得上。macOS 拿它和自己最后一次确认到的位置比：
-//! 对端刚收到数据、还欠着一个延迟确认（最多一两百毫秒）时就对不上，RST 被丢掉。挑战 ACK 回到本端：Linux 上连接已经没了，
-//! 回一个 RST，这一个对端认；macOS 上刚关掉的连接还在表里，挑战 ACK 被悄悄丢掉。所以本端和对端都是 macOS 时
-//! （本机的代理和本机的程序就是这样），刚发完数据就被重置的连接，对端不知道它被重置了，一直等下去。
+//! RST 的序号为本端下一个待发送字节的序号。对端仅接受序号精确匹配的 RST（RFC 5961），不匹配时将其忽略并回复挑战 ACK。
+//! Linux 将其与下一个待接收字节序号比较，只要对端已收到本端已发送数据即可匹配。macOS 则将其与最后一次确认的位置比较：
+//! 当对端刚收到数据且尚未发出延迟确认（最长约 100~200 毫秒）时，序号不匹配，RST 被丢弃。挑战 ACK 返回本端后：Linux 上连接已移除，
+//! 内核会回复新的 RST 并被对端接受；而 macOS 上刚关闭的连接仍停留在连接表中，挑战 ACK 会被静默丢弃。因此当两端均为 macOS 时
+//! （如本机代理与本机程序），刚发送完数据即被重置的连接会使对端无法感知重置而持续等待。
 //!
 //! 所以 macOS 上关闭之前先等对端确认完本端发出去的所有数据（发送缓冲空了：`SO_NWRITE` 是 0），这时它最后一次确认到的
 //! 位置就是 RST 的序号。最多等 [`ACK_WAIT`]，等不到（对端不读了、断了）也照样关。等的时候连接在后台留着，调用方不用等。
@@ -14,9 +14,9 @@
 //!
 //! 搬运用户数据的连接一开始就设成"关闭时发 RST"（`SO_LINGER` 为 0），中途出错、任务被取消、进程退出时对端看到的
 //! 都是重置；两个方向都正常结束了才改回正常关闭。macOS 上这一步可能来不及：一条 socket 两个方向都关了之后（本端发了
-//! FIN，对端的 FIN 也到了），那里的 setsockopt 一律返回 EINVAL，"关闭时发 RST"再也改不回来。于是正常结束的连接照样以
-//! RST 关闭，发送缓冲里还没送到的数据被丢掉：对端读到的是重置；对端也是 macOS 并且不认这个 RST 时，它一直等那些数据。
-//! 所以这样的连接用 [`shutdown_write`] 发 FIN、用 [`graceful_close`] 改回正常关闭，别直接调 `shutdown` 和 `set_linger`。
+//! FIN 且已收到对端 FIN），后续 setsockopt 会一律返回 EINVAL，无法再取消"关闭时发送 RST"设置。结果正常结束的连接仍会以
+//! RST 关闭，发送缓冲区中尚未送达的数据会被丢弃：对端会收到连接重置；若对端同样为 macOS 且不接受该 RST，则会一直等待剩余数据。
+//! 因此此类连接应使用 [`shutdown_write`] 发送 FIN、使用 [`graceful_close`] 恢复正常关闭，避免直接调用 `shutdown` 和 `set_linger`。
 
 use std::borrow::Borrow;
 use std::io;
@@ -41,7 +41,7 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 /// 不用等：macOS 上要等对端确认时，连接交给一个后台任务，它在 tokio 运行时里关掉连接；不在运行时里时马上关。
 pub fn close(stream: impl Borrow<TcpStream> + Send + 'static) {
     if let Err(error) = stream.borrow().set_zero_linger() {
-        tracing::debug!(%error, "设置不了 SO_LINGER，这条连接关闭时对端可能看到正常结束");
+        tracing::debug!(%error, "设置 SO_LINGER 失败，关闭连接时对端可能看到正常结束");
     }
     #[cfg(target_os = "macos")]
     if unacknowledged(stream.borrow()).is_ok_and(|bytes| bytes > 0)
@@ -61,10 +61,10 @@ pub fn close(stream: impl Borrow<TcpStream> + Send + 'static) {
 
 /// 正常结束写的一半：发 FIN，排在还没送出去的数据后面。连接设着"关闭时发 RST"、要等两个方向都结束才定怎么关时用它。
 ///
-/// 对端的 FIN 什么时候到由不得本端，到了之后再发 FIN，macOS 上就改不回正常关闭了（模块文档）。所以 macOS 上发 FIN
-/// 之前先改回正常关闭：这个方向到这里是完整的。之后整条连接要是异常结束，调用方照常再设"关闭时发 RST"（[`close`]
-/// 就会设）；那时对端的 FIN 已经到了的话设不上，对端看到的是正常关闭，它要发的那时已经发完了，只是不知道有没有送到。
-/// 别的系统上随时都能改，这里只发 FIN，"关闭时发 RST"留到 [`graceful_close`] 再改：中途被取消、进程退出时对端照样看到重置。
+/// 本端无法控制对端 FIN 的到达时机；若在收到对端 FIN 后再发 FIN，macOS 上将无法恢复正常关闭（见模块文档）。因此 macOS 上在发 FIN
+/// 之前先恢复正常关闭：该发送方向至此已完整。若后续整条连接异常终止，调用方仍会重新设置"关闭时发 RST"（由 [`close`]
+/// 执行）；若此时对端 FIN 已到达而无法设置，对端将看到正常关闭（其待发送数据此时已发完，仅无法得知是否送达）。
+/// 其他系统可随时修改该选项，此处仅发送 FIN，待 [`graceful_close`] 再恢复正常关闭，确保中途取消或进程退出时对端仍会收到重置。
 ///
 /// # Errors
 ///
@@ -72,7 +72,7 @@ pub fn close(stream: impl Borrow<TcpStream> + Send + 'static) {
 pub fn shutdown_write(stream: &TcpStream) -> io::Result<()> {
     let socket = SockRef::from(stream);
     if !LINGER_SETTABLE_ONCE_SHUT && let Err(error) = socket.set_linger(None) {
-        tracing::debug!(%error, "发 FIN 之前改不回正常关闭，这条连接关闭时可能发 RST");
+        tracing::debug!(%error, "发送 FIN 前恢复正常关闭模式失败，连接关闭时可能发送 RST");
     }
     socket.shutdown(Shutdown::Write)
 }
@@ -83,7 +83,7 @@ pub fn shutdown_write(stream: &TcpStream) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// 设不上 `SO_LINGER`。这条连接关闭时会发 RST。
+/// 无法设置 `SO_LINGER`，该连接在关闭时仍会发送 RST。
 pub fn graceful_close(stream: &TcpStream) -> io::Result<()> {
     if LINGER_SETTABLE_ONCE_SHUT { SockRef::from(stream).set_linger(None) } else { Ok(()) }
 }

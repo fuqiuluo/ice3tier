@@ -1,4 +1,4 @@
-//! 数据报上下文里的一帧：头，以及把装不下的内容切成几片。逐字节的格式在上一级模块的文档里。
+//! 数据报上下文中的帧结构：帧头定义，以及将超出单帧容量的内容拆分为多分片。逐字节格式见上级模块文档。
 
 use std::slice::Chunks;
 
@@ -38,7 +38,7 @@ impl Recipient {
         }
     }
 
-    /// 只看首字节，判断一帧是给哪一侧的。空的、或者标志里有不认识的位的帧返回 `None`，应该直接丢掉。
+    /// 仅检查首字节以判断帧的接收侧。空帧或标志含未知位的帧返回 `None`，应直接丢弃。
     #[must_use]
     pub fn peek(frame: &[u8]) -> Option<Self> {
         let &flags = frame.first()?;
@@ -98,7 +98,7 @@ impl DatagramHeader {
     ///
     /// # Errors
     ///
-    /// 帧比头还短、标志里有不认识的位，或者分片头自相矛盾。这样的帧应该直接丢掉。
+    /// 帧长度短于帧头、标志含未知位，或分片头无效。此类帧应直接丢弃。
     pub fn decode(frame: &[u8]) -> Result<(Self, &[u8]), FrameError> {
         let truncated = FrameError::Truncated { len: frame.len() };
         let (&[flags, c0, c1, c2, c3], rest) = frame.split_first_chunk().ok_or(truncated)?;
@@ -118,16 +118,16 @@ impl DatagramHeader {
     }
 }
 
-/// 一帧解析不了的原因。
+/// 帧解析失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
-    #[error("数据报只有 {len} 字节，比头还短")]
+    #[error("数据报长度为 {len} 字节，短于帧头长度")]
     Truncated { len: usize },
-    #[error("标志里的保留位不是 0：{0:#010b}")]
+    #[error("标志中的保留位非 0：{0:#010b}")]
     ReservedFlags(u8),
-    #[error("分片头自相矛盾：一共 {count} 片，这是第 {index} 片（从 0 数）")]
+    #[error("分片头无效：总片数为 {count}，当前片序号为 {index}（从 0 开始）")]
     InvalidFragment { index: u8, count: u8 },
-    #[error("合在一帧里的第 {index} 个包（从 0 数）读不出来：一个都没有，长度是 0，或者写的长度比剩下的还长")]
+    #[error("合并帧中第 {index} 个数据包（从 0 开始）解析失败：帧为空、声明长度为 0 或声明长度超过剩余字节数")]
     BrokenBundle { index: usize },
 }
 
@@ -154,7 +154,7 @@ impl<'a> Frames<'a> {
     ///
     /// # Errors
     ///
-    /// 内容超过 [`MAX_DATAGRAM_BODY_LEN`]，或者 `max_len` 小到切成 255 片也装不下。
+    /// 内容超过 [`MAX_DATAGRAM_BODY_LEN`]，或 `max_len` 过小导致即使分为 255 片仍无法容纳。
     pub fn split(recipient: Recipient, context: u32, message: u16, body: &'a [u8], max_len: usize) -> Result<Self, SplitError> {
         if body.len() > MAX_DATAGRAM_BODY_LEN {
             return Err(SplitError::BodyTooLarge { len: body.len() });
@@ -196,12 +196,12 @@ impl Iterator for Frames<'_> {
     }
 }
 
-/// 一个报文发不出去的原因。
+/// 报文无法分片发送的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SplitError {
-    #[error("数据报的内容有 {len} 字节，最长 {MAX_DATAGRAM_BODY_LEN} 字节")]
+    #[error("数据报内容长度为 {len} 字节，超过上限 {MAX_DATAGRAM_BODY_LEN} 字节")]
     BodyTooLarge { len: usize },
-    #[error("连接一次只能发 {max_len} 字节的数据报，{len} 字节的内容切成 {MAX_FRAGMENTS} 片也装不下")]
+    #[error("单次数据报最大长度为 {max_len} 字节，{len} 字节内容即使分为 {MAX_FRAGMENTS} 片仍无法容纳")]
     FrameTooSmall { len: usize, max_len: usize },
 }
 

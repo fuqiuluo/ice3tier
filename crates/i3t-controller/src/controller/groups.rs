@@ -1,6 +1,6 @@
 //! 分组：增删改查和成员。
 //!
-//! 分组只在 controller 里：节点拿到的是按规则算好的访问关系，看不到分组。所以改名不下发任何东西；
+//! 分组仅在 controller 侧维护：节点收到的是按规则展开后的访问关系，不感知分组。因此分组改名无需下发更新；
 //! 成员变了、用到它的规则被删了，才要重算受影响的节点。
 
 use std::collections::BTreeSet;
@@ -114,10 +114,8 @@ impl Controller {
                 .collect();
             let (node_count, rule_count, token_count) = (count(nodes.len()), count(rules.len()), count(tokens.len()));
             let params = json!({ "group": id, "group_name": group.name, "nodes": node_count, "rules": rule_count, "tokens": token_count });
-            let detail = format!(
-                "删除分组 {}：从 {node_count} 个节点上去掉，删掉 {rule_count} 条规则，从 {token_count} 个注册令牌上去掉",
-                group.name
-            );
+            let detail =
+                format!("删除分组 {}：从 {node_count} 个节点移除，删除 {rule_count} 条规则，从 {token_count} 个注册令牌移除", group.name);
             store.log_refs(now, Some(network), action::GROUP_DELETE, &detail, &refs, params)?;
             Ok::<_, Error>(DeletedGroup { id, name: group.name, nodes, rules, tokens })
         })?;
@@ -213,7 +211,7 @@ impl Controller {
             Ok::<_, Error>(changed)
         })?;
         if !changed.is_empty() {
-            tracing::info!(%network, group = %id, nodes = ?changed, "分组的成员变了");
+            tracing::info!(%network, group = %id, nodes = ?changed, "分组成员已变更");
             inner.refresh(network, Seeds::of(changed), None)?;
             self.wake_if_needed(&inner);
         }
@@ -231,7 +229,7 @@ impl Inner {
 
 /// 在这些分组里的节点：一条规则变了，要重算的就是它两头的节点。有 `All` 时是全网。
 ///
-/// 在改规则的事务里读：提交之后再读，读不出来时规则已经改了，却没人去重算。
+/// 须在修改规则的同一事务中读取：若提交后再读取，一旦读取失败会导致规则已变更但无人触发重算。
 pub(super) fn members_of(store: &Store, network: NetworkId, groups: &[GroupId]) -> Result<Seeds, Error> {
     if store.builtin_group(network)?.is_some_and(|all| groups.contains(&all)) {
         return Ok(Seeds::All);

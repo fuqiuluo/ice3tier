@@ -9,20 +9,20 @@ use i3t_proto::NodeId;
 use i3t_proto::backbone::RelayState;
 use serde::{Deserialize, Serialize};
 
-/// 直连是怎么建立起来的。
+/// 直连建立方式。
 ///
-/// 设计里还列了"端口映射"这一种。对端的候选端点在 netmap 里不分来源，本节点看不出某个地址是不是它的路由器上
-/// 映射出来的，所以这里归在 [`DirectKind::Reachable`] 里。
+/// 设计文档中另列有“端口映射”类型；由于 netmap 中对端候选端点不区分来源，本节点无法分辨某地址是否由路由器映射，
+/// 故统一归入 [`DirectKind::Reachable`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectKind {
-    /// 同一个局域网：对端的信标是在本地网段上看到的，或者两边的公网地址相同而且对端的这个地址是私有地址。
+    /// 同一局域网：通过本地网段信标发现，或双方公网地址相同且该地址为私有地址。
     Lan,
     /// 对端的 IPv6 地址。
     Ipv6,
-    /// 对端的这个地址本来就连得上（公网地址、端口转发、端口映射），没有用到打洞信令。
+    /// 对端地址直接可达（公网地址、端口转发或端口映射），未依赖打洞信令。
     Reachable,
-    /// 和对端交换打洞信令之后打通的。
+    /// 与对端交换打洞信令后完成连通。
     Punched,
 }
 
@@ -56,7 +56,7 @@ pub enum DirectState {
     Failed,
 }
 
-/// 直连上一次为什么没有成。
+/// 最近一次直连失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectFailureCause {
@@ -72,12 +72,12 @@ pub enum DirectFailureCause {
     Stale,
 }
 
-/// 经 relay 时，本节点到路径上第一个 relay 的那一段用的传输。
+/// 经 relay 转发时，本节点到路径上首个 relay 的传输协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayLeg {
     Udp,
-    /// UDP 用不了时，经 relay 的 TCP 监听。
+    /// UDP 不可用时，回退至 relay 的 TCP 监听端口。
     Tcp,
 }
 
@@ -90,7 +90,7 @@ pub struct LegReport {
     pub rtt_ms: f64,
     /// 抖动，毫秒。
     pub jitter_ms: f64,
-    /// 丢包率，0 到 1。目的节点到它挂靠的 relay 的那一段只知道延迟，抖动和丢包都是 0。
+    /// 丢包率（0 至 1）。目的节点到其挂靠 relay 的链路仅上报延迟，抖动与丢包记为 0。
     pub loss: f64,
 }
 
@@ -122,7 +122,7 @@ pub struct PathReport {
     pub route: Route,
     /// 现在走直连时，它是怎么建立起来的。
     pub direct: Option<DirectKind>,
-    /// 现在经 relay 时，本节点到第一个 relay 的那一段走 UDP 还是 TCP。不经 relay、或者第一个 relay 就是本节点自己时是 `None`。
+    /// 经 relay 转发时，本节点到首个 relay 的传输方式（UDP 或 TCP）；不经 relay 或首个 relay 为本节点自身时为 `None`。
     #[serde(default)]
     pub relay_leg: Option<RelayLeg>,
     /// 为什么是现在这条路，给人看的。
@@ -134,9 +134,9 @@ pub struct PathReport {
     pub since_switch_ms: Option<u64>,
     /// 直连现在在哪一步，不管现在走不走它。
     pub direct_status: DirectStatus,
-    /// 本节点没在用的那种选路模式此刻会选的路：默认模式下是延迟优先会选的（代价最低，按选路器的差距从现在的路算），
-    /// 延迟优先模式下是默认模式会选的（有验证过的直连就直连，否则照常挑 relay）。那种模式没有路可走时是 [`Route::None`]。
-    /// 和现在的路一样、或者还没有算过（默认模式下第一个评估窗口之前）时是 `None`。
+    /// 另一种未启用的选路模式当前会选择的路径：默认模式下对应延迟优先的选择（按选路器阈值基于当前路径计算），
+    /// 延迟优先模式下对应默认模式的选择（直连可用优先直连，否则按常规规则选择 relay）。若该模式无可用路径则为 [`Route::None`]。
+    /// 当与当前路径相同或尚未计算（默认模式首个评估窗口前）时为 `None`。
     #[serde(default)]
     pub alternative: Option<Alternative>,
     /// 考虑过的候选路径，按代价从低到高。没有任何测量值的路径不在里面。
@@ -155,7 +155,7 @@ pub struct Alternative {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BackboneLink {
     pub to: NodeId,
-    /// 往返延迟，毫秒；`None` 表示连不上。
+    /// 往返延迟（毫秒）；`None` 表示不可达。
     pub rtt_ms: Option<u16>,
     pub jitter_ms: u8,
     /// 丢包率，0 到 1。

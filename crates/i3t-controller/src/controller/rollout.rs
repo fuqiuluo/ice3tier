@@ -2,23 +2,23 @@
 //!
 //! 规矩都在 [`Inner::plan`] 和 [`Inner::roll_out`] 里：
 //!
-//! - **能更新的节点**：在线、懂更新的协议、自己说能自己更新、版本比已知的发布旧、发布里有它的平台的包。
-//!   不满足的节点从不下发，管理员强制也不行。
+//! - **能更新的节点**：在线、支持更新协议、允许自主更新、当前版本低于已知正式版，且发布清单中包含其对应平台的更新包。
+//!   不满足条件的节点绝不下发指令，管理员强制触发亦不例外。
 //! - **等节点先上报**：节点连上来之后，要等它的第一次上报到了才给它下发。上报里有它的更新状态，
 //!   它可能正带着"这个版本在我这里失败过"回来；不等的话会先把同一个版本又发给它一遍。
 //! - **自动更新**（时机是"空闲时"）：全局的开关和这个节点自己的开关都开着，这个版本在节点所在的网络里没有被暂停，
 //!   这个节点没有在这个版本上失败过。节点自己等到没有流才换程序。
 //! - **强制更新**（"立刻"或者"排空后"）：管理员点的，不看两个开关、暂停和以前的失败。
-//! - **包**：要更新的节点所用平台的包取回来之前不下发，先去取。
-//! - **relay 一个一个来**：同一个网络里一次只让一个 relay 更新，它更新完、重新上线并且站稳之后才轮到下一个，
-//!   这样节点换路时总有别的 relay 可用。轮到的 relay 离线期间一直等它，不跳过：它要是更新之后再也没有回来，
-//!   多半是新版本有问题，这时候接着更新别的 relay 只会把 relay 全部搞掉。管理员单独点的"立即更新"不排这个队。
-//!   自己的自动更新开关关着的 relay 不在队里：它拿不到自动的指令，也就不占轮次；轮到它的时候关掉它的开关，
-//!   它的指令被撤回，这一轮随即让给下一个，别的 relay 不用等它。
+//! - **更新包**：待更新节点对应平台的更新包下载缓存完成前暂不下发指令，先触发下载。
+//! - **relay 逐台滚动更新**：同一网络内同一时间仅允许一台 relay 更新，待其完成更新、重新上线并度过稳定期后才轮到下一台，
+//!   确保节点切换路径时总有其他 relay 可用。当前轮次的 relay 离线期间持续等待而不跳过：若其更新后未能恢复上线，
+//!   极可能是新版本存在故障，此时继续更新其他 relay 会导致全网 relay 瘫痪。管理员单独触发的「立即更新」不受该队列限制。
+//!   关闭了自身自动更新开关的 relay 不参与排队：它不会收到自动更新指令，也不占用轮次；若在轮到它时关闭其开关，
+//!   将立即撤回其指令并让出轮次，不阻塞后续 relay。
 //! - **网络里唯一的 relay** 没有特别的处理：节点自己知道它是不是唯一的 relay、有没有在替人转发，
 //!   "空闲时"的时机下它把正在转发也算作不空闲。
-//! - **撤回**：自动更新不该再做的时候（全局的或者节点自己的开关关了、版本被暂停了），给还没做完的节点发撤回，
-//!   节点没有换上去的话就此停下。
+//! - **撤回**：自动更新条件不再满足时（全局或节点开关关闭、版本被暂停），向尚未完成更新的节点发送撤回指令，
+//!   若节点尚未替换程序则中止更新。
 //!
 //! 离线的节点什么都不用记：它重新连上来的时候和别的节点一样过一遍这些规矩。
 
@@ -35,7 +35,7 @@ use super::{Failures, Inner, Live};
 use crate::error::Error;
 use crate::store::NodeRecord;
 
-/// 下发更新指令没做完（读不出存储）时，过多久再做一遍。
+/// 更新指令调度未完成（如存储读取失败）时的重试间隔。
 const ROLLOUT_RETRY: Duration = Duration::from_secs(1);
 
 /// 这次连接上发给一个节点的更新指令。
@@ -43,7 +43,7 @@ const ROLLOUT_RETRY: Duration = Duration::from_secs(1);
 pub(crate) struct Order {
     pub(crate) version: Version,
     pub(crate) timing: UpdateTiming,
-    /// 节点说没有成。留着这条记录，同一条连接上就不会反复重发；下次查发布源时清掉，于是会再试。
+    /// 节点已上报本次更新失败。保留该标记以避免在同一连接上反复重发；下次检查发布源时清除以允许重试。
     pub(crate) failed: bool,
 }
 
@@ -51,7 +51,7 @@ pub(crate) struct Order {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Forced {
     pub(crate) timing: UpdateTiming,
-    /// 单独点的"立即更新"不排 relay 的队；"全部更新"里的 relay 照样一个一个来。
+    /// 对单节点单独触发的「立即更新」跳过 relay 队列；「全部更新」中的 relay 仍按序逐台更新。
     pub(crate) skips_relay_queue: bool,
 }
 
@@ -75,7 +75,7 @@ pub(crate) struct Plan {
 }
 
 impl Live {
-    /// 节点懂不懂更新用的那几条消息。最初一版的节点收到不认识的消息会断开，所以不懂的不能发。
+    /// 节点是否支持更新相关协议消息。初代协议节点收到未知消息会断开连接，因此不支持的节点不得下发。
     pub(crate) const fn understands_updates(&self) -> bool {
         self.protocol >= 1
     }
@@ -129,22 +129,22 @@ impl Inner {
     /// 按现在的情况给该更新的节点下发指令，撤回不该再做的。任何可能改变结论的事情之后都要调用一次：
     /// 节点上线、节点报了失败、查到了新的发布、包取回来了、设置变了、管理员点了按钮、轮到的 relay 站稳了。
     ///
-    /// 读不出存储、没做完时过 [`ROLLOUT_RETRY`] 再做一遍：不然要等下一件可能改变结论的事，这期间该下发的指令发不出去，
-    /// 该撤回的（比如管理员刚关掉了自动更新）也撤不回来。
+    /// 存储读取失败导致未完成时，间隔 [`ROLLOUT_RETRY`] 后重试：否则只能等到下一次状态变更事件，期间应下发的指令无法发出，
+    /// 应撤回的指令（例如管理员刚关闭自动更新）也无法及时撤回。
     ///
-    /// 有好几个节点读不出来时交回第一个错误，别的打日志。
+    /// 若有多个节点读取失败，返回首个错误并记录其余错误日志。
     pub(crate) fn roll_out(&mut self) -> Result<(), Error> {
         self.roll_out_reporting(Failures::into_result)
     }
 
-    /// 后台到点时做的 [`Self::roll_out`]：有好几个节点读不出来时，别的只打在 debug 里。它们一直读不出来的话，
-    /// 后台每 [`ROLLOUT_RETRY`] 就要再碰上一遍；后台的错误日志由调用方限着频（见 `server::maintain`），
-    /// 在这里每次都打就绕过去了。
+    /// 后台定时触发的 [`Self::roll_out`]：若多个节点读取失败，其余错误仅输出 debug 日志。当持续失败时，
+    /// 后台每 [`ROLLOUT_RETRY`] 都会重试；错误日志由调用方统一限流（见 `server::maintain`），
+    /// 若在此处逐条输出会绕过限流。
     pub(crate) fn roll_out_in_background(&mut self) -> Result<(), Error> {
         self.roll_out_reporting(Failures::into_first)
     }
 
-    /// `report` 决定一个以上的节点读不出来时，第一个以外的错误怎么打。
+    /// `report` 控制多个节点读取失败时，首个之外的错误如何记录。
     fn roll_out_reporting(&mut self, report: fn(Failures) -> Result<(), Error>) -> Result<(), Error> {
         self.updates.next_rollout = None;
         let mut failures = Failures::default();
@@ -168,11 +168,11 @@ impl Inner {
     /// 边看边发的话，排在它前面的下一个 relay 先拿到指令，看到它之前读存储出了错，它的撤回这一轮就发不出去，
     /// 两个 relay 同时在更新。
     ///
-    /// 只是某一个节点读不出来时跳过它，别的照常：不然它一直读不出的话，每次重做都卡在它这里，谁都拿不到指令，
-    /// 管理员强制更新别的节点也不行。它手上还有没撤回的指令时，不知道该不该撤回，它可能正在更新、占着这个网络的轮次：
-    /// 这个网络里排队的 relay 这一轮不开始。整个数据库都读不了时不往下试，别的节点也读不出来。
+    /// 仅单个节点读取失败时跳过该节点，继续处理其余节点：避免单节点持续失败阻塞全量调度，
+    /// 甚至影响管理员对其他节点的强制更新。若该节点仍持有未撤回的指令，无法确认其是否应被撤回，它可能仍在更新并占用本网轮次，
+    /// 因此本轮不启动该网络中排队的其他 relay。若整个数据库不可读则提前中止，避免对剩余节点做无效尝试。
     ///
-    /// 只和某一个节点有关的错误记进 `failures`；整个数据库都读不了时提前交回那个错误。
+    /// 单节点错误记录到 `failures`；整个数据库不可读时直接返回该错误。
     fn roll_out_at(&mut self, now: Instant, failures: &mut Failures) -> Result<(), Error> {
         self.settle_relay_turns(now, failures)?;
 
@@ -213,7 +213,7 @@ impl Inner {
             if current.is_some_and(|order| order.version == version && order.timing == timing) {
                 continue;
             }
-            // 空着的轮次不给排队的 relay：读不出来的节点可能还在更新（见上）。它自己占着这一轮时照常，多不出一个 relay。
+            // 不将空闲轮次分配给排队的 relay：读取失败的节点可能仍在更新（见上）。若当前节点自身已持有轮次则正常推进，不会新增并发更新的 relay。
             let blocked =
                 unsure.contains(&node.network) && self.queues_for_turn(&node) && !self.updates.relay_turns.contains_key(&node.network);
             match plan.waiting {
@@ -245,7 +245,7 @@ impl Inner {
 
     fn cancel_order(&mut self, node: &NodeRecord) {
         if self.send(node.id, ToNode::UpdateCancel) {
-            tracing::info!(node = %node.id, name = %node.name, "撤回给节点的更新指令：现在不该让它更新了");
+            tracing::info!(node = %node.id, name = %node.name, "撤回节点的更新指令：当前不再满足更新条件");
             self.counters.orders_cancelled += 1;
         }
         if let Some(live) = self.live.get_mut(&node.id) {
@@ -266,10 +266,10 @@ impl Inner {
         }
     }
 
-    /// 看每个网络里轮到的那个 relay 是不是已经结束了它的这一轮，结束了就把这一轮让出来。
+    /// 检查各网络当前持有轮次的 relay 是否已完成更新轮次，若已完成则释放轮次。
     ///
-    /// 只是它读不出来时这一轮还留给它（不知道它是不是还在更新），错误记进 `failures`，别的网络照常；
-    /// 整个数据库都读不了时不往下试。
+    /// 若仅该节点读取失败，则暂保留其轮次（无法确认其是否仍在更新），错误记录到 `failures`，其余网络正常处理；
+    /// 若整个数据库不可读则提前中止。
     fn settle_relay_turns(&mut self, now: Instant, failures: &mut Failures) -> Result<(), Error> {
         let turns: Vec<_> = self.updates.relay_turns.iter().map(|(network, turn)| (*network, *turn)).collect();
         for (network, turn) in turns {
@@ -284,7 +284,7 @@ impl Inner {
                 }
             };
             if over {
-                tracing::info!(%network, relay = %turn.holder, "这个 relay 的更新告一段落，轮到下一个");
+                tracing::info!(%network, relay = %turn.holder, "该 relay 更新轮次结束，允许下一个 relay 更新");
                 self.updates.relay_turns.remove(&network);
             }
         }
@@ -295,7 +295,7 @@ impl Inner {
         let Some(target) = self.updates.usable_release().map(|release| release.manifest.version.clone()) else { return true };
         let updated = node.version.parse::<Version>().is_ok_and(|running| running >= target);
         let Some(live) = self.live.get(&node.id) else {
-            // 不在线：多半是正在重启。等它回来，不跳过它（原因见模块文档）。
+            // 离线通常表示节点正在重启。保持等待而不跳过（原因见模块文档）。
             return false;
         };
         if live.update.is_none() {
@@ -316,9 +316,9 @@ impl Inner {
             return false;
         }
         match &live.order {
-            // 不该再让它更新了（开关关了、版本被暂停了）：这次 `roll_out` 接着就撤回它的指令，这一轮不用等到下一次才让出来。
+            // 不再满足更新条件（如开关关闭或版本暂停）：本次 `roll_out` 随后即撤回指令，无需等到下一轮再释放轮次。
             Some(order) => order.failed || self.plan(node).wanted.is_none(),
-            // 在线、还是旧版本、这次连接上还没有发过指令：还该让它更新的话马上会重发，这一轮接着是它的。
+            // 节点在线、仍为旧版本且本次连接尚未下发指令：若仍需更新则会立即重发，本轮继续由其持有。
             None => self.plan(node).wanted.is_none(),
         }
     }

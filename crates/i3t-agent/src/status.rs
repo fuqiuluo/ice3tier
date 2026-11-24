@@ -1,7 +1,7 @@
 //! 运行着的节点的状态，给本机的 `i3t status` 和 `i3t routes` 看。
 //!
 //! 这些类型就是本机状态接口应答的 JSON。问的一方和答的一方通常是同一个程序文件，但更新的那一小段时间里
-//! 可能不是同一个版本，所以字段都有默认值，不认识的字段被忽略。
+//! 可能并非同一版本，因此字段均设有默认值，未识别的字段将被忽略。
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -110,7 +110,7 @@ pub enum ListenerState {
     Failed,
     Virtual,
     Unsupported,
-    /// 比这个程序新的节点报的、这里不认识的状态。
+    /// 来自较新版本节点、当前版本无法识别的状态。
     #[serde(other)]
     Unknown,
 }
@@ -284,12 +284,12 @@ pub(crate) fn listen_state(state: &ListenState) -> control::ListenState {
         ListenState::Unsupported { reason, cause } => {
             control::ListenState::Unsupported { detail: reason.clone(), cause: Some(bind_cause(*cause)) }
         }
-        // 入口模块以后可能有新的状态；这里认不出来的照实说认不出来。
+        // 入口模块后续可能新增状态；当前无法识别时按 Unknown 上报。
         _ => control::ListenState::Unknown,
     }
 }
 
-/// 入口模块说的没有绑上的原因的种类，写成上报的代码。
+/// 将入口模块的监听失败原因映射为上报原因码。
 fn bind_cause(cause: ListenCause) -> BindCause {
     match cause {
         ListenCause::AddressInUse => BindCause::AddressInUse,
@@ -297,12 +297,12 @@ fn bind_cause(cause: ListenCause) -> BindCause {
         ListenCause::AddressNotAvailable => BindCause::AddressNotAvailable,
         ListenCause::VirtualPortZero => BindCause::VirtualPortZero,
         ListenCause::Other => BindCause::Other,
-        // 入口模块以后可能多出新的种类：这里认不出来的算别的原因，原话照样在 `detail` 里。
+        // 入口模块后续可能新增原因分类；当前无法识别时归为 Other，原始详情保留在 `detail` 中。
         _ => BindCause::Other,
     }
 }
 
-/// 一条端口转发最近一次在目标那里失败，写成上报的样子。
+/// 将端口转发最近一次目标失败记录转换为上报格式。
 pub(crate) fn target_failure(failure: &TargetFailure) -> TargetFailureReport {
     let cause = match failure.cause {
         TargetCause::Refused => control::TargetCause::Refused,
@@ -312,7 +312,7 @@ pub(crate) fn target_failure(failure: &TargetFailure) -> TargetFailureReport {
         TargetCause::AccessDenied => control::TargetCause::AccessDenied,
         TargetCause::NodeUnreachable => control::TargetCause::NodeUnreachable,
         TargetCause::Other => control::TargetCause::Other,
-        // 入口模块以后可能多出新的原因：这里认不出来的算别的原因。
+        // 入口模块后续可能新增原因分类；当前无法识别时归为 Other。
         _ => control::TargetCause::Other,
     };
     TargetFailureReport { cause, secs_ago: failure.at.elapsed().as_secs() }

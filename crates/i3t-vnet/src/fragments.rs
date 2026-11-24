@@ -1,20 +1,20 @@
-//! 对端发来的被切开的 IPv4 包（IP 分片）：在这里攒齐，核对过才一起写进网卡。
+//! 入站 IPv4 分片缓存与校验：在用户态收齐并校验全部分片后，再批量写入虚拟网卡。
 //!
-//! 内核拼片用的缓存是整台机器（一个网络命名空间）共用的：Linux 上默认 4MB，拼不齐的包要等 30 秒才扔，满了之后哪块网卡上来的片
-//! 都拼不了。对端发来一些永远拼不齐的片就能把它占满。所以拼不齐的片不交给内核：同一个包的片（来源、标识、协议相同）在这里攒着，
-//! 从头到尾一个字节不缺、互不重叠、最后一片也到了，才按先后一起写进网卡，内核一收到就拼好、放掉。拼不齐的过一会儿在这里扔掉，
-//! 占的是这个进程里有上限的内存，挤掉的也只是那个对端自己的。片乱了序也拼得起来。
+//! 操作系统内核的 IP 分片重组缓存在同一网络命名空间内全局共享（Linux 默认约 4 MB，不完整分片超时长达 30 秒），
+//! 缓存占满后会影响主机所有网卡的分片重组。若恶意对端持续发送不完整分片即可耗尽内核缓存。因此不完整分片不直接交由内核，
+//! 而是按（源 IP、标识、协议）在本模块暂存，直至从 0 到末片连续无缺、互不重叠且末片到达后，再按偏移顺序一并写入虚拟网卡，
+//! 使内核即时完成重组并释放资源。超时未收齐的分片在本进程的有界内存内淘汰，且仅影响发送对端自身配额。支持乱序分片重组。
 //!
-//! 包让不让进来看第一片（端口、ICMP 的类型都在那里）：攒齐之后拿第一片去判断（[`crate::engine`]），不让进来的整个扔掉，
-//! 后面的片不会单独溜进去。重叠的片整个扔掉：有的系统拼片时让后到的盖掉先到的，后面的片因此能改写第一片里的端口和标志
-//! （RFC 1858、RFC 3128）。TCP 不该被切，切开的 TCP 在这之前就扔了。
+//! 访问控制规则需要依据首片判定（端口及 ICMP 类型均位于首片）：收齐后取首片送入策略检查（[`crate::engine`]），不放行时整包丢弃，
+//! 防止后续分片绕过检查单独进入内核。遇到重叠分片直接丢弃整包，避免不同内核的覆盖策略导致首片端口或标志位被篡改
+//! （RFC 1858、RFC 3128）。TCP 分片会在进入本模块前即被拒绝。
 //!
-//! 齐了的片是原样写进网卡的，所以每一片都要是内核会收进拼片缓存的样子：内核在拼片之前就扔的片（头的校验和不对、带着不合规矩的
-//! IP 选项）要是混在里面，它前面的片照样留在内核的缓存里，又是一个拼不齐的包。因此片上不许有选项（头正好 20 字节，内核发出的片
-//! 都是这样，要带的选项在第一片里）、头的校验和要对、不许置"不许分片"和保留位、TTL 不是 0，有一条不符合，这个包整个扔掉。
+//! 由于收齐的分片会原样写入虚拟网卡，每片均须满足内核前置合法性检查：若某分片因校验和错误或非法 IP 选项被内核在重组前丢弃，
+//! 其余分片将滞留内核缓存。因此本模块要求所有分片不含 IP 选项（头长严格为 20 字节）、IP 头校验和正确、未置 DF 或保留位且 TTL 非 0，
+//! 任一条件不满足则丢弃整包。
 //!
-//! 内存的上限：每个对端最多同时攒 [`MAX_PER_PEER`] 个包、[`PEER_BYTES`] 字节，超出时扔它自己最早的；所有对端加起来最多
-//! [`TOTAL_BYTES`] 字节，超出时扔攒得最多的那个对端最早的。一个包从先到的那片算起最多等 [`FRAGMENT_WAIT`]。
+//! 内存配额：单个对端最多同时缓存 [`MAX_PER_PEER`] 个未完成包、占用 [`PEER_BYTES`] 字节（超限时淘汰该对端最早缓存的包）；
+//! 所有对端总计不超过 [`TOTAL_BYTES`] 字节（超限时淘汰占用最多字节的对端中最早缓存的包）。单包自首片到达起最多等待 [`FRAGMENT_WAIT`]。
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -24,46 +24,46 @@ use bytes::Bytes;
 
 use crate::ipv4::Ipv4;
 
-/// 一个对端最多同时攒多少个没齐的包。正常时一个包的片是一口气发出来的，同时没齐的只有一两个。
+/// 单个对端最多同时缓存的未完成分片包数量。正常场景下同一包的分片连续发出，同时在途的通常仅 1–2 个。
 pub const MAX_PER_PEER: usize = 64;
 
-/// 一个对端攒着的片最多占多少字节（连同每片的开销 [`PIECE_OVERHEAD`]）。装得下几个最大的包（65535 字节）。
+/// 单个对端分片缓存占用的最大字节数（含每片元数据开销 [`PIECE_OVERHEAD`]），足以容纳数个最大尺寸 IPv4 包（65535 字节）。
 pub const PEER_BYTES: usize = 256 * 1024;
 
-/// 所有对端加起来最多占多少字节。
+/// 所有对端分片缓存合计占用的最大字节数。
 pub const TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
-/// 一个包最多等多久。片是一口气发出来的，正常时差不了一个往返；等不到多半是丢了，上面的协议自己重发。
+/// 单个分片包的最长等待时间。分片连续发出时正常延迟不超过一次往返；超时未齐通常意味着丢包，交由上层协议重传。
 pub const FRAGMENT_WAIT: Duration = Duration::from_secs(5);
 
-/// 一个包最多多少片。最小的 MTU（576 字节）把最大的包切开是 120 片左右，留些余量。
+/// 单个数据包允许的最大分片数。按最小 MTU（576 字节）拆分最大 IPv4 包约 120 片，此处预留一定余量。
 pub const MAX_PIECES: usize = 192;
 
-/// 每一片除了它自己的字节，记账时另外算这么多：很小的片攒不了太多。
+/// 每个分片在内存记账时附加的固定开销，用于限制大量微小分片占用过多结构开销。
 const PIECE_OVERHEAD: usize = 64;
 
-/// 拼起来的内容（头后面的部分）最长多少：IPv4 的包最长 65535 字节，片的头正好 20 字节。
+/// 重组后负载（不含 IP 头）的最大长度：IPv4 最大包长 65535 字节减去 20 字节固定 IP 头。
 const MAX_CONTENT: usize = 65535 - 20;
 
-/// 多久扫一次过期的包。
+/// 过期分片清理扫描的最小间隔。
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
-/// 一片收下之后怎样了。
+/// 接收单个 IP 分片后的处理结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gathered {
-    /// 还没齐，攒着。
+    /// 分片尚未收齐，已暂存等待。
     Waiting,
-    /// 齐了：这个包的所有片，按在包里的先后，第一片在最前面。
+    /// 全部分片已收齐：按偏移量升序排列（首片位于索引 0）。
     Complete(Vec<Bytes>),
-    /// 这一片自己就不对，或者和攒着的对不上：这个包攒着的片连同这一片都扔了。
+    /// 当前分片自身非法或与已缓存分片冲突：已连同该包已缓存分片一并丢弃。
     Broken(&'static str),
 }
 
-/// 攒着的片。
+/// 入站 IPv4 分片重组缓存表。
 #[derive(Debug)]
 pub struct Fragments {
     peers: HashMap<Ipv4Addr, Peer>,
-    /// 所有对端加起来占的字节。
+    /// 所有对端当前缓存占用的总字节数。
     total: usize,
     swept: Instant,
 }
@@ -74,43 +74,43 @@ impl Default for Fragments {
     }
 }
 
-/// 一个包在它的来源里的身份：标识和协议（目的都是本节点的虚拟 IP）。
+/// 同一源地址下区分不同分片包的复合键：IP 标识与协议号（目的地址均为本节点虚拟 IP）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
     id: u16,
     protocol: u8,
 }
 
-/// 一个对端攒着的包。
+/// 单个对端的未完成分片包集合。
 #[derive(Debug, Default)]
 struct Peer {
     bytes: usize,
     datagrams: HashMap<Key, Datagram>,
 }
 
-/// 一个没齐的包。
+/// 单个尚未收齐的分片包状态。
 #[derive(Debug)]
 struct Datagram {
     started: Instant,
-    /// 最后一片说的内容长度；最后一片还没到时是 `None`。
+    /// 末片声明的完整负载总长度；末片尚未到达时为 `None`。
     end: Option<usize>,
-    /// 到了的内容字节数。片之间不重叠、都在最后一片说的长度以内，所以它等于 `end` 时就齐了。
+    /// 已到达的有效负载总字节数。由于所有分片互不重叠且不超过末片长度，当该值等于 `end` 时即表示收齐。
     content: usize,
-    /// 占的字节（记账用）。
+    /// 该包在记账中占用的总字节数。
     cost: usize,
     pieces: Vec<Piece>,
 }
 
 #[derive(Debug)]
 struct Piece {
-    /// 这一片的内容在原包里的范围（字节，头后面的部分算起）。
+    /// 当前分片负载在原数据包负载中的字节区间 `[start, end)`。
     start: usize,
     end: usize,
     packet: Bytes,
 }
 
 impl Fragments {
-    /// 收下对端发来的一片：`ip` 是读过的 `packet`，来源、目的已经核对过。
+    /// 接收来自对端的单个 IP 分片：`ip` 为已解析的 `packet`，且源、目的地址已通过校验。
     pub fn accept(&mut self, ip: &Ipv4<'_>, packet: Bytes, now: Instant) -> Gathered {
         self.sweep(now);
         let source = ip.source();
@@ -141,20 +141,20 @@ impl Fragments {
         Gathered::Complete(pieces.into_iter().map(|piece| piece.packet).collect())
     }
 
-    /// 还没齐的包有几个。
+    /// 返回当前未收齐的分片包数量。
     #[must_use]
     pub fn pending(&self) -> usize {
         self.peers.values().map(|peer| peer.datagrams.len()).sum()
     }
 
-    /// 攒着的片占的字节（连同每片的开销）。
+    /// 返回当前分片缓存占用的总字节数（含每片开销）。
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.total
     }
 
-    /// 给 `source` 的一片（`cost` 字节，属于包 `key`）腾地方：先按这个对端自己的上限扔它最早的包，再按总的上限扔攒得最多的
-    /// 那个对端最早的包。正在攒的这个包不扔。
+    /// 为来自 `source`、归属 `key` 且记账大小为 `cost` 的新分片腾出配额：先按单对端上限淘汰该对端最早的包，
+    /// 再按全局上限淘汰占用字节最多的对端中最早的包。不淘汰当前正在接收的 `key`。
     fn make_room(&mut self, source: Ipv4Addr, key: Key, cost: usize) {
         while let Some(peer) = self.peers.get(&source) {
             let new = !peer.datagrams.contains_key(&key);
@@ -175,7 +175,7 @@ impl Fragments {
         }
     }
 
-    /// 拿掉一个包，返回它。
+    /// 移除并返回指定分片包的状态。
     fn remove(&mut self, source: Ipv4Addr, key: Key) -> Option<Datagram> {
         let peer = self.peers.get_mut(&source)?;
         let datagram = peer.datagrams.remove(&key)?;
@@ -187,7 +187,7 @@ impl Fragments {
         Some(datagram)
     }
 
-    /// 扔掉等太久的包。每 [`SWEEP_EVERY`] 最多扫一遍。
+    /// 清理超过 [`FRAGMENT_WAIT`] 仍未收齐的过期包，至多每 [`SWEEP_EVERY`] 执行一次。
     fn sweep(&mut self, now: Instant) {
         if now.saturating_duration_since(self.swept) < SWEEP_EVERY {
             return;
@@ -209,34 +209,34 @@ impl Fragments {
     }
 }
 
-/// 只看这一片自己就知道不对的：头是内核拼片之前就会扔的样子，或者内容的长度、位置不对。
+/// 检查单个分片自身的合法性：过滤内核重组前就会丢弃的异常头部，以及非法的负载长度与偏移。
 fn check_alone(ip: &Ipv4<'_>, start: usize, end: usize, last: bool) -> Result<(), &'static str> {
     if ip.header_len() != 20 {
-        return Err("片上带着 IP 选项");
+        return Err("分片包含 IP 选项");
     }
     if !ip.header_checksum_ok() {
-        return Err("IP 头的校验和不对");
+        return Err("IP 头校验和错误");
     }
     if ip.dont_fragment_or_reserved() {
-        return Err("片上置了“不许分片”或者保留位");
+        return Err("分片设置了 DF 或保留标志位");
     }
     if ip.ttl() == 0 {
-        return Err("TTL 是 0");
+        return Err("TTL 为 0");
     }
     if end == start {
-        return Err("空的片");
+        return Err("分片负载为空");
     }
     if !last && !(end - start).is_multiple_of(8) {
-        return Err("不是最后一片，长度却不是 8 的倍数");
+        return Err("非末片长度不是 8 字节的倍数");
     }
     if end > MAX_CONTENT {
-        return Err("拼起来比 IPv4 的包能有的还长");
+        return Err("重组后长度超出 IPv4 最大限制");
     }
     Ok(())
 }
 
 impl Peer {
-    /// 最早开始攒的包，`skip` 除外。
+    /// 返回该对端最早开始缓存的包（跳过 `skip`）。
     fn oldest(&self, skip: Option<Key>) -> Option<Key> {
         self.datagrams.iter().filter(|(key, _)| Some(**key) != skip).min_by_key(|(_, datagram)| datagram.started).map(|(key, _)| *key)
     }
@@ -247,24 +247,24 @@ impl Datagram {
         Self { started: now, end: None, content: 0, cost: 0, pieces: Vec::new() }
     }
 
-    /// 加上一片。对不上的时候不动，说为什么。
+    /// 追加一个分片。若与已有分片冲突或超出上限，则保持状态不变并返回错误原因。
     fn add(&mut self, piece: Piece, last: bool) -> Result<(), &'static str> {
         if self.pieces.len() >= MAX_PIECES {
-            return Err("一个包的片太多");
+            return Err("单个数据包的分片数量超出上限");
         }
         if self.pieces.iter().any(|other| other.start < piece.end && piece.start < other.end) {
-            return Err("片和先到的片重叠");
+            return Err("分片与已接收分片重叠");
         }
         if last {
             if self.end.is_some() {
-                return Err("最后一片来了两次");
+                return Err("收到重复的末片");
             }
             if self.pieces.iter().any(|other| other.end > piece.end) {
-                return Err("有片超出了最后一片说的长度");
+                return Err("已有分片超出末片声明的总长度");
             }
             self.end = Some(piece.end);
         } else if self.end.is_some_and(|end| piece.end > end) {
-            return Err("片超出了最后一片说的长度");
+            return Err("分片超出末片声明的总长度");
         }
         self.content += piece.end - piece.start;
         self.pieces.push(piece);
@@ -333,25 +333,25 @@ mod tests {
         // 盖住第一片的后半截（偏移 8）：有的系统拼的时候让它盖掉先到的。
         let mut overlap = whole[..20 + 48].to_vec();
         overlap[2..4].copy_from_slice(&68u16.to_be_bytes());
-        assert_eq!(give(&mut fragments, &refragment(overlap, 3, 8, true), now), Gathered::Broken("片和先到的片重叠"));
+        assert_eq!(give(&mut fragments, &refragment(overlap, 3, 8, true), now), Gathered::Broken("分片与已接收分片重叠"));
         assert_eq!(fragments.pending(), 0, "攒着的也扔了");
         assert_eq!(give(&mut fragments, &pieces[1], now), Gathered::Waiting, "之后再来的从头攒");
 
         let mut fragments = Fragments::default();
         give(&mut fragments, &pieces[2], now);
-        assert_eq!(give(&mut fragments, &pieces[2], now), Gathered::Broken("片和先到的片重叠"), "同一片来两次");
+        assert_eq!(give(&mut fragments, &pieces[2], now), Gathered::Broken("分片与已接收分片重叠"), "同一片来两次");
         give(&mut fragments, &pieces[2], now);
         let longer_last = refragment(pieces[1].clone(), 3, 48, false);
-        assert_eq!(give(&mut fragments, &longer_last, now), Gathered::Broken("最后一片来了两次"));
+        assert_eq!(give(&mut fragments, &longer_last, now), Gathered::Broken("收到重复的末片"));
         give(&mut fragments, &pieces[1], now);
-        assert_eq!(give(&mut fragments, &refragment(pieces[2].clone(), 3, 40, false), now), Gathered::Broken("片和先到的片重叠"));
+        assert_eq!(give(&mut fragments, &refragment(pieces[2].clone(), 3, 40, false), now), Gathered::Broken("分片与已接收分片重叠"));
 
         let mut fragments = Fragments::default();
         give(&mut fragments, &pieces[2], now);
         let beyond = refragment(pieces[0].clone(), 3, 112, true);
-        assert_eq!(give(&mut fragments, &beyond, now), Gathered::Broken("片超出了最后一片说的长度"));
+        assert_eq!(give(&mut fragments, &beyond, now), Gathered::Broken("分片超出末片声明的总长度"));
         give(&mut fragments, &refragment(pieces[1].clone(), 3, 200, true), now);
-        assert_eq!(give(&mut fragments, &pieces[2], now), Gathered::Broken("有片超出了最后一片说的长度"));
+        assert_eq!(give(&mut fragments, &pieces[2], now), Gathered::Broken("已有分片超出末片声明的总长度"));
     }
 
     #[test]
@@ -359,11 +359,11 @@ mod tests {
         let now = Instant::now();
         let mut fragments = Fragments::default();
         let odd = refragment(udp(B, ME, (53, 5000), &[1; 13]), 4, 0, true);
-        assert_eq!(give(&mut fragments, &odd, now), Gathered::Broken("不是最后一片，长度却不是 8 的倍数"));
+        assert_eq!(give(&mut fragments, &odd, now), Gathered::Broken("非末片长度不是 8 字节的倍数"));
         let empty = refragment(crate::ipv4::testing::packet(17, B, ME, &[]), 4, 64, false);
-        assert_eq!(give(&mut fragments, &empty, now), Gathered::Broken("空的片"));
+        assert_eq!(give(&mut fragments, &empty, now), Gathered::Broken("分片负载为空"));
         let huge = refragment(udp(B, ME, (53, 5000), &[1; 40]), 4, 65512, false);
-        assert_eq!(give(&mut fragments, &huge, now), Gathered::Broken("拼起来比 IPv4 的包能有的还长"));
+        assert_eq!(give(&mut fragments, &huge, now), Gathered::Broken("重组后长度超出 IPv4 最大限制"));
         assert_eq!(fragments.pending(), 0);
     }
 
@@ -397,11 +397,11 @@ mod tests {
             bytes
         };
         for (piece, why) in [
-            (options, "片上带着 IP 选项"),
-            (bad_sum, "IP 头的校验和不对"),
-            (resum(df), "片上置了“不许分片”或者保留位"),
-            (resum(reserved), "片上置了“不许分片”或者保留位"),
-            (resum(no_ttl), "TTL 是 0"),
+            (options, "分片包含 IP 选项"),
+            (bad_sum, "IP 头校验和错误"),
+            (resum(df), "分片设置了 DF 或保留标志位"),
+            (resum(reserved), "分片设置了 DF 或保留标志位"),
+            (resum(no_ttl), "TTL 为 0"),
         ] {
             let mut fragments = Fragments::default();
             assert_eq!(give(&mut fragments, &pieces[0], now), Gathered::Waiting);

@@ -48,7 +48,7 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// 对端的入口按"每个客户端地址一个上下文"开 UDP 端口转发的会话，一条对外开放的转发最多开
 /// `i3t_access` 里每条转发的会话上限（64）这么多。这里取它的两倍：一条转发被人占满时，
-/// 那个节点经本节点的别的 UDP（SOCKS5 的 UDP 关联、别的转发）还有一半的名额，不会跟着用不了。
+/// 该节点经本节点发起的其他 UDP 流量（SOCKS5 UDP 关联、其他转发）仍留有一半配额，不会随之不可用。
 pub(crate) const MAX_CONTEXTS_PER_PEER: usize = 128;
 
 /// 一个上下文最多记多少个目标的检查结果。满了就全部清掉重新记，和域名解析的缓存一个做法。
@@ -70,7 +70,7 @@ pub(crate) struct ContextLimit {
 }
 
 impl ContextLimit {
-    /// 给 `peer` 再记一个上下文。它已经到了上限时返回 `None`。返回的守卫被丢弃时这一个不再算数。
+    /// 为 `peer` 申请一个上下文配额。已达上限时返回 `None`；返回的守卫被丢弃时归还配额。
     pub(crate) fn acquire(&self, peer: NodeId) -> Option<ContextSlot<'_>> {
         let mut open = self.open.lock().expect("context limit mutex poisoned");
         let count = open.entry(peer).or_insert(0);
@@ -296,7 +296,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                         true
                     }
                     Err(error) => {
-                        tracing::debug!(peer = %self.peer, %error, "接力回来的一个报文没有送回发起节点");
+                        tracing::debug!(peer = %self.peer, %error, "向发起节点返回接力报文失败");
                         false
                     }
                 },
@@ -326,7 +326,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
         legs.retain(|_, leg| leg.grant.withdrawn(netmap, self.peer, ForwardProtocol::Udp, None).is_none());
         let removed = destinations.withdraw(netmap, self.peer) + (legs_before - legs.len());
         if removed > 0 {
-            tracing::info!(peer = %self.peer, removed, "放行数据报目标的能力被收回了：这些目标两个方向的报文都不再转发");
+            tracing::info!(peer = %self.peer, removed, "数据报目标的放行权限已收回，将停止双向转发");
         }
     }
 
@@ -353,7 +353,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                             kind = datagram.target.kind(),
                             status = ?reply.status,
                             detail = %reply.detail,
-                            "拒绝了发往一个目标的数据报；{VERDICT_TTL:?} 之内发往它的都直接丢掉"
+                            "已拒绝发往目标的数据报；{VERDICT_TTL:?} 内发往该目标的报文将直接丢弃"
                         );
                         Outcome::Refused
                     }
@@ -373,7 +373,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
         };
         if exit_traffic && !self.limits.admit_datagram(datagram.payload.len()) {
             self.counters.datagram_limited();
-            tracing::trace!(peer = %self.peer, "丢掉一个发往目标的数据报：出口的配额用完了");
+            tracing::trace!(peer = %self.peer, "已丢弃发往目标的数据报：出口配额已耗尽");
             return false;
         }
         match self.socket.send_to(&datagram.payload, real).await {
@@ -383,7 +383,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                 true
             }
             Err(error) => {
-                tracing::debug!(peer = %self.peer, kind = datagram.target.kind(), %error, "一个数据报没有发出去");
+                tracing::debug!(peer = %self.peer, kind = datagram.target.kind(), %error, "发送数据报失败");
                 false
             }
         }
@@ -399,12 +399,12 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
         tally: &mut Tally,
     ) -> bool {
         let Some(source) = destinations.sources.get(&from) else {
-            tracing::trace!(peer = %self.peer, "丢掉 UDP 端口上收到的一个报文：没有往它的来源发过报文");
+            tracing::trace!(peer = %self.peer, "已丢弃 UDP 端口收到的报文：来源地址无对应的发送记录");
             return false;
         };
         if source.exit_traffic && !self.limits.admit_datagram(payload.len()) {
             self.counters.datagram_limited();
-            tracing::trace!(peer = %self.peer, "丢掉目标发回来的一个数据报：出口的配额用完了");
+            tracing::trace!(peer = %self.peer, "已丢弃目标返回的数据报：出口配额已耗尽");
             return false;
         }
         match sender.send(&source.target, payload).await {
@@ -414,7 +414,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                 true
             }
             Err(error) => {
-                tracing::debug!(peer = %self.peer, %error, "目标发回来的一个报文没有送回发起节点");
+                tracing::debug!(peer = %self.peer, %error, "向发起节点返回目标报文失败");
                 false
             }
         }
@@ -431,7 +431,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
             let mut context = match opener.open(node, self.class, self.origin.clone()).await {
                 Ok(context) => context,
                 Err(error) => {
-                    tracing::info!(peer = %self.peer, %node, forward, ?error, "到端口转发的目标节点开数据报上下文失败，这个报文丢掉");
+                    tracing::info!(peer = %self.peer, %node, forward, ?error, "到端口转发目标节点建立数据报上下文失败，已丢弃该报文");
                     legs.remove(&forward);
                     return false;
                 }
@@ -468,7 +468,7 @@ impl<S: System, C: Connector + Datagrams> Session<'_, S, C> {
                 true
             }
             Err(error) => {
-                tracing::debug!(peer = %self.peer, %node, forward, %error, "一个报文没有转给端口转发的目标节点，下一个报文重新开上下文");
+                tracing::debug!(peer = %self.peer, %node, forward, %error, "向端口转发目标节点转发报文失败，后续报文将重新建立上下文");
                 legs.remove(&forward);
                 false
             }
@@ -560,7 +560,7 @@ impl Ended {
             Self::Idle | Self::Peer(ContextEnd::Finished) => false,
             Self::Revoked => true,
             Self::Peer(ContextEnd::Aborted(aborted)) => aborted.code().0 != Reason::Cancelled.to_wire(),
-            // `ContextEnd` 以后可能有新的结束方式；不认识的按异常算。
+            // `ContextEnd` 后续可能新增结束类型；无法识别的统一按异常结束处理。
             Self::Peer(_) => true,
         }
     }

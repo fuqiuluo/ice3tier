@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// 比"最近被确认的那一批"更早的记录留几条。乱序到达的确认还会用到它们；更早的包要么已经确认，
-/// 要么马上被判定丢失，不会再有确认来。找不到记录的后果只是少一个速率样本。
+/// 否则即将被判定丢失，不会再收到确认。未命中发送记录仅导致跳过单个速率样本。
 const KEPT_BEHIND: usize = 8;
 /// 记录数的硬上限。正常情况下记录数不超过在途的批数；这个上限只防一直没有确认回来时无限增长。
 const MAX_RECORDS: usize = 1 << 16;
@@ -49,7 +49,7 @@ pub(super) struct AckSample {
     pub(super) sent: Instant,
     /// 往返时间：那个包从发出到被确认用了多久。含对端攒确认的时间。
     pub(super) rtt: Duration,
-    /// 送达速率，字节每秒。采样区间太短、或者找不到发送时的记录时没有。
+    /// 送达速率（字节/秒）。采样区间过短或未找到对应发送记录时为 `None`。
     pub(super) rate: Option<u64>,
     /// 这个样本是在应用没有填满连接的时候量的，只能用来抬高带宽估计，不能用来拉低。
     pub(super) app_limited: bool,
@@ -128,7 +128,7 @@ impl Sampler {
         self.delivered += bytes;
         self.delivered_time = now;
         self.batch.acked += bytes;
-        // 同一批发出去的包发送时刻相同、快照相同，查过一次就不用再查；比已经见过的更早的包也用不着。
+        // 同一批次发出的包具有相同的发送时刻与快照，无需重复查找；早于已处理最新发送时刻的包也可直接跳过。
         if self.batch.newest_sent.is_some_and(|newest| sent <= newest) {
             return;
         }

@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::texts::texts;
 
-/// 配置文件的内容有错（语法不对、不认识的配置项、值不合规矩）。和读文件失败分开：内容不对重启多少次都不会好。
+/// 配置文件内容有误（语法错误、存在未识别的配置项或取值无效）。与读取文件失败区分处理：内容有误时重复重启也无法恢复。
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct InvalidConfig(String);
@@ -41,7 +41,7 @@ pub struct Config {
     pub performance: PerformanceConfig,
     #[serde(default)]
     pub network: Network,
-    /// 以前的透明访问（`[intercept]`），被虚拟网卡取代了：照收、不起作用，节点启动时记一行（[`Config::retired`]）。
+    /// 原透明访问配置（`[intercept]`），已由虚拟网卡取代：仍接受但不生效，节点启动时记录日志（[`Config::retired`]）。
     #[serde(default, rename = "intercept")]
     retired_intercept: Option<Retired>,
     #[serde(default)]
@@ -49,11 +49,11 @@ pub struct Config {
 }
 
 impl Config {
-    /// 读配置文件。文件不存在时返回默认值，不创建文件。
+    /// 读取配置文件。文件不存在时返回默认值，不创建文件。
     ///
     /// # Errors
     ///
-    /// 文件读不了、语法不对、有不认识的配置项，或者某个值不合规矩。错误信息里有文件名和出错的位置。
+    /// 文件读取失败、语法错误、存在未识别的配置项或取值无效。错误信息包含文件名与出错位置。
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         crate::state::ensure_not_reparse_or_symlink(path).with_context(|| (texts().read_config)(path))?;
         let text = match fs::read_to_string(path) {
@@ -88,20 +88,20 @@ impl Config {
         }
     }
 
-    /// 把配置文件里的一项声明改成 `on`，注释和排版原样保留。文件不存在时先写出模板。
+    /// 将配置文件中的一项声明修改为 `on`，保留原有注释和排版。文件不存在时先写出模板。
     ///
     /// # Errors
     ///
-    /// 文件读写失败，或者现有的内容解析不了。
+    /// 文件读写失败，或现有内容无法解析。
     pub fn set_declared(path: &Path, capability: Capability, on: bool) -> anyhow::Result<()> {
         Self::set(path, Change::Declare(capability, on))
     }
 
-    /// 改配置文件里的一项，注释和排版原样保留。文件不存在时先写出模板。
+    /// 修改配置文件中的一项，保留原有注释和排版。文件不存在时先写出模板。
     ///
     /// # Errors
     ///
-    /// 文件读写失败，或者现有的内容解析不了。
+    /// 文件读写失败，或现有内容无法解析。
     pub fn set(path: &Path, change: Change) -> anyhow::Result<()> {
         if let Change::CanForward(_) = change {
             return Ok(());
@@ -131,7 +131,7 @@ impl Config {
             }
         }
         let updated = document.to_string();
-        // 改完先整个验一遍，不把一个读不回来的文件写下去。
+        // 修改后整体校验一遍，避免写入无法解析的配置。
         Self::parse(&updated).with_context(|| (texts().config_error)(path))?;
         fs::write(path, updated).with_context(|| (texts().write_config)(path))
     }
@@ -168,7 +168,7 @@ impl Config {
         self.performance.validate()
     }
 
-    /// 配置文件里还写着、已经不起作用的节（以前的透明访问的 `[intercept]`）。节点启动时各记一行。
+    /// 配置文件中仍保留但已失效的节（原透明访问的 `[intercept]`）。节点启动时逐一记录日志。
     #[must_use]
     pub fn retired(&self) -> Vec<&'static str> {
         self.retired_intercept.as_ref().map(|_| "intercept").into_iter().collect()
@@ -213,8 +213,8 @@ pub struct Declare {
     pub exit: bool,
     #[serde(default)]
     pub relay: bool,
-    /// 以前的"可以作为端口转发的目标"。现在只由管理员在 controller 上打开，本机不声明：这一项照收、不起作用，
-    /// 写着它的旧配置文件照样读得进来。
+    /// 原“可作为端口转发目标”声明。现仅由管理员在 controller 上开启，本机不再声明：此项仍接受但不生效，
+    /// 旧配置文件仍可正常加载。
     #[serde(default, rename = "forward")]
     _forward: bool,
     /// 作为 relay 时，别的节点还可以经这个地址连它：只有人知道的那一种，机房或者路由器把另一个地址上的端口
@@ -229,7 +229,7 @@ impl From<Declare> for Declared {
     }
 }
 
-/// 声明的 relay 地址别的节点连得了：一个具体的单播地址（不是全零、回环、组播、广播），端口不是 0。
+/// 校验声明的 relay 地址是否对其他节点可达：须为具体单播地址（非全零、回环、组播、广播），且端口非 0。
 fn is_relay_address(address: SocketAddr) -> bool {
     let ip = address.ip().to_canonical();
     let unusable =
@@ -272,7 +272,7 @@ pub enum Setting {
     Firewall,
     /// 虚拟网卡的 MTU（`[network] mtu`）。
     Mtu,
-    /// 虚拟网卡和内核之间是不是一大块一大块地交接（`[network] offload`，只有 Linux 上有这回事）。
+    /// 虚拟网卡与内核之间是否启用分片卸载（`[network] offload`，仅 Linux 支持）。
     Offload,
 }
 
@@ -437,9 +437,9 @@ impl fmt::Display for Capability {
     }
 }
 
-/// 本机的组网入口（`[proxy]`）：只通到组网里的节点，不经出口、不认证，只能绑回环地址。默认都不开：
-/// 节点不打开任何没有配过的代理端口。以前的版本默认开着 1080 和 1081，配置文件里写了这两个地址的照旧开着，意思变成了"只通到节点"。
-/// 它们不是 controller 下发的代理，没有 ice3proxy 的选项：流只走共用的连接。
+/// 本机组网入口（`[proxy]`）：仅通往组网内节点，不经出口、不鉴权，仅允许绑定回环地址。默认全部关闭：
+/// 节点不会打开未配置的代理端口。旧版本默认开启 1080 和 1081，配置文件中已填写这两个地址的仍会开启，语义变更为“仅通往节点”。
+/// 它们不属于 controller 下发的代理，不支持 ice3proxy 选项：流仅经共用连接传输。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
@@ -588,22 +588,22 @@ fn profile_spelling<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result
 
 /// 虚拟网卡（`[network]`）：本机的程序用虚拟 IP 访问别的节点。默认打开。
 ///
-/// 它改这台机器的网络配置（一块网卡、它的地址和路由，两条防火墙规则），所以只在本机开关，controller 只显示状态。
-/// 权限不够、没有驱动、地址段和本机的网络重叠时不装，状态里说为什么，代理和端口转发照常。做法见 `i3t_vnet`。
+/// 它会修改本机网络配置（网卡、地址、路由及两条防火墙规则），因此仅在本机开关，controller 仅展示状态。
+/// 权限不足、缺少驱动或地址段与本机网络重叠时不安装，并在状态中说明原因，代理和端口转发不受影响。实现细节见 `i3t_vnet`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 程序加不加那两条防火墙规则（像 Tailscale 的 `--netfilter-mode`）。关着时一条规则也不碰。
+    /// 是否由程序添加两条防火墙规则（类似 Tailscale 的 `--netfilter-mode`）。关闭时不修改任何防火墙规则。
     #[serde(default = "default_true")]
     pub firewall: bool,
-    /// 这台机器的网卡的 MTU，字节（`i3t set mtu`），要在 [`i3t_vnet::MTU_RANGE`] 里。还是 [`i3t_vnet::DEFAULT_MTU`]（没有另外设）
-    /// 时用网络的默认值；设了别的值就用它，只管这台机器：别的节点设得不一样也通。重启之后生效。
+    /// 本机虚拟网卡的 MTU（字节，`i3t set mtu`），须在 [`i3t_vnet::MTU_RANGE`] 范围内。保持 [`i3t_vnet::DEFAULT_MTU`]（未单独配置）
+    /// 时使用网络默认值；配置为其他值时仅影响本机：其他节点配置不同也可互通。重启后生效。
     #[serde(default = "default_mtu")]
     pub mtu: u16,
-    /// Linux：网卡和内核之间一大块一大块地交接数据，不是一个个的包（`i3t set offload`）。默认打开，内核不给时自己退回去；
-    /// 关掉是为了排查：经网卡的传输出了怪事时看是不是它。网络的开关关着时这里开着也不用。别的平台上没有这回事。重启之后生效。
+    /// Linux：启用虚拟网卡与内核之间的分片卸载（`i3t set offload`）。默认开启，内核不支持时自动回退；
+    /// 关闭用于排查经虚拟网卡传输的异常问题。虚拟网卡关闭时此项不生效。其他平台不支持。重启后生效。
     #[serde(default = "default_true")]
     pub offload: bool,
 }

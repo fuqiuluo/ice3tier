@@ -1,8 +1,8 @@
 //! 代理：在节点 A 上监听，经出口节点 B 出去，认一对用户名和密码。
 //!
-//! 用户名和密码原样存着：管理员要能再看、再复制（数据库要凭连接串里的密码才连得上，管理接口要管理令牌）。
-//! 节点拿到的只是按这一行的盐算出来的校验值（[`ProxyRecord::verifier`]）。
-//! 密码不进日志：绑定它的时候包了一层（`codec::Secret`），驱动在 debug 级别打参数时看不到内容。
+//! 用户名与密码按原文持久化，以便管理员后续查看与复制（访问数据库需要连接串凭据，访问管理接口需要管理令牌）。
+//! 下发给节点的仅是由该行盐值派生的校验值（[`ProxyRecord::verifier`]）。
+//! 密码不会进入日志：SQL 参数绑定时通过 `codec::Secret` 包装，驱动在 debug 级别输出参数时不会暴露明文。
 
 use std::net::SocketAddr;
 
@@ -28,7 +28,7 @@ pub struct ProxyRecord {
     pub protocol: ListenerProtocol,
     /// 只有升级前就有、当时没有出口的代理，和出口节点被删掉了的代理是 `None`。
     pub exit: Option<NodeId>,
-    /// 都是空的表示不认证。
+    /// 用户名与密码均为空时表示不启用认证。
     pub username: String,
     pub password: String,
     /// 算校验值用的盐，用户名或者密码变了就换一个。
@@ -42,7 +42,7 @@ pub struct ProxyRecord {
 }
 
 impl ProxyRecord {
-    /// 节点核对用户名和密码用的校验值；不认证的代理没有。
+    /// 供节点校验用户名与密码的凭证摘要；不启用认证的代理返回 `None`。
     #[must_use]
     pub fn verifier(&self) -> Option<Verifier> {
         let anonymous = self.username.is_empty() && self.password.is_empty();

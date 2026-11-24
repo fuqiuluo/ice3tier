@@ -27,11 +27,11 @@ use crate::timing::{PROBE_TIMEOUT_MAX, SETTLE, SWITCH_WINDOWS};
 /// 从没有路变成有路之后多久之内，选中的 relay 还不算"在用"，见 [`relay_in_use`]。
 const FIRST_ROUTE_GRACE: Duration = Duration::from_secs(1);
 
-/// 到路径上第一个 relay 的那一段走的是什么。
+/// 到路径上首个 relay 的传输方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Via {
     Udp(SocketAddr),
-    /// TCP，值是那条 TCP 的编号：重连之后编号变了，发包用的队列也要跟着换。
+    /// TCP 连接编号：重连后编号变更，发送队列也随之更新。
     Tcp(u64),
     /// relay 就是本节点自己。
     Local,
@@ -102,15 +102,15 @@ impl View<'_> {
         self.shared.local_relay.get().is_some_and(|local| local.has_session(peer))
     }
 
-    /// 对端挂在本节点自己的 relay 上时，"本节点的 relay → 对端"这一段此刻的测量值和它从哪里来。
-    /// 本节点这一头没有延迟（包直接交给对端的会话），这一段有多长全看对端的会话那一截：
+    /// 对端挂靠在本节点自身 relay 上时，“本节点 relay → 对端”链路当前的测量值及其来源。
+    /// 本节点侧无传输延迟（数据包直接交由对端会话），该段质量完全取决于对端会话链路：
     ///
-    /// 1. 对端是 relay，它的会话就在本节点和它之间的那条骨干 TCP 上（[`crate::backbone`]）：本节点自己的会话也在这条 TCP 上，
-    ///    一直测着它，用自己的数（按 TCP 的算法，见 `crate::estimate`）。这和经它的 relay 的那条路是同一条 TCP，两条路的代价应该一样。
-    /// 2. 对端把本节点列进了挂靠表：用它报的延迟，那是它在这个会话上测的。
-    /// 3. 都没有：本节点经这个会话给对端发的端到端探测（[`crate::estimate::Sampler`]，对端从它自己的路回答）。
+    /// 1. 对端为 relay 且其会话位于双方之间的骨干 TCP 连接上（[`crate::backbone`]）：本节点自身会话也在同一条 TCP 上，
+    ///    持续进行测量，因此直接采用本端测量值（按 TCP 估算规则，见 `crate::estimate`），使该路径与经对端 relay 的路径代价一致。
+    /// 2. 对端在挂靠列表中上报了本节点：采用其上报的延迟（对端在该会话上测得）。
+    /// 3. 均不可用时：采用本节点经该会话向对端发送的端到端探测（[`crate::estimate::Sampler`]，对端沿自身路由应答）。
     ///
-    /// 还没有量到时是 `None`。以前这时按 1 毫秒算，这条路就成了 2 毫秒、比什么都便宜。
+    /// 尚未测得时返回 `None`。此前按 1 毫秒估算会导致该路径总代价低至 2 毫秒而异常优先。
     pub(super) fn local_leg(&self, id: NodeId, peer: &PeerState) -> Option<(Segment, HopSource)> {
         let theirs = self.shared.local_relay.get()?.session_leg(id)?;
         self.known_local_leg(id, peer, theirs).or_else(|| {
@@ -153,7 +153,7 @@ impl View<'_> {
     }
 
     fn is_broken(&self, from: NodeId, to: NodeId) -> bool {
-        // 两个编号相同的记录表示 `from` 不肯转发任何多级路径。
+        // 两个节点 ID 相同表示 `from` 拒绝转发任何多级路径。
         self.broken.iter().any(|&(first, next, _)| first == from && (next == to || next == first))
     }
 
@@ -162,7 +162,7 @@ impl View<'_> {
         if relay == self.shared.me {
             return self.local_session(peer);
         }
-        // 对端不是 relay 时，"对端自己"这个候选在 relay 表里找不到，自然落空。
+        // 对端不是 relay 时，“对端自身”候选在 relay 表中不存在，自然忽略。
         match self.relays.get(&relay).and_then(|entry| entry.link.leg()) {
             Some(Leg::Udp(_)) => true,
             Some(Leg::Tcp) => self.legs.contains_key(&relay),
@@ -188,10 +188,10 @@ impl View<'_> {
         routing::direct_first(direct, order, |relay| self.usable(id, relay))
     }
 
-    /// 默认模式在直连和一个 relay 都走不了时退而求其次的一串 relay（"谁连得上，它就是谁的 relay"）：
-    /// `candidates`（延迟优先模式用的同一份候选，经 2 个到网络的最大中转级数个 relay）里此刻走得了的、代价最低的一串。
-    /// 现在走着的一串（`current`）还走得了、又没有被便宜 `max(5ms, 10%)` 以上的另一串比下去时，还是它
-    /// （和主动测试说"延迟优先会怎么选"是同一条规矩，[`super::active::lowest_cost_path`]），不跟着测量的起伏换。
+    /// 默认模式在直连与单跳 relay 均不可达时回退使用的多级 relay 路径（按“各自可达的 relay”拼接）：
+    /// 从 `candidates`（与延迟优先模式共用的候选集，经 2 至最大跳数个 relay）中选取当前可达且代价最低的一条。
+    /// 若当前正在使用的多级路径（`current`）仍可达，且不存在代价低 `max(5ms, 10%)` 以上的其他多级路径，则保持不变
+    /// （与主动测试判断延迟优先决策的规则一致，见 [`super::active::lowest_cost_path`]），避免随测量波动频繁切换。
     pub(super) fn chain(&self, id: NodeId, peer: &PeerState, candidates: &[Candidate], current: Option<PathId>) -> Option<PathId> {
         let usable: Vec<&Candidate> = candidates.iter().filter(|candidate| self.resolve(id, peer, candidate.path).is_some()).collect();
         routing::fallback_chain(&usable, current)
@@ -223,8 +223,8 @@ impl View<'_> {
         if self.allow_relay {
             entries.extend_from_slice(self.entries);
             if self.local_session(id) {
-                // 对端挂在本节点自己的 relay 上：包直接交给它的会话，本节点这一头没有延迟，后面那一段见 `local_leg`。
-                // 还没有量到时按探测等回答的上限（1.5 秒）算：一般比量得到的路都贵，没有别的路时才走它；也不会因为代价换到它上面。
+                // 对端挂靠在本节点自身 relay 上：数据包直接交给其会话，本节点侧无延迟，后半段质量见 `local_leg`。
+                // 尚未测得时按探测超时上限（1.5 秒）估算：通常高于已测路径代价，仅在无其他路径时选用，也不会因低代价触发切换。
                 // WebUI 认这个数：经本节点自己的 relay、代价不低于 1.5 秒的候选显示成「未测」。改这个上限或者这里的算法时要告诉前端。
                 let leg = self.local_leg(id, peer).map(|(segment, _)| segment);
                 let unmeasured = Segment::from_rtt_ms(PROBE_TIMEOUT_MAX.as_secs_f64() * 1000.0);
@@ -254,7 +254,7 @@ impl View<'_> {
         if !found.iter().any(is_relayed) {
             found = enumerate(&|_| false);
         }
-        // 刚被告知、或者被怀疑走不通的路径先不用，除非那样就一条经 relay 的路都没有了。
+        // 刚被报告或怀疑不可达的路径暂不使用，除非排除后无任何经 relay 的可用路径。
         let doubtful = |candidate: &Candidate| match candidate.path {
             PathId::Direct(_) => false,
             PathId::Relays(path) => {
@@ -268,7 +268,7 @@ impl View<'_> {
         found
     }
 
-    /// 把一条路径落实成收发路径上的做法。此刻走不了（直连没有验证过、到第一个 relay 没有会话）时返回 `None`。
+    /// 将逻辑路径解析为收发路径使用的转发条目。若当前不可达（直连未验证或到首个 relay 无会话）则返回 `None`。
     pub(super) fn resolve(&self, id: NodeId, peer: &PeerState, path: PathId) -> Option<(RouteKey, Hop)> {
         let me = self.shared.me;
         let path = match path {
@@ -334,11 +334,11 @@ pub(super) fn relay_in_use(peer: &PeerState, now: Instant) -> Option<NodeId> {
 /// 默认模式下经哪些 relay 能到这个对端，按优先顺序。本节点会和其中是 relay 的那些保持会话。
 ///
 /// 1. **对端自己。** 对端本身是启用了的 relay 时，在它那里建一个会话，把中转帧直接发给它，它收到目的是自己的帧就地收下。
-///    这相当于它"挂靠在自己身上、延迟为 0"：包只走本节点到对端这一段，不绕第三个节点。UDP 完全用不了的节点
-///    就是这样用一条 TCP 连到有公网端口的对端的。
-/// 2. **本节点自己。** 本节点是 relay、对端在它上面有会话时，经那个会话直接送过去，同样不绕路。
-///    对端的挂靠表是按它自己的延迟排的，别的 relay 排在前面也不该先用。
-/// 3. **对端挂靠的 relay**，按它上报的延迟从低到高。只有前两条都走不通时才用。
+///    相当于对端“挂靠于自身、延迟为 0”：数据包仅经由本节点至对端一段，不绕行第三节点。完全无法使用 UDP 的节点
+///    即通过一条 TCP 连接直达具备公网端口的对端。
+/// 2. **本节点自身。** 当本节点为 relay 且对端在其上有会话时，经该会话直接转发，同样无需绕路。
+///    即便对端挂靠列表中其他 relay 排在更前，也应优先采用该会话。
+/// 3. **对端挂靠的 relay**，按其上报延迟升序排列。仅在前两类均不可达时使用。
 ///    `current` 是现在走着的 relay：它还在对端的挂靠表里、延迟又没有明显高过表里最低的那个时，排在这一组的最前面。
 ///    对端到两个 relay 的延迟相近时，它上报的顺序会随着测量的起伏来回变，不该让路跟着变。
 ///
@@ -404,14 +404,14 @@ pub(crate) const fn hint_text(hint: RouteHint) -> &'static str {
         RouteHint::DirectUnavailable => "直连不可用",
         RouteHint::RelayDraining => "relay 通知即将下线",
         RouteHint::RelayOverloaded => "relay 通知过载",
-        RouteHint::RelayPathBroken => "relay 说多级路径走不下去",
-        RouteHint::PeerNotAttached => "relay 说对端没有挂在它上面",
-        RouteHint::PathProbeSilent => "经多个 relay 的路径上端到端的探测一直没有回音",
-        RouteHint::PreferredRelayReady => "刚有路时先连上的不是对端排在前面的 relay，那个 relay 的会话随后也建好了",
-        RouteHint::Shortcut => "有了少绕路的中转会话",
+        RouteHint::RelayPathBroken => "relay 报告多级路径不可达",
+        RouteHint::PeerNotAttached => "relay 报告对端未挂靠",
+        RouteHint::PathProbeSilent => "经多级 relay 路径的端到端探测持续无响应",
+        RouteHint::PreferredRelayReady => "首次建路时先连上了非首选 relay，现对端首选 relay 会话已就绪",
+        RouteHint::Shortcut => "已建立更短路径的中转会话",
         RouteHint::RelayUnavailable => "原来的 relay 不可用",
-        RouteHint::RelayLost => "中转会话断开，没有别的路",
-        RouteHint::RouteFailed => "原来的路不能用了",
+        RouteHint::RelayLost => "中转会话断开，无其他可用路径",
+        RouteHint::RouteFailed => "原路径不可用",
         RouteHint::NoPath => "没有任何可用的路径",
         RouteHint::Unknown => "原因不明",
     }
@@ -483,11 +483,11 @@ pub(super) fn describe(peer: NodeId, from: RouteKey, to: RouteKey, hint: Option<
     };
     // 新的路是不是两个节点之间直接的中转会话。
     let is_shortcut = |path: RelayPath, via: Via| via == Via::Local || *path.as_slice() == [peer];
-    // 默认模式经一串 relay：只在没有一个 relay 两端都用得上的时候（见 `View::chain`）。
+    // 默认模式经多级 relay：仅在无两端共同可达的单个 relay 时使用（见 `View::chain`）。
     let chain = |path: RelayPath, via: Via, hint: Option<RouteHint>| {
         let because = hint.map(|hint| format!("{}；", hint_text(hint))).unwrap_or_default();
         Reason::new(
-            format!("{because}没有一个 relay 两端都用得上，经 {}（到第一个 relay 的会话走 {}）", relays_text(path), transport(via)),
+            format!("{because}无两端共同可达的单个 relay，经 {}（到首个 relay 的会话使用 {}）", relays_text(path), transport(via)),
             RouteCause::NoSharedRelay { hint },
         )
     };
@@ -577,11 +577,11 @@ mod tests {
         assert_eq!(describe(peer, via_tcp, via_udp, None).text, "到 relay 9 的会话改走 UDP");
         assert_eq!(
             describe(peer, via_udp, other, Some(RouteHint::PeerNotAttached)).text,
-            "relay 说对端没有挂在它上面，从 relay 9 换到对端挂靠的 relay 8（会话走 UDP）"
+            "relay 报告对端未挂靠，从 relay 9 换到对端挂靠的 relay 8（会话走 UDP）"
         );
         assert_eq!(describe(peer, via_udp, other, None).text, "原来的 relay 不可用，从 relay 9 换到对端挂靠的 relay 8（会话走 UDP）");
         assert_eq!(describe(peer, direct, RouteKey::None, None).text, "直连不可用，也没有 relay 可走");
-        assert_eq!(describe(peer, via_udp, RouteKey::None, None).text, "中转会话断开，没有别的路");
+        assert_eq!(describe(peer, via_udp, RouteKey::None, None).text, "中转会话断开，无其他可用路径");
 
         // 两个节点之间直接的中转会话：说明为什么不走对端挂靠表里排在前面的 relay。
         assert_eq!(
@@ -590,30 +590,30 @@ mod tests {
         );
         assert_eq!(
             describe(peer, via_udp, itself, None).text,
-            "有了少绕路的中转会话，从 relay 9 换到对端自己的 relay（它本身就是 relay，会话走 TCP，不用绕别的 relay）"
+            "已建立更短路径的中转会话，从 relay 9 换到对端自己的 relay（它本身就是 relay，会话走 TCP，不用绕别的 relay）"
         );
         assert_eq!(
             describe(peer, via_udp, local, None).text,
-            "有了少绕路的中转会话，从 relay 9 换到本节点自己的 relay（对端在它上面有会话，不用绕别的 relay）"
+            "已建立更短路径的中转会话，从 relay 9 换到本节点自己的 relay（对端在它上面有会话，不用绕别的 relay）"
         );
 
-        // 默认模式在没有一个 relay 两端都用得上时经一串 relay，一有一个就够的 relay 就换过去：少绕了路。
+        // 默认模式在无两端共同可达的单个 relay 时经多级 relay，出现可用的单跳 relay 后立即切换以缩短路径。
         let two_hops = RouteKey::Relay { path: path(&[8, 9]), via: Via::Udp(addr("198.51.100.8:20330")) };
         assert_eq!(
             describe(peer, RouteKey::None, two_hops, None).text,
-            "没有一个 relay 两端都用得上，经 relay 8 → 9（到第一个 relay 的会话走 UDP）"
+            "无两端共同可达的单个 relay，经 relay 8 → 9（到首个 relay 的会话使用 UDP）"
         );
         assert_eq!(
             describe(peer, direct, two_hops, Some(RouteHint::DirectTimeouts)).text,
-            "直连探测连续超时；没有一个 relay 两端都用得上，经 relay 8 → 9（到第一个 relay 的会话走 UDP）"
+            "直连探测连续超时；无两端共同可达的单个 relay，经 relay 8 → 9（到首个 relay 的会话使用 UDP）"
         );
         assert_eq!(
             describe(peer, via_udp, two_hops, None).text,
-            "原来的 relay 不可用；没有一个 relay 两端都用得上，经 relay 8 → 9（到第一个 relay 的会话走 UDP）"
+            "原来的 relay 不可用；无两端共同可达的单个 relay，经 relay 8 → 9（到首个 relay 的会话使用 UDP）"
         );
         assert_eq!(
             describe(peer, two_hops, via_udp, None).text,
-            "有了少绕路的中转会话，从 relay 8 → 9 换到对端挂靠的 relay 9（会话走 UDP）"
+            "已建立更短路径的中转会话，从 relay 8 → 9 换到对端挂靠的 relay 9（会话走 UDP）"
         );
         let two_hops_tcp = RouteKey::Relay { path: path(&[8, 9]), via: Via::Tcp(4) };
         assert_eq!(describe(peer, two_hops, two_hops_tcp, None).text, "到 relay 8 的会话改走 TCP");
@@ -701,11 +701,11 @@ mod tests {
         );
         assert_eq!(
             explain(Why::Failover, direct, two_hops, &candidates[1..], Some(RouteHint::RelayPathBroken)).text,
-            "relay 说多级路径走不下去，不等迟滞，立刻换到剩下的 1 条候选里代价最低的直连 203.0.113.7:4000（201ms）"
+            "relay 报告多级路径不可达，不等迟滞，立刻换到剩下的 1 条候选里代价最低的直连 203.0.113.7:4000（201ms）"
         );
         assert_eq!(
             explain(Why::Failover, direct, two_hops, &candidates[1..], None).text,
-            "原来的路不能用了，不等迟滞，立刻换到剩下的 1 条候选里代价最低的直连 203.0.113.7:4000（201ms）"
+            "原路径不可用，不等迟滞，立刻换到剩下的 1 条候选里代价最低的直连 203.0.113.7:4000（201ms）"
         );
         assert_eq!(
             explain(Why::Lan, direct, two_hops, &candidates, None).text,

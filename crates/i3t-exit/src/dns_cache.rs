@@ -30,8 +30,8 @@ impl DnsCache {
         self.entries.get(name).filter(|entry| entry.expires > now).map(|entry| entry.addrs.clone())
     }
 
-    /// 记下一条结果。满了的时候先清掉过期的；还是满的就全部清空，重新攒：
-    /// 这只在一分钟之内连了上千个不同域名时发生，那时缓存本来也帮不上什么忙。
+    /// 写入一条解析结果。缓存已满时先清理过期条目；若仍满则整体清空重建：
+    /// 该情况仅在一分钟内访问上千个不同域名时发生，此时缓存本身命中率有限。
     pub(crate) fn put(&mut self, name: String, addrs: Vec<IpAddr>, now: Instant) {
         if self.entries.len() >= CAPACITY && !self.entries.contains_key(&name) {
             self.entries.retain(|_, entry| entry.expires > now);

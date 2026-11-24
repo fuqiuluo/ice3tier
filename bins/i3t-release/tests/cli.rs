@@ -286,7 +286,7 @@ fn a_truncated_or_missing_file_is_detected() {
     assert!(!output.status.success());
     let report = stdout(&output);
     assert!(report.contains("不符  linux-x86_64") && report.contains("大小"), "{report}");
-    assert!(report.contains("不符  windows-x86_64") && report.contains("读不了"), "{report}");
+    assert!(report.contains("不符  windows-x86_64") && report.contains("无法读取文件"), "{report}");
     assert!(stderr(&output).contains("2 个文件"), "{}", stderr(&output));
 }
 

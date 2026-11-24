@@ -1,16 +1,16 @@
 //! 每个节点的 netmap 下发到了哪一步，以及变更的生效顺序。
 //!
-//! 访问关系的变更要按顺序生效，否则版本交错期间会出现"发起端已经在用、目的端还不认"的失败：
+//! 访问关系变更须按顺序生效，避免版本交错期间出现「发起端已启用、目的端尚未放行」的失败：
 //!
-//! - **授权**先到目的端：目的节点确认自己已经认了发起节点之后，发起节点的 netmap 里才出现"可以访问它"。
-//! - **撤销**先到发起端：发起节点确认自己已经不再访问目的节点之后，目的节点的 netmap 里才去掉"它可以访问我"。
+//! - **授权**先下发至目的端：目的节点确认已允许发起节点接入后，发起节点的 netmap 中才会加入该出向访问权限。
+//! - **撤销**先下发至发起端：发起节点确认已移除出向访问权限后，目的节点的 netmap 中才会移除对应的入向许可。
 //!
 //! 所以一个节点的 netmap 里实际写着的关系可能暂时落后于规则算出来的关系。这里记的就是这两样东西：
 //! 每个节点的 netmap 里现在实际写着什么（[`NodeSync::relations`]），以及它还欠着哪些确认。
 //!
-//! 确认有三个来源：节点发来 `Ack`；节点不在线（它没法确认，等它没有意义）；等得太久（不让一个不回话的节点卡住别人）。
-//! "太久"从开始等的那一刻算起，每一项分开算：之后再给节点发多少份 netmap、节点换多少次连接都不往后推，
-//! 否则一个不回话的节点只要不停地让 controller 给它发东西，就能让一次撤销永远生效不了。
+//! 确认有三种来源：节点返回 `Ack`；节点离线（无法确认，无需继续等待）；等待超时（避免无响应节点阻塞其他节点）。
+//! 超时自开始等待起按项独立计时：后续重发 netmap 或节点重连均不重置计时，
+//! 否则无响应节点只需持续触发重发即可使撤销操作永久无法生效。
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,16 +30,16 @@ pub(crate) struct NodeSync {
     awaiting_accept: BTreeMap<NodeId, Pending>,
     /// 刚被收回许可的目的节点 → 去掉它的那个版本。节点确认到这个版本之前，它可能还在访问对方。
     awaiting_undial: BTreeMap<NodeId, Pending>,
-    /// 最近一次因为别的节点的上报（端点、挂靠、连得上哪些 relay）给它排的重算的时刻，见 `Inner::defer_report`。
+    /// 最近一次因其他节点上报（端点、挂靠、relay 可达性）为其安排的延迟重算时刻，见 `Inner::defer_report`。
     pub report_due: Option<Instant>,
-    /// 它的重算没做成，还排着重试：它手上的 netmap 可能已经跟不上规则了，哪怕它确认过的就是当前这个版本号。
+    /// 当前节点的重算尚未完成，仍在重试队列中：其持有的 netmap 可能落后于最新规则，即便已确认当前版本号。
     pub retrying: bool,
 }
 
 /// 一项还欠着的确认。
 #[derive(Debug, Clone, Copy)]
 struct Pending {
-    /// 节点确认到这个版本才算数。
+    /// 节点需确认至该版本才视为生效。
     version: u64,
     /// 开始等的时刻。等没等太久从这里算起。
     since: Instant,
@@ -92,7 +92,7 @@ impl NodeSync {
         self.awaiting_undial.contains_key(&peer)
     }
 
-    /// 授权的第一步：这个节点从下一个版本起认 `peer`。在线的节点要确认过才算数。
+    /// 授权的第一步：该节点从下一版本起接受 `peer` 的访问。在线节点需确认后才视为生效。
     pub(crate) fn begin_accepting(&mut self, peer: NodeId, online: bool, now: Instant) {
         self.relations.entry(peer).or_default().inbound = true;
         if online {
@@ -100,10 +100,10 @@ impl NodeSync {
         }
     }
 
-    /// 撤销的第一步：这个节点从下一个版本起不再访问 `peer`。在线的节点要确认过，`peer` 那边才能不认它。
+    /// 撤销的第一步：该节点从下一版本起不再访问 `peer`。在线节点需确认后，`peer` 侧才可移除入向许可。
     ///
-    /// 和 [`Self::begin_accepting`] 一样，关系在这里就改掉，不等新的一版定下来。不然这一版一直定不下来时，
-    /// 等待超时之后看到的还是"它在访问 `peer`"，同一项等待又被登记一遍，`peer` 那边永远等不到头。
+    /// 与 [`Self::begin_accepting`] 一致，此处立即更新关系而不等待新版本落盘。否则若新版本迟迟无法生成，
+    /// 等待超时后状态仍显示为允许访问 `peer`，会反复重新登记等待，导致 `peer` 侧永久无法推进。
     pub(crate) fn begin_undialing(&mut self, peer: NodeId, online: bool, now: Instant) {
         if let Entry::Occupied(mut relation) = self.relations.entry(peer) {
             relation.get_mut().outbound = false;
@@ -118,9 +118,9 @@ impl NodeSync {
 
     /// 现在这个版本号刚定下来（每个版本号只有这一次）。等它确认的授权从这一刻起算等了多久。
     ///
-    /// 登记和定下来通常是同一刻。版本号一时记不进存储时会差出很久，那段时间节点没有可确认的东西：
-    /// 还从登记算起的话，这一版刚发出去就已经"超时"，对端马上被放开，节点连收下的工夫都没有。
-    /// 撤销不动：它的期限从登记起算，不取决于这一版什么时候定下来。
+    /// 登记与版本下发通常在同一时刻发生。当版本号暂时无法写入存储时两者会相隔较久，期间节点尚无可确认的版本：
+    /// 若授权仍自登记时计时，新版本刚下发便已超时，会导致发起端立即被放行而目的端尚未收到配置。
+    /// 撤销的超时保持不变：自登记起算，不依赖新版本何时落盘。
     pub(crate) fn version_issued(&mut self, now: Instant) {
         let version = self.state.version;
         for pending in self.awaiting_accept.values_mut().filter(|pending| pending.version == version) {
@@ -137,7 +137,7 @@ impl NodeSync {
         let relations = &self.relations;
         let mut released = BTreeSet::new();
         // 等待登记的是"下一个版本"。内容其实没变、版本号没有加的话，那个版本永远不会被确认，不能留着。
-        // 关系又变回去的（刚认下又不认了、刚收回又给了）也不用再等。
+        // 关系已恢复原状的（刚授权又撤销、刚撤销又授权）也无需继续等待。
         self.awaiting_accept.retain(|peer, pending| {
             let keep = pending.version <= version && relations.get(peer).is_some_and(|relation| relation.inbound);
             if !keep {
@@ -162,11 +162,11 @@ impl NodeSync {
 
     /// 开始等了 `timeout` 还没确认的不再等。后来才开始等的照旧等满它自己的时间。返回可以继续下一步的对端。
     ///
-    /// 等的那一版还没定下来时（版本号记不进存储，还在重试），两种等待都往严的一边靠：
+    /// 所等待的版本尚未落盘时（版本号写入存储失败，仍在重试），两类等待均采用偏安全策略：
     ///
-    /// - 授权接着等。节点没有可确认的东西，这时放开发起端，它就先于目的端拿到许可。
-    /// - 撤销到点就不等。目的端多久之后不认发起端，不能取决于发起端那一版记不记得下来；
-    ///   发起端晚一点才停，只是它那几次访问被拒绝。
+    /// - 授权继续等待：目的端尚未收到可确认的版本，此时放开发起端会导致其先于目的端获得访问许可。
+    /// - 撤销到期即放行：目的端移除入向许可的时限不应受制于发起端版本能否落盘；
+    ///   即便发起端稍晚才停止访问，也仅表现为其少数请求被拒绝。
     pub(crate) fn give_up_waiting(&mut self, now: Instant, timeout: Duration) -> BTreeSet<NodeId> {
         let issued = self.state.version;
         let overdue = |pending: &Pending| now.saturating_duration_since(pending.since) >= timeout;

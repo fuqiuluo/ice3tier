@@ -19,7 +19,7 @@ use crate::store::{DIGEST_LEN, NewNode, NewToken, NodeRecord, Store, TokenRecord
 /// 注册令牌默认一天之后过期。
 const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 24 * 60 * 60;
 
-/// 一次注册没成的原因：要么是该告诉节点的拒绝，要么是 controller 自己出了错。
+/// 注册失败的原因：向节点返回的拒绝原因，或 controller 内部错误。
 enum EnrollFailure {
     Rejected(Rejection),
     Internal(Error),
@@ -67,7 +67,7 @@ impl Controller {
                 if store.tokens(network.id)?.iter().any(|token| is_pending(token, now) && token.virtual_ip == Some(virtual_ip)) {
                     return Err(Error::Conflict {
                         with: Entity::Token,
-                        message: format!("虚拟 IP {virtual_ip} 已经预设在另一个还没用掉的注册令牌上"),
+                        message: format!("虚拟 IP {virtual_ip} 已预设在另一个未使用的注册令牌上"),
                     }
                     .in_field("virtual_ip"));
                 }
@@ -138,7 +138,7 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// 令牌无效，或者这把公钥、令牌预设的东西现在用不了。原因可以原样告诉节点。
+    /// 令牌无效，或该公钥、令牌预设的配置当前不可用。失败原因可直接返回给节点。
     pub fn enroll(
         &self,
         key: PublicKey,
@@ -203,7 +203,7 @@ impl Inner {
 const MAX_NAME_SUFFIX: u32 = 99;
 
 /// 按节点上报的主机名给新节点起名字：主机名本身，被占用（或者在冷却期）时加 `-2`、`-3`……
-/// 主机名取不出合法的名字、或者序号用完了，返回 `None`，节点叫 `node-<编号>`。
+/// 主机名无法提取出合法名称或序号已用尽时返回 `None`，节点将命名为 `node-<编号>`。
 fn name_after_hostname(store: &Store, network: NetworkId, hostname: &str, now: Timestamp) -> Result<Option<String>, Error> {
     let Some(base) = naming::from_hostname(hostname).filter(|base| !naming::is_default_node_name(base)) else { return Ok(None) };
     let candidates = std::iter::once(base.clone()).chain((2..=MAX_NAME_SUFFIX).map(|index| format!("{base}-{index}")));

@@ -30,9 +30,9 @@ pub struct Netmap {
     /// 只有本节点启用为 relay 时才有：网络里全部节点的编号和公钥，用来认证中转会话。
     #[serde(default)]
     pub relay_clients: Vec<RelayClient>,
-    /// `peers` 里说自己没有装虚拟网卡的那些（关着、没有权限、地址段重叠，或者是不懂虚拟网卡的旧版本），按编号排。
-    /// 本机的程序发给它们的包当场回"主机不可达"，不白等。controller 还不知道的（这次启动以来没有报过、旧的 controller）不在里面：
-    /// 包照发，对端没有网卡就是收不到。
+    /// `peers` 中未启用虚拟网卡的对端列表（已关闭、缺少权限、地址段重叠，或不支持虚拟网卡的旧版本），按节点编号排序。
+    /// 本机程序发往这些节点的包立即返回"主机不可达"，不再等待。controller 尚未获知状态的节点（本次启动后尚未上报，或旧版本 controller）不在其中：
+    /// 数据包仍会发送，但对端无虚拟网卡时无法接收。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub no_vnet: Vec<NodeId>,
 }
@@ -76,7 +76,7 @@ pub struct Network {
     pub name: String,
     /// 节点全名的后缀，例如 `home.i3t`：节点 `nas-01` 的全名是 `nas-01.home.i3t`。
     pub domain: String,
-    /// 虚拟地址段。落在这一段里的目标一律是组网目标，不会被当成互联网目标交给出口。
+    /// 虚拟地址段。落在该网段内的目标一律视为组网目标，不会被当作互联网目标交给出口。
     pub cidr: Ipv4Net,
     #[serde(default)]
     pub routing: RoutingMode,
@@ -183,15 +183,15 @@ pub(crate) const fn default_max_relay_hops() -> u8 {
 /// 再加上这些单独的确认包，回程的包数翻了一倍；回程按包数限速的线路上，能送过去的数据因此只有一半。
 /// 阈值到 2 以上，回程就只剩里面的确认，实测吞吐翻倍，小包的往返延迟不变；回程没有包可搭的单向流量，确认包也少一半以上。
 ///
-/// 取 3 而不是更大：拥塞控制的窗口最小四个包，阈值不超过 3 时窗口里总有够数的包，对端一收到第四个就确认，用不着它的定时器。
-/// 阈值比窗口大的时候，对端攒不够，每一轮都要等定时器（[`Network::max_ack_delay_ms`]）；定时器不准的系统上
-/// （Windows 默认的粒度是十几毫秒）等的远比说好的久，发送方按"确认来得慢"把速度降下去，再也升不回来。
-/// 实测阈值 10 时，对端的等待一到十几毫秒吞吐就掉，25 毫秒时只剩百分之几；阈值 4 以下不受等待多久的影响。
+/// 取 3 而非更大值：拥塞控制窗口最小为 4 个包，阈值不超过 3 时窗口内总有足够数据包，对端收到第 4 个包即立即确认，无需触发延迟确认定时器。
+/// 阈值大于窗口时，对端无法攒满，每轮均需等待定时器（[`Network::max_ack_delay_ms`]）；在定时器精度较低的系统上
+/// （Windows 默认粒度为十几毫秒），实际等待时间远超预期，发送方会误判确认变慢而降速且难以恢复。
+/// 实测阈值 10 时，对端等待达到十几毫秒吞吐即明显下降，25 毫秒时仅剩百分之几；阈值 4 以下不受等待时长影响。
 pub const DEFAULT_ACK_ELICITING_THRESHOLD: u32 = 3;
 
 /// [`Network::max_ack_delay_ms`] 的默认值。
 ///
-/// 要小：发送方的窗口里装不下 [`Network::ack_eliciting_threshold`] 那么多个包时，对端永远攒不够，每一轮都要等满这么久才有确认。
+/// 须设小：当发送方窗口无法容纳 [`Network::ack_eliciting_threshold`] 个包时，对端无法达到触发阈值，每轮都须等待该超时时间才会发送确认。
 /// 实测等 25 毫秒、阈值又超过窗口时，单向流量丢掉两成到九成；等 2 毫秒时不丢。
 pub const DEFAULT_MAX_ACK_DELAY_MS: u32 = 2;
 
@@ -230,7 +230,7 @@ pub(crate) const fn default_vnet_offload() -> bool {
 /// 再大就要切成两片发。它也是 IPv6 要求链路至少送得了的包长。
 pub const DEFAULT_VNET_MTU: u16 = 1280;
 
-/// [`Network::vnet_mtu`] 可以取的值。下限是 IPv4 要求每台主机都收得了的包长，上限是以太网的 1500：再大就有送不到的包。
+/// [`Network::vnet_mtu`] 的合法取值范围。下限为 IPv4 要求每台主机均可接收的最小包长，上限为以太网标准的 1500，超出可能导致报文无法送达。
 pub const VNET_MTU: RangeInclusive<u16> = 576..=1500;
 
 pub(crate) const fn default_vnet_mtu() -> u16 {
@@ -292,12 +292,12 @@ pub struct LocalNode {
     /// 管理员固定的挂靠 relay；空表示自己挑延迟最低的。
     #[serde(default)]
     pub pinned_relays: Vec<NodeId>,
-    /// 管理员给这个节点选的性能档位；没有值时节点用本机配置文件里的。比本程序新的 controller 下发了这里不认识的档位时
-    /// 也读成没有值。
+    /// 管理员为该节点指定的性能档位；未指定时使用本机配置文件中的设置。较新版本 controller 下发未知档位时
+    /// 也按未指定处理。
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "tolerant_profile")]
     pub profile: Option<Profile>,
-    /// 除了自己按延迟挑的之外还要挂靠的 relay：有的对端连不上本节点挑的那几个、本节点也连不上它们挂靠的，
-    /// controller 按各节点上报的"连得上哪些 relay"找一个两边都连得上的，让两边都挂上去。最多 [`MAX_SHARED_RELAYS`] 个。
+    /// 除按延迟自行选择外需额外挂靠的 relay：当部分对端无法连接本节点所选 relay 且本节点也无法连接对端挂靠的 relay 时，
+    /// controller 根据各节点上报的可达 relay 列表选取两端均可连接的公共 relay，通知双方挂靠。最多 [`MAX_SHARED_RELAYS`] 个。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_relays: Vec<NodeId>,
 }
@@ -358,10 +358,10 @@ impl FromStr for Profile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("不认识的性能档位 {0:?}：可以是 low-footprint、balanced、high-throughput")]
+#[error("未知的性能档位 {0:?}：可选值为 low-footprint、balanced、high-throughput")]
 pub struct UnknownProfile(pub String);
 
-/// netmap 里的档位：不认识的值读成没有值，不让整份 netmap 因为一个新的档位而读不了。
+/// netmap 中的性能档位：未知值解析为 `None`，避免因新增档位导致整份 netmap 解析失败。
 fn tolerant_profile<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Profile>, D::Error> {
     let text = Option::<String>::deserialize(deserializer)?;
     Ok(text.and_then(|text| text.parse().ok()))
@@ -376,7 +376,7 @@ pub struct RelayRole {
 
 /// 出口的设置：netmap 里本节点的出口角色，也是管理接口里出口的设置（`PUT …/exit`）和 controller 存着的那一份。
 ///
-/// 出口没有带宽上限。早先的 `bandwidth_mbps` 照收，没有作用（不认识的字段一律忽略）。
+/// 出口不设带宽上限。为兼容旧配置仍接受 `bandwidth_mbps` 字段但不生效（未知字段一律忽略）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExitRole {
     /// 互联网目标允许的端口。没有值（默认）表示不限制；写了列表就只允许这些。局域网目标不受它限制。
@@ -481,22 +481,22 @@ pub struct Peer {
     pub keep_alive: bool,
     /// 和这个对端之间备不备着 ice3proxy（lane）。controller 只给有选了 ice3proxy 的代理（[`Proxy::lane`]）的一对
     /// 下发 `always`：代理监听的节点和它的出口，两边的 netmap 里是同一个值；别的都是 `off`。备着 lane 也只有这种代理的流走它，
-    /// 端口转发和别的流照旧走共用的连接。比本程序新的 controller 下发了这里不认识的值时按 `off` 处理。
+    /// 端口转发及其他流仍沿用共用连接。较新版本 controller 下发未知值时按 `off` 处理。
     #[serde(default, deserialize_with = "tolerant_lane_mode")]
     pub lane: LaneMode,
     /// 和这个对端之间的连接用哪种拥塞控制；没有值时用节点自己的默认（BBR）。一对节点各自的 netmap 里互相看到同一个值，
-    /// 两边各自按它管自己往外发的那个方向。只对之后建立的连接生效。比本程序新的 controller 下发了不认识的值时按没有值处理。
+    /// 两端各自按该设置控制自身出站方向，仅对后续新建连接生效。较新版本 controller 下发未知值时按未设置处理。
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "tolerant_congestion")]
     pub congestion: Option<Congestion>,
-    /// 对端用不了 UDP：它连上的 relay 一个也不经 UDP（controller 认定的，见管理接口的 `Node.no_udp`）。
-    /// `udp_fallback` 下本节点经 relay 到它的路即使自己这一段有 UDP，也按没有 UDP 的路算：那条路上总有一段是它的 TCP。
-    /// 和它直连着时不看这一项：直连的整条路都是 UDP（这样的节点出去的 UDP 有时到得了个别对端）。
-    /// 旧的 controller 不发，读成 `false`；旧的节点不认。
+    /// 对端无法使用 UDP：其已连接的 relay 均未走 UDP（由 controller 判定，见管理接口 `Node.no_udp`）。
+    /// 在 `udp_fallback` 模式下，即使本节点到 relay 这一跳使用 UDP，经 relay 到该对端的路径仍视为无 UDP 路径（路径中必有一段走其 TCP）。
+    /// 直连时忽略该标志：直连全程均走 UDP（此类节点发出的 UDP 有时仍可到达个别对端）。
+    /// 旧版本 controller 不会下发该字段，默认解析为 `false`；旧版本节点会忽略该字段。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_udp: bool,
 }
 
-/// netmap 里的拥塞控制设置：不认识的值按没有设置，不让整份 netmap 因为一个新的取值而读不了。
+/// netmap 中的拥塞控制设置：未知值解析为 `None`，避免因新增取值导致整份 netmap 解析失败。
 fn tolerant_congestion<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Congestion>, D::Error> {
     let text = Option::<String>::deserialize(deserializer)?;
     Ok(text.and_then(|text| text.parse().ok()))
@@ -538,10 +538,10 @@ impl FromStr for Congestion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("不认识的拥塞控制 {0:?}：可以是 bbr、cubic")]
+#[error("未知的拥塞控制算法 {0:?}：可选值为 bbr、cubic")]
 pub struct UnknownCongestion(pub String);
 
-/// netmap 里的 ice3proxy 设置：不认识的值按 `off`，不让整份 netmap 因为一个新的取值而读不了。
+/// netmap 中的 ice3proxy 设置：未知值解析为 `off`，避免因新增取值导致整份 netmap 解析失败。
 fn tolerant_lane_mode<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<LaneMode, D::Error> {
     let text = String::deserialize(deserializer)?;
     Ok(text.parse().unwrap_or_default())
@@ -549,7 +549,7 @@ fn tolerant_lane_mode<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Resu
 
 /// 一对节点之间备不备着 ice3proxy（lane，每条流一条只属于它的 TCP），备着时什么时候用。
 ///
-/// 要两个节点里至少有一个启用了 relay、它的 TCP 端口另一个连得上（见 [`Relay::tcp`]），否则不起作用，按 `off` 走。
+/// 要求两端至少有一方启用了 relay 且另一方可连接其 TCP 端口（见 [`Relay::tcp`]），否则不生效，按 `off` 处理。
 /// 只有要求走 ice3proxy 的流（选了它的代理的 TCP 流）会用它；UDP 应用的数据、端口转发和别的流始终走共用的连接。
 ///
 /// `Default` 是 `Off`：netmap 里没有这一项（旧的 controller）时就是不用。controller 现在只下发 `off` 和 `always`；
@@ -561,7 +561,7 @@ pub enum LaneMode {
     #[default]
     Off,
     /// 共用的连接到对端的路上没有 UDP（UDP 不通、只能经 relay 的 TCP 中转）时，新的 TCP 流走 ice3proxy。
-    /// 拨号方也只在这时拨，UDP 回来一阵之后放手：两边都有 UDP 的路时什么都不连。
+    /// 拨号方也仅在此情况下发起拨号，UDP 恢复一段时间后释放连接：双方均存在 UDP 路径时不建立连接。
     UdpFallback,
     /// 能开出 ice3proxy 时新的 TCP 流都走它。拨号方一直拨着。
     Always,
@@ -597,15 +597,15 @@ impl FromStr for LaneMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("不认识的 ice3proxy 设置 {0:?}：可以是 off、udp_fallback、always")]
+#[error("未知的 ice3proxy 设置 {0:?}：可选值为 off、udp_fallback、always")]
 pub struct UnknownLaneMode(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub relay: NodeId,
     pub rtt_ms: u32,
-    /// 不是节点按延迟自己挑的，是 controller 为了让连不上它那几个 relay 的对端也到得了它，要它另外挂靠的
-    /// （[`LocalNode::shared_relays`]）。controller 算谁还缺一个共同的 relay 时只看节点自己挑的那几个，不然算出来的结果会来回变。
+    /// 非节点按延迟自选，而是 controller 为使无法连接其自选 relay 的对端可达而指定额外挂靠的 relay
+    /// （[`LocalNode::shared_relays`]）。controller 计算公共 relay 缺口时仅参考节点自选列表，避免结果反复震荡。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared: bool,
 }
@@ -629,10 +629,10 @@ pub struct Relay {
     pub key: PublicKey,
     pub name: String,
     /// 它的 UDP 地址，按要试的顺序。由 controller 下发时和 `tcp` 是同一组：controller 找出来的地址，
-    /// 节点并行地试，用回答的那个。不一定每个都连得上：谁连得上它，它就是谁的 relay。
+    /// 节点并行探测并采用响应的地址。并非每个地址均可达：哪个节点能连通，该 relay 就服务于哪个节点。
     #[serde(default)]
     pub udp: Vec<SocketAddr>,
-    /// 它的 TCP 地址，给 UDP 用不了的节点用。
+    /// 其 TCP 地址，供无法使用 UDP 的节点连接。
     #[serde(default)]
     pub tcp: Vec<SocketAddr>,
 }
@@ -657,7 +657,7 @@ pub struct Proxy {
     pub protocol: ListenerProtocol,
     /// 请求经哪个节点出去。
     pub exit: NodeId,
-    /// 用户名和密码的校验值。没有时不认证：只在回环地址上可以这样，绑在别的地址上又没有它的代理，节点一律拒绝。
+    /// 用户名与密码校验值。缺省表示不启用认证，仅允许用于回环地址；绑定在非回环地址且未配置认证的代理，节点一律拒绝启动。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Verifier>,
     /// 来源白名单；空表示不限制。
@@ -670,10 +670,10 @@ pub struct Proxy {
     /// 没有值时看出口的设置，出口也没有设时按目标的种类：互联网目标不等，组网目标（节点的服务、局域网）等。
     #[serde(default)]
     pub optimistic: Option<bool>,
-    /// 这个代理的 TCP 流（CONNECT 和明文 HTTP 的转发）走 ice3proxy：和对端之间备着 lane
-    /// （那个对端的 [`Peer::lane`] 不是 `off`）就一律走它，开不出 lane 时退回共用的连接。controller 给这个代理的节点和出口之间
-    /// 下发 `always`，所以经出口的流都走 ice3proxy；去组网里别的节点的流，那一对一般没有 lane，照旧走共用的连接。
-    /// UDP 的数据报不走 ice3proxy。旧的 controller 不发，读成 `false`：节点什么都不放到 ice3proxy 上，直到 controller 也更新。
+    /// 该代理的 TCP 流（CONNECT 与明文 HTTP 转发）走 ice3proxy：若与对端之间配置了 lane
+    /// （对应对端的 [`Peer::lane`] 非 `off`）则一律走 lane，无法建立 lane 时回退至共用连接。controller 为该代理的监听节点与出口节点之间
+    /// 下发 `always`，因此经出口的流均走 ice3proxy；发往组网内其他节点的流通常未配置 lane，仍沿用共用连接。
+    /// UDP 数据报不走 ice3proxy。旧版本 controller 不会下发该字段，默认解析为 `false`：节点不将流量走 ice3proxy，直至 controller 同步更新。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lane: bool,
 }
@@ -719,13 +719,13 @@ impl FromStr for ListenerProtocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("不认识的代理协议 {0:?}：可以是 mixed、socks5、http")]
+#[error("未知的代理协议 {0:?}：可选值为 mixed、socks5、http")]
 pub struct UnknownListenerProtocol(pub String);
 
 /// 代理的用户名和密码的校验值：`SHA-256(盐 ‖ SHA-256(用户名) ‖ 密码)`。
 ///
-/// 监听的节点只要核对，拿到的是它而不是密码：读到 netmap 的人拿它登录不了。盐每个代理一份，改密码时换，
-/// 两个代理用同一个密码看不出来。用户名先哈希成定长再接上密码，两段的分界不会有歧义。
+/// 监听节点仅需校验凭据，下发校验值而非明文密码，读取 netmap 者无法据此登录。每个代理使用独立随机盐值并在修改密码时更换，
+/// 避免相同密码产生相同校验值。用户名先哈希为定长再拼接密码，以消除两段边界歧义。
 /// 密码是管理员写的，可能不长，所以校验值和 netmap 一样只该在节点和 controller 手里。
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verifier {
@@ -774,7 +774,7 @@ impl<const N: usize> fmt::Display for Hex<N> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("应该是 {0} 个十六进制字符")]
+#[error("应为 {0} 个十六进制字符")]
 pub struct InvalidHex(usize);
 
 impl<const N: usize> FromStr for Hex<N> {
@@ -822,7 +822,7 @@ pub struct Forward {
     pub protocol: ForwardProtocol,
     /// 监听地址。IP 是本节点的虚拟 IP 时只对组网里被允许的节点可达：经虚拟网卡来的连到这个地址上的监听，
     /// 经流来的（没有网卡的节点、SOCKS5 入口）由目标一侧接住。监听在全部地址上（`0.0.0.0`、`[::]`）的对组网里的节点也一样，
-    /// 来源白名单按发起节点的虚拟 IP 查；只监听在别的某一个地址上的，组网里的节点经流到不了。
+    /// 来源白名单按发起节点的虚拟 IP 匹配；仅监听在其他特定地址上的端口，组网节点无法通过流访问。
     pub bind: SocketAddr,
     pub target: NodeId,
     #[serde(default)]
@@ -842,7 +842,7 @@ pub struct ForwardTarget {
     /// 监听这条转发的节点。只有它开过来的流才能用这一条。
     pub listener: NodeId,
     /// 连上之后先给目标发一个 PROXY protocol 的头，说出发起节点的虚拟 IP（只有 TCP 的转发有）。
-    /// 旧版本的节点不认这一项，照旧不发。
+    /// 旧版本节点不识别该字段，保持默认不发送。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<ProxyProtocol>,
 }
@@ -881,7 +881,7 @@ impl FromStr for ProxyProtocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("不认识的 PROXY protocol 版本 {0:?}：可以是 v1、v2")]
+#[error("未知的 PROXY protocol 版本 {0:?}：可选值为 v1、v2")]
 pub struct UnknownProxyProtocol(pub String);
 
 #[cfg(test)]

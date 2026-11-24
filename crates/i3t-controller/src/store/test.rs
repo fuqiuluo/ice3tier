@@ -12,7 +12,7 @@ use super::{Store, StoreError};
 pub const KEEP_PER_PAIR: u32 = 20;
 
 impl Store {
-    /// 记下一个刚开始的测试，返回它的编号。`view` 里的编号不算数，以返回的为准。
+    /// 插入新发起的主动测试记录并返回生成的编号。`view` 中原有的编号无效，以返回值为准。
     ///
     /// # Errors
     ///
@@ -43,7 +43,7 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn test(&self, network: NetworkId, id: u64) -> Result<Option<TestView>, StoreError> {
-        // 编号是数据库发的，都放得进有符号的 64 位。放不进的不会是哪个测试的编号：没有这个测试，而不是出错。
+        // 测试编号由数据库生成，必然在有符号 64 位整数范围内；超出该范围的编号不可能存在，直接视为未找到而非报错。
         if i64::try_from(id).is_err() {
             return Ok(None);
         }

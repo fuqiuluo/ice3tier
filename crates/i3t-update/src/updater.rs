@@ -1,4 +1,4 @@
-//! 把验签、取包、自检、替换、确认与回退连成一次更新。
+//! 串联验签、下载、自检、安装、确认与回滚的完整更新流程。
 
 use std::ffi::OsString;
 use std::fs;
@@ -22,50 +22,50 @@ use crate::state::{self, FailedVersion, Pending, State, StateFile};
 use crate::timing;
 use crate::trust::TrustedKeys;
 
-/// 新程序换上去之后最多启动几次；到了这个数还没有连上 controller，再启动时就换回旧程序。
+/// 新版本安装后的最大未确认启动次数；达到该上限仍未能连接 controller 时，下次启动将回滚至旧版本。
 pub const MAX_UNCONFIRMED_STARTS: u32 = 3;
 
-/// 新程序换上去之后最多等多久；到时候还没有连上 controller 就换回旧程序。
+/// 新版本安装后的确认等待窗口；超过该时长仍未能连接 controller 时将回滚至旧版本。
 pub const CONFIRMATION_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-/// 程序文件换过之后，进程用这个退出码退出，由外面把它重新拉起来。
+/// 可执行文件替换完成后，进程以该退出码退出，由外部进程管理器拉起新进程。
 ///
-/// 它是 sysexits 里的 `EX_TEMPFAIL`（"暂时失败，请重试"）。随项目发的 systemd 单元是 `Restart=always`，
-/// 什么退出码都会重启；单独定一个值，是为了让日志和别的看护程序分得清"请重启我"和"出错了"。
+/// 该值对应 sysexits 中的 `EX_TEMPFAIL`（临时故障，请重试）。项目附带的 systemd 单元配置为 `Restart=always`，
+/// 任意退出码都会触发重启；使用独立退出码便于日志与守护进程区分“请求重启”与“异常退出”。
 pub const RESTART_EXIT_CODE: u8 = 75;
 
-/// 状态目录里归更新用的子目录。
+/// 状态目录下用于存放更新文件的子目录。
 const UPDATE_DIR: &str = "update";
 
-/// 取下来的包在更新目录里的名字是 `staged-<SHA-256>.bin`。名字里带哈希，所以接着取的一定是同一个包。
+/// 更新目录中暂存包的文件名前缀，完整名称为 `staged-<SHA-256>.bin`。包含摘要可确保断点续传对应同一更新包。
 const STAGED_PREFIX: &str = "staged-";
 
-/// 建一个 [`Updater`] 要知道的东西。
+/// 构造 [`Updater`] 所需的配置。
 #[derive(Debug, Clone)]
 pub struct UpdaterConfig {
-    /// 正在运行的程序文件，[`current_program`](crate::current_program) 的结果。
+    /// 当前运行的可执行文件路径，来自 [`current_program`](crate::current_program)。
     pub program: PathBuf,
-    /// 节点的状态目录。更新只用它下面的 `update/`。
+    /// 节点状态目录。更新模块仅使用其下的 `update/` 子目录。
     pub state_dir: PathBuf,
-    /// 正在运行的版本。
+    /// 当前运行的版本号。
     pub running: Version,
-    /// 运行新程序做自检时给它的参数，一般是 `["--state-dir", <状态目录>, "self-check"]`。约定见 [`mod@self_check`]。
+    /// 启动新版本执行自检时传递的命令行参数，通常为 `["--state-dir", <状态目录>, "self-check"]`。约定见 [`mod@self_check`]。
     pub self_check_args: Vec<OsString>,
-    /// 这个节点不能自己更新的原因，[`self_update_blocker`](crate::self_update_blocker) 的结果。不是 `None` 时所有清单都被拒绝。
+    /// 当前节点无法自动更新的原因，来自 [`self_update_blocker`](crate::self_update_blocker)。非 `None` 时将拒绝所有发布清单。
     pub blocker: Option<SelfUpdateBlocker>,
 }
 
-/// 一份通过了检查、可以去取包的清单里，和本节点有关的部分。
+/// 通过校验、可供下载的发布清单中与本节点相关的信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
     pub version: Version,
-    /// 本平台的节点程序。
+    /// 适用于当前平台的节点可执行文件元数据。
     pub artifact: Artifact,
 }
 
-/// 一个取完、验过、自检也通过了的新程序，放在程序旁边等着换上去。
+/// 已完成下载、完整性校验与自检的新版本候选程序，已放置于主程序同目录等待安装。
 #[derive(Debug)]
-#[must_use = "新程序只是准备好了，交给 Updater::install 才会换上去"]
+#[must_use = "新版本仅已完成准备，需调用 Updater::install 才会执行安装"]
 pub struct Prepared {
     version: Version,
     artifact: Artifact,
@@ -78,46 +78,46 @@ impl Prepared {
     }
 }
 
-/// 程序文件已经换过了，调用方现在要重启进程：以 [`RESTART_EXIT_CODE`] 退出，或者自己重新执行程序。
+/// 可执行文件已完成替换，调用方应重启进程：以 [`RESTART_EXIT_CODE`] 退出，或自行重新拉起进程。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "程序文件已经换过了，不重启的话跑着的还是原来的程序"]
+#[must_use = "可执行文件已替换，未重启前仍将继续运行旧版本"]
 pub struct RestartRequired {
-    /// 重启之后运行的版本。
+    /// 重启后将运行的版本。
     pub version: Version,
 }
 
-/// 一个没有被确认的版本被换回去了。
+/// 未完成确认的新版本已回滚至旧版本。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolledBack {
-    /// 被换下去的那个版本。它已经被记为在这台机器上失败过。
+    /// 被回滚的新版本。该版本已记录为在当前主机更新失败。
     pub failed: Version,
     pub reason: String,
     pub restart: RestartRequired,
 }
 
-/// 启动时的情况，[`Updater::startup`] 的结果。
+/// 启动阶段更新状态检查结果，由 [`Updater::startup`] 返回。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Startup {
-    /// 没有待确认的更新，照常启动。
+    /// 无待确认更新，正常启动。
     Clean,
-    /// 这个程序是刚换上来的，还没有被确认。照常启动；连上 controller 时调用 [`Updater::confirm`]，
-    /// 同时跑着 [`Updater::enforce_confirmation_deadline`]。
+    /// 当前运行的是刚安装且尚未确认的新版本。应继续正常启动；连接上 controller 后调用 [`Updater::confirm`]，
+    /// 同时在后台运行 [`Updater::enforce_confirmation_deadline`]。
     AwaitingConfirmation { version: Version },
-    /// 这个程序是刚换上来的，但一直没能连上 controller，已经换回旧程序。不要继续启动，按 [`RolledBack::restart`] 重启。
+    /// 当前运行的是刚安装的新版本，但一直未能连接 controller，已回滚至旧版本。不应继续启动，应按 [`RolledBack::restart`] 重启。
     RolledBack(RolledBack),
 }
 
-/// 节点上的更新。一个进程里建一个，从启动用到退出。
+/// 节点更新器。单个进程创建一个实例，生命周期贯穿启动至退出。
 ///
-/// 一次更新分三步，可以分开调用，也可以用 [`Updater::update`] 一口气做完：
+/// 一次完整更新分为三步，可分段调用，也可通过 [`Updater::update`] 连续执行：
 ///
-/// 1. [`prepare`](Self::prepare)：验签、取包、核对、自检。不动正在运行的程序，随时可以丢弃。
-/// 2. [`wait_for_slot`](Self::wait_for_slot)：等 controller 指定的时机。
-/// 3. [`install`](Self::install)：换上新程序，旧的留作备份，然后调用方重启。
+/// 1. [`prepare`](Self::prepare)：验签、下载、完整性校验与自检。不修改当前运行的程序，可随时取消。
+/// 2. [`wait_for_slot`](Self::wait_for_slot)：等待 controller 指定的安装时机。
+/// 3. [`install`](Self::install)：替换可执行文件、保留旧版本备份，并通知调用方重启。
 ///
-/// 重启之后的新进程先调用 [`startup`](Self::startup)，连上 controller 时调用 [`confirm`](Self::confirm)。
+/// 重启后的新进程应先调用 [`startup`](Self::startup)，连接上 controller 后再调用 [`confirm`](Self::confirm)。
 ///
-/// 清单只用编译在程序里的公钥验（[`TrustedKeys::compiled_in`]）。这里没有、也不应该有换公钥的入口。
+/// 发布清单仅使用编译内置的公钥验签（[`TrustedKeys::compiled_in`]），不提供运行时替换公钥的入口。
 #[derive(Debug)]
 pub struct Updater {
     files: ProgramFiles,
@@ -129,10 +129,10 @@ pub struct Updater {
     self_check_args: Vec<OsString>,
     blocker: Option<SelfUpdateBlocker>,
     status: watch::Sender<UpdateStatus>,
-    /// 同一时刻只准备一个新程序：暂存文件和程序旁边的新程序都只有一份。
+    /// 同一时刻仅允许准备一个新版本：暂存文件与候选可执行文件均只有一份。
     preparing: Mutex<()>,
-    /// "读状态、换文件、写状态"的每一段都要一口气做完。确认和到期换回可能在两个线程上同时发生，
-    /// 交错起来会出现程序已经换回、记录却写着已确认的情况。
+    /// 串行化“读取状态—替换文件—写入状态”临界区。确认更新与超时回滚可能并发发生，
+    /// 若无互斥保护，可能出现程序已回滚但状态记录仍写入已确认的竞态。
     transition: StdMutex<()>,
 }
 
@@ -142,7 +142,7 @@ impl Updater {
         Self::assemble(config, TrustedKeys::compiled_in(), Swap::NATIVE)
     }
 
-    /// 测试要用自己的公钥和两种替换方式，所以装配留了这个只在本 crate 里看得见的口子。
+    /// 供 crate 内部测试注入自定义公钥与替换策略的构造入口。
     fn assemble(config: UpdaterConfig, keys: TrustedKeys, swap: Swap) -> Self {
         let update_dir = config.state_dir.join(UPDATE_DIR);
         Self {
@@ -164,33 +164,33 @@ impl Updater {
         self.transition.lock().expect("transition mutex poisoned")
     }
 
-    /// 更新进行到哪一步了。调用方把每次变化转给 controller。
+    /// 订阅当前更新状态。调用方应将每次状态变更上报给 controller。
     ///
-    /// 看到 [`UpdateStatus::Draining`] 时调用方要停止接新的流，直到进程重启。
+    /// 观察到 [`UpdateStatus::Draining`] 时，调用方应停止接受新流，直至进程重启。
     #[must_use]
     pub fn status(&self) -> watch::Receiver<UpdateStatus> {
         self.status.subscribe()
     }
 
-    /// 在这台机器上失败过、因而不会自动重试的版本。
+    /// 返回当前主机历史上更新失败、不再自动重试的版本列表。
     ///
     /// # Errors
     ///
-    /// 状态文件读不了。
+    /// 无法读取或解析更新状态文件时返回错误。
     pub fn failures(&self) -> Result<Vec<FailedVersion>, UpdateError> {
         Ok(self.state.load()?.failed)
     }
 
-    /// 进程启动时调用一次，要在连 controller 之前。
+    /// 进程启动时在连接 controller 之前调用一次。
     ///
-    /// 有待确认的更新时给启动次数加一；已经启动过 [`MAX_UNCONFIRMED_STARTS`] 次，或者换上去已经超过
-    /// [`CONFIRMATION_WINDOW`]，就换回旧程序，把这个版本记为失败。
+    /// 若存在待确认更新则递增启动计数；若已启动 [`MAX_UNCONFIRMED_STARTS`] 次，或安装至今已超过
+    /// [`CONFIRMATION_WINDOW`]，则回滚至旧版本并将该版本记录为失败。
     ///
-    /// 做不到的事：新程序要是在走到这里之前就崩了，没有人替它换回去。这一种情况靠换之前的自检挡住。
+    /// 局限说明：若新版本在执行到此函数前即崩溃，无法自动触发回滚；此类故障依赖安装前的自检阶段拦截。
     ///
     /// # Errors
     ///
-    /// 状态文件读不了或写不了，或者要换回的时候换不了。
+    /// 加载或保存更新状态失败，或回滚到上一版本失败。
     pub fn startup(&self) -> Result<Startup, UpdateError> {
         let _transition = self.transition();
         let mut state = self.state.load()?;
@@ -200,8 +200,8 @@ impl Updater {
             return Ok(Startup::Clean);
         };
         if pending.version != self.running {
-            // 记下了要换成它，可跑着的不是它：换到一半断了电，或者有人手动换了程序。
-            tracing::warn!(recorded = %pending.version, running = %self.running, "待确认的记录和正在运行的版本对不上，作废这条记录");
+            // 待确认记录与当前运行版本不一致：可能发生在安装中途断电，或人工手动替换了可执行文件。
+            tracing::warn!(recorded = %pending.version, running = %self.running, "当前运行版本与待确认版本不一致，将清除待确认记录");
             state.pending = None;
             self.state.save(&state)?;
             self.tidy();
@@ -210,7 +210,7 @@ impl Updater {
 
         let give_up = if pending.starts >= MAX_UNCONFIRMED_STARTS {
             Some((
-                format!("新程序启动了 {MAX_UNCONFIRMED_STARTS} 次都没有连上 controller"),
+                format!("新版本已启动 {MAX_UNCONFIRMED_STARTS} 次仍未能连接 controller"),
                 UpdateCause::StartsUnconfirmed { starts: MAX_UNCONFIRMED_STARTS },
             ))
         } else if pending.age(state::now()) >= CONFIRMATION_WINDOW {
@@ -225,17 +225,17 @@ impl Updater {
         let starts = pending.starts + 1;
         state.pending = Some(Pending { starts, ..pending });
         self.state.save(&state)?;
-        tracing::info!(version = %self.running, starts, "这是刚换上来的新程序，连上 controller 才算更新成功");
+        tracing::info!(version = %self.running, starts, "新版本已启动，等待连接 controller 以确认更新");
         Ok(Startup::AwaitingConfirmation { version: self.running.clone() })
     }
 
-    /// 新程序连上了 controller：更新成了，删掉备份。返回被确认的版本；没有待确认的更新时什么都不做，返回 `None`。
+    /// 确认新版本已成功连接 controller：清除待确认记录并删除旧版本备份。返回已确认版本号；若无待确认更新则无操作并返回 `None`。
     ///
-    /// 每次连上 controller 都可以调用。
+    /// 每次成功连接 controller 时均可调用。
     ///
     /// # Errors
     ///
-    /// 状态文件读不了或写不了。
+    /// 无法读取或保存更新状态文件时返回错误。
     pub fn confirm(&self) -> Result<Option<Version>, UpdateError> {
         let _transition = self.transition();
         let mut state = self.state.load()?;
@@ -245,27 +245,27 @@ impl Updater {
         state.pending = None;
         state.forget_failures_up_to(&self.running);
         self.state.save(&state)?;
-        // 记录已经落盘，从这里起备份只是占地方：删不掉的话下次启动再清。
+        // 状态已持久化落盘，此时备份文件已不再需要；若删除失败将在下次启动时重试清理。
         self.tidy();
-        tracing::info!(version = %self.running, "新程序连上了 controller，更新完成");
+        tracing::info!(version = %self.running, "新版本已连接 controller，更新已确认完成");
         self.status.send_replace(UpdateStatus::Confirmed { version: self.running.clone() });
         Ok(Some(self.running.clone()))
     }
 
-    /// 守着确认的期限：换上去满 [`CONFIRMATION_WINDOW`] 还没有 [`confirm`](Self::confirm)，就换回旧程序。
+    /// 监控新版本确认期限：若安装满 [`CONFIRMATION_WINDOW`] 仍未调用 [`confirm`](Self::confirm)，则自动回滚至旧版本。
     ///
-    /// [`startup`](Self::startup) 返回 [`Startup::AwaitingConfirmation`] 之后，调用方让它在后台跑着：
-    /// 返回 `Some` 就按里面的 [`RolledBack::restart`] 重启；返回 `None` 是已经确认了，或者本来就没有待确认的更新。
+    /// 在 [`startup`](Self::startup) 返回 [`Startup::AwaitingConfirmation`] 后，调用方应在后台运行此任务：
+    /// 返回 `Some` 时应按 [`RolledBack::restart`] 重启进程；返回 `None` 表示更新已确认或原本不存在待确认更新。
     ///
-    /// 期限按系统时钟从换上去的那一刻算起，所以跨重启也有效。
+    /// 确认期限按系统时钟自安装时刻起算，因此跨进程重启依然有效。
     ///
     /// # Errors
     ///
-    /// 状态文件读不了或写不了，或者换不回去。
+    /// 加载或保存更新状态失败，或回滚旧版本失败。
     pub async fn enforce_confirmation_deadline(&self) -> Result<Option<RolledBack>, UpdateError> {
         let Some(pending) = self.unconfirmed(&self.state.load()?) else { return Ok(None) };
         tokio::time::sleep(CONFIRMATION_WINDOW.saturating_sub(pending.age(state::now()))).await;
-        // 等的这段时间里可能已经确认了。醒来之后不再看系统时钟：等够了就是等够了。
+        // 等待期间更新可能已完成确认；唤醒后无需再次比对系统时钟，已等待满确认窗口即可触发判定。
         let _transition = self.transition();
         let state = self.state.load()?;
         match self.unconfirmed(&state) {
@@ -277,20 +277,20 @@ impl Updater {
         }
     }
 
-    /// 验签，再看这份清单该不该装。不取包，不动磁盘上的任何东西。被拒绝的原因会出现在状态里
-    /// （"不比现在的新"除外：那不是出了什么错）。
+    /// 校验发布清单签名并判断该发布清单是否适用。不下载更新包，也不修改磁盘。拒绝原因会更新到状态中
+    /// （目标版本不高于当前版本除外，该情况不视为错误）。
     ///
-    /// 规矩：
+    /// 校验规则：
     ///
-    /// - 签名必须是编译在程序里的某一把公钥签的；
-    /// - 只装比正在运行的版本新的，一样的和更旧的都不装；
-    /// - 预发布版只装在正在运行预发布版的节点上。跑正式版的节点不会因为有人把一份测试用的清单发给它，就换成预发布版；
-    /// - 在这台机器上失败过的版本，自动更新（[`UpdateTiming::Idle`]）不再试，管理员强制的更新可以再试；
-    /// - 清单里要有本平台的包。
+    /// - 签名必须由内置受信任公钥之一签发；
+    /// - 仅接受高于当前运行版本的更新，拒绝同版本及降级；
+    /// - 预发布版仅允许安装在当前运行预发布版的节点上，正式版节点不会因收到预发布清单而切换至预发布版；
+    /// - 当前主机历史上失败过的版本不会由自动更新（[`UpdateTiming::Idle`]）重试，但管理员强制更新可以重试；
+    /// - 清单中必须包含适用于当前平台的更新包。
     ///
     /// # Errors
     ///
-    /// [`UpdateError::Refused`]，里面是不装的原因；或者状态文件读不了。
+    /// 拒绝清单时返回 [`UpdateError::Refused`]，或读取状态文件失败时返回对应错误。
     pub fn check(&self, signed: &SignedManifest, timing: UpdateTiming) -> Result<Offer, UpdateError> {
         let manifest = self.keys.verify(signed).map_err(|error| self.refuse(None, error.into()))?;
         let state = self.state.load()?;
@@ -320,16 +320,16 @@ impl Updater {
         Ok(Offer { version: offered.clone(), artifact: artifact.clone() })
     }
 
-    /// 第一步：验签、取包、核对大小和 SHA-256、把新程序放到程序旁边并运行它的自检。
+    /// 第一步：验签、下载更新包、校验大小与 SHA-256、放置候选程序并执行自检。
     ///
-    /// 正在运行的程序不受影响。链路中断会一直重试，不算失败；这个 future 可以随时丢弃，取了一半的包留在状态目录里，
-    /// 下次（包括进程重启之后）接着取。同一时刻只有一个在做，后来的等前一个结束或者被丢弃。
+    /// 不会影响当前运行中的程序。链路中断会持续重试而不视为失败；调用方可随时丢弃该 future，已下载的部分保留在状态目录中，
+    /// 下次（包括进程重启后）将自动断点续传。同一时刻仅允许执行一次准备流程，后续调用需等待前一次完成或取消。
     ///
-    /// 自检不通过时不替换，把这个版本记为在这台机器上失败过。
+    /// 自检失败时不会替换可执行文件，并将该版本记录为在当前主机失败。
     ///
     /// # Errors
     ///
-    /// 清单被拒绝、包取不到或者对不上、自检不通过、磁盘出错。除了"不比现在的新"之外，原因都会出现在状态里。
+    /// 发布清单被拒绝、更新包获取或校验失败、自检未通过或磁盘读写错误时返回错误。除“版本不高于当前版本”外，其余原因均会写入状态。
     pub async fn prepare<S: PackageSource>(
         &self,
         signed: &SignedManifest,
@@ -357,19 +357,19 @@ impl Updater {
 
         self.status.send_replace(UpdateStatus::SelfCheck { version: version.clone() });
         let candidate = self.files.candidate();
-        // 从这里到自检通过，新程序是没验过的：这一段里不管怎么离开（自检不通过，或者这次更新被放弃、这个 future 被丢弃），它都被收走。
+        // 在自检通过前，候选程序尚未完成验证：无论因自检失败、更新取消还是 future 被丢弃退出，均通过守卫自动清理。
         let unchecked = Unchecked::new(candidate.clone());
         let (files, from) = (self.files.clone(), package.clone());
         tokio::task::spawn_blocking(move || files.place_candidate(&from))
             .await
-            .expect("拷贝文件的线程不会 panic：里面只有文件操作")
-            .map_err(UpdateError::io("把新程序放到", &candidate))?;
+            .expect("候选程序复制任务异常终止")
+            .map_err(UpdateError::io("写入候选程序", &candidate))?;
         if let Err(rejected) = self_check::run_candidate(&candidate, &self.self_check_args, version, self_check::TIMEOUT).await {
             drop(unchecked);
             discard(&package);
             let _transition = self.transition();
             let mut state = self.state.load()?;
-            let recorded = format!("自检没有通过：{}", rejected.reason);
+            let recorded = format!("自检失败：{}", rejected.reason);
             let error = UpdateError::SelfCheck {
                 version: version.clone(),
                 reason: rejected.reason,
@@ -381,22 +381,22 @@ impl Updater {
             return Err(error);
         }
         unchecked.passed();
-        tracing::info!(%version, "新程序的自检通过了");
+        tracing::info!(%version, "新版本自检通过");
         Ok(())
     }
 
-    /// 第二步：等到可以换程序的时刻。`flows` 是调用方通报的活跃的流的数量；这里不数流。
+    /// 第二步：等待允许安装新版本的时机。`flows` 为调用方上报的活跃流数量，本模块不直接计数。
     ///
-    /// - [`UpdateTiming::Now`]：不等；
-    /// - [`UpdateTiming::Idle`]：等到数量是 0，等的时候状态是 [`UpdateStatus::WaitingForIdle`]；
-    /// - [`UpdateTiming::AfterDrain`]：状态变成 [`UpdateStatus::Draining`]（调用方看到就不再接新的流），等到数量是 0。
+    /// - [`UpdateTiming::Now`]：立即返回；
+    /// - [`UpdateTiming::Idle`]：等待活跃流归零，期间状态为 [`UpdateStatus::WaitingForIdle`]；
+    /// - [`UpdateTiming::AfterDrain`]：将状态切换为 [`UpdateStatus::Draining`]（调用方据此停止接收新流），并等待活跃流归零。
     ///
-    /// 可以随时丢弃再用别的时机重新调用，比如等空闲的时候管理员点了"立即更新"。
-    /// 返回之后要马上调用 [`install`](Self::install)：这中间新来的流会被重启打断。
+    /// 可随时丢弃该 future 并以新的时机重新调用（例如等待空闲期间管理员触发“立即更新”）。
+    /// 返回后应立即调用 [`install`](Self::install)，避免重启前进入的新流被中断。
     ///
     /// # Errors
     ///
-    /// `flows` 的发送端没了。
+    /// `flows` 发送端已关闭时返回错误。
     pub async fn wait_for_slot(
         &self,
         prepared: &Prepared,
@@ -408,18 +408,18 @@ impl Updater {
             .inspect_err(|error| self.fail(Some(&prepared.version), error))
     }
 
-    /// 第三步：把新程序换上去，旧的留作备份，并记下"这个版本待确认"。成功之后调用方要重启进程。
+    /// 第三步：将候选新版本替换到目标路径、保留旧版本备份，并持久化“待确认”记录。成功后调用方应重启进程。
     ///
-    /// 换之前再核对一次新程序的内容：等时机可能等了很久。
+    /// 替换前会再次校验候选文件的大小与 SHA-256，防止等待安装时机期间文件发生变动。
     ///
     /// # Errors
     ///
-    /// 新程序的文件不见了或者被改过、状态写不了、文件换不了。这时正在运行的程序没有被动过。
+    /// 候选文件缺失或被篡改、状态保存失败或可执行文件替换失败时返回错误；此时当前运行的程序未被修改。
     pub async fn install(&self, prepared: Prepared) -> Result<RestartRequired, UpdateError> {
         let Prepared { version, artifact } = prepared;
         self.status.send_replace(UpdateStatus::Installing { version: version.clone() });
         let restart = self.swap_in(&version, &artifact).await.inspect_err(|error| self.fail(Some(&version), error))?;
-        tracing::info!(%version, previous = %self.running, "新程序已经换上去，需要重启");
+        tracing::info!(%version, previous = %self.running, "新版本已安装，重启后生效");
         self.status.send_replace(UpdateStatus::Restarting { version });
         Ok(restart)
     }
@@ -429,8 +429,8 @@ impl Updater {
         let path = candidate.clone();
         let digest = tokio::task::spawn_blocking(move || FileDigest::of_file(&path))
             .await
-            .expect("算哈希的线程不会 panic：里面只有读文件和喂数据")
-            .map_err(UpdateError::io("读", &candidate))?;
+            .expect("文件摘要计算任务异常终止")
+            .map_err(UpdateError::io("读取", &candidate))?;
         if !digest.matches(artifact) {
             discard(&candidate);
             return Err(UpdateError::Corrupt {
@@ -446,14 +446,14 @@ impl Updater {
         if let Some(installed) = self.awaiting_restart(&state) {
             return Err(Refusal::RestartPending { installed }.into());
         }
-        // 先记账再换文件。反过来的话，换完还没记上就断电，新程序起来之后没有人知道它需要确认，坏了也不会被换回。
-        // 记了账却没换成（下面失败，或者这中间断电），启动时会发现版本对不上，把这条记录作废。
+        // 先持久化待确认记录，再替换可执行文件。若颠倒顺序，替换后尚未写盘即断电会导致新版本启动时缺少确认与回滚保护。
+        // 若写盘后替换失败或中途断电，下次启动时会因运行版本与记录不一致而自动清除该待确认记录。
         state.pending = Some(Pending { version: version.clone(), previous: self.running.clone(), starts: 0, since: state::now() });
         self.state.save(&state)?;
         if let Err(error) = self.files.install_candidate() {
             state.pending = None;
             if let Err(error) = self.state.save(&state) {
-                tracing::warn!(error = %describe(&error), "替换程序失败之后没能撤掉待确认的记录，下次启动时会作废它");
+                tracing::warn!(error = %describe(&error), "程序替换失败后无法清除待确认记录，将在下次启动时自动清理");
             }
             return Err(UpdateError::io("替换程序文件", self.files.program())(error));
         }
@@ -461,9 +461,9 @@ impl Updater {
         Ok(RestartRequired { version: version.clone() })
     }
 
-    /// 三步连起来做：准备、等时机、换上去。成功之后调用方要重启进程。
+    /// 连续执行准备、等待时机与安装三步流程。成功后调用方应重启进程。
     ///
-    /// controller 中途改了主意（换了时机，或者有了更新的版本）时，丢弃这个 future 重新调用：取过的包不会重新取。
+    /// 若 controller 中途变更策略（调整时机或发布更新版本），可直接丢弃该 future 并重新调用，已下载的暂存包会被复用。
     ///
     /// # Errors
     ///
@@ -480,17 +480,17 @@ impl Updater {
         self.install(prepared).await
     }
 
-    /// 正在运行的这个程序是不是刚换上来、还没有被确认的。
+    /// 判断当前运行的版本是否为刚安装且尚未确认的新版本。
     fn unconfirmed(&self, state: &State) -> Option<Pending> {
         state.pending.clone().filter(|pending| pending.version == self.running)
     }
 
-    /// 这个进程已经把别的版本换上去了、还没有重启：这时程序文件和备份都不是它以为的样子，不能再换一次。
+    /// 判断当前进程是否已安装了其他版本并正在等待重启：此时磁盘上的可执行文件与备份已发生变更，禁止再次安装。
     fn awaiting_restart(&self, state: &State) -> Option<Version> {
         state.pending.as_ref().filter(|pending| pending.version != self.running).map(|pending| pending.version.clone())
     }
 
-    /// 换回旧程序并把新版本记为失败。备份不见了就没有东西可换，返回 `None`，继续跑现在的程序。
+    /// 回滚至旧版本并将当前新版本记录为失败。若备份文件缺失则无法回滚，返回 `None` 并继续运行当前版本。
     fn roll_back(
         &self,
         mut state: State,
@@ -500,14 +500,14 @@ impl Updater {
     ) -> Result<Option<RolledBack>, UpdateError> {
         state.pending = None;
         if !self.files.has_backup() {
-            tracing::error!(version = %pending.version, %reason, "新版本没有被确认，但备份的旧程序不见了，只能继续运行新版本");
+            tracing::error!(version = %pending.version, %reason, "新版本未完成确认，但旧版本备份文件缺失，将继续运行当前新版本");
             self.state.save(&state)?;
             return Ok(None);
         }
-        self.files.restore_backup().map_err(UpdateError::io("换回旧程序", self.files.program()))?;
+        self.files.restore_backup().map_err(UpdateError::io("回滚旧版本程序", self.files.program()))?;
         state.record_failure(pending.version.clone(), reason.clone(), cause.clone());
         self.state.save(&state)?;
-        tracing::warn!(version = %pending.version, previous = %pending.previous, %reason, "新版本没有被确认，已经换回旧程序，需要重启");
+        tracing::warn!(version = %pending.version, previous = %pending.previous, %reason, "新版本未完成确认，已回滚至旧版本，需要重启");
         self.status.send_replace(UpdateStatus::Failed {
             version: Some(pending.version.clone()),
             kind: FailureKind::VersionRejected,
@@ -517,7 +517,7 @@ impl Updater {
         Ok(Some(RolledBack { failed: pending.version.clone(), reason, restart: RestartRequired { version: pending.previous.clone() } }))
     }
 
-    /// 旧程序在换回之后重新启动时，把"上次想更新到某个版本，失败了"摆到状态上，好让 controller 一连上就知道。
+    /// 回滚后的旧版本重新启动时，将高于当前版本的最近一次失败记录同步到状态中，便于连接 controller 后立即上报。
     fn announce_standing_failure(&self, state: &State) {
         if let Some(failure) = state.failed.iter().filter(|failure| failure.version > self.running).max_by(|a, b| a.version.cmp(&b.version))
         {
@@ -534,8 +534,8 @@ impl Updater {
         let not_newer = matches!(refusal, Refusal::NotNewer { .. });
         let error = UpdateError::from(refusal);
         if not_newer {
-            // 节点已经是这个版本或者更新的了，没有什么出了错，所以不去动状态。
-            tracing::info!(reason = %describe(&error), "不装这份清单");
+            // 节点已运行相同或更新版本，不视为错误，因此不修改当前状态。
+            tracing::info!(reason = %describe(&error), "当前版本无需更新，已跳过该发布清单");
         } else {
             self.fail(version, &error);
         }
@@ -544,7 +544,7 @@ impl Updater {
 
     fn fail(&self, version: Option<&Version>, error: &UpdateError) {
         let reason = describe(error);
-        tracing::warn!(version = version.map(tracing::field::display), %reason, "更新没有成功");
+        tracing::warn!(version = version.map(tracing::field::display), %reason, "更新失败");
         self.status.send_replace(UpdateStatus::Failed {
             version: version.cloned(),
             kind: error.kind(),
@@ -553,16 +553,16 @@ impl Updater {
         });
     }
 
-    /// 没有待确认的更新时，把程序旁边不该再留着的文件清掉：备份，和没换上去的新程序。
-    /// 取了一半的包不在这里清：它留在状态目录里，下次接着取。
+    /// 无待确认更新时，清理主程序同目录下不再需要的遗留文件（旧版本备份与未安装的候选程序）。
+    /// 不在此处清理部分下载的暂存包：它们保留在状态目录中，供下次断点续传。
     fn tidy(&self) {
         if let Err(error) = self.files.remove_backup() {
-            tracing::warn!(path = %self.files.backup().display(), %error, "删不掉备份的旧程序");
+            tracing::warn!(path = %self.files.backup().display(), %error, "无法删除旧版本备份文件");
         }
         self.files.remove_leftovers();
     }
 
-    /// 删掉取下来的包，`keep` 除外。
+    /// 清理暂存更新包，`keep` 指定的路径除外。
     fn remove_staged_packages(&self, keep: Option<&Path>) {
         let Ok(entries) = fs::read_dir(&self.update_dir) else { return };
         entries
@@ -574,10 +574,10 @@ impl Updater {
     }
 }
 
-/// 放在程序旁边、还没有通过自检的新程序。自检通过之前它被丢掉，文件就删掉：没验过的程序不留在程序旁边。
+/// 位于主程序同目录、尚未通过自检的候选文件守卫。若在自检通过前被丢弃，则自动删除文件，避免未验证的可执行文件残留。
 ///
-/// 准备新版本的 future 可以随时被丢弃（controller 撤回了更新、换了时机），所以收走它靠的是析构，不是某一条返回路径。
-/// 见过的情形：一个节点自检到一半，别的节点先报了这个版本失败，controller 撤回指令，坏的 `i3t.new` 就留了下来。
+/// 准备阶段的 future 可能因 controller 撤回指令或变更时机而被随时取消，因此必须借助 `Drop` 析构执行清理，而非仅依赖某条返回路径。
+/// 典型场景：某节点正在自检时，其他节点率先上报该版本失败导致 controller 撤回指令，若无守卫则损坏的 `i3t.new` 将残留在磁盘上。
 struct Unchecked(Option<PathBuf>);
 
 impl Unchecked {
@@ -585,7 +585,7 @@ impl Unchecked {
         Self(Some(candidate))
     }
 
-    /// 自检通过了：文件留着，等着换上去。
+    /// 标记自检已通过：解除自动清理，保留候选文件等待安装。
     fn passed(mut self) {
         self.0 = None;
     }
@@ -599,18 +599,18 @@ impl Drop for Unchecked {
     }
 }
 
-/// 删掉一个更新留下的文件。删不掉只是占地方，下次还会再清，所以只记一条日志。
+/// 删除更新过程中遗留的文件。删除失败仅占用少量磁盘空间，下次启动仍会重试清理，因此仅记录警告日志。
 fn discard(path: &Path) {
     match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => tracing::warn!(path = %path.display(), %error, "删不掉更新留下的文件"),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => tracing::warn!(path = %path.display(), %error, "无法删除更新遗留文件"),
         _ => {}
     }
 }
 
-/// 新程序过了确认的期限还没有连上 controller：原因的原话和代码。
+/// 生成确认超时的失败描述与原因代码。
 fn overdue() -> (String, UpdateCause) {
     let minutes = CONFIRMATION_WINDOW.as_secs() / 60;
-    (format!("新程序换上去 {minutes} 分钟还没有连上 controller"), UpdateCause::NotConfirmed { minutes })
+    (format!("新版本安装超过 {minutes} 分钟仍未连接 controller"), UpdateCause::NotConfirmed { minutes })
 }
 
 #[cfg(test)]

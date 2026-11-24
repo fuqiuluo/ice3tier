@@ -26,7 +26,7 @@ use i3t_proto::flow::Host;
 pub(crate) use self::body::{Body, BodyFraming};
 use crate::message::{Parsed, Password, ProxyAuth};
 
-/// 请求行加请求头最长多少字节。读到这么多还没有见到空行就拒绝，客户端没办法让读的一方无限地攒数据。
+/// 请求行与请求头的总长度上限（字节）。读取到此上限仍未遇到空行则拒绝请求，防止客户端迫使读取方无限缓存数据。
 ///
 /// 明文 HTTP 的请求带着网站的 Cookie，常见的服务器收 8 KB 的一行、几十 KB 的整个请求头，所以取 32 KB。
 pub(crate) const MAX_HEAD_LEN: usize = 32 * 1024;
@@ -243,7 +243,7 @@ struct AbsoluteUrl<'a> {
 impl<'a> AbsoluteUrl<'a> {
     fn parse(target: &'a str) -> Result<Self, HttpError> {
         let Some((scheme, rest)) = target.split_once("://") else {
-            return Err(HttpError::Malformed("请求的目标不是 http:// 开头的完整地址（这是代理，不是网站）"));
+            return Err(HttpError::Malformed("请求目标不是以 http:// 开头的完整地址（当前端口为代理而非源站）"));
         };
         if scheme.eq_ignore_ascii_case("https") {
             return Err(HttpError::NotImplemented("https:// 的地址要用 CONNECT"));
@@ -256,7 +256,7 @@ impl<'a> AbsoluteUrl<'a> {
         if authority.contains('@') {
             return Err(HttpError::Malformed("地址里不能带用户名"));
         }
-        let (host, port) = parse_authority(authority, Some(HTTP_PORT)).map_err(|_| HttpError::Malformed("地址里的主机或端口不对"))?;
+        let (host, port) = parse_authority(authority, Some(HTTP_PORT)).map_err(|_| HttpError::Malformed("地址中的主机或端口无效"))?;
         let path = if path.starts_with('/') { path.to_owned() } else { format!("/{path}") };
         Ok(Self { host, port, authority, path })
     }
@@ -339,7 +339,7 @@ pub(crate) enum Response {
     NotImplemented,
     BadGateway,
     ServiceUnavailable,
-    /// 节点正在排空：503，并且告诉客户端过一会儿再试。
+    /// 节点正在排空：返回 503 并提示客户端稍后重试。
     Draining,
     GatewayTimeout,
 }

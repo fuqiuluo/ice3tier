@@ -3,7 +3,7 @@
 //! 安装脚本（`deploy/install.ps1`）用 `i3t service install` 把本程序登记成开机自动启动的服务，服务的命令行是
 //! `i3t.exe run --service`，以 LocalSystem 运行。服务停下时退出码不是 0，SCM 过 [`RESTART_DELAY`] 把它重新拉起来，
 //! 和 Linux 上 systemd 的 `Restart=always` 是一回事：节点自己更新之后"请重启我"的退出也走这条路。
-//! 重启救不了的情况（还没有加入网络、配置文件有错、被吊销）以 0 停止，SCM 不再拉。
+//! 无法通过重启恢复的情况（尚未加入网络、配置错误、节点被吊销）以退出码 0 停止，使 SCM 不再自动重启。
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -43,7 +43,7 @@ pub type Stop = Pin<Box<dyn Future<Output = ()>>>;
 /// 服务要做的事：运行到 [`Stop`] 完成为止，返回服务的退出码。0 是正常停止，别的 SCM 会重新启动服务。
 type Job = Box<dyn FnOnce(Stop) -> u32 + Send>;
 
-/// [`dispatch`] 交给 [`service_main`] 的事。SCM 在它自己的线程上调用服务的入口，带不了参数，所以放在这里。
+/// 供 [`dispatch`] 传递给 [`service_main`] 的任务闭包。SCM 在独立线程中调用服务入口且不支持传参，因此通过全局变量中转。
 static JOB: Mutex<Option<Job>> = Mutex::new(None);
 
 /// 在 SCM 下面运行 `job`，等到服务停止才返回。
@@ -70,7 +70,7 @@ fn service_main(_arguments: Vec<OsString>) {
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
     };
-    // 登记不上就没有办法向 SCM 报状态，它等不到"运行中"会自己判定启动失败。这时日志还没有初始化。
+    // 注册控制处理器失败则无法向 SCM 上报状态，SCM 未收到"运行中"状态将判定启动失败。此时日志尚未初始化。
     let Ok(status) = service_control_handler::register(NAME, handler) else { return };
     report(status, ServiceState::Running, 0);
     let stop = Box::pin(async move {
@@ -101,7 +101,7 @@ fn report(status: ServiceStatusHandle, state: ServiceState, exit_code: u32) {
         process_id: None,
     });
     if let Err(error) = reported {
-        tracing::warn!(%error, ?state, "没能把服务的状态报给系统");
+        tracing::warn!(%error, ?state, "向系统上报服务状态失败");
     }
 }
 
@@ -123,7 +123,7 @@ fn open(access: ServiceAccess) -> windows_service::Result<Option<Service>> {
     }
 }
 
-/// 服务登记了没有。问不出来时当作没有。
+/// 查询服务是否已注册。查询失败时按未注册处理。
 pub fn is_installed() -> bool {
     matches!(open(ServiceAccess::QUERY_STATUS), Ok(Some(_)))
 }
@@ -182,7 +182,7 @@ pub fn uninstall() -> windows_service::Result<()> {
 ///
 /// # Errors
 ///
-/// 没有管理员权限，或者服务启动不了。
+/// 缺少管理员权限或服务启动失败。
 pub fn restart() -> windows_service::Result<bool> {
     let Some(service) = open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START)? else { return Ok(false) };
     stop(&service)?;

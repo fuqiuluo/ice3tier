@@ -21,44 +21,44 @@ use crate::runtime::Runtime;
 pub(crate) fn render(runtime: &Runtime) -> String {
     let mut out = Exposition::new();
     let netmap = runtime.netmap.borrow().clone();
-    out.gauge("i3t_info", "节点程序的版本", &[("version", &runtime.program.version.to_string())], 1.0);
-    out.gauge("i3t_uptime_seconds", "这个进程运行了多久", &[], runtime.started.elapsed().as_secs_f64());
-    out.gauge("i3t_netmap_version", "正在用的配置（netmap）是第几版", &[], as_gauge(netmap.version));
+    out.gauge("i3t_info", "节点程序版本", &[("version", &runtime.program.version.to_string())], 1.0);
+    out.gauge("i3t_uptime_seconds", "进程已运行时长（秒）", &[], runtime.started.elapsed().as_secs_f64());
+    out.gauge("i3t_netmap_version", "当前生效的 netmap 版本号", &[], as_gauge(netmap.version));
 
     // 静态模式下没有这条连接，也就没有这个指标。
     if let Some(link) = &runtime.link {
         let online = *link.borrow() == LinkState::Online;
-        out.gauge("i3t_controller_link_up", "和 controller 的长连接：连着是 1，没连着是 0", &[], f64::from(u8::from(online)));
+        out.gauge("i3t_controller_link_up", "与 controller 的长连接状态：已连接为 1，未连接为 0", &[], f64::from(u8::from(online)));
     }
 
     let sample = runtime.sample_flows();
-    let help = "正在进行的流：ingress 是入口上的连接，exit 是替别的节点连目标的流和数据报上下文";
+    let help = "活跃流数：ingress 为入口连接，exit 为替对端节点转发目标的流与数据报上下文";
     out.gauge("i3t_flows_active", help, &[("side", "ingress")], as_gauge(sample.ingress));
     out.gauge("i3t_flows_active", help, &[("side", "exit")], as_gauge(sample.exit));
     out.gauge(
         "i3t_flows_blocking_update",
-        "更新要等它变成零的那个数：活跃的流，唯一的 relay 正在转发时再加一",
+        "阻塞更新重启的活跃计数：活跃流数，若作为唯一 relay 正在转发则加 1",
         &[],
         as_gauge(*runtime.flows.borrow()),
     );
 
     let stats = runtime.exit.stats();
-    out.counter("i3t_exit_flows_total", "出口收到过的建流请求", &[], stats.total);
-    let help = "出口搬运的字节数";
+    out.counter("i3t_exit_flows_total", "出口收到的建流请求总数", &[], stats.total);
+    let help = "出口转发的字节数";
     out.counter("i3t_exit_bytes_total", help, &[("direction", "to_target")], stats.bytes_to_target);
     out.counter("i3t_exit_bytes_total", help, &[("direction", "from_target")], stats.bytes_from_target);
-    let help = "出口没有建成的请求，按归因分：target 是目标的问题，refused 是被规则或策略拒绝，exit 是出口自己的问题";
+    let help = "出口未能建立的请求数，按归因分类：target 为目标问题，refused 为规则或策略拒绝，exit 为出口自身问题";
     out.counter("i3t_exit_failures_total", help, &[("attribution", "target")], stats.failed_by_target);
     out.counter("i3t_exit_failures_total", help, &[("attribution", "refused")], stats.refused);
     out.counter("i3t_exit_failures_total", help, &[("attribution", "exit")], stats.failed_by_exit);
-    out.counter("i3t_exit_flows_aborted_total", "建成之后没有正常结束的流", &[], stats.aborted);
+    out.counter("i3t_exit_flows_aborted_total", "建立后异常结束的流数量", &[], stats.aborted);
     out.counter(
         "i3t_drain_refused_total",
-        "因为节点正在排空而拒绝的请求，入口和出口两边的",
+        "因节点正在排空而拒绝的请求数（含入口与出口）",
         &[],
         stats.drained.saturating_add(runtime.access.drained()),
     );
-    out.gauge("i3t_draining", "节点正在排空：是 1，不接新的流", &[], f64::from(u8::from(stats.draining)));
+    out.gauge("i3t_draining", "节点正在排空时为 1（不再接受新流），否则为 0", &[], f64::from(u8::from(stats.draining)));
     if let Some(quota) = stats.quota {
         out.gauge("i3t_exit_quota_bytes", "出口每个账期的流量配额（字节）", &[], bytes_gauge(quota.limit_bytes));
         out.gauge("i3t_exit_quota_used_bytes", "出口本账期已经用掉的流量（字节）", &[], bytes_gauge(quota.used_bytes));
@@ -94,14 +94,19 @@ pub(crate) fn render(runtime: &Runtime) -> String {
     }
 
     let relay = runtime.endpoint.relay_counters();
-    out.gauge("i3t_relay_enabled", "本节点是不是启用成了 relay", &[], f64::from(u8::from(netmap.me.relay.is_some())));
-    out.gauge("i3t_relay_sessions", "relay 上现在的中转会话数", &[], as_gauge(relay.sessions));
-    out.counter("i3t_relay_sessions_opened_total", "relay 上握手成功过的次数", &[], relay.sessions_opened);
-    out.counter("i3t_relay_forwarded_packets_total", "relay 转发出去的包数", &[], relay.forwarded_packets);
-    out.counter("i3t_relay_forwarded_bytes_total", "relay 转发出去的字节数，含中转头", &[], relay.forwarded_bytes);
+    out.gauge("i3t_relay_enabled", "本节点是否启用为 relay（启用为 1，未启用为 0）", &[], f64::from(u8::from(netmap.me.relay.is_some())));
+    out.gauge("i3t_relay_sessions", "relay 当前的中转会话数", &[], as_gauge(relay.sessions));
+    out.counter("i3t_relay_sessions_opened_total", "relay 握手成功总次数", &[], relay.sessions_opened);
+    out.counter("i3t_relay_forwarded_packets_total", "relay 转发的数据包总数", &[], relay.forwarded_packets);
+    out.counter("i3t_relay_forwarded_bytes_total", "relay 转发的字节总数（含中转头）", &[], relay.forwarded_bytes);
     for reason in DropReason::ALL {
         let label = snake_case(&format!("{reason:?}"));
-        out.counter("i3t_relay_dropped_total", "relay 没有照办的包和握手，按原因分", &[("reason", &label)], relay.dropped(reason));
+        out.counter(
+            "i3t_relay_dropped_total",
+            "relay 丢弃或拒绝的数据包与握手次数，按原因分类",
+            &[("reason", &label)],
+            relay.dropped(reason),
+        );
     }
 
     let routes = runtime.endpoint.routes();
@@ -127,9 +132,9 @@ pub(crate) fn render(runtime: &Runtime) -> String {
     for entry in &routes {
         let Some(actual) = runtime.endpoint.connection_rtt(entry.peer) else { continue };
         let peer = name_of(entry.peer);
-        out.gauge("i3t_peer_connection_rtt_ms", "到每个对端的连接自己量的往返时间（毫秒）", &[("peer", &peer)], millis(actual));
+        out.gauge("i3t_peer_connection_rtt_ms", "到各对端连接的实测往返时间（毫秒）", &[("peer", &peer)], millis(actual));
         if let Some(deviation) = rtt_deviation_ms(entry.rtt_ms, actual) {
-            let help = "到每个对端的连接实际的往返时间减去路由层按各段推算的（毫秒）：差得多说明测量失真";
+            let help = "到各对端连接的实测往返时间与路由层推算值之差（毫秒）：偏差过大表示测量失真";
             out.gauge("i3t_peer_rtt_deviation_ms", help, &[("peer", &peer)], deviation);
         }
     }
@@ -138,22 +143,22 @@ pub(crate) fn render(runtime: &Runtime) -> String {
     vnet_metrics(&mut out, &runtime.vnet_report());
 
     let update = update_label(&runtime.update.borrow());
-    out.gauge("i3t_update_state", "程序更新进行到哪一步", &[("state", &update)], 1.0);
+    out.gauge("i3t_update_state", "程序更新当前所处阶段", &[("state", &update)], 1.0);
     out.finish()
 }
 
-/// 虚拟网卡：装没装、收发的包和字节、按原因丢掉的包。
+/// 虚拟网卡指标：安装状态、收发数据包与字节数，以及按原因分类的丢包数。
 fn vnet_metrics(out: &mut Exposition, report: &VnetReport) {
     let installed = matches!(report.state, VnetState::Installed { .. });
-    out.gauge("i3t_vnet_installed", "虚拟网卡装着是 1，没装（关着、装不上）是 0", &[], f64::from(u8::from(installed)));
-    let help = "经虚拟网卡发给别的节点（sent）、从别的节点收进网卡（received）的包";
+    out.gauge("i3t_vnet_installed", "虚拟网卡已安装为 1，未安装（已关闭或初始化失败）为 0", &[], f64::from(u8::from(installed)));
+    let help = "经虚拟网卡发送至对端（sent）与从对端接收（received）的数据包数";
     out.counter("i3t_vnet_packets_total", help, &[("direction", "sent")], report.sent_packets);
     out.counter("i3t_vnet_packets_total", help, &[("direction", "received")], report.received_packets);
-    let help = "经虚拟网卡发出、收进的字节（IP 包的长度）";
+    let help = "经虚拟网卡发送与接收的字节数（按 IP 包长度统计）";
     out.counter("i3t_vnet_bytes_total", help, &[("direction", "sent")], report.sent_bytes);
     out.counter("i3t_vnet_bytes_total", help, &[("direction", "received")], report.received_bytes);
     let dropped = report.dropped;
-    let help = "虚拟网卡丢掉的包，按原因";
+    let help = "虚拟网卡丢弃的数据包数，按原因分类";
     for (reason, count) in [
         ("bad_source", dropped.bad_source),
         ("bad_destination", dropped.bad_destination),
@@ -169,13 +174,13 @@ fn millis(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-/// 连接实际的往返时间比路由层推算的多出多少毫秒（少了是负的）。推算不出来时没有。
+/// 连接实测往返时间与路由层推算值之差（毫秒，偏小为负值）。无法推算时返回 `None`。
 fn rtt_deviation_ms(predicted_ms: Option<u32>, actual: std::time::Duration) -> Option<f64> {
     predicted_ms.map(|predicted| millis(actual) - f64::from(predicted))
 }
 
-/// ice3proxy（lane）：每个列出来的对端一组（`always` 的，和 `udp_fallback` 里现在要用或者正在用的，见 `lanes::listed`），
-/// 加上全节点的握手失败。
+/// ice3proxy（lane）指标：为每个展示对端输出一组指标（`always` 与 `udp_fallback` 中需要或正在使用的对端，见 `lanes::listed`），
+/// 外加全节点的握手失败计数。
 fn lane_metrics(out: &mut Exposition, status: &LaneStatus, name_of: &impl Fn(NodeId) -> String) {
     for peer in &status.peers {
         let name = name_of(peer.peer);
@@ -183,32 +188,32 @@ fn lane_metrics(out: &mut Exposition, status: &LaneStatus, name_of: &impl Fn(Nod
         let counts = &peer.counts;
         out.gauge(
             "i3t_lane_control_up",
-            "和每个对端之间的控制 lane 在不在：在是 1，不在时新的 TCP 流走共用的连接",
+            "与各对端之间的控制 lane 状态：已建立为 1，未建立时新 TCP 流走共用连接",
             &label,
             f64::from(u8::from(peer.control)),
         );
-        let help = "空闲的 lane：parked_here 是对端停在本节点的，ready 是本节点拨好留给自己的，parked_at_peer 是本节点停在对端的";
+        let help = "空闲的 lane：parked_here 为对端停靠在本节点的，ready 为本节点拨好预留自用的，parked_at_peer 为本节点停靠在对端的";
         for (pool, value) in [("parked_here", peer.idle), ("ready", peer.ready), ("parked_at_peer", peer.parked_at_peer)] {
             out.gauge("i3t_lane_idle", help, &[("peer", name.as_str()), ("pool", pool)], as_gauge(value));
         }
-        out.gauge("i3t_lane_in_use", "正在承载流的 lane", &label, as_gauge(counts.in_use));
-        out.gauge("i3t_lane_dialling", "正在拨号（连接或握手）的 lane", &label, as_gauge(counts.dialling));
-        out.counter("i3t_lane_claims_total", "从对端停在本节点的 lane 里取用的次数", &label, counts.claims);
-        out.counter("i3t_lane_claims_waited_total", "取用时池是空的、要等补拨的次数", &label, counts.claims_waited);
+        out.gauge("i3t_lane_in_use", "正在承载流的 lane 数量", &label, as_gauge(counts.in_use));
+        out.gauge("i3t_lane_dialling", "正在拨号（连接或握手）的 lane 数量", &label, as_gauge(counts.dialling));
+        out.counter("i3t_lane_claims_total", "从对端停靠在本节点的 lane 池中取用的次数", &label, counts.claims);
+        out.counter("i3t_lane_claims_waited_total", "获取 lane 时池为空并等待补拨的次数", &label, counts.claims_waited);
         let waited = u64::try_from(counts.claim_wait.as_millis()).unwrap_or(u64::MAX);
-        out.counter("i3t_lane_claim_wait_milliseconds_total", "取用时一共等了多少毫秒", &label, waited);
-        out.counter("i3t_lane_claims_failed_total", "取不到 lane 的次数", &label, counts.claims_failed);
-        out.counter("i3t_lane_fallbacks_total", "本来要走 lane、取不到改走共用连接的 TCP 流", &label, counts.fallbacks);
-        out.counter("i3t_lane_dial_failures_total", "本节点拨 lane 失败的次数", &label, counts.dial_failures);
-        out.counter("i3t_lane_refused_total", "握手成功、但因为用途或数量不对被关掉的 lane", &label, counts.refused);
-        let help = "lane 上搬运的流数据字节数（两个方向合计）：sealed 在 TLS 里，passthrough 不再加密、在程序里搬，spliced 由内核直接搬";
+        out.counter("i3t_lane_claim_wait_milliseconds_total", "获取 lane 累计等待时长（毫秒）", &label, waited);
+        out.counter("i3t_lane_claims_failed_total", "获取 lane 失败的次数", &label, counts.claims_failed);
+        out.counter("i3t_lane_fallbacks_total", "计划经 lane 传输但因获取失败而回退到共用连接的 TCP 流数量", &label, counts.fallbacks);
+        out.counter("i3t_lane_dial_failures_total", "本节点拨号建立 lane 失败的次数", &label, counts.dial_failures);
+        out.counter("i3t_lane_refused_total", "握手成功但因用途或数量不符被关闭的 lane 数量", &label, counts.refused);
+        let help = "经 lane 传输的流数据字节数（双向合计）：sealed 为 TLS 加密转发，passthrough 为应用层直通转发，spliced 为内核态直接转发";
         for (mode, value) in [("sealed", counts.sealed_bytes), ("passthrough", counts.passthrough_bytes), ("spliced", counts.spliced_bytes)]
         {
             out.counter("i3t_lane_bytes_total", help, &[("peer", name.as_str()), ("mode", mode)], value);
         }
     }
     let failures = &status.handshake_failures;
-    let help = "拨进来、没有握手成功的连接，按原因分";
+    let help = "入站拨号中握手失败的连接数，按原因分类";
     for (reason, value) in [
         ("deadline", failures.deadline),
         ("unknown_key", failures.unknown_key),
@@ -220,7 +225,7 @@ fn lane_metrics(out: &mut Exposition, status: &LaneStatus, name_of: &impl Fn(Nod
     }
 }
 
-/// 把一个数当作状态量的值。这里用到的都是小数目（流数、会话数、版本号），放不进 `u32` 时停在最大值。
+/// 将整数转换为状态量（gauge）值。此处均为小数值（流数、会话数、版本号），超出 `u32` 范围时饱和为最大值。
 fn as_gauge(value: impl TryInto<u32>) -> f64 {
     f64::from(value.try_into().unwrap_or(u32::MAX))
 }

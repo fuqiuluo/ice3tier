@@ -1,5 +1,5 @@
-//! 负载端到上游的第一段：直接连，或者经 ice3tier 的代理（SOCKS5、HTTP CONNECT）。走哪个出口是代理自己定的，
-//! 网址里的用户名和密码是这个代理认的那一对（回环上不认证的代理可以不写）。
+//! 负载端到上游的第一段链路：直连或经 ice3tier 代理（SOCKS5、HTTP CONNECT）。出口选择由代理决定，
+//! URL 中的用户名和密码用于代理认证（回环地址上无需认证的代理可省略）。
 
 use std::fmt;
 use std::io;
@@ -87,10 +87,10 @@ impl fmt::Display for Proxy {
     }
 }
 
-/// 建立隧道失败。分开是为了在结果里区分"连不上代理""代理拒绝"和"握手中途出错"。
+/// 建立隧道失败。细分错误类型以便在结果中区分"无法连接代理"、"代理拒绝"和"握手过程出错"。
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error("连不上")]
+    #[error("连接失败")]
     Connect(#[source] io::Error),
     #[error("代理拒绝：{0}")]
     Refused(String),
@@ -149,7 +149,7 @@ async fn socks5_handshake(stream: &mut TcpStream, auth: Option<&Auth>, host: &st
         let mut status = [0_u8; 2];
         stream.read_exact(&mut status).await?;
         if status[1] != 0 {
-            return Err(ProxyError::Refused(format!("用户名 {:?} 认证没有通过（状态 {}）", auth.user, status[1])));
+            return Err(ProxyError::Refused(format!("用户名 {:?} 认证失败（状态 {}）", auth.user, status[1])));
         }
     }
     stream.write_all(&socks5_request(host, port)?).await?;
@@ -167,7 +167,7 @@ async fn socks5_handshake(stream: &mut TcpStream, auth: Option<&Auth>, host: &st
             stream.read_exact(&mut len).await?;
             usize::from(len[0])
         }
-        other => return Err(ProxyError::Refused(format!("代理的回答里地址类型不认识：{other}"))),
+        other => return Err(ProxyError::Refused(format!("代理响应包含未知的地址类型：{other}"))),
     };
     let mut rest = vec![0_u8; address_len + 2];
     stream.read_exact(&mut rest).await?;
@@ -206,7 +206,7 @@ fn socks5_reply_text(code: u8) -> &'static str {
         0x06 => "TTL 过期（06）",
         0x07 => "不支持的命令（07）",
         0x08 => "不支持的地址类型（08）",
-        _ => "不认识的错误码",
+        _ => "未知错误码",
     }
 }
 

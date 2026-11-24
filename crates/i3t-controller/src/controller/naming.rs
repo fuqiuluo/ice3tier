@@ -28,7 +28,7 @@ pub(super) fn label(what: &str, raw: &str) -> Result<String, Error> {
     Ok(name)
 }
 
-/// 从节点上报的主机名里取一个可以当节点名的写法；取不出来时返回 `None`，节点就叫 `node-<编号>`。
+/// 从节点上报的主机名中提取合法的节点名称；无法提取时返回 `None`，节点将命名为 `node-<编号>`。
 ///
 /// 只取第一段（`nas.lan` 取 `nas`），大写转小写，名字里不能有的字符换成连字符。
 /// 结果留出加序号的余地：同一个网络里重名时调用方在后面加 `-2`、`-3`。
@@ -55,7 +55,7 @@ const UNIQUE_SUFFIX_ROOM: usize = 5;
 /// 分组的名字：1 到 32 个字符，字母（任何文字的）、数字、连字符、下划线。首尾的空白去掉，大小写保留。
 ///
 /// 字符按 Unicode 的标量值数，字母和数字按 Unicode 的属性认（`char::is_alphanumeric`），所以中文、带变音的字母都可以。
-/// 全是数字也可以：分组在请求里按编号引用，命令行按名字找不到时才把它当编号。
+/// 允许纯数字分组名：API 请求中按分组编号引用，命令行仅在按名称未匹配到时才将其视为编号。
 pub(super) fn group_name(raw: &str) -> Result<String, Error> {
     let name = raw.trim();
     if name.is_empty() {

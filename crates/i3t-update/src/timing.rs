@@ -1,26 +1,27 @@
-//! 什么时候换程序。
+//! 更新安装时机控制。
 //!
-//! 时机由 controller 定（[`UpdateTiming`]），流有多少由调用方报（一个 `watch`，值是活跃的流的数量）。
-//! 这里不数流，只是把两者对起来：
+//! 更新时机由 controller 指定（[`UpdateTiming`]），活跃流数量由调用方通过 `watch` 通道提供。
+//! 本模块不直接统计流量，仅按以下规则协调二者：
 //!
-//! | 时机 | 有流的时候 | 没有流的时候 |
+//! | 时机 | 存在活跃流 | 无活跃流 |
 //! |---|---|---|
-//! | `Now` | 换 | 换 |
-//! | `Idle` | 状态变成"等待空闲"，等到没有流 | 换 |
-//! | `AfterDrain` | 状态变成"排空中"，等到没有流 | 状态变成"排空中"，然后换 |
+//! | `Now` | 立即安装 | 立即安装 |
+//! | `Idle` | 上报“等待空闲”，直至活跃流归零 | 立即安装 |
+//! | `AfterDrain` | 上报“排空中”，直至活跃流归零 | 上报“排空中”，随后立即安装 |
 //!
-//! 调用方看到"排空中"就不再接新的流，直到进程重启。没有流的时候也先宣布再换，是为了把从这里到重启之间的门也关上。
+//! 调用方观察到“排空中”状态后将不再接受新流，直至进程重启。即使当前无活跃流也先切换为排空状态，
+//! 以阻止安装到重启间隙内新流进入。
 
 use i3t_model::update::{UpdateStatus, UpdateTiming, Version};
 use tokio::sync::watch;
 
 use crate::error::UpdateError;
 
-/// 等到可以换程序的时刻。随时可以丢弃这个 future：这里只是在等，没有动任何东西。
+/// 等待允许安装新版本的时机。可随时丢弃该 future 以取消等待：此阶段不会修改磁盘或状态。
 ///
 /// # Errors
 ///
-/// `flows` 的发送端没了：调用方不再通报流的数量，也就等不到了。
+/// `flows` 发送端已关闭，无法继续获取活跃流数量时返回错误。
 pub(crate) async fn wait_for_slot(
     timing: UpdateTiming,
     version: &Version,
@@ -33,7 +34,7 @@ pub(crate) async fn wait_for_slot(
         UpdateTiming::Idle => UpdateStatus::WaitingForIdle { version: version.clone() },
         UpdateTiming::AfterDrain => UpdateStatus::Draining { version: version.clone() },
     };
-    tracing::info!(%version, ?timing, flows = *flows.borrow(), "新程序已经准备好，等没有流的时候再换");
+    tracing::info!(%version, ?timing, flows = *flows.borrow(), "新版本已就绪，等待活跃流归零后执行安装");
     status.send_replace(waiting);
     flows.wait_for(|active| *active == 0).await.map_err(|_| UpdateError::Cancelled)?;
     Ok(())

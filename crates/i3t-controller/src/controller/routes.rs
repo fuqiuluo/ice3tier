@@ -4,7 +4,7 @@
 //!
 //! - **上报**：节点连上之后的第一次上报带着完整的路由表，之后只报变化的条目。这里存每个节点最近的一份，
 //!   节点离线之后留着（界面上标成过期），controller 重启就没有了。
-//! - **现问**：controller 给发送方发一条查询，它用当前的测量值回答。问不到（不在线、版本太旧、没有按时回答）时退回到上报的那一份。
+//! - **实时查询**：controller 向发送方下发查询，由其基于当前测量值应答。无法查询时（离线、版本过旧或超时未应答）退回最近的上报记录。
 //!   回答里带着选路的细节：模式、候选路径和它们的代价、为什么是现在这条。这些随时在变，又只有看路径的时候才用得到，
 //!   所以不随上报走，只在问的时候现取。
 //! - **骨干矩阵**：relay 之间的延迟，每个 relay 自己测、签好名发给别的 relay 和挂靠它的节点。controller 也是现问：
@@ -39,7 +39,7 @@ const MAX_CANDIDATES: usize = 16;
 #[derive(Debug)]
 pub(crate) struct Reported {
     pub(crate) entries: BTreeMap<NodeId, RouteEntry>,
-    /// 各条路的细节：直连的类型、到第一个 relay 的那一段的传输、直连在哪一步。节点说不出来（或者版本太旧不报）的对端不在里面。
+    /// 各条路径的详细信息：直连类型、到首跳 relay 的传输方式以及直连探测阶段。节点无法提供（或版本过旧未上报）的对端不包含在内。
     kinds: BTreeMap<NodeId, ReportedKind>,
     /// 每一条路 controller 第一次看到它的时刻：路换了才重新算，只是延迟变了不算。
     since: BTreeMap<NodeId, Instant>,
@@ -73,7 +73,7 @@ impl ReportedKind {
 /// 一条发出去、还在等回答的查询。
 #[derive(Debug)]
 pub(crate) struct PendingQuery {
-    /// 问的是谁。只有它的回答算数。
+    /// 被查询的目标节点，仅接受该节点返回的应答。
     node: NodeId,
     reply: Reply,
 }
@@ -100,7 +100,7 @@ impl Reply {
 /// 一个节点对骨干矩阵查询的回答，还在路上。
 type PendingRows = oneshot::Receiver<Vec<BackboneRow>>;
 
-/// 两个方向各自在等的回答。问不了的方向是 `None`。
+/// 两个方向各自等待的查询应答。无法发起查询的方向为 `None`。
 #[derive(Debug)]
 pub struct RouteAnswers {
     forward: Option<oneshot::Receiver<RouteAnswer>>,
@@ -185,7 +185,7 @@ impl Controller {
         })
     }
 
-    /// 两个节点之间两个方向的当前路径：先问两端，问不到的方向退回到它最近的上报。
+    /// 查询两个节点间双向当前路径：先向两端实时查询，无法查询的方向退回最近的上报记录。
     ///
     /// 两个方向各由发送方决定走哪条路，所以两端都要问。最多等几秒。
     ///
@@ -209,7 +209,7 @@ impl Controller {
     /// 两个节点不都在这个网络里，或者是同一个节点。
     pub fn ask_path(&self, network: NetworkId, from: NodeId, to: NodeId) -> Result<RouteAnswers, Error> {
         if from == to {
-            return Err(Error::invalid_field("to", "same_node", "要查的是两个不同的节点之间的路径"));
+            return Err(Error::invalid_field("to", "same_node", "查询路径的两端必须为不同的节点"));
         }
         let mut inner = self.lock();
         inner.require_node(network, from)?;
@@ -245,7 +245,7 @@ impl Controller {
     /// 没有这个网络，或者读存储失败。
     pub async fn backbone(self: &Arc<Self>, network: NetworkId) -> Result<BackboneView, Error> {
         let asked = blocking(self, move |controller| controller.ask_backbone(network)).await?;
-        // 查询是同时发出去的，所以一个一个等、共用一个截止时间，总共也只等这么久。
+        // 查询已并发发出，因此顺序等待并共用同一截止时间，总耗时不超过单次超时上限。
         let deadline = tokio::time::Instant::now() + ANSWER_TIMEOUT;
         let mut answers = Vec::with_capacity(asked.len());
         for (node, pending) in asked {
@@ -318,7 +318,7 @@ impl Inner {
 
     /// 记下节点上报的路由和它们的细节。`full` 时整个替换，否则只更新报上来的条目。
     ///
-    /// `kinds` 和 `routes` 是同一批对端：报上来的条目没有细节，就是节点现在说不出来，原来记的那一份也不再对。
+    /// `kinds` 与 `routes` 对应同一批对端：若上报条目缺少对应细节，表示节点当前无法提供，旧缓存记录也随之失效。
     pub(super) fn routes_reported(&mut self, id: NodeId, routes: Vec<RouteEntry>, kinds: Vec<RouteKind>, full: bool) {
         let (Some(sync), Some(live)) = (self.sync.get(&id), self.live.get(&id)) else { return };
         let now = Instant::now();
@@ -358,7 +358,7 @@ impl Inner {
         reported.at = now;
     }
 
-    /// 问 `from`"到 `to` 现在会怎么走"。问不了（不在线，或者它的版本不懂这条消息）时返回 `None`。
+    /// 向 `from` 查询当前前往 `to` 的路由。无法发起查询（节点离线或版本不支持该消息）时返回 `None`。
     fn ask_route(&mut self, from: NodeId, to: NodeId) -> Option<oneshot::Receiver<RouteAnswer>> {
         if !self.live.get(&from).is_some_and(Live::understands_updates) {
             return None;
@@ -368,7 +368,7 @@ impl Inner {
         Some(answer)
     }
 
-    /// 问 `node` 手上的骨干矩阵。问不了（不在线，或者它的版本不懂这条消息）时返回 `None`。
+    /// 向 `node` 查询其持有的骨干矩阵。无法发起查询（节点离线或版本不支持该消息）时返回 `None`。
     fn ask_backbone_of(&mut self, node: NodeId) -> Option<PendingRows> {
         if !self.live.get(&node).is_some_and(Live::understands_backbone) {
             return None;
@@ -378,9 +378,9 @@ impl Inner {
         Some(answer)
     }
 
-    /// 给节点发一条查询，记下谁在等回答。发不出去时返回 `None`。
+    /// 给节点发一条查询，记下谁在等回答。发送失败时返回 `None`。
     pub(super) fn query(&mut self, node: NodeId, message: impl FnOnce(u64) -> ToNode, reply: Reply) -> Option<()> {
-        // 没有人等的查询顺手清掉：节点一直不回答的话，它们不会自己消失。
+        // 顺带清理调用方已放弃等待的查询：若节点长期不应答，这些条目不会自行移除。
         self.route_queries.retain(|_, pending| !pending.reply.is_closed());
         let request = self.next_request();
         if !self.send(node, message(request)) {
@@ -415,14 +415,14 @@ impl Inner {
         }
     }
 
-    /// 取出 `node` 对第 `request` 条查询的回答要交给谁。不是被问的那个节点答的、答的不是问的那种，都不算数，查询接着等。
+    /// 取出 `node` 对第 `request` 号查询对应的应答通道。若来源节点不符或应答类型不匹配则忽略并继续等待原请求。
     fn take_query(&mut self, node: NodeId, request: u64, expected: impl Fn(&Reply) -> bool) -> Option<Reply> {
         let Some(pending) = self.route_queries.remove(&request) else {
-            tracing::debug!(%node, request, "丢掉一条查询的回答：没有在等这个编号（多半是等得太久已经放弃了）");
+            tracing::debug!(%node, request, "忽略查询应答：未找到对应的待处理请求（可能已超时放弃）");
             return None;
         };
         if pending.node != node || !expected(&pending.reply) {
-            tracing::debug!(%node, asked = %pending.node, request, "丢掉一条查询的回答：不是被问的那个节点答的，或者答非所问");
+            tracing::debug!(%node, asked = %pending.node, request, "忽略查询应答：应答节点或应答类型与请求不匹配");
             self.route_queries.insert(request, pending);
             return None;
         }
@@ -453,7 +453,7 @@ impl Inner {
             switches: Vec::new(),
         };
         let reported = self.routes.get(&from.id);
-        // 上报里的细节只在说的是同一条路时才用得上。
+        // 仅当上报记录与当前查询结果指向同一条路径时，才复用其细节字段。
         let reported_kind = |route: &Route| {
             let reported = reported?;
             reported.entries.get(&to.id).filter(|entry| entry.route == *route)?;

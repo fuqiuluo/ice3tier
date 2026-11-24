@@ -100,16 +100,16 @@ impl FromStr for Series {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("不认识的序列 {0:?}")]
+#[error("未知的序列 {0:?}")]
 pub struct UnknownSeries(pub String);
 
 /// 序列里的值是什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Unit {
-    /// 个数（节点、流）。一段里的值是这一段里的平均数，所以可以有小数。
+    /// 数量（节点数、流数）。每个时间桶的值为该时间段内的平均值，因此可能带有小数。
     Count,
-    /// 字节每秒。一段里的值是这一段里节点在线的那些时间的平均速率。
+    /// 字节每秒。每个时间桶的值为该时间段内节点在线期间的平均速率。
     BytesPerSecond,
 }
 
@@ -144,8 +144,8 @@ pub struct SeriesView {
     /// 第一个点和最后一个点的时间（都按 `step` 对齐）。
     pub from: Timestamp,
     pub to: Timestamp,
-    /// `[时间, 值]`。时间是这一段的开始，从 `from` 到 `to` 每一段都在；没有数据的段（节点不在线、controller 没在运行、
-    /// 已经过了保留期）值是 `null`，图上画成断开。还没过完的那一段不在里面。
+    /// `[时间, 值]`。时间为该时间桶的起始时间，覆盖从 `from` 到 `to` 的每个时间桶；无数据的区间（节点离线、controller 未运行
+    /// 或已超出保留期）其值为 `null`，在图表中显示为断开。尚未结束的当前时间桶不包含在内。
     pub points: Vec<(Timestamp, Option<f64>)>,
 }
 

@@ -29,8 +29,8 @@ use crate::socket;
 /// 从 `i3t-lane/2` 起，passthrough 的流上发起方的方向也要等接受方的 SWITCH 才离开 TLS（见 crate 文档）。
 pub const ALPN: &[u8] = b"i3t-lane/2";
 
-/// 上一个版本。还认它，和没升级的节点之间照样拨得通、开得了流，只是本端开的流一律 sealed：
-/// 那边的接受方不认"等 SWITCH"，passthrough 只能是发起方在 OPENING 之后马上离开 TLS（[`Mode::Early`]），本端不再那样做。
+/// 上一协议版本。仍保持兼容，可与未升级节点正常建立连接并开流，但本端发起的流一律采用 sealed 模式：
+/// 旧版接受方不支持等待 SWITCH，其 passthrough 仅支持发起方在 OPENING 后立即离开 TLS（[`Mode::Early`]），本端不再使用该模式。
 ///
 /// [`Mode::Early`]: crate::frame::Mode::Early
 pub(crate) const ALPN_V1: &[u8] = b"i3t-lane/1";
@@ -73,7 +73,7 @@ pub(crate) fn client_config(identity: &Identity, expected: PublicKey) -> Result<
     Ok(Arc::new(config))
 }
 
-/// 接受方的 TLS 配置：`is_allowed` 决定认不认对端的公钥；不发会话票据，也不存会话。
+/// 接受方的 TLS 配置：由 `is_allowed` 决定是否信任对端公钥；不签发会话票据，也不缓存会话。
 ///
 /// # Errors
 ///
@@ -103,7 +103,7 @@ pub(crate) struct Lane {
 }
 
 impl Lane {
-    /// 读下一个帧；对端发了 close_notify 时返回 `None`。可以取消：读到一半的字节留在 lane 里，下次接着读。
+    /// 读取下一帧；收到对端 close_notify 时返回 `None`。支持取消安全：已读取但未凑齐整帧的字节会保留在缓冲中，供下次继续读取。
     ///
     /// # Errors
     ///
@@ -143,7 +143,7 @@ impl Lane {
 
     /// 空闲在池里的 lane 拿出来用之前问一下：对端没有关掉它，也没有在上面发不该发的东西。
     ///
-    /// 不等待。死了但还没被发现的 lane 这里看不出来，要靠开流时较短的 `TCP_USER_TIMEOUT`（见 [`socket`]）。
+    /// 非阻塞检查。此处无法检测尚未感知失效的半开连接，依赖开流阶段较短的 `TCP_USER_TIMEOUT` 发现（见 [`socket`]）。
     pub(crate) fn is_usable(&self) -> bool {
         if !self.sealed.inbound.is_empty() || !self.sealed.at_record_boundary() {
             return false;
@@ -222,17 +222,17 @@ pub(crate) struct Dial<'a> {
 
 /// 拨一条 lane：连上、握手、把 HELLO 排进待发的密文。HELLO 不在这里写出去，调用方可以让后面的帧和它一起走。
 ///
-/// 对方是 relay，有几个地址（controller 找出来的），不一定都连得上。和路径层连 relay 的 TCP 中转一样
-/// （[`i3t_path::connect_first`]）：按顺序错开一点时间一起连，先连上的那个为准，不回答的地址不让后面的等它超时。
+/// 对端为 relay 时可能存在多个候选地址（由 controller 发现），并非全部可达。与路径层连接 relay TCP 中转一致
+/// （[`i3t_path::connect_first`]）：按序错峰并发建连，采用最先连通的地址，避免无响应地址阻塞后续地址。
 /// 返回用的是哪一个，下一次先试它。
 ///
 /// # Errors
 ///
-/// 都连不上、握手失败（包括对端的公钥不对），或者过了 `deadline`。
+/// 所有地址均无法连通、握手失败（含对端公钥不匹配），或超过 `deadline`。
 pub(crate) async fn dial(dial: Dial<'_>) -> Result<(Lane, SocketAddr), LaneError> {
     let Dial { addrs, config, peer, membership, purpose, epoch, deadline } = dial;
     if addrs.is_empty() {
-        return Err(LaneError::Protocol("没有可以拨的地址"));
+        return Err(LaneError::Protocol("缺少可拨号的候选地址"));
     }
     let (socket, addr) = match timeout_at(deadline, i3t_path::connect_first(addrs)).await {
         Ok(Ok(connected)) => connected,
@@ -270,7 +270,7 @@ async fn establish(
 /// 接受一条拨进来的 lane：握手、认出对端、读 HELLO。
 ///
 /// `prefix` 是调用方为了分辨协议已经从 socket 读走的字节。`resolve` 把握手认过的公钥换成节点编号；
-/// 握手和这里之间公钥可能刚被去掉，换不出来就当作不认识。
+/// 握手完成至此处之间该公钥可能已被移除，若无法映射回节点则视为不受信任。
 ///
 /// 时限都是从接受连接时算起的绝对时刻，来多少字节都不延长：`first_record` 之内要收到一条完整的记录（ClientHello），
 /// `deadline` 之内要握手完成并读到 HELLO。
@@ -305,8 +305,8 @@ pub(crate) async fn accept(
             .connection()
             .peer_certificates()
             .and_then(|certificates| certificates.first())
-            .ok_or(LaneError::Protocol("对端没有出示证书"))
-            .and_then(|certificate| tls::peer_key(certificate).map_err(|_| LaneError::Protocol("对端证书里的公钥不对")))?;
+            .ok_or(LaneError::Protocol("对端未提供证书"))
+            .and_then(|certificate| tls::peer_key(certificate).map_err(|_| LaneError::Protocol("无法从对端证书提取有效的 Ed25519 公钥")))?;
         let (peer, membership) = resolve(&key)
             .ok_or(LaneError::Tls(rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)))?;
         let mut removed = membership.clone();
@@ -325,7 +325,7 @@ pub(crate) async fn accept(
                 lane.sealed.shrink();
                 Ok(lane)
             }
-            _ => Err(LaneError::Protocol("lane 上的第一个帧不是 HELLO")),
+            _ => Err(LaneError::Protocol("lane 收到的首帧不是 HELLO")),
         }
     };
     let total = deadline.saturating_duration_since(Instant::now());

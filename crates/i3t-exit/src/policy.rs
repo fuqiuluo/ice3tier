@@ -40,10 +40,10 @@ const BLOCKED_V4: [(Ipv4Net, &str); 16] = [
     (v4(168, 63, 129, 16, 32), "云平台的元数据地址"),
 ];
 
-/// IPv6 的全球单播地址都在这一段里。这一段之外的（未指定、回环、映射、NAT64、唯一本地、链路本地、组播……）一律不放行。
+/// IPv6 全球单播地址均位于该网段内。该网段之外的地址（未指定、回环、映射、NAT64、唯一本地、链路本地、组播等）一律拒绝。
 const GLOBAL_UNICAST_V6: Ipv6Net = v6(0x2000, 0, 3);
 
-/// 全球单播那一段里不放行的部分。
+/// 全球单播地址段中需拒绝的特殊用途子网。
 const BLOCKED_V6: [(Ipv6Net, &str); 4] = [
     // Teredo、ORCHID、基准测试等都在这里面，其中有的把一个 IPv4 地址包在里面。
     (v6(0x2001, 0, 23), "协议保留地址"),
@@ -63,7 +63,7 @@ pub(crate) fn not_public(ip: IpAddr) -> Option<&'static str> {
     }
 }
 
-/// `ip` 是不是链路本地地址。这类地址要带着网卡才有意义，而且云平台的元数据服务就在这一段里。
+/// 判断 `ip` 是否为链路本地地址。此类地址仅在指定网卡作用域内有效，且云平台元数据服务亦位于该网段。
 pub(crate) fn is_link_local(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(ip) => ip.is_link_local(),

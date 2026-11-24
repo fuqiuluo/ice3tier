@@ -17,7 +17,7 @@ use tokio_postgres::types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
 
 type Failure = Box<dyn Error + Sync + Send>;
 
-/// 读一行的结果。列的值读不懂（范围不对、JSON 不是这个类型）也是这个错。
+/// 读取单行记录的结果。列值解析失败（如数值越界或 JSON 结构不匹配）也返回该错误类型。
 pub(super) type Read<T> = Result<T, tokio_postgres::Error>;
 
 /// JSONB 的二进制写法：一个字节的版本号，后面是 JSON 的文字。
@@ -35,8 +35,8 @@ impl<T> Debug for Json<T> {
 impl<T: Serialize> ToSql for Json<T> {
     fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Failure> {
         let mut text = serde_json::to_string(&self.0)?;
-        // PostgreSQL 的文本里放不了 NUL，JSONB 里的字符串也一样。合法的内容里不会有它（名字、主机名在进来时就过滤了），
-        // 可节点报上来的东西不都逐字检查过：去掉它，不让一个字符卡住整条记录。
+        // PostgreSQL 文本和 JSONB 字符串均不允许包含 NUL 字符。合法输入不会包含它（名称与主机名在入口处已过滤），
+        // 但节点上报的字段并非全部逐字符校验，此处剥离 NUL 以免单个字符导致整条记录写入失败。
         if text.contains("\\u0000") {
             let mut value: serde_json::Value = serde_json::from_str(&text)?;
             strip_nul(&mut value);
@@ -61,7 +61,7 @@ impl<'a, T: DeserializeOwned> FromSql<'a> for Json<T> {
         let text = if *ty == Type::JSONB {
             match raw.split_first() {
                 Some((&JSONB_VERSION, text)) => text,
-                _ => return Err("不认识的 JSONB 写法".into()),
+                _ => return Err("不支持的 JSONB 二进制格式".into()),
             }
         } else {
             raw
@@ -148,13 +148,13 @@ impl ToSql for Secret<'_> {
     to_sql_checked!();
 }
 
-/// PostgreSQL 的文本里放不了 NUL。合法的内容里没有它；可有的文本里带着节点报上来的话（更新失败的原因写进操作记录），
-/// 那里面有一个 NUL 不该让整条记录记不下来：去掉它。
+/// PostgreSQL 文本列不允许包含 NUL 字符。正常内容不含 NUL，但部分文本会拼接节点上报信息（如写入操作记录的更新失败原因），
+/// 此处过滤 NUL 以避免单个非法字符导致整条记录写入失败。
 pub(super) fn without_nul(text: &str) -> std::borrow::Cow<'_, str> {
     if text.contains('\0') { text.replace('\0', "").into() } else { text.into() }
 }
 
-/// 存成 `BIGINT` 的无符号整数：编号、时间、版本号、计数。写的时候放不进、读的时候是负数或者超出 `T` 的范围，都是错。
+/// 以 `BIGINT` 存储的无符号整数（编号、时间戳、版本号、计数）。写入溢出 `i64`、读取为负数或超出 `T` 范围时均返回错误。
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Int<T>(pub T);
 

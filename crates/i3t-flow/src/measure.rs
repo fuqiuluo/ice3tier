@@ -6,8 +6,8 @@
 //!   本机的开关），接的话调用 [`MeasureRequest::serve`]。接受方的上限（[`MeasureLimits`]）由它自己定，不管发起方要多少：
 //!   字节数和时长到了就停，另有一个总的时限，发起方不发数据、不读数据都占不住它。
 //! - 数据是全零的块。连接本身是加密的，量到的就是真实负载的吞吐。
-//! - 速率不算开头起步的那一段（[`WARM_UP`]）：连接刚开始发的时候速率是从很低爬上来的，把它算进去，
-//!   先量的那条路径就比后量的低一截，而它们可能是同一条路。字节数和用时仍然是整次搬运的。
+//! - 速率计算排除起始预热阶段（[`WARM_UP`]）：连接启动初期速率仍在爬升，若计入该阶段，
+//!   先测路径的结果会明显偏低，即使两条测试走的是同一路径。总字节数与总耗时仍按完整传输统计。
 
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use crate::{FlowError, header};
 
 /// 一次读写的块有多大。
 const CHUNK: usize = 64 * 1024;
-/// 量完之后等对方的收尾（"收"的方式下接受方写回的那一段）最多等多久。
+/// 测量结束后等待对端收尾（接收模式下接受方写回的汇总数据）的最长时间。
 const SUMMARY_WAIT: Duration = Duration::from_secs(5);
 /// 除了时长上限，接受方另外给流留的余量：建流、慢启动之前的空档、收尾。过了这个总时限一律重置。
 const GRACE: Duration = Duration::from_secs(3);
@@ -51,11 +51,11 @@ pub struct Measured {
     /// 从第一个字节到最后一个字节。
     pub elapsed: Duration,
     pub end: MeasureEnd,
-    /// 去掉起步之后的那一段。搬运没有过完起步就结束了、或者对端是不报这一段的旧版本时没有。
+    /// 剔除起始预热阶段后的稳态统计。若传输在预热阶段内结束，或对端为不上报该字段的旧版本，则为 `None`。
     pub steady: Option<Steady>,
 }
 
-/// 一次搬运去掉开头起步的那一段之后：收到多少、用了多久。
+/// 单次传输剔除起始预热阶段后的接收字节数与耗时。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Steady {
     pub bytes: u64,
@@ -63,12 +63,12 @@ pub struct Steady {
 }
 
 impl Measured {
-    /// 每秒多少比特：有起步之后的那一段就按它算，没有就按整次搬运算。用时太短（不到 1 毫秒）时算不出来，是 `None`。
+    /// 吞吐速率（bit/s）：存在稳态统计时按稳态段计算，否则按整次传输计算。耗时不足 1 毫秒时无法计算，返回 `None`。
     #[must_use]
     pub fn bits_per_second(&self) -> Option<f64> {
         let (bytes, elapsed) = self.steady.map_or((self.bytes, self.elapsed), |steady| (steady.bytes, steady.elapsed));
         let seconds = elapsed.as_secs_f64();
-        // 一次测量最多几十 MB，放得进 u32；真放不下时停在最大值，算出来的只会偏低。
+        // 单次测量最多几十 MB，通常在 u32 范围内；若超出则饱和到最大值，结果只会偏低。
         let bits = f64::from(u32::try_from(bytes).unwrap_or(u32::MAX)) * 8.0;
         (seconds >= 0.001).then(|| bits / seconds)
     }
@@ -109,7 +109,7 @@ impl Meter {
 
     fn measured(&self, end: MeasureEnd) -> Measured {
         let elapsed = self.first.map_or(Duration::ZERO, |first| self.last.saturating_duration_since(first));
-        // 起步结束之后一个字节也没有再来（搬运太短），就没有"之后的那一段"。
+        // 预热结束后若未再收到任何字节（传输过短），则不产生稳态统计。
         let steady = self
             .warmed
             .filter(|(_, before)| self.bytes > *before)
@@ -178,7 +178,7 @@ impl<S: SendStream, R: RecvStream> MeasureRequest<S, R> {
                 self.send.reset(code);
                 self.recv.stop(code);
                 if let Ok(Err(error)) = failed {
-                    tracing::debug!(peer = %self.peer, %error, "测量流中途断了");
+                    tracing::debug!(peer = %self.peer, %error, "测量流中途断开");
                 }
                 Measured { bytes: 0, elapsed: Duration::ZERO, end: MeasureEnd::Time, steady: None }
             }
@@ -249,7 +249,7 @@ async fn source(send: &mut impl SendStream, limits: MeasureLimits) -> std::io::R
         }
     };
     send.shutdown().await?;
-    // 发的一侧不知道对端什么时候收到的，起步之后的那一段由收的一侧自己数。
+    // 发送方无法获知对端各字节的到达时刻，稳态阶段由接收方自行统计。
     Ok(Measured { bytes, elapsed: started.elapsed(), end, steady: None })
 }
 
@@ -260,7 +260,7 @@ async fn source(send: &mut impl SendStream, limits: MeasureLimits) -> std::io::R
 ///
 /// # Errors
 ///
-/// 开不了流、对端拒绝（[`FlowError::Refused`]），或者中途出错、超时。
+/// 开流失败、对端拒绝（[`FlowError::Refused`]），或传输中途出错、超时。
 pub async fn measure<C: Connector>(connector: &C, peer: NodeId, open: &OpenMeasure) -> Result<Measured, FlowError> {
     let (mut send, mut recv) = connector.open(peer).await?;
     send.set_priority(Priority::Low);
@@ -301,7 +301,7 @@ fn abandon(send: &mut impl SendStream, recv: &mut impl RecvStream) {
     recv.stop(code);
 }
 
-/// 上行：写到自己的上限或者对端叫停，然后读对端写回的那一段。
+/// 上行测量：持续写入直至达到上限或被对端中止，随后读取对端写回的汇总信息。
 async fn upload(send: &mut impl SendStream, recv: &mut impl RecvStream, open: &OpenMeasure) -> Result<Measured, FlowError> {
     let chunk = vec![0; CHUNK];
     let started = Instant::now();
@@ -312,7 +312,7 @@ async fn upload(send: &mut impl SendStream, recv: &mut impl RecvStream, open: &O
         let left = duration.saturating_sub(started.elapsed());
         match time::timeout(left, send.write_all(&chunk[..size])).await {
             Ok(Ok(())) => written += u64::try_from(size).unwrap_or(u64::MAX),
-            // 对端到了它的上限，叫停了这个方向；或者时间到了。都去读它写回的那一段。
+            // 对端达到上限中止了写入，或本地超时，均转去读取对端写回的汇总信息。
             Ok(Err(_)) | Err(_) => break,
         }
     }
@@ -327,7 +327,7 @@ async fn upload(send: &mut impl SendStream, recv: &mut impl RecvStream, open: &O
     })
 }
 
-/// 读对端写回的那一段：前面固定的部分一定有；后面"起步之后"的部分较早的版本不写，流在那里就结束了。
+/// 读取对端写回的汇总信息：前部固定字段必然存在；后部稳态统计字段较早版本不写入，流会在此处结束。
 async fn read_summary(recv: &mut impl RecvStream) -> Result<MeasureSummary, FlowError> {
     let mut head = [0; MeasureSummary::LEN];
     recv.read_exact(&mut head).await.map_err(|error| match error.kind() {

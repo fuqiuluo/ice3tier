@@ -1,14 +1,14 @@
-//! 以前的透明访问（0.1.7 到 0.1.25，Linux）留下的东西：虚拟网卡取代了它，节点被杀掉时没来得及拆的要在这里拆掉。
+//! 旧版透明访问模式（0.1.7 至 0.1.25，Linux）遗留系统配置的检测与清理：虚拟网卡已取代该模式，节点异常终止时残留的规则需在此清理。
 //!
-//! 它们不只是多余：那张 nftables 的表会把发往地址段的连接改到一个已经没有人听的端口、把别的包当场拒绝，
-//! 虚拟网卡就不通了。认的办法和以前一样，只认得出是它的才动：
+//! 这些残留不仅多余，其中的 nftables 表还会将发往虚拟网段的连接重定向至无人监听的端口并拒绝其余流量，
+//! 导致虚拟网卡无法正常通信。本模块沿用原有识别特征，仅操作可明确归属于旧版透明访问的配置项：
 //!
-//! | 东西 | 怎么认 |
+//! | 配置项 | 识别依据 |
 //! |---|---|
-//! | nftables 的表 `ip i3t` | 名字（虚拟网卡的表名带编号） |
-//! | 策略路由 `2033: fwmark 0x20000000/0x20000000 lookup 2033 proto 203` | 优先级 2033、`proto 203` |
-//! | 表 2033 里的路由 | `proto 203` |
-//! | dummy 网卡 `i3t0` | 种类是 dummy、别名是 `ice3tier` |
+//! | nftables 表 `ip i3t` | 表名（虚拟网卡使用的表名均带有数字编号） |
+//! | 策略路由 `2033: fwmark 0x20000000/0x20000000 lookup 2033 proto 203` | 优先级 2033 且 `proto 203` |
+//! | 路由表 2033 中的路由 | `proto 203` |
+//! | dummy 虚拟接口 `i3t0` | 接口类型为 `dummy` 且别名为 `ice3tier` |
 
 use serde_json::Value;
 
@@ -23,24 +23,24 @@ const PROTO: &str = "203";
 const LINK: &str = "i3t0";
 const LINK_ALIAS: &str = "ice3tier";
 
-/// 读到的以前留下的东西。
+/// 探测到的旧版透明访问遗留项汇总。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Leftover {
     pub table: bool,
-    /// 自己的策略路由规则有几条。
+    /// 匹配旧版透明访问特征的策略路由规则条数。
     pub rules: usize,
     pub routes: bool,
     pub link: bool,
 }
 
 impl Leftover {
-    /// 一样都没有。
+    /// 判断是否未检测到任何旧版遗留配置。
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         !self.table && self.rules == 0 && !self.routes && !self.link
     }
 
-    /// 读到的每一样，写成系统里的名字（给人看，不翻译）。
+    /// 将检测到的遗留项格式化为系统级名称列表（面向用户展示，不做本地化翻译）。
     #[must_use]
     pub fn items(&self) -> Vec<&'static str> {
         [(self.table, "table ip i3t"), (self.rules > 0, "ip rule 2033"), (self.routes, "ip route table 2033"), (self.link, "dummy i3t0")]
@@ -49,11 +49,11 @@ impl Leftover {
             .collect()
     }
 
-    /// 读一遍（Linux）。
+    /// 扫描当前系统中的旧版透明访问遗留配置（Linux）。
     ///
     /// # Errors
     ///
-    /// 读不了或者读不懂系统的回答。
+    /// 执行系统命令失败或无法解析命令输出时返回错误。
     pub fn find(machine: &mut impl Machine) -> Result<Self, CommandError> {
         let table = has_table(&machine.run(Program::Nft, &linux::list_tables(), None)?, TABLE)?;
         let rules = rules(&machine.run(Program::Ip, &args(&["-j", "rule", "show"]), None)?)?;
@@ -73,11 +73,11 @@ impl Leftover {
         Ok(Self { table, rules, routes, link })
     }
 
-    /// 拆掉读到的那些。每一项各自做，返回第一个失败。
+    /// 依次清理已检测到的遗留配置项。各项独立执行，返回首个发生的错误。
     ///
     /// # Errors
     ///
-    /// 某一项拆不掉。别的项照样拆了。
+    /// 任一配置项清理失败时返回首个错误，其余配置项仍会继续尝试清理。
     pub fn remove(&self, machine: &mut impl Machine) -> Result<(), CommandError> {
         let mut first = None;
         let mut keep = |result: Result<String, CommandError>| {
@@ -102,7 +102,7 @@ impl Leftover {
     }
 }
 
-/// `ip -j rule show` 的输出里以前的规则有几条。
+/// 统计 `ip -j rule show` 输出中属于旧版透明访问的策略路由规则条数。
 fn rules(json: &str) -> Result<usize, CommandError> {
     let rules = listing(json)?;
     Ok(rules
@@ -112,16 +112,16 @@ fn rules(json: &str) -> Result<usize, CommandError> {
         .count())
 }
 
-/// `ip -j` 的输出：一个 JSON 数组。什么都没有输出算空的；读不懂的是错误，不是"没有"。
+/// 解析 `ip -j` 输出的 JSON 数组。空输出视为空列表；无法解析的内容返回错误，而非视为无条目。
 fn listing(json: &str) -> Result<Vec<Value>, CommandError> {
     if json.trim().is_empty() {
         return Ok(Vec::new());
     }
     serde_json::from_str(json)
-        .map_err(|error| CommandError::Io { program: Program::Ip, detail: format!("读不懂 ip 的输出：{error}") })
+        .map_err(|error| CommandError::Io { program: Program::Ip, detail: format!("无法解析 ip 命令输出：{error}") })
 }
 
-/// `ip -j` 有时把编号写成字符串，有时写成数。
+/// 提取 `ip -j` 字段值（不同版本可能将编号序列化为字符串或整数）。
 fn text(value: Option<&Value>) -> Option<String> {
     match value? {
         Value::String(text) => Some(text.clone()),

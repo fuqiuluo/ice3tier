@@ -2,7 +2,7 @@
 //!
 //! cookie 是用一把只有本进程知道的密钥，对"来源地址 + 节点编号 + 时间片"算出来的消息认证码。
 //! relay 发出去之后什么都不记；AUTH 把它带回来时重算一遍，对得上就说明对方收到过发往这个地址的 CHALLENGE。
-//! 伪造来源地址的人收不到 CHALLENGE，也就拿不出 cookie，relay 不会为它验签名。
+//! 伪造来源地址的一方无法收到 CHALLENGE，因而无法提供有效 cookie，relay 不会为其执行签名验证。
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ impl CookieJar {
         message[18..22].copy_from_slice(&node.to_be_bytes());
         message[22..].copy_from_slice(&slice.to_be_bytes());
         let tag = hmac::sign(&self.key, &message);
-        *tag.as_ref().first_chunk::<COOKIE_LEN>().expect("HMAC-SHA256 的输出是 32 字节，比 cookie 长")
+        *tag.as_ref().first_chunk::<COOKIE_LEN>().expect("HMAC-SHA256 输出长度为 32 字节，大于 cookie 长度")
     }
 }
 

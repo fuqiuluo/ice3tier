@@ -2,13 +2,13 @@
 //!
 //! | 模块 | 内容 |
 //! |---|---|
-//! | [`port`] | 节点唯一的那个 UDP 端口：绑定、批量收发 |
-//! | [`ifaddr`] | 本机网卡地址，用来当局域网里的候选端点 |
-//! | [`addr_query`] | 向别人问"你看到我的地址是什么" |
-//! | [`tcp_leg`] | TCP 中转的一条 TCP：限制积压的写、按帧读。节点和 relay 两头共用 |
-//! | [`tcp_recovery`] | 节点之间的 TCP 断网之后尽快恢复：重传上限和放弃时限一起设 |
-//! | [`tcp_mss`] | 本进程开出去、接进来的 TCP 都通告一个压低的 MSS，躲开路径 MTU 黑洞 |
-//! | [`tcp_reset`] | 异常结束一条 TCP：关闭时发 RST，并且让对端认它；设成这样的连接怎样正常结束 |
+//! | [`port`] | 节点唯一的 UDP 端口：绑定、批量收发 |
+//! | [`ifaddr`] | 本机网卡地址，用作局域网候选端点 |
+//! | [`addr_query`] | 反射地址查询：向服务器询问其观察到的本机地址 |
+//! | [`tcp_leg`] | TCP 中继连接封装：限制积压的写入与逐帧读取，节点与 relay 共用 |
+//! | [`tcp_recovery`] | 节点间 TCP 断网后快速恢复：同时配置重传上限与放弃时限 |
+//! | [`tcp_mss`] | 为出站与入站 TCP 连接通告较低的 MSS，规避路径 MTU 黑洞 |
+//! | [`tcp_reset`] | 异常关闭 TCP 连接（关闭时发送 RST 并确保对端接收）以及此类连接的正常关闭流程 |
 //! | [`lan`] | 局域网发现：组播信标 |
 //! | [`portmap`] | 自动端口映射：PCP、NAT-PMP、UPnP-IGD |
 
@@ -31,11 +31,11 @@ use ring::rand::{SecureRandom, SystemRandom};
 ///
 /// # Panics
 ///
-/// 操作系统的随机数源不可用。这种情况下进程没法安全地做任何握手，也没有可以退回的办法。
+/// 操作系统的随机数源不可用。此时进程无法安全完成握手，且无可用的回退方案。
 #[must_use]
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0; N];
-    SystemRandom::new().fill(&mut bytes).expect("操作系统的随机数源不可用，进程没法继续安全地运行");
+    SystemRandom::new().fill(&mut bytes).expect("操作系统随机数源不可用，进程无法安全运行");
     bytes
 }
 

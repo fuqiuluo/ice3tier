@@ -48,7 +48,7 @@ pub(crate) async fn serve(listener: TcpListener, router: Router, mut shutdown: w
                     connections.spawn(serve_connection(stream, remote, router.clone(), pass, shutdown.clone()));
                 }
                 Err(err) => {
-                    // 多半是文件描述符用完了。歇一下再接，免得空转。
+                    // 通常由文件描述符耗尽导致。短暂休眠后再继续接受连接，避免空转。
                     if let Some(suppressed) = accept_errors.allow() {
                         tracing::warn!(suppressed, "管理 API 接受连接失败：{err}");
                     }
@@ -62,7 +62,7 @@ pub(crate) async fn serve(listener: TcpListener, router: Router, mut shutdown: w
     drop(listener);
     // 每条连接自己也在看 shutdown：答完手上的请求就关。
     if timeout(SHUTDOWN_GRACE, async { while connections.join_next().await.is_some() {} }).await.is_err() {
-        tracing::warn!("有管理 API 的连接没有在 {SHUTDOWN_GRACE:?} 之内结束，不再等它们");
+        tracing::warn!("部分管理 API 连接未在 {SHUTDOWN_GRACE:?} 内结束，放弃等待");
     }
 }
 
@@ -85,7 +85,7 @@ async fn serve_connection(stream: TcpStream, remote: SocketAddr, router: Router,
                 return;
             }
             () = pass.evicted() => {
-                tracing::debug!(%remote, "管理 API 的连接太多，这一条被挤掉了");
+                tracing::debug!(%remote, "管理 API 连接数已达上限，当前连接被淘汰");
                 return;
             }
             _ = shutdown.changed(), if !closing => {

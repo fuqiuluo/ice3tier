@@ -9,10 +9,10 @@
 //!
 //! 更新在这里的接法：
 //!
-//! 1. 启动时先问更新库上一次更新怎么样了：新程序没被确认过太多次或者太久，这时已经换回旧程序，本进程直接要求重启。
+//! 1. 启动时先检查更新库中的上次更新状态：若新版本多次或长时间未获确认，则已回退至旧版本，本进程直接请求重启。
 //! 2. 每次连上 controller 就向更新库确认一次：新程序连上了 controller 才算更新成功。
 //! 3. controller 的指示交给 [`update`](crate::update)，包经长连接取，状态的每次变化马上上报。
-//! 4. 更新进行到"排空中"时不再接新的流（见 [`drain`](crate::drain)）：入口和出口都明确拒绝新的请求，监听照常开着；
+//! 4. 更新进入“排空中”阶段后不再接受新流（见 [`drain`](crate::drain)）：入口与出口均明确拒绝新请求，监听器保持开启；
 //!    对端不再在和本节点之间的 ice3proxy 上开新的流。
 //! 5. 程序文件换好之后把最后的状态报上去，然后返回 [`Outcome::Restart`]。
 
@@ -67,20 +67,20 @@ pub enum Source {
     Static(PathBuf),
 }
 
-/// 重启也救不了的退出码（sysexits 的 `EX_CONFIG`）：配置文件有错、还没有加入网络，或者被 controller 吊销、拒绝。
+/// 无法通过重启恢复的退出码（sysexits 的 `EX_CONFIG`）：配置文件有误、尚未加入网络，或被 controller 吊销、拒绝。
 ///
 /// systemd 单元里用 `RestartPreventExitStatus=78` 拦住它，免得 `Restart=always` 加 `StartLimitIntervalSec=0`
 /// 每两秒白白重启一次、刷日志或者反复打 controller。
 pub const NO_RESTART_EXIT_CODE: u8 = 78;
 
-/// 节点碰到了重启也救不了的错误：改好配置、重新加入网络，或者由管理员处理之前，再启动多少次都会同样失败。
+/// 节点遇到了无法通过重启恢复的错误：在修正配置、重新加入网络或管理员处理之前，重复启动仍会同样失败。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StopError {
     #[error("{NOT_JOINED}")]
     NotJoined,
     #[error("controller 吊销了这个节点")]
     Revoked,
-    #[error("controller 不认这个节点了（它可能已经被删除）。要重新加入网络：echo <令牌> | i3t join")]
+    #[error("本节点已被 controller 拒绝（节点可能已被删除）。请重新加入网络：echo <令牌> | i3t join")]
     Rejected,
 }
 
@@ -89,8 +89,8 @@ pub enum StopError {
 pub enum Outcome {
     /// 被要求停止。
     Stopped,
-    /// 程序文件换过了（更新，或者更新没成换回了旧的），要重新启动进程：
-    /// 以 [`RESTART_EXIT_CODE`](i3t_update::RESTART_EXIT_CODE) 退出，由外面的看护程序拉起来。
+    /// 程序文件已替换（更新完成，或更新失败后回退至旧版本），需要重启进程：
+    /// 以 [`RESTART_EXIT_CODE`](i3t_update::RESTART_EXIT_CODE) 退出，由外部守护进程拉起。
     Restart,
 }
 
@@ -99,7 +99,7 @@ pub enum Outcome {
 ///
 /// # Errors
 ///
-/// 配置文件有错，或者静态模式下 netmap 文件读不了。还没有加入网络不算错：那时 [`run`] 自己会报。
+/// 配置文件有误，或静态模式下无法读取 netmap 文件。尚未加入网络不视为错误：该情况由 [`run`] 自行报告。
 pub fn starting_performance(state: &StateDir, source: &Source) -> anyhow::Result<Performance> {
     let config = Config::load(&state.config_path())?;
     let netmap = match source {
@@ -120,7 +120,7 @@ fn read_static(path: &Path) -> anyhow::Result<Netmap> {
 ///
 /// # Errors
 ///
-/// 配置文件有错、还没有加入网络、端口绑不上，或者运行中被 controller 吊销、拒绝。
+/// 配置文件有误、尚未加入网络、端口绑定失败，或运行期间被 controller 吊销、拒绝。
 pub async fn run(
     state: StateDir,
     source: Source,
@@ -130,7 +130,7 @@ pub async fn run(
 ) -> anyhow::Result<Outcome> {
     let config = Config::load(&state.config_path())?;
     for section in config.retired() {
-        tracing::info!(section, "配置文件里的这一节已经不起作用（透明访问被虚拟网卡取代了，见 [network]），照收、忽略；可以删掉它");
+        tracing::info!(section, "配置文件中的该节已废弃（透明访问已由虚拟网卡取代，见 [network]），将忽略该配置，可安全删除");
     }
     let (key, initial) = match &source {
         Source::Controller => {
@@ -144,13 +144,13 @@ pub async fn run(
         Source::Static(_) => None,
     };
 
-    // 更新的善后要在连 controller、绑端口之前做：上一次换上来的程序要是一直没被确认，这里就换回去并要求重启。
+    // 更新启动检查必须在连接 controller 和绑定端口之前执行：若上次替换的新版本未获确认，将在此回退并请求重启。
     let updater = controller.is_some().then(|| updater_for(&state, &program));
     let mut awaiting_confirmation = false;
     let updater = match updater.map(|updater| (updater.startup(), updater)) {
         Some((Ok(Startup::Clean), updater)) => Some(updater),
         Some((Ok(Startup::AwaitingConfirmation { version }), updater)) => {
-            tracing::info!(%version, "这是刚换上来的新版本，连上 controller 才算更新成功");
+            tracing::info!(%version, "新版本已启动，将在成功连接 controller 后确认更新");
             awaiting_confirmation = true;
             Some(updater)
         }
@@ -159,14 +159,14 @@ pub async fn run(
             return Ok(Outcome::Restart);
         }
         Some((Err(error), _)) => {
-            // 更新的记录读不了。节点的本职是组网，不能因此起不来：这次运行不更新，并且如实告诉 controller。
-            tracing::error!("更新的状态读不了，这次运行不接受更新：{:#}", anyhow::Error::from(error));
+            // 无法完成更新启动流程。节点的核心职责是组网，不能因此无法启动：本次运行停用自更新，并如实上报给 controller。
+            tracing::error!("无法完成更新启动流程，本次运行已停用自更新：{:#}", anyhow::Error::from(error));
             None
         }
         None => None,
     };
-    // 报给 controller、也显示在本机状态里的"能不能自己更新"。由 controller 管理、这次运行却不接受更新时，
-    // 说"不能"而不给原因：原因不在程序文件上，是更新的记录读不了。
+    // 上报给 controller 并在本机状态中展示的自更新能力。受 controller 管理但本次停用自更新时，
+    // 上报“不可自更新”而不附带原因码：原因不在可执行文件本身，而是更新启动流程失败。
     let self_update = match (&updater, &controller) {
         (None, Some(_)) => SelfUpdate { able: false, blocker: None },
         (Some(_), _) | (None, None) => program.self_update(),
@@ -185,7 +185,7 @@ pub async fn run(
         "节点启动"
     );
     let addr_servers = match &controller {
-        // 解析不了时只是少一个问自己地址的地方，不耽误启动。
+        // 解析失败时仅少一个外部地址探测目标，不影响启动。
         Some(controller) => tokio::net::lookup_host(&controller.address).await.map(Iterator::collect).unwrap_or_default(),
         None => Vec::new(),
     };
@@ -211,8 +211,8 @@ pub async fn run(
     let (performance_tx, performance_rx) = watch::channel(performance.report(threads));
     let give_back_memory = tokio::spawn(memory::give_back());
     let quota = state.exit_quota().unwrap_or_else(|error| {
-        // 读不出来只是这个账期的用量从零记起，不值得让节点起不来。
-        tracing::warn!("上次存下的出口配额用量读不出来，从零开始记：{error:#}");
+        // 加载失败时仅本账期用量从零开始统计，不应阻断节点启动。
+        tracing::warn!("无法加载已保存的出口配额用量，将从零开始统计：{error:#}");
         None
     });
     let quota =
@@ -228,7 +228,7 @@ pub async fn run(
         .with_port_book(ports)
         .with_routes(Arc::clone(&routes));
     let access = Arc::new(access);
-    // 虚拟网卡：默认打开，装不上时说为什么，别的照常。它的名字服务登记进入口的那张"程序自己的监听"的表。
+    // 虚拟网卡默认启用，初始化失败时记录原因，其余功能不受影响。其内置 DNS 服务登记到入口的自有监听表中。
     let vnet = Arc::new(Vnet::start(config.network, local_rx.clone(), Arc::clone(&endpoint), access.own_listeners()));
     // 出口不替别人连本节点自己对外的地址（反射地址、路由器映射出来的地址），这些地址数据面最清楚。
     // 两份都要：候选端点里有本机网卡上的地址，"别人看到的地址"在只经 relay 的节点上也有。
@@ -361,9 +361,9 @@ pub async fn run(
             };
             let outcome = managed.run(updates, shutdown).await;
             if matches!(outcome, Ok(Outcome::Restart)) {
-                // 进程马上要退出：把"正在重启"（或者"换回了旧程序"）送到 controller，之后就没有机会了。
+                // 进程即将退出：将“正在重启”（或“已回退旧版本”）状态上报给 controller，退出后将无法再上报。
                 let sent = link.report_and_wait(FAREWELL_TIMEOUT).await;
-                tracing::info!(sent, "程序文件已经换过，节点退出，等看护程序把它重新拉起来");
+                tracing::info!(sent, "程序文件已替换，节点即将退出以等待守护进程重启");
             }
             watch_reachability.abort();
             outcome
@@ -407,7 +407,7 @@ fn log_rollback(rolled: &RolledBack) {
         failed = %rolled.failed,
         back_to = %rolled.restart.version,
         reason = %rolled.reason,
-        "新版本一直没有连上 controller，已经换回旧程序，需要重启"
+        "新版本未能连接 controller，已回滚至旧版本，需要重启"
     );
 }
 
@@ -424,7 +424,7 @@ struct Managed<'a> {
     config: &'a Config,
     drain: &'a mut Drain,
     updater: Option<&'a Updater>,
-    /// 正在运行的是刚换上来、还没有被确认的新版本。
+    /// 当前运行的是刚替换上线、尚未确认的新版本。
     awaiting_confirmation: bool,
     performance: Tuned<'a>,
 }
@@ -438,7 +438,7 @@ struct Tuned<'a> {
 }
 
 impl Tuned<'_> {
-    /// netmap 里的档位（或者本机配置）变了的话，换上新的设置。线程数要重启才变，上报里说明。
+    /// netmap 中的档位（或本机配置）变更时应用新设置。工作线程数需重启后生效，并在上报中说明。
     fn follow(&mut self, netmap: &Netmap, config: &Config, endpoint: &Endpoint) {
         let next = Performance::resolve(netmap.me.profile, &config.performance);
         if next == self.current {
@@ -449,8 +449,8 @@ impl Tuned<'_> {
             profile = %next.profile,
             threads = next.threads,
             running_threads = self.threads,
-            "性能档位换了：缓冲、窗口和空闲回收的时间立刻生效{}",
-            if restart { "，工作线程数要重启才变" } else { "" }
+            "性能档位已变更：缓冲、窗口和空闲回收时长立即生效{}",
+            if restart { "，工作线程数需重启后生效" } else { "" }
         );
         apply(&next, endpoint);
         self.report.send_replace(next.report(self.threads));
@@ -508,7 +508,7 @@ impl Managed<'_> {
                 None => std::future::pending().await,
             }
         };
-        // 新程序换上来之后限时要连上 controller，到时候还没连上就换回旧的。
+        // 新版本替换上线后须在时限内连接 controller，超时未连接则回退至旧版本。
         let deadline = async {
             match updater {
                 Some(updater) => updater.enforce_confirmation_deadline().await,
@@ -527,9 +527,9 @@ impl Managed<'_> {
                 draining = drain.changed() => {
                     if draining {
                         // 两种情况会走到这里：管理员选了"排空后更新"，或者任何一种更新走到了换程序的那一步。
-                        tracing::info!("不再接新的流，直到更新之后重启：本机入口和别的节点开过来的新请求都明确拒绝，监听照常开着；手上的流不受影响");
+                        tracing::info!("已停止接受新流，直至更新重启：本机入口与对端的新请求将被明确拒绝，监听器保持开启，现有流不受影响");
                     } else {
-                        tracing::info!("更新没有继续下去：照常接受新的流");
+                        tracing::info!("更新已取消或中止，恢复接受新流");
                     }
                     let detail = drain.detail();
                     exit.set_draining(detail.clone());
@@ -551,7 +551,7 @@ impl Managed<'_> {
                                 match updater.confirm() {
                                     Ok(Some(version)) => tracing::info!(%version, "更新成功：新版本连上了 controller"),
                                     Ok(None) => {}
-                                    Err(error) => tracing::error!("没能记下更新已经成功：{:#}", anyhow::Error::from(error)),
+                                    Err(error) => tracing::error!("记录更新确认状态失败：{:#}", anyhow::Error::from(error)),
                                 }
                                 awaiting_confirmation = false;
                             }
@@ -560,7 +560,7 @@ impl Managed<'_> {
                     }
                 }
                 restart = &mut updates, if has_updates => {
-                    tracing::info!(version = %restart.version, "新程序已经换上去");
+                    tracing::info!(version = %restart.version, "新版本程序替换完成");
                     return Ok(Outcome::Restart);
                 }
                 rolled = &mut deadline, if awaiting_confirmation => {
@@ -572,7 +572,7 @@ impl Managed<'_> {
                         }
                         // 已经确认过了。
                         Ok(None) => {}
-                        Err(error) => tracing::error!("新版本一直没有连上 controller，但换不回旧程序：{:#}", anyhow::Error::from(error)),
+                        Err(error) => tracing::error!("新版本未能连接 controller，且回退旧版本失败：{:#}", anyhow::Error::from(error)),
                     }
                 }
             }
@@ -601,9 +601,9 @@ async fn report_when_reachability_changes(endpoint: Arc<Endpoint>, report_now: A
     }
 }
 
-/// 本机配置文件里的组网入口（`[proxy]`，默认都关着）：不认证、没有出口，只通到组网里的节点。
+/// 本机配置文件中的组网入口（`[proxy]`，默认关闭）：不鉴权、不经出口，仅通往组网内节点。
 ///
-/// controller 在同一个地址上配了代理时让给它（入口模块自己处理，见 [`Access`]）。
+/// controller 在同一地址上配置代理时让位于 controller（由入口模块处理，见 [`Access`]）。
 pub(crate) fn local_entries(config: &Config) -> Vec<LocalEntry> {
     [
         ("local-socks5", config.proxy.socks5.addr(), ListenerProtocol::Socks5),
@@ -614,22 +614,22 @@ pub(crate) fn local_entries(config: &Config) -> Vec<LocalEntry> {
     .collect()
 }
 
-/// 把 controller 下发的 netmap 按本机的配置调整成各层实际使用的样子：去掉本机没有声明过的能力。
-/// controller 被攻破或者管理员密码被盗时，它也不能把一台没有声明的机器变成出口或者 relay。
-/// 端口转发的目标不在此列：它只由管理员打开，下发来的转发照收，
-/// 所以 controller 能经转发碰到这台机器能碰到的一切。
+/// 按本机配置裁剪 controller 下发的 netmap：移除本机未声明的能力。
+/// 即使 controller 被攻破或管理员密码泄露，也无法将未声明能力的节点变成出口或 relay。
+/// 端口转发目标不在此列：该能力仅由管理员开启，下发的转发规则直接生效，
+/// 因此 controller 可经转发访问本机可达的目标。
 ///
-/// 排空不在这里管：监听照常开着，由入口和出口模块明确拒绝新的请求（见 [`drain`](crate::drain)）。
+/// 排空不在此处处理：监听器保持开启，由入口和出口模块明确拒绝新请求（见 [`drain`](crate::drain)）。
 #[must_use]
 pub fn localize(netmap: &Netmap, config: &Config) -> Netmap {
     let mut netmap = netmap.clone();
     let declared = config.declare;
     if !declared.exit && netmap.me.exit.take().is_some() {
-        tracing::warn!("controller 把本节点启用成了出口，但本机没有声明可以作为出口，不生效。要声明请执行 i3t set can-exit on");
+        tracing::warn!("controller 已将本节点配置为出口，但本机未声明可作为出口，该配置未生效。如需启用请执行 i3t set can-exit on");
     }
     if !declared.relay && netmap.me.relay.take().is_some() {
         netmap.relay_clients.clear();
-        tracing::warn!("controller 把本节点启用成了 relay，但本机没有声明可以作为 relay，不生效。要声明请执行 i3t set can-relay on");
+        tracing::warn!("controller 已将本节点配置为 relay，但本机未声明可作为 relay，该配置未生效。如需启用请执行 i3t set can-relay on");
     }
     netmap
 }

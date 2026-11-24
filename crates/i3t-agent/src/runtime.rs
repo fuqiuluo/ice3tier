@@ -289,20 +289,20 @@ pub(crate) fn exit_report(stats: &ExitStats) -> ExitReport {
     }
 }
 
-/// 上报里的计数都是 `u32`。真的数不下时停在最大值。
-/// 毫秒数，装不下时停在最大值。
+/// 将时长转换为毫秒数，超出 `u32` 范围时饱和为最大值。
 fn millis(duration: std::time::Duration) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
+/// 上报中的计数值均为 `u32`，超出范围时饱和为最大值。
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-/// 到每个对端的路上一次是什么时候、因为什么换的。路由层只在换路的那一刻说一次原因，这里把它记下来。
+/// 记录到各对端最近一次路径切换的时间与原因。路由层仅在切换瞬间发出一次原因，此处负责留存。
 ///
-/// 另外攒着还没有报给 controller 的换路（controller 给每对节点留一段历史），最多
-/// [`MAX_REPORTED_SWITCHES`] 条：controller 连不上的时候满了就丢最早的。
+/// 同时缓存尚未上报给 controller 的切换记录（controller 为每对节点保留一段历史），最多保留
+/// [`MAX_REPORTED_SWITCHES`] 条：无法连接 controller 导致队列满时丢弃最早的记录。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RouteHistory {
     changes: Arc<Mutex<BTreeMap<NodeId, (Instant, RouteChange)>>>,
@@ -346,7 +346,7 @@ impl RouteHistory {
         loop {
             match changes.recv().await {
                 Ok(change) => self.record(change),
-                // 落后太多被丢掉了几条：只是少记了几次原因，接着记后面的。
+                // 消费落后导致部分事件被跳过：仅缺失少量历史原因记录，继续记录后续事件。
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             }

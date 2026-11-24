@@ -15,7 +15,7 @@ pub(crate) const MAX_DATA_LEN: usize = (1 << 14) - HEADER_LEN;
 /// OPENING 里流的头最长多少字节。流层的头（OPEN 连同首批数据）不超过 17 KB，这里留一倍的余量。
 pub(crate) const MAX_HEADER_LEN: usize = 32 * 1024;
 
-/// 不认识的帧最长多少字节。只在控制 lane 上跳过它们（给以后的版本留余地），流的 lane 上不认识就是错。
+/// 未知帧的最大允许长度。仅在控制 lane 上跳过以预留版本扩展空间；在承载流的 lane 上收到未知帧视为协议错误。
 const MAX_UNKNOWN_LEN: usize = 1024;
 
 const TYPE_HELLO: u8 = 0x01;
@@ -36,7 +36,7 @@ const MODE_MUTUAL: u8 = 2;
 /// 一条 lane 拨出来是做什么用的。拨号的一方在 HELLO 里说明，之后不变，所以两边永远不会争用同一条 lane。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Purpose {
-    /// 控制 lane：不承载流，只传"再拨几条"、保活和"要走了"。
+    /// 控制 lane：不承载业务流，仅传输池补拨指令、保活及排空（GoAway）通知。
     Control,
     /// 停在接受方那里，给接受方开往拨号方的流用。
     Parked,
@@ -119,7 +119,7 @@ pub(crate) enum Frame {
     },
     Ping(u64),
     Pong(u64),
-    /// 发的一方要走了（排空）：对方不再用和它之间的 lane 开新的流，空闲的关掉。
+    /// 发送方进入排空状态：对端不再在与其之间的 lane 上新建流，并关闭空闲 lane。
     GoAway,
     /// 发起方在一条 lane 上开流：选定的负载方式，和流的头（流层的 OPEN 连同首批数据）。
     /// 负载方式是 [`Mode::Early`] 时，发起方这个方向在这个帧所在的记录之后就离开 TLS。
@@ -136,7 +136,7 @@ pub(crate) enum Frame {
     Abort(u32),
     /// 发的一方不再读了，请对方停止发送，带原因码。
     Stop(u32),
-    /// 不认识的类型，内容已经跳过。
+    /// 未知帧类型，其内容已被跳过。
     Unknown(u8),
 }
 
@@ -192,7 +192,7 @@ impl Frame {
     ///
     /// # Errors
     ///
-    /// 帧头一到就检查类型和长度：不认识的类型（`allow_unknown` 为假时）、长度超出这种帧的范围、内容不合法。
+    /// 收到帧头即校验类型与长度：未知帧类型（`allow_unknown` 为 `false` 时）、长度超出允许范围或帧内容不合法。
     pub(crate) fn decode(buf: &mut BytesMut, allow_unknown: bool) -> Result<Option<Self>, FrameError> {
         let Some(&[kind, hi, lo]) = buf.first_chunk::<HEADER_LEN>() else { return Ok(None) };
         let len = usize::from(u16::from_be_bytes([hi, lo]));
@@ -217,7 +217,7 @@ impl Frame {
         let mut body = buf.split_to(len);
         let frame = match kind {
             TYPE_HELLO => {
-                let purpose = Purpose::from_wire(body.get_u8()).ok_or(FrameError::Invalid("HELLO 里的用途"))?;
+                let purpose = Purpose::from_wire(body.get_u8()).ok_or(FrameError::Invalid("HELLO 中的用途字段"))?;
                 Self::Hello { purpose, epoch: body.get_u64() }
             }
             TYPE_POOL => Self::Pool { idle: body.get_u16(), extra: body.get_u16() },
@@ -225,7 +225,7 @@ impl Frame {
             TYPE_PONG => Self::Pong(body.get_u64()),
             TYPE_GOAWAY => Self::GoAway,
             TYPE_OPENING => {
-                let mode = Mode::from_wire(body.get_u8()).ok_or(FrameError::Invalid("OPENING 里的负载方式"))?;
+                let mode = Mode::from_wire(body.get_u8()).ok_or(FrameError::Invalid("OPENING 中的负载方式字段"))?;
                 Self::Opening { mode, header: body.freeze() }
             }
             TYPE_DATA => Self::Data(body.freeze()),
@@ -251,14 +251,14 @@ fn put_header(buf: &mut Vec<u8>, kind: u8, len: usize) {
     buf.put_u16(len);
 }
 
-/// 帧不合法。
+/// 帧格式无效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
-    #[error("不认识的帧类型 {0:#04x}")]
+    #[error("未知帧类型 {0:#04x}")]
     UnknownType(u8),
-    #[error("类型 {kind:#04x} 的帧不能是 {len} 字节")]
+    #[error("帧类型 {kind:#04x} 的长度 {len} 无效")]
     Length { kind: u8, len: usize },
-    #[error("帧的内容不合法：{0}")]
+    #[error("帧内容无效：{0}")]
     Invalid(&'static str),
 }
 

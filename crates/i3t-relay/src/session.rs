@@ -8,7 +8,7 @@ use i3t_proto::session::Nonce;
 use i3t_proto::{NodeId, PublicKey};
 use i3t_underlay::tcp_leg::FrameSender;
 
-/// 会话多久收不到 PING 就删掉。节点每 5 秒发一次，中间丢几个也够不着这个数。
+/// 会话超时未收到 PING 的清理时限。节点每 5 秒发送一次保活，容忍偶发丢包。
 pub(crate) const SESSION_TTL: Duration = Duration::from_secs(30);
 
 /// 一个数据报是从哪里到 relay 的。
@@ -46,7 +46,7 @@ impl Binding {
 
 #[derive(Debug)]
 struct Session {
-    /// 握手时验过签名的那把公钥。netmap 里这个节点的公钥换了，这个会话就不算数了。
+    /// 握手验签时使用的公钥。若 netmap 中该节点的公钥发生变更，此会话即失效。
     key: PublicKey,
     binding: Binding,
     /// 节点握手时给的随机数（AUTH 里的那个）。只有 relay 和收得到发往会话地址的包的节点知道它，
@@ -57,12 +57,12 @@ struct Session {
     expires: Instant,
 }
 
-/// 会话表。一个节点最多一个会话：新的握手成功就顶掉旧的，所以节点从 TCP 换回 UDP 只要在 UDP 上再握一次手。
+/// 会话表。每个节点至多保留一个活跃会话：新握手成功即替换旧会话，因此节点从 TCP 切回 UDP 只需在 UDP 上重新握手。
 #[derive(Debug, Default)]
 pub(crate) struct Sessions {
     by_node: HashMap<NodeId, Session>,
-    /// 会话断过（TCP 断开，或者过期）的节点，和断掉的那个会话是哪把公钥建的。同一把公钥下一次建立的会话算"重新建的"；
-    /// 节点换了公钥就是换了主人，这条记录不作数。
+    /// 记录会话曾中断（TCP 断开或超时过期）的节点及其原会话对应的公钥。同一公钥下次建链视为重连会话；
+    /// 若节点更换公钥则视为新身份，原有中断记录失效。
     broke: HashMap<NodeId, PublicKey>,
 }
 

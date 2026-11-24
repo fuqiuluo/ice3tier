@@ -5,13 +5,13 @@
 //! | 这一头发生了什么 | 另一头看到什么 |
 //! |---|---|
 //! | TCP 读到 EOF（对方发了 FIN） | 流的发送方向正常结束 |
-//! | 流读到 EOF | TCP 发 FIN（只关写的一半，另一个方向照常搬运） |
+//! | 流读到 EOF | TCP 发送 FIN（仅关闭写半部，另一方向继续转发） |
 //! | TCP 读写出错（被重置、保活超时） | 流的两个方向都异常结束，带原因码 |
 //! | 流被对端重置或叫停、连接断开、搬运被取消 | TCP 被重置（RST），不是 FIN |
 //!
 //! 被截断的数据不能看起来像正常结束。所以搬运一开始就把 TCP 设成"关闭时发 RST"，只有两个方向都正常结束了才改回去：
-//! 中途不管是出错、任务被取消还是进程退出，TCP 那一头看到的都是重置。macOS 上等不到那时：一条 socket 两个方向都关了
-//! 之后就改不了了，所以那里在往它发 FIN 的时候改回去，之后出错再设回来（见 `i3t_underlay::tcp_reset`）。
+//! 中途无论发生错误、任务取消还是进程退出，TCP 对端都会收到重置。macOS 上不能等到此时：socket 双向关闭后
+//! 无法再修改该选项，因此会在发送 FIN 时先恢复正常关闭，后续出错时再重新设置（见 `i3t_underlay::tcp_reset`）。
 //!
 //! 静默不是断开的理由：经端口转发的 SSH 会话、数据库连接池里的空闲连接，一连几个小时不说话都是正当的。
 //! 所以流没有"多久没有数据就切断"的时限，而是和 TCP 的保活一样，静默久了去探一探两头还在不在，不在了才断：
@@ -20,7 +20,7 @@
 //! - TCP 那一头还在不在：内核保活（[`keep_alive`]），入口一侧的客户端连接和出口一侧到目标的连接都打开。
 //!   探测没有回应时内核报错，搬运把流重置，另一头的节点跟着重置它那一头的 TCP。
 //!
-//! 一头悄无声息地消失（断电、换了网络、NAT 回收了映射）之后，两头的资源在几分钟之内释放；活着的连接照常回应探测，一直留着。
+//! 任一端无声中断（断电、切换网络、NAT 映射回收）后，两端资源会在数分钟内释放；存活连接会正常响应探测并保持不断开。
 //! 活着却一直不说话的流占着的资源，由接受方按发起节点限制同时处理的流数来约束（[`crate::Handler::screen`]）。
 //!
 //! 流在 ice3proxy（lane）上、并且负载不再加密（用户自己的 TLS 原样过去）时，那个方向在 lane 交出原始的 socket 之后
@@ -28,7 +28,7 @@
 //! 不再经过流的接口。结局的传法和上表一样：EOF 对 FIN，出错对 RST；计量和配额照样在每一段上记。
 //!
 //! 发起方选了不再加密（它的首批数据是 TLS 1.3 的 ClientHello）也只是可以：两个方向都要等出口看到目标回了 TLS 1.3 的
-//! ServerHello（[`ServerHelloWatch`]）。ServerHello 照常加密地送回去，之后出口往回的方向不再加密，入口那边的 lane 收到这个切换
+//! ServerHello（[`ServerHelloWatch`]）。ServerHello 仍按加密方式发回，此后出口回传方向不再加密，入口侧 lane 收到切换信号
 //! 时它的方向跟着切换；目标回了 HelloRetryRequest、用的是 TLS 1.2（证书会明文来回）、或者根本不是 TLS 时，两个方向一直加密。
 //! 所以入口一侧两个方向每一段之前都问一下切换了没有。
 //!
@@ -163,12 +163,12 @@ impl<S: SendStream, R: RecvStream> Flow<S, R> {
         run(self.parts, tcp, cancel, meter, None).await
     }
 
-    /// 和 [`relay_metered`](Self::relay_metered) 一样，只是从 `tcp` 读到的字节里只有 `framing` 划出来的那一段写进流。
+    /// 与 [`relay_metered`](Self::relay_metered) 类似，但仅将 `tcp` 中由 `framing` 界定的消息片段写入流。
     ///
-    /// 给一条 TCP 连接上只有一段属于这条流的协议用：明文 HTTP 代理的一个请求（请求头已经随 OPEN 发出，这里搬的是请求体）。
-    /// 这一段完整之后不再读 `tcp`，读到的多余字节丢掉；流的发送方向这时**不**正常结束，等另一个方向结束（目标的应答发完）
-    /// 才结束：有的服务器把客户端的半关闭当作客户端走了，会丢下还没回完的应答。这一段还没完整 `tcp` 就读到了 EOF，
-    /// 是被截断，按 TCP 出错处理（流被重置），不会让目标以为请求是完整的。
+    /// 适用于单条 TCP 连接上仅有部分数据属于当前流的协议，例如明文 HTTP 代理请求（请求头已随 OPEN 发出，此处仅转发请求体）。
+    /// 该片段完整后即停止读取 `tcp`，丢弃多余字节；此时流的发送方向**不**立即正常关闭，而是等待另一方向结束（目标响应发完）
+    /// 后再关闭，避免部分服务器将客户端半关闭视为连接中断而丢弃未发完的响应。若片段尚未完整时 `tcp` 即读到 EOF，
+    /// 视为数据截断并按 TCP 错误处理（重置流），避免目标误认为请求已完整。
     ///
     /// 流的头之后的字节一直经过这一层（不交给 ice3proxy 直接搬）：要划分就得看得到它们。首批数据是 TLS 握手的流不该用它。
     pub async fn relay_framed(
@@ -191,14 +191,14 @@ impl<S: SendStream, R: RecvStream> Flow<S, R> {
 
 /// 从 TCP 读到的字节里哪些属于这条流（见 [`Flow::relay_framed`]）。
 pub trait Framing {
-    /// `bytes` 是刚从 TCP 读到的，返回开头有多少字节属于这条流。比 `bytes.len()` 少，说明这一段在中间结束了。
+    /// `bytes` 为刚从 TCP 读取的数据，返回开头属于当前流的字节数。若小于 `bytes.len()`，表示当前消息片段已结束。
     ///
     /// # Errors
     ///
-    /// 字节不合这一段的格式。流用这个原因码重置，TCP 那一头也被重置。
+    /// 数据不符合当前分帧格式。流将按返回的原因码重置，TCP 连接也会随之重置。
     fn take(&mut self, bytes: &[u8]) -> Result<usize, Reason>;
 
-    /// 这一段已经完整了。
+    /// 当前消息片段是否已完整。
     fn is_complete(&self) -> bool;
 }
 
@@ -245,7 +245,7 @@ pub enum End {
     Lost(io::Error),
     /// 乐观回复时，对端的 REPLY 是拒绝。
     Refused(Reply),
-    /// 乐观回复时，对端的 REPLY 读不出来。
+    /// 乐观回复模式下，读取或解析对端 REPLY 失败。
     BadReply(FlowError),
     /// 调用者取消了搬运。
     Cancelled(Reason),
@@ -317,7 +317,7 @@ pub(crate) async fn run<S: SendStream, R: RecvStream>(
     let cancel = cancel_on_revocation(cancel, revocation.clone());
     // 先设成"关闭时发 RST"。这个选项只管 close，中途用 shutdown 发的 FIN 不受影响。
     if let Err(error) = tcp.set_zero_linger() {
-        tracing::warn!(%error, "设置不了 SO_LINGER，搬运中断时 TCP 一侧可能看到正常结束");
+        tracing::warn!(%error, "设置 SO_LINGER 失败，转发中断时 TCP 侧可能视为正常关闭");
     }
 
     let mut from_tcp = Traffic::default();
@@ -347,7 +347,7 @@ pub(crate) async fn run<S: SendStream, R: RecvStream>(
         let downstream = flow_to_tcp(&mut recv, tcp_write, &mut from_flow, Progress { started, class, meter }, reply_pending, &lane);
         drive(upstream, downstream, cancel).await
     };
-    // 划分过的那一段发完之后发送方向一直开着（见 [`Flow::relay_framed`]），两个方向都结束了才正常结束它。
+    // 分帧数据发完后发送方向保持开启（见 [`Flow::relay_framed`]），待双向均结束后再正常关闭。
     let outcome = match outcome {
         Ok(()) if framed => send.shutdown().await.map_err(Abort::Flow),
         outcome => outcome,
@@ -361,12 +361,12 @@ pub(crate) async fn run<S: SendStream, R: RecvStream>(
         Ok(()) => {
             // 两头写的一半都是用 `tcp_reset::shutdown_write` 关的：macOS 上那时已经改回了正常关闭（见 `i3t_underlay::tcp_reset`）。
             if let Err(error) = i3t_underlay::tcp_reset::graceful_close(&tcp) {
-                tracing::warn!(%error, "恢复不了 SO_LINGER，正常结束的连接会以 RST 关闭");
+                tracing::warn!(%error, "禁用 SO_LINGER 失败，关闭连接时可能发送 RST");
             }
             if let Some(lane) = lane.get()
                 && let Err(error) = i3t_underlay::tcp_reset::graceful_close(lane)
             {
-                tracing::warn!(%error, "恢复不了 ice3proxy 的 SO_LINGER，正常结束的流会以 RST 关闭");
+                tracing::warn!(%error, "禁用 ice3proxy 的 SO_LINGER 失败，关闭流时可能发送 RST");
             }
             drop(tcp);
             End::Clean
@@ -511,7 +511,7 @@ async fn tcp_to_flow<S: SendStream, M: Meter>(
             send.end_header(Payload::Passthrough);
             if let Some(raw) = send.take_raw() {
                 let rest = Bytes::copy_from_slice(&buf[sealed..len]);
-                // 不再加密之后用不着这块缓冲，不能让它跟着 `tcp_to_raw` 一直占到连接结束。
+                // 切换为透传后不再需要此缓冲区，提前释放以避免在 `tcp_to_raw` 期间持续占用内存。
                 drop(buf);
                 return tcp_to_raw(tcp, raw, rest, lane, traffic, Progress { started, class, meter }).await;
             }
@@ -536,7 +536,7 @@ async fn deliver<S: SendStream, M: Meter>(send: &mut S, meter: &M, traffic: &mut
     Ok(())
 }
 
-/// 只把 `framing` 划出来的那一段从 TCP 搬进流。这一段完整了就返回，不读 TCP 剩下的、也不结束流的发送方向（[`run`] 在最后结束它）。
+/// 仅将 `framing` 界定的消息片段从 TCP 转发至流。片段完整后即返回，不继续读取 TCP 剩余数据，也不关闭流发送方向（由 [`run`] 在最后关闭）。
 async fn tcp_to_flow_framed<S: SendStream, M: Meter>(
     mut tcp: ReadHalf<'_>,
     send: &mut S,
@@ -550,7 +550,7 @@ async fn tcp_to_flow_framed<S: SendStream, M: Meter>(
     while !framing.is_complete() {
         let read = tcp.read(&mut buf).await.map_err(Abort::Tcp)?;
         if read == 0 {
-            return Err(Abort::Tcp(io::Error::new(io::ErrorKind::UnexpectedEof, "这一段还没有完整，TCP 那一头就结束了")));
+            return Err(Abort::Tcp(io::Error::new(io::ErrorKind::UnexpectedEof, "TCP 连接在当前分帧尚未完整时关闭")));
         }
         traffic.arrived(started);
         let len = framing.take(&buf[..read]).map_err(Abort::Cancelled)?;
@@ -586,7 +586,7 @@ async fn flow_to_tcp<R: RecvStream, M: Meter>(
             Err(error) => return Err(Abort::BadReply(error)),
         }
     }
-    // 一开始就不再加密的（出口收发起方的方向）用不着缓冲：先问，切换了就不分配。
+    // 初始即透传的方向（出口接收发起方数据）无需缓冲区：先检查切换状态，避免多余分配。
     if let Some(raw) = recv.wait_raw().await {
         return raw_to_tcp(raw, tcp, lane, traffic, progress).await;
     }
@@ -594,7 +594,7 @@ async fn flow_to_tcp<R: RecvStream, M: Meter>(
     loop {
         // 对端可能先加密地送一段、之后才切换（出口要先把目标的 ServerHello 加密地送回来）：每一段之前都问一下。
         if let Some(raw) = recv.wait_raw().await {
-            // 不再加密之后用不着这块缓冲，不能让它跟着 `raw_to_tcp` 一直占到连接结束。
+            // 切换为透传后不再需要此缓冲区，提前释放以避免在 `raw_to_tcp` 期间持续占用内存。
             drop(buf);
             return raw_to_tcp(raw, tcp, lane, traffic, progress).await;
         }

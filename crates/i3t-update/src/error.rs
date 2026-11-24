@@ -1,4 +1,4 @@
-//! 更新过程里会出的错。
+//! 更新流程中的错误类型定义。
 
 use std::error::Error;
 use std::fmt::Write;
@@ -7,17 +7,17 @@ use std::path::{Path, PathBuf};
 
 use i3t_model::update::{FailureKind, Platform, SelfUpdateBlocker, Sha256, UpdateCause, Version};
 
-/// 一份带签名的清单没有通过检查。
+/// 带签名发布清单的校验错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("清单的签名不是任何一把受信任的发布公钥签的")]
+    #[error("发布清单签名验证失败：签名与受信任的发布公钥不匹配")]
     BadSignature,
-    /// 签名是对的，所以这是发布的人写错了清单，或者清单是给更新的程序看的。
-    #[error("清单的签名正确，但内容读不懂")]
+    /// 签名有效，通常表示发布清单格式有误，或清单由更新版本的发布工具生成。
+    #[error("发布清单签名验证通过，内容解析失败")]
     Malformed(#[source] serde_json::Error),
 }
 
-/// 节点不肯装一份清单的原因。这时什么都还没有动。
+/// 节点拒绝应用发布清单的原因。此时尚未对本地状态或可执行文件做任何修改。
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Refusal {
@@ -25,16 +25,16 @@ pub enum Refusal {
     Manifest(#[from] ManifestError),
     #[error("{0}")]
     CannotSelfUpdate(SelfUpdateBlocker),
-    #[error("清单里的版本 {offered} 不比正在运行的 {running} 新")]
+    #[error("发布清单中的版本 {offered} 不高于当前运行版本 {running}")]
     NotNewer { offered: Version, running: Version },
-    #[error("{offered} 是预发布版，而正在运行的 {running} 是正式版")]
+    #[error("目标版本 {offered} 为预发布版，而当前运行版本 {running} 为正式版")]
     Prerelease { offered: Version, running: Version },
-    #[error("版本 {version} 在这台机器上失败过，不再自动重试（上次的原因：{reason}）")]
+    #[error("版本 {version} 在当前主机曾更新失败，不再自动重试（上次失败原因：{reason}）")]
     FailedBefore { version: Version, reason: String },
-    #[error("版本 {version} 没有 {platform} 平台的包")]
+    #[error("版本 {version} 缺少适用于 {platform} 平台的更新包")]
     NoArtifact { version: Version, platform: Platform },
-    /// 这个进程已经换上了一个版本，还没有重启。重启之前不能再换。
-    #[error("已经换上了 {installed}，在等进程重启")]
+    /// 当前进程已安装新版本但尚未重启，重启前不允许再次安装。
+    #[error("已安装版本 {installed}，等待进程重启生效")]
     RestartPending { installed: Version },
 }
 
@@ -56,23 +56,23 @@ impl Refusal {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum UpdateError {
-    #[error("不装这份清单")]
+    #[error("已拒绝该发布清单")]
     Refused(#[from] Refusal),
-    /// 给包的一方明确说没有，或者给出来的东西不合约定。链路中断不在这里：那种情况一直重试，不返回。
-    #[error("取不到包：{0}")]
+    /// 更新源明确无法提供更新包，或返回的数据不符合分块协议约定。链路中断不会返回该错误，而是持续重试。
+    #[error("获取更新包失败：{0}")]
     Unavailable(String),
-    #[error("包的内容和清单对不上：大小 {actual_size} 字节、SHA-256 {actual}，清单上是 {expected_size} 字节、{expected}")]
+    #[error("更新包校验失败：实际大小 {actual_size} 字节、SHA-256 {actual}，预期大小 {expected_size} 字节、SHA-256 {expected}")]
     Corrupt { expected_size: u64, expected: Sha256, actual_size: u64, actual: Sha256 },
-    #[error("版本 {version} 的自检没有通过：{reason}")]
+    #[error("版本 {version} 自检失败：{reason}")]
     SelfCheck {
         version: Version,
         reason: String,
-        /// 新程序的退出码；被信号杀掉、没有运行起来或者超时时没有。
+        /// 新版本程序的退出码；被信号终止、无法启动或超时时为 `None`。
         exit_code: Option<i32>,
-        /// 新程序在标准错误上最后说的话。
+        /// 新版本程序标准错误输出的末尾内容。
         output: String,
     },
-    #[error("调用方不再通报流的数量，等不到换程序的时机")]
+    #[error("活跃流计数通道已关闭，无法等待更新时机")]
     Cancelled,
     #[error("{action} {} 失败", path.display())]
     Io {
@@ -81,7 +81,7 @@ pub enum UpdateError {
         #[source]
         source: io::Error,
     },
-    #[error("更新状态文件 {} 读不懂", path.display())]
+    #[error("无法解析更新状态文件 {}", path.display())]
     State {
         path: PathBuf,
         #[source]
@@ -90,8 +90,8 @@ pub enum UpdateError {
 }
 
 impl UpdateError {
-    /// 这次失败算不算"这个版本在这台机器上不能用"。只有自检不通过算；
-    /// 另一种（装上之后没能连上 controller）不经过这个类型，由回退的那一步直接记下。
+    /// 判断该错误是否应归类为“该版本在当前主机不可用”。仅自检失败属于此类；
+    /// 安装后未能连接 controller 的情况不经由该错误类型，而在回滚流程中直接记录。
     #[must_use]
     pub const fn kind(&self) -> FailureKind {
         match self {
@@ -102,7 +102,7 @@ impl UpdateError {
         }
     }
 
-    /// 上报给 controller 的原因代码，和 [`describe`] 写的那句话说的是同一件事。
+    /// 转换为上报给 controller 的结构化原因代码，与 [`describe`] 生成的描述语义一致。
     #[must_use]
     pub fn cause(&self) -> UpdateCause {
         match self {
@@ -118,19 +118,19 @@ impl UpdateError {
         }
     }
 
-    /// 给 `map_err` 用：把一个 I/O 错误连同"在对哪个文件做什么"一起包起来。
+    /// 供 `map_err` 使用：将 I/O 错误与对应的操作名称和文件路径封装为 [`UpdateError::Io`]。
     pub(crate) fn io(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Self {
         let path = path.to_owned();
         move |source| Self::Io { action, path, source }
     }
 }
 
-/// 一个错误连同它的全部来由，写成一句话。上报给 controller 的失败原因只有一个字符串，所以要把来由链接进去。
+/// 将错误及其完整原因链拼接为单行描述。由于上报给 controller 的失败原因仅为单个字符串，需将底层原因一并串联。
 pub(crate) fn describe(error: &dyn Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
-        // 往 String 里写不会失败。
+        // 写入 String 不会失败。
         let _ = write!(text, "：{cause}");
         source = cause.source();
     }
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn description_includes_every_cause_once() {
         let error = UpdateError::Refused(Refusal::Manifest(ManifestError::BadSignature));
-        assert_eq!(describe(&error), "不装这份清单：清单的签名不是任何一把受信任的发布公钥签的");
+        assert_eq!(describe(&error), "已拒绝该发布清单：发布清单签名验证失败：签名与受信任的发布公钥不匹配");
         let error = UpdateError::Io { action: "写", path: PathBuf::from("/x/y"), source: io::Error::other("磁盘满了") };
         assert_eq!(describe(&error), "写 /x/y 失败：磁盘满了");
     }

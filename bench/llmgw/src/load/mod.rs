@@ -222,9 +222,9 @@ fn raise_open_files(scenario: &Scenario) {
     let streams: usize = scenario.groups.iter().map(|group| group.count).sum();
     let wanted = u64::try_from(streams * 2 + 256).unwrap_or(u64::MAX);
     match rlimit::increase_nofile_limit(wanted) {
-        Ok(limit) if limit < wanted => eprintln!("警告：打开文件数上限只能提到 {limit}，{streams} 条流可能不够；用 ulimit -n 调高"),
+        Ok(limit) if limit < wanted => eprintln!("警告：打开文件数上限仅能提高至 {limit}，{streams} 条流可能不足；请使用 ulimit -n 调高"),
         Ok(_) => {}
-        Err(err) => eprintln!("警告：调不了打开文件数上限（{err}），{streams} 条流可能不够"),
+        Err(err) => eprintln!("警告：无法提高打开文件数上限（{err}），{streams} 条流可能不足"),
     }
 }
 

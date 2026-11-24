@@ -1,11 +1,11 @@
-//! 端口转发的目标连不连得上。
+//! 端口转发目标的连通性状态。
 //!
-//! 看得到的是监听一侧：它开到目标节点的流被目标节点拒绝时，REPLY 里的状态就是原因（目标节点知道为什么：连接被拒绝、超时、
-//! 不可达、这条转发没有下发给它），开不出流时是到目标节点不通。所以记在监听节点上，随它的上报（`ForwardReport`）到 controller。
-//! 一条流成功了（目标节点回了成功、或者数据已经在往回走），记录就清掉。
+//! 连通性由监听侧观测：向目标节点发起的流被目标节点拒绝时，REPLY 中的状态即为原因（目标节点可区分连接被拒绝、超时、
+//! 不可达、未下发该转发等）；若无法向目标节点建流，则说明到目标节点不可达。该状态记录在监听节点上，随 `ForwardReport` 上报给 controller。
+//! 一旦有流成功（目标节点返回成功，或已收到返回数据），即清除失败记录。
 //!
-//! 监听在虚拟 IP 上的转发由出口模块接住（`i3t_exit`），它把同样的结果记到同一份里（[`ForwardHealth`] 是可以共用的）。
-//! UDP 的转发只看得到会话开不开得起来：报文发出去之后目标有没有收到，UDP 本身不说。
+//! 监听在虚拟 IP 上的转发由出口模块（`i3t_exit`）处理，并将相同结果写入同一份状态（[`ForwardHealth`] 可共享）。
+//! UDP 转发只能观测会话是否成功建立：报文发出后目标是否收到，UDP 协议本身无法反馈。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use std::time::Instant;
 use i3t_flow::{End, Summary};
 use i3t_proto::flow::Status;
 
-/// 端口转发的一条流在目标那里没有成功的原因。
+/// 端口转发的流在目标侧失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TargetCause {
@@ -28,7 +28,7 @@ pub enum TargetCause {
     NotDeclared,
     /// 目标节点的访问规则不允许监听节点访问它。
     AccessDenied,
-    /// 到目标节点开不出流：它不在线，或者没有路。
+    /// 无法向目标节点建立流：目标节点不在线，或无可用路由。
     NodeUnreachable,
     /// 别的原因（目标节点在排空、内部出错等），见监听节点的日志。
     Other,
@@ -56,13 +56,13 @@ impl TargetCause {
         })
     }
 
-    /// 一条经过搬运（不等 REPLY）的流说明了什么：失败的原因，成功是 `Ok`，说明不了（比如客户端自己先断了）是 `None`。
+    /// 判断一条已进入数据转发阶段（未等待 REPLY）的流所反映的结果：失败返回具体原因，成功返回 `Ok`，无法判断（如客户端先断开）返回 `None`。
     pub(crate) fn of_summary(summary: &Summary) -> Option<Result<(), Self>> {
         match &summary.end {
             End::Refused(reply) => Some(Err(Self::of(reply.status).unwrap_or(Self::Other))),
             End::BadReply(_) => Some(Err(Self::Other)),
             End::Clean => Some(Ok(())),
-            // 对端发回了数据，说明 REPLY 是成功的；之后怎么结束和目标连不连得上无关。
+            // 对端已返回数据，说明 REPLY 成功；后续流如何结束与目标连通性无关。
             _ if summary.from_flow.first_byte.is_some() => Some(Ok(())),
             _ => None,
         }
@@ -87,12 +87,12 @@ impl ForwardHealth {
         match outcome {
             Ok(()) => {
                 if failures.remove(&forward).is_some() {
-                    tracing::info!(forward, "端口转发的目标又连上了");
+                    tracing::info!(forward, "端口转发目标已恢复连接");
                 }
             }
             Err(cause) => {
                 if failures.insert(forward, TargetFailure { cause, at: Instant::now() }).is_none_or(|before| before.cause != cause) {
-                    tracing::info!(forward, ?cause, "端口转发的目标连不上");
+                    tracing::info!(forward, ?cause, "连接端口转发目标失败");
                 }
             }
         }

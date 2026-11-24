@@ -1,28 +1,28 @@
-//! 程序文件的替换与换回。
+//! 可执行文件的替换与回滚。
 //!
-//! 程序旁边会出现这几个文件（以 `i3t` 为例，Windows 上标记插在 `.exe` 前面）：
+//! 可执行文件同目录下可能出现以下辅助文件（以 `i3t` 为例，Windows 平台下标记插入在 `.exe` 之前）：
 //!
-//! | 文件 | 是什么 | 什么时候有 |
+//! | 文件 | 用途 | 生命周期 |
 //! |---|---|---|
-//! | `i3t.new` | 验过、等着换上去的新程序 | 自检开始到换上去之前 |
-//! | `i3t.old` | 被换下来的旧程序 | 换上去之后，到新程序被确认或者被换回之前 |
-//! | `i3t.failed` | 被换回时挪开的新程序 | 只在 Windows 上，到下一次启动为止 |
+//! | `i3t.new` | 已校验、待安装的新版本候选程序 | 从自检开始到替换完成前 |
+//! | `i3t.old` | 被替换的旧版本备份 | 从替换完成到新版本被确认或回滚前 |
+//! | `i3t.failed` | 回滚时移出的新版本程序 | 仅限 Windows 平台，保留至下次启动清理 |
 //!
-//! 它们和程序在同一个目录里，所以改名不会跨文件系统，是原子的。
+//! 上述文件均与主程序位于同一目录，因此重命名不会跨文件系统，具有原子性。
 
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 正在运行的程序文件能怎么换。两种做法都只用到改名，哪个系统上都能跑，所以测试可以把两种都测到。
+/// 正在运行的可执行文件的替换策略。两种策略均仅依赖重命名操作，可在所有平台上运行，便于单元测试覆盖。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Swap {
-    /// 把新文件改名盖上去。Unix 上正在运行的程序文件可以被盖掉，进程继续用着旧的那一份。
-    /// 这样做任何时刻程序的路径上都有一个完整的文件。
+    /// 将新文件直接重命名覆盖目标路径。Unix 允许覆盖正在运行的可执行文件，当前进程继续使用旧文件句柄。
+    /// 该方式可保证任意时刻目标路径上均存在完整的可执行文件。
     Overwrite,
-    /// 先把正在运行的文件改名挪开，再把新文件改名过来。Windows 不许覆盖或者删除正在运行的程序文件，但许改名。
-    /// 两次改名之间有一瞬间程序的路径上没有文件，这一瞬间断电的话要手动把备份改回来。
+    /// 先将当前运行文件重命名移出，再将新文件重命名到目标路径。Windows 不允许覆盖或删除正在运行的可执行文件，但允许重命名。
+    /// 两次重命名之间存在极短窗口目标路径为空，若此时异常断电需手动将备份文件改回原名。
     MoveAside,
 }
 
@@ -45,12 +45,12 @@ impl ProgramFiles {
         &self.program
     }
 
-    /// 等着换上去的新程序。
+    /// 待安装的新版本候选文件路径。
     pub fn candidate(&self) -> PathBuf {
         self.sibling("new")
     }
 
-    /// 被换下来的旧程序。
+    /// 被替换的旧版本备份文件路径。
     pub fn backup(&self) -> PathBuf {
         self.sibling("old")
     }
@@ -59,7 +59,7 @@ impl ProgramFiles {
         self.sibling("failed")
     }
 
-    /// 程序旁边带标记的文件。`.exe` 留在最后：Windows 上要运行的文件得是这个扩展名。
+    /// 生成同目录下带标记的辅助文件路径。保留末尾的 `.exe` 扩展名，以满足 Windows 执行要求。
     fn sibling(&self, tag: &str) -> PathBuf {
         let name = self.program.file_name().unwrap_or_default();
         let is_exe = self.program.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
@@ -72,7 +72,7 @@ impl ProgramFiles {
         self.program.with_file_name(tagged)
     }
 
-    /// 把验过的包拷到程序旁边，权限照着现在的程序。这是阻塞的调用。
+    /// 将已校验的更新包复制到目标程序同目录并沿用原文件权限。该调用为阻塞 I/O。
     pub fn place_candidate(&self, package: &Path) -> io::Result<()> {
         let candidate = self.candidate();
         remove_if_exists(&candidate)?;
@@ -82,13 +82,13 @@ impl ProgramFiles {
         file.sync_all()
     }
 
-    /// 把新程序换上去，原来的留作备份。失败时程序还是原来的那个。
+    /// 将候选新程序替换到目标路径，并保留旧程序作为备份。失败时保持原程序不变。
     pub fn install_candidate(&self) -> io::Result<()> {
         let (candidate, backup) = (self.candidate(), self.backup());
         remove_if_exists(&backup)?;
         match self.swap {
             Swap::Overwrite => {
-                // 硬链接不用拷贝，也不占地方；文件系统不支持时才拷一份。
+                // 优先使用硬链接避免拷贝与额外空间占用；文件系统不支持时回退为复制。
                 if fs::hard_link(&self.program, &backup).is_err() {
                     fs::copy(&self.program, &backup)?;
                 }
@@ -110,7 +110,7 @@ impl ProgramFiles {
         remove_if_exists(&self.backup())
     }
 
-    /// 把备份换回来。调用的是正在运行的新程序，它自己的文件被盖掉或者挪开。失败时程序还是新的那个。
+    /// 将备份的旧程序回滚至目标路径。由正在运行的新程序调用，其自身文件会被覆盖或移出；失败时保持当前新程序不变。
     pub fn restore_backup(&self) -> io::Result<()> {
         let backup = self.backup();
         match self.swap {
@@ -125,20 +125,20 @@ impl ProgramFiles {
         self.sync_dir()
     }
 
-    /// 清掉不该再留着的文件：没换上去的新程序，和上次换回时挪开的那个（那时它正在运行，删不掉）。
-    /// 清不掉不要紧，下次再清，所以只记日志。
+    /// 清理不再需要的遗留文件：未完成安装的候选新程序，以及上次 Windows 回滚时因正在运行而移出的失败程序。
+    /// 清理失败不影响正常运行，将在下次启动时重试，因此仅记录警告日志。
     pub fn remove_leftovers(&self) {
         for leftover in [self.candidate(), self.discarded()] {
             if let Err(error) = remove_if_exists(&leftover) {
-                tracing::warn!(path = %leftover.display(), %error, "清不掉上次更新留下的文件");
+                tracing::warn!(path = %leftover.display(), %error, "无法清理上次更新遗留的文件");
             }
         }
     }
 
-    /// 让改名落盘。Windows 上目录不能这样打开，那里改名的落盘由文件系统的日志保证。
+    /// 同步父目录元数据以确保重命名落盘。Windows 不支持以此方式打开目录，其重命名持久化由文件系统日志保证。
     fn sync_dir(&self) -> io::Result<()> {
         if cfg!(unix) {
-            let dir = self.program.parent().ok_or_else(|| io::Error::other("程序的路径没有上一级目录"))?;
+            let dir = self.program.parent().ok_or_else(|| io::Error::other("可执行文件路径缺少父目录"))?;
             File::open(dir)?.sync_all()?;
         }
         Ok(())
@@ -152,19 +152,19 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 替换失败之后收拾刚做的备份。收拾不掉也不影响程序，下次启动会再清。
+/// 替换失败后清理刚创建的备份文件。清理失败不影响程序运行，将在下次启动时重试。
 fn discard(backup: &Path) {
     if let Err(error) = remove_if_exists(backup) {
-        tracing::warn!(path = %backup.display(), %error, "替换程序失败之后删不掉刚做的备份");
+        tracing::warn!(path = %backup.display(), %error, "程序替换失败后无法删除新建的备份文件");
     }
 }
 
-/// 第二次改名失败之后把刚挪开的文件放回去。放不回去的话程序的路径上就没有文件了，这只能交给人处理，所以要把话说清楚。
+/// 第二次重命名失败后尝试恢复刚移出的原程序文件。若恢复也失败，目标路径将缺失可执行文件，必须记录明确错误供人工介入。
 fn put_back(moved: &Path, program: &Path) {
     if let Err(error) = fs::rename(moved, program) {
         tracing::error!(
             from = %moved.display(), to = %program.display(), %error,
-            "替换程序中途失败，而且没能把原来的程序放回去：请手动把它改回原来的名字，否则节点下次启动不了"
+            "程序替换中途失败，且无法恢复原可执行文件：请手动将其重命名回原路径，否则节点下次将无法启动"
         );
     }
 }
