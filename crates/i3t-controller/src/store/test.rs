@@ -12,19 +12,27 @@ use super::{Store, StoreError};
 pub const KEEP_PER_PAIR: u32 = 20;
 
 impl Store {
-    /// 插入新发起的主动测试记录并返回生成的编号。`view` 中原有的编号无效，以返回值为准。
+    /// 插入新发起的主动测试记录。编号由数据库生成，写入 `view.id` 后与结果一同存储；`view` 中原有的编号被覆盖。
     ///
     /// # Errors
     ///
     /// 写数据库失败，包括两个节点有一个不存在。
-    pub fn insert_test(&self, view: &TestView) -> Result<u64, StoreError> {
-        let id = self.query_one(
-            "INSERT INTO tests (network_id, node_a, node_b, started_at, view) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            &[&SqlNetwork(view.network), &SqlNode(view.a.id), &SqlNode(view.b.id), &Unsigned(view.started_at), &Json(view)],
-            |row| Ok(row.try_get::<_, Unsigned>(0)?.0),
+    pub fn insert_test(&self, view: &mut TestView) -> Result<(), StoreError> {
+        // 先取得编号再插入，使存储的结果自第一次写入起即带有正确的编号。
+        view.id =
+            self.query_one("SELECT nextval(pg_get_serial_sequence('tests', 'id'))", &[], |row| Ok(row.try_get::<_, Unsigned>(0)?.0))?;
+        self.execute(
+            "INSERT INTO tests (id, network_id, node_a, node_b, started_at, view) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &Unsigned(view.id),
+                &SqlNetwork(view.network),
+                &SqlNode(view.a.id),
+                &SqlNode(view.b.id),
+                &Unsigned(view.started_at),
+                &Json(&*view),
+            ],
         )?;
-        self.prune_tests(view.network, view.a.id, view.b.id)?;
-        Ok(id)
+        self.prune_tests(view.network, view.a.id, view.b.id)
     }
 
     /// 换上一个测试的最新结果。
@@ -47,8 +55,8 @@ impl Store {
         if i64::try_from(id).is_err() {
             return Ok(None);
         }
-        let sql = "SELECT view FROM tests WHERE id = $1 AND network_id = $2";
-        self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], |row| Ok(row.try_get::<_, Json<TestView>>(0)?.0))
+        let sql = "SELECT id, view FROM tests WHERE id = $1 AND network_id = $2";
+        self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], read_test)
     }
 
     /// 最近的测试，新的在前。`pair` 有值时只要这一对节点的（先后无所谓）。
@@ -57,17 +65,16 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn tests(&self, network: NetworkId, pair: Option<(NodeId, NodeId)>, limit: u32) -> Result<Vec<TestView>, StoreError> {
-        let read = |row: &Row| -> Read<TestView> { Ok(row.try_get::<_, Json<TestView>>(0)?.0) };
         match pair {
             Some((a, b)) => self.query(
-                "SELECT view FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2))
+                "SELECT id, view FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2))
                  ORDER BY id DESC LIMIT $4",
                 &[&SqlNetwork(network), &SqlNode(a), &SqlNode(b), &Int(limit)],
-                read,
+                read_test,
             ),
             None => {
-                let sql = "SELECT view FROM tests WHERE network_id = $1 ORDER BY id DESC LIMIT $2";
-                self.query(sql, &[&SqlNetwork(network), &Int(limit)], read)
+                let sql = "SELECT id, view FROM tests WHERE network_id = $1 ORDER BY id DESC LIMIT $2";
+                self.query(sql, &[&SqlNetwork(network), &Int(limit)], read_test)
             }
         }
     }
@@ -81,6 +88,12 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// 读出一行 `id, view`。编号以行的 `id` 为准：早先的版本在测试结束前未将编号写入结果，期间重启留下的记录中编号为 0。
+fn read_test(row: &Row) -> Read<TestView> {
+    let id = row.try_get::<_, Unsigned>(0)?.0;
+    Ok(TestView { id, ..row.try_get::<_, Json<TestView>>(1)?.0 })
 }
 
 #[cfg(test)]
