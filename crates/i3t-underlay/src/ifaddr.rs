@@ -28,6 +28,8 @@ pub struct InterfaceAddr {
     pub ip: IpAddr,
     /// 网卡的编号。IPv6 的组播要靠它指明从哪块网卡收发；系统没有给时是 `None`。
     pub index: Option<u32>,
+    /// 这个地址所在网段的前缀长度。系统没有给掩码时是 0。
+    pub prefix: u8,
 }
 
 /// 本机启用着的网卡上的全部地址，不做筛选（回环和链路本地的也在）。读不到网卡列表时返回空表。
@@ -37,7 +39,13 @@ pub fn interface_addresses() -> Vec<InterfaceAddr> {
     interfaces
         .iter()
         .filter(|interface| interface.is_oper_up())
-        .map(|interface| InterfaceAddr { ip: interface.ip(), index: interface.index })
+        .map(|interface| {
+            let prefix = match &interface.addr {
+                if_addrs::IfAddr::V4(addr) => addr.prefixlen,
+                if_addrs::IfAddr::V6(addr) => addr.prefixlen,
+            };
+            InterfaceAddr { ip: interface.ip(), index: interface.index, prefix }
+        })
         .collect()
 }
 

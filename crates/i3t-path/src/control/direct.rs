@@ -168,13 +168,16 @@ impl Control {
     }
 
     /// 在本地网段上看到了一个对端的信标：它的来源地址成为一个直连候选，照样要用带签名的探测验证过才用。
+    /// 信标造得出来，所以它最多引出一个探测，别的都不动（见 [`DirectPath::on_lan_sighting`](crate::direct::DirectPath::on_lan_sighting)）。
     pub(super) fn on_lan(&mut self, sighting: Sighting, now: Instant) {
         if !self.allow_direct {
             return;
         }
         let Some((&id, peer)) = self.peers.iter_mut().find(|(_, peer)| peer.key == sighting.key) else { return };
-        tracing::debug!(peer = %id, addr = %sighting.addr, "在局域网里看到了对端，把这个地址加进直连的候选");
-        peer.direct.on_lan_sighting(sighting.addr, now);
+        tracing::debug!(peer = %id, addr = %sighting.addr, "在局域网里看到了对端的信标");
+        let policy = direct_policy(&self.shared, self.allow_direct, self.dial_out_only, self.mode, &self.endpoints, peer, now);
+        let probe = peer.direct.on_lan_sighting(sighting.addr, now, &policy);
+        self.perform(id, probe);
     }
 
     /// 把直连状态机要做的事做掉：给 PING 签名发出去，把信令交给钩子。

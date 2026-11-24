@@ -15,6 +15,10 @@
 //!   （回环、组播、广播、链路本地；本节点自己绑在回环上的测试除外），信令引出的探测最多每 [`PUNCH_ATTEMPT`] 一轮，
 //!   重试的退避照常推进，所以对端不能让本节点不停地向随便什么地址发探测。
 //! - 每个候选地址来的 PING 有自己的验签额度，伪造的 PING 花不掉别的地址的额度。
+//! - 局域网信标谁知道对端的公钥都造得出来，所以信标带来的地址只是一个线索（[`DirectPath::on_lan_sighting`]）：
+//!   它另占几个名额（[`MAX_SIGHTED`]），挤不掉别处学来的候选；一个信标最多引出一个探测，探测有额度；
+//!   重试的节奏、退避和搁置不因为它重来，也不为它发信令；别处也说到这个地址之前，它来的 PING 用不上候选地址自己的验签额度。
+//!   公网 IPv4 地址不会因为信标被当成本地网络里的，信标停了一阵之后别的地址也不再算。
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
@@ -42,6 +46,14 @@ const PINGED_TTL: Duration = Duration::from_secs(15);
 /// 三轮在 600ms 里发完，这些都从它的同一个地址来。
 const CANDIDATE_VERIFIES_PER_SEC: f64 = 25.0;
 const CANDIDATE_VERIFY_BURST: f64 = 50.0;
+/// 只在局域网信标里见过的候选地址最多记多少个。对端在本节点的网段上一般只有一两个地址（每块网卡上 IPv4、IPv6 各一个）。
+/// 信标造得再多，也只在这几个名额里互相挤。
+const MAX_SIGHTED: usize = 4;
+/// 多久没有再看到信标，一个地址就不再算是在本地网段上看到的。信标每 10 秒一个。
+const SIGHTING_TTL: Duration = Duration::from_secs(60);
+/// 信标引出的探测，一个对端每秒最多几个、最多攒几个。对端的每个地址每 10 秒才有一个信标。
+const SIGHTING_PROBES_PER_SEC: f64 = 1.0;
+const SIGHTING_PROBE_BURST: f64 = 4.0;
 /// 发出去的 PING 等多久还没有回答就不再等。比一次打洞尝试长，晚到的 PONG 照样算数。
 const PENDING_TTL: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 64;
@@ -144,8 +156,10 @@ struct Candidate {
     proven: Option<Instant>,
     /// 最近一次从这个地址收到对端签了名的 PING。
     pinged: Option<Instant>,
-    /// 是从对端在本地网段上发的信标里得知的。
-    lan: bool,
+    /// 最近一次在本地网段上看到对端从这个地址发的信标。[`SIGHTING_TTL`] 里没有再看到就清掉。
+    sighted: Option<Instant>,
+    /// 只在信标里见过：对端没有上报它，信令里没有它，也没有从它收到过对端签了名的探测或者回答。
+    sighted_only: bool,
     /// 最近一次本端往这个地址发探测。
     probed: Option<Instant>,
     /// 最近一次因为收到对端从这个地址来的 PING 而反过来验证它（每个地址最多每 [`REVERSE_PROBE_INTERVAL`] 一次）。
@@ -155,6 +169,24 @@ struct Candidate {
     unsolicited: Option<Instant>,
     /// 这个地址来的 PING 的验签额度。
     budget: Budget,
+}
+
+impl Candidate {
+    fn new(addr: SocketAddr, sighted_only: bool, now: Instant) -> Self {
+        Self {
+            addr,
+            reported: false,
+            refreshed: now,
+            proven: None,
+            pinged: None,
+            sighted: None,
+            sighted_only,
+            probed: None,
+            reverse_probed: None,
+            unsolicited: None,
+            budget: Budget::new(CANDIDATE_VERIFIES_PER_SEC, CANDIDATE_VERIFY_BURST, now),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -250,6 +282,8 @@ pub(crate) struct DirectPath {
     same_nat: bool,
     /// 上一次因为信令立刻发一轮探测的时刻。
     signal_volley: Option<Instant>,
+    /// 信标引出的探测的额度。看到头一个信标时才有。
+    sighting_probes: Option<Budget>,
     /// 回环地址可以当候选：本节点自己就绑在回环上（测试里几个节点在同一台机器上）。
     loopback: bool,
     /// 最近一次尝试开始的时刻，和最近一次失败的原因：只记下来给界面看（[`DirectPath::status`]），不影响什么时候去试。
@@ -269,6 +303,7 @@ impl DirectPath {
             requested: None,
             same_nat: false,
             signal_volley: None,
+            sighting_probes: None,
             loopback: false,
             attempted: None,
             failure: None,
@@ -329,18 +364,19 @@ impl DirectPath {
     }
 
     fn came_from_beacon(&self, addr: SocketAddr) -> bool {
-        self.candidates.iter().any(|candidate| candidate.addr == addr && candidate.lan)
+        self.candidates.iter().any(|candidate| candidate.addr == addr && candidate.sighted.is_some())
     }
 
-    /// 到 `addr` 的包是不是不经过地址转换：它是私有地址，或者是从局域网信标里得知的。
-    /// 这样的地址上的对端看到的本节点地址，应该就是本节点网卡上的地址。
+    /// 到 `addr` 的包是不是不经过地址转换：它是私有地址，或者是从局域网信标里得知的（公网 IPv4 地址不会是，
+    /// 见 [`on_lan_sighting`](Self::on_lan_sighting)）。这样的地址上的对端看到的本节点地址，应该就是本节点网卡上的地址。
     pub(crate) fn is_local_network(&self, addr: SocketAddr) -> bool {
         ifaddr::is_private(addr.ip()) || self.came_from_beacon(addr)
     }
 
     /// `from` 是这个对端的候选地址时，从它的验签额度里扣一次，返回扣没扣到；不是候选地址返回 `None`。
+    /// 只在信标里见过的地址不算候选地址：信标谁都造得出来，凭它拿不到一份自己的额度。
     pub(crate) fn charge(&mut self, from: SocketAddr, now: Instant) -> Option<bool> {
-        self.candidate_mut(from).map(|candidate| candidate.budget.take(now))
+        self.candidate_mut(from).filter(|candidate| !candidate.sighted_only).map(|candidate| candidate.budget.take(now))
     }
 
     /// 本节点和对端是不是在同一个 NAT 后面（两边上报的公网地址里有相同的 IP）。
@@ -348,16 +384,34 @@ impl DirectPath {
         self.same_nat = same_nat;
     }
 
-    /// 在本地网段上看到了对端的信标，来源是 `addr`。它成为一个候选地址，照样要验证过才用。
-    pub(crate) fn on_lan_sighting(&mut self, addr: SocketAddr, now: Instant) {
-        let appeared = self.learn(addr, now);
-        if let Some(candidate) = self.candidate_mut(addr) {
-            candidate.lan = true;
+    /// 在本地网段上看到了对端的信标，来源是 `addr`。它成为一个候选地址，照样要验证过才用。返回要不要马上向它发一个探测。
+    ///
+    /// 信标谁知道对端的公钥都造得出来，所以它能引起的只有这些：占信标自己的一个名额
+    /// （[`learn_sighted`](Self::learn_sighted)），引出最多一个探测（有额度），让这个地址在 [`SIGHTING_TTL`] 里算作本地网段上的。
+    /// 重试的节奏不因为它重来，也不为它发信令：局域网里不用打洞，两边各自看到对方的信标、各发一个探测就通了；
+    /// 没有通的话，这个地址也在之后每一次尝试的那几轮探测里。
+    pub(crate) fn on_lan_sighting(&mut self, addr: SocketAddr, now: Instant, policy: &Policy<'_>) -> Option<Action> {
+        // IPv4 的信标只从私有地址发。公网 IPv4 地址不能因为一个信标就被当成不经过地址转换的：在地址转换后面的节点，
+        // 对端看到的是它的公网地址，那样一来对端的回答就再也对不上了。
+        let ip = addr.ip().to_canonical();
+        if ip.is_ipv4() && !ifaddr::is_private(ip) {
+            return None;
         }
-        // 信标每隔几秒就来一个，只有头一次才算"候选变了"，不然重试的节奏会被它一直打断。
-        if appeared {
-            self.candidates_changed();
+        if !self.learn_sighted(addr, now) {
+            return None;
         }
+        self.candidate_mut(addr)?.sighted = Some(now);
+        // 有地址在用时不为它另发。还没有开始试的也不用：下一次推进就从头尝试，那一轮探测里有它。
+        let due = policy.wanted && policy.initiate && self.active.is_none() && self.punch != Punch::Idle;
+        if !due || self.is_shunned(addr, now) {
+            return None;
+        }
+        let budget = self.sighting_probes.get_or_insert_with(|| Budget::new(SIGHTING_PROBES_PER_SEC, SIGHTING_PROBE_BURST, now));
+        if !budget.take(now) {
+            return None;
+        }
+        let coordinated = self.signalled_recently(now);
+        Some(self.probe(addr, coordinated, now))
     }
 
     /// 在用的直连地址和到它的延迟。
@@ -520,7 +574,10 @@ impl DirectPath {
         let index = self.pending.iter().position(|pending| pending.nonce == *nonce && pending.addr == from)?;
         let answered = self.pending.remove(index)?;
         let sample = now.saturating_duration_since(answered.sent);
-        self.prove(from, now);
+        // 探测发出去之后，这个地址可能被别的候选挤掉了。对端签了名的回答是它最硬的证明，重新记上；
+        // 记不上（表里全是对端上报的地址）就不用它：收包只认候选地址来的。
+        self.learn(from, now);
+        self.candidate_mut(from)?.proven = Some(now);
         let shunned = self.is_shunned(from, now);
         match &mut self.active {
             Some(active) if active.addr == from => {
@@ -694,6 +751,8 @@ impl DirectPath {
         }
         if let Some(candidate) = self.candidate_mut(addr) {
             candidate.refreshed = now;
+            // 别处也说到了它，不再只是信标里的线索。
+            candidate.sighted_only = false;
             return false;
         }
         if self.candidates.len() >= MAX_CANDIDATES {
@@ -704,19 +763,31 @@ impl DirectPath {
             let Some((oldest, _)) = evictable.min_by_key(|(_, candidate)| candidate.refreshed) else { return false };
             self.candidates.swap_remove(oldest);
         }
-        let budget = Budget::new(CANDIDATE_VERIFIES_PER_SEC, CANDIDATE_VERIFY_BURST, now);
-        self.candidates.push(Candidate {
-            addr,
-            reported: false,
-            refreshed: now,
-            proven: None,
-            pinged: None,
-            lan: false,
-            probed: None,
-            reverse_probed: None,
-            unsolicited: None,
-            budget,
-        });
+        self.candidates.push(Candidate::new(addr, false, now));
+        true
+    }
+
+    /// 记下信标里来的地址。返回记没记下，本来就有也算。
+    ///
+    /// 新的地址只占信标自己的名额：名额满了、或者整张表满了，挤掉的也只是另一个只在信标里见过的地址（最久没有出现的那个），
+    /// 没有可挤的就不记。对端上报的、信令和探测里来的候选不会被它挤掉。
+    fn learn_sighted(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        if !self.can_probe(addr) {
+            return false;
+        }
+        if let Some(candidate) = self.candidate_mut(addr) {
+            candidate.refreshed = now;
+            return true;
+        }
+        let sighted_only = self.candidates.iter().filter(|candidate| candidate.sighted_only).count();
+        if sighted_only >= MAX_SIGHTED || self.candidates.len() >= MAX_CANDIDATES {
+            let active = self.active.as_ref().map(|active| active.addr);
+            let evictable =
+                self.candidates.iter().enumerate().filter(|(_, candidate)| candidate.sighted_only && Some(candidate.addr) != active);
+            let Some((oldest, _)) = evictable.min_by_key(|(_, candidate)| candidate.refreshed) else { return false };
+            self.candidates.swap_remove(oldest);
+        }
+        self.candidates.push(Candidate::new(addr, true, now));
         true
     }
 
@@ -750,6 +821,11 @@ impl DirectPath {
         self.candidates.retain(|candidate| {
             candidate.reported || Some(candidate.addr) == active || now.saturating_duration_since(candidate.refreshed) < CANDIDATE_TTL
         });
+        for candidate in &mut self.candidates {
+            if candidate.sighted.is_some_and(|at| now.saturating_duration_since(at) >= SIGHTING_TTL) {
+                candidate.sighted = None;
+            }
+        }
     }
 }
 
@@ -1424,6 +1500,17 @@ mod tests {
         assert_eq!(path.sources(start + 40 * MS).count(), 2, "两个地址来的包都认");
     }
 
+    /// 让一条通着的直连一直通到 `until`：每秒推进一次，保活探测都有回答。
+    fn kept_alive(path: &mut DirectPath, from: Instant, until: Instant) {
+        let mut now = from;
+        while now < until {
+            now = (now + Duration::from_secs(1)).min(until);
+            for (to, nonce) in pings(&path.poll(now, &policy(&[])).actions) {
+                path.on_pong(to, &nonce, now);
+            }
+        }
+    }
+
     #[test]
     fn a_peer_seen_through_a_lan_beacon_becomes_a_candidate_that_still_has_to_be_validated() {
         let start = Instant::now();
@@ -1431,14 +1518,30 @@ mod tests {
         let mut path = DirectPath::new();
         // 对端没有上报任何端点；信标是唯一的线索。
         assert!(path.poll(start, &policy(&[])).actions.iter().all(|action| !matches!(action, Action::Ping { .. })));
-        path.on_lan_sighting(lan, start + 10 * MS);
-        assert_eq!(path.active(), None, "看到信标不等于验证过");
-        let step = path.poll(start + 10 * MS, &policy(&[]));
-        let [(to, nonce)] = pings(&step.actions)[..] else { panic!("应该立刻去探测信标里的地址：{step:?}") };
+        let probe = path.on_lan_sighting(lan, start + 10 * MS, &policy(&[]));
+        let Some(Action::Ping { to, nonce }) = probe else { panic!("应该立刻去探测信标里的地址：{probe:?}") };
         assert_eq!(to, lan);
+        assert_eq!(path.active(), None, "看到信标不等于验证过");
         assert_eq!(path.on_pong(lan, &nonce, start + 12 * MS), Some(Change::Up { addr: lan }));
         assert_eq!(path.kind(), Some(DirectKind::Lan));
         assert!(path.is_lan_active());
+
+        // 还没有开始试的不另发：下一次推进就从头尝试，那一轮探测里有它。
+        let mut fresh = DirectPath::new();
+        assert_eq!(fresh.on_lan_sighting(lan, start, &policy(&[])), None);
+        let step = fresh.poll(start, &policy(&[]));
+        assert_eq!(pings(&step.actions).iter().map(|(to, _)| *to).collect::<Vec<_>>(), [lan]);
+
+        // 用不到这个对端时只是记下，不探测；只主动连接的对端也不由本端去探测。
+        let idle = Policy { wanted: false, ..policy(&[]) };
+        let dial_out_only = Policy { initiate: false, ..policy(&[]) };
+        for unwanted in [idle, dial_out_only] {
+            let mut path = DirectPath::new();
+            path.poll(start, &unwanted);
+            assert_eq!(path.on_lan_sighting(lan, start, &unwanted), None);
+            assert!(pings(&path.poll(start, &unwanted).actions).is_empty());
+            assert_eq!(path.candidate_count(), 1);
+        }
     }
 
     #[test]
@@ -1446,18 +1549,174 @@ mod tests {
         let start = Instant::now();
         let lan = addr("192.168.1.7:20330");
         let mut path = DirectPath::new();
-        path.on_lan_sighting(lan, start);
+        path.on_lan_sighting(lan, start, &policy(&[]));
         path.poll(start, &policy(&[]));
         // 这一次尝试失败之后进入退避。信标每隔几秒再来一个，不该每次都把退避清掉重来。
         path.poll(start + PUNCH_ATTEMPT, &policy(&[]));
         assert!(matches!(path.punch, Punch::Backoff { round: 0, .. }));
-        path.on_lan_sighting(lan, start + PUNCH_ATTEMPT + 10 * MS);
+        path.on_lan_sighting(lan, start + PUNCH_ATTEMPT + 10 * MS, &policy(&[]));
         assert!(matches!(path.punch, Punch::Backoff { round: 0, .. }));
         // 信标一直在来，这个候选就一直留着（不是对端上报的候选本来两分钟不出现就忘掉）。
         let later = start + CANDIDATE_TTL + Duration::from_secs(1);
-        path.on_lan_sighting(lan, later - Duration::from_secs(5));
+        path.on_lan_sighting(lan, later - Duration::from_secs(5), &policy(&[]));
         path.poll(later, &Policy { wanted: false, ..policy(&[]) });
         assert_eq!(path.candidates.len(), 1);
+    }
+
+    #[test]
+    fn forged_beacons_neither_restart_the_retry_schedule_nor_crowd_out_other_candidates() {
+        let start = Instant::now();
+        let local = [addr("198.51.100.1:20330")];
+        let policy = policy(&local);
+        let (reported, signalled, pinged) = (addr("203.0.113.7:20330"), addr("203.0.113.7:4000"), addr("203.0.113.7:4001"));
+        let mut path = DirectPath::new();
+        path.set_reported(&[reported], start);
+        path.on_signal(&Signal::PunchReply { endpoints: vec![signalled] }, start, &policy);
+        path.on_ping(pinged, start);
+        // 一整轮都没有打通，之后每分钟才再试一次。
+        let mut now = start;
+        while !matches!(path.punch, Punch::Exhausted { .. }) {
+            now += 100 * MS;
+            path.poll(now, &policy);
+        }
+        let exhausted = path.punch;
+        let known = |path: &DirectPath| {
+            [reported, signalled, pinged].iter().all(|addr| path.candidates.iter().any(|candidate| candidate.addr == *addr))
+        };
+        assert!(known(&path));
+
+        // 知道对端公钥的人在网段上灌信标，每个的来源都不一样：每秒 50 个，灌 20 秒。
+        let mut probes = Vec::new();
+        for forged in 0..1000u16 {
+            now += 20 * MS;
+            let from = SocketAddr::from(([192, 168, 1, 66], 1000 + forged));
+            if let Some(action) = path.on_lan_sighting(from, now, &policy) {
+                let Action::Ping { to, .. } = action else { panic!("信标只会引出探测：{action:?}") };
+                assert_eq!(to, from, "只探测信标里的那个地址");
+                probes.push(now);
+            }
+            assert!(path.poll(now, &policy).actions.is_empty(), "不为它另发一轮探测，也不发信令");
+            assert_eq!(path.punch, exhausted, "重试的节奏不因为它重来");
+            assert!(path.candidates.iter().filter(|candidate| candidate.sighted_only).count() <= MAX_SIGHTED);
+        }
+        // 攒着的 4 个，加上 20 秒里每秒补的一个。
+        assert!((20..=24).contains(&probes.len()), "{}", probes.len());
+        assert!(known(&path), "别处学来的候选没有被挤掉");
+        assert!(path.candidates.len() <= 3 + MAX_SIGHTED);
+
+        // 到了该再试的时候照常再试。
+        let Punch::Exhausted { retry_at } = exhausted else { unreachable!() };
+        let step = path.poll(retry_at, &policy);
+        assert_eq!(signals(&step.actions).len(), 1);
+        assert_eq!(pings(&step.actions).len(), path.candidates.len());
+    }
+
+    #[test]
+    fn beacons_do_not_bring_back_an_address_put_aside_for_loss() {
+        let peer = addr("192.168.1.7:20330");
+        let (mut path, down, _) = taken_down_for_loss(peer);
+        let policy = policy(&[]);
+        let shunned = path.punch;
+        assert!(matches!(shunned, Punch::Shunned { .. }));
+        // 对端的信标照常每 10 秒一个：搁着的那个地址不因为它提前再试。
+        for seconds in [1, 11, 21, 31, 41, 51] {
+            let now = down + Duration::from_secs(seconds);
+            assert_eq!(path.on_lan_sighting(peer, now, &policy), None);
+            assert!(path.poll(now, &policy).actions.is_empty());
+            assert_eq!(path.punch, shunned);
+        }
+        // 别的地址上看到了它：只探测那一个，搁着的照旧搁着。
+        let other = addr("192.168.1.8:20330");
+        let now = down + Duration::from_secs(52);
+        let probe = path.on_lan_sighting(other, now, &policy);
+        let Some(Action::Ping { to, nonce }) = probe else { panic!("别的地址照样探测：{probe:?}") };
+        assert_eq!((to, path.punch), (other, shunned));
+        assert_eq!(path.on_pong(other, &nonce, now + MS), Some(Change::Up { addr: other }), "别的地址验证通过了照样用");
+    }
+
+    #[test]
+    fn a_beacon_cannot_make_a_public_address_count_as_the_local_network() {
+        let public = addr("203.0.113.7:20330");
+        let (mut path, up) = established(public);
+        assert!(!path.is_local_network(public));
+        // 有人造了一个来源是对端公网地址的信标。本节点在地址转换后面的话，对端看到的是本节点的公网地址：
+        // 把这个地址当成本地网络里的，对端的回答就再也对不上，直连断了也回不来。
+        assert_eq!(path.on_lan_sighting(public, up, &policy(&[])), None);
+        assert!(!path.is_local_network(public));
+        assert_eq!(path.kind(), Some(DirectKind::Reachable));
+        // 没有听说过的公网地址也不因为信标成为候选。
+        let unknown = addr("198.51.100.3:9");
+        let mut idle = DirectPath::new();
+        idle.poll(up, &policy(&[]));
+        assert_eq!(idle.on_lan_sighting(unknown, up, &policy(&[])), None);
+        assert_eq!(idle.candidate_count(), 0);
+    }
+
+    #[test]
+    fn an_address_stops_counting_as_seen_on_the_lan_once_the_beacons_stop() {
+        // 对端上报的地址不会过期，信标给它的记号会。
+        for peer in ["192.168.1.7:20330", "[2001:db8::7]:20330"].map(addr) {
+            let (mut path, up) = established(peer);
+            let private = ifaddr::is_private(peer.ip());
+            assert_eq!(path.is_local_network(peer), private);
+            path.on_lan_sighting(peer, up, &policy(&[]));
+            assert!(path.is_local_network(peer));
+            assert_eq!(path.is_lan_active(), private, "公网的 IPv6 地址在同一个网段上也不叫局域网直连");
+
+            // 信标还在来的时候一直算。
+            let seen_again = up + SIGHTING_TTL - Duration::from_secs(1);
+            kept_alive(&mut path, up, seen_again);
+            path.on_lan_sighting(peer, seen_again, &policy(&[]));
+            let almost = seen_again + SIGHTING_TTL - Duration::from_secs(1);
+            kept_alive(&mut path, seen_again, almost);
+            assert!(path.is_local_network(peer));
+            // 信标停了。
+            kept_alive(&mut path, almost, seen_again + SIGHTING_TTL);
+            assert_eq!(path.active().map(|(addr, _)| addr), Some(peer), "直连本身不受影响");
+            assert_eq!(path.is_local_network(peer), private);
+            assert!(!path.is_lan_active());
+        }
+    }
+
+    #[test]
+    fn an_address_known_only_from_a_beacon_has_no_verify_budget_of_its_own() {
+        let start = Instant::now();
+        let (lan, reported, signalled) = (addr("192.168.1.7:20330"), addr("192.168.1.8:20330"), addr("203.0.113.7:4000"));
+        let mut path = DirectPath::new();
+        path.set_reported(&[reported], start);
+        path.on_signal(&Signal::PunchReply { endpoints: vec![signalled] }, start, &policy(&[]));
+        path.on_lan_sighting(lan, start, &policy(&[]));
+        path.on_lan_sighting(reported, start, &policy(&[]));
+        // 对端上报的、信令里的地址来的 PING 用那个地址自己的额度，信标里也看到了它不改变这一点。
+        assert_eq!((path.charge(reported, start), path.charge(signalled, start)), (Some(true), Some(true)));
+        // 只在信标里见过的照陌生地址算：造几个信标换不来几份额度。
+        assert_eq!(path.charge(lan, start), None);
+        // 对端签了名的探测从这个地址来过之后，它就是一个普通的候选了。
+        path.on_ping(lan, start + MS);
+        assert_eq!(path.charge(lan, start + MS), Some(true));
+    }
+
+    #[test]
+    fn an_answer_from_an_address_crowded_out_meanwhile_puts_it_back_among_the_candidates() {
+        let start = Instant::now();
+        let lan = addr("192.168.1.7:20330");
+        let mut path = DirectPath::new();
+        path.poll(start, &policy(&[]));
+        let probe = path.on_lan_sighting(lan, start + MS, &policy(&[]));
+        let Some(Action::Ping { to, nonce }) = probe else { panic!("应该探测信标里的地址：{probe:?}") };
+        // 回答还在路上，造出来的信标把它从信标的名额里挤了出去。
+        for port in 1..=4 {
+            path.on_lan_sighting(SocketAddr::from(([192, 168, 1, 66], port)), start + 2 * MS, &policy(&[]));
+        }
+        assert!(path.candidates.iter().all(|candidate| candidate.addr != lan));
+        assert_eq!(path.on_pong(to, &nonce, start + 3 * MS), Some(Change::Up { addr: lan }));
+        assert!(path.sources(start + 3 * MS).any(|source| source == lan), "它发来的连接包要认得出来");
+        assert_eq!(path.charge(lan, start + 3 * MS), Some(true));
+        // 在用的地址不会再被挤掉。
+        for port in 5..=20 {
+            path.on_lan_sighting(SocketAddr::from(([192, 168, 1, 66], port)), start + 4 * MS, &policy(&[]));
+        }
+        assert!(path.sources(start + 4 * MS).any(|source| source == lan));
     }
 
     #[test]
@@ -1473,7 +1732,7 @@ mod tests {
         assert_eq!(path.kind(), Some(DirectKind::Lan));
         path.set_same_nat(false);
         // 或者对端的信标就是从这个地址发来的。
-        path.on_lan_sighting(private, start + Duration::from_secs(1));
+        path.on_lan_sighting(private, start + Duration::from_secs(1), &policy(&[]));
         assert_eq!(path.kind(), Some(DirectKind::Lan));
 
         // 公网地址不管怎样都不是局域网。
