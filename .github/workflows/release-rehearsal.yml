@@ -1,0 +1,239 @@
+# 临时的：合并前在各个平台上把 release.yml 的编译部分照原样跑一遍，签名用一次性的密钥演练，不发布。合并前删掉。
+name: Release rehearsal (temporary)
+
+on:
+  push:
+    branches: [worktree-fix-issue-54-release-supply-chain]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 这个版本的节点需要的 controller 最低版本，写进清单。节点从哪个版本起不兼容旧的 controller，就在发那个版本之前改这里。
+  MIN_CONTROLLER: "0.1.0"
+  # 安全下限：比它旧的版本有已知的安全问题，写进清单，界面据此把升级标成安全更新。没有就留空。
+  # 定了之后每次发布都带着，直到更旧的版本早就没人用了。
+  SECURITY_FLOOR: ""
+  # 额外信任的一把发布公钥，编译进节点（仓库变量，不是密钥）。项目自己不设；改了代码另行发布的人设成自己的公钥。
+  I3T_RELEASE_EXTRA_KEY: ${{ vars.I3T_RELEASE_EXTRA_KEY }}
+
+jobs:
+  check:
+    name: tag matches the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/release-toolchain
+      - name: Compare the tag with the version of the node program
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "i3t") | .version')
+          if false; then
+            # 节点装上之后报的是程序里的版本号。它和清单里的对不上的话，自检会拒绝这个包。
+            echo "::error::标签是 $TAG，但 bins/i3t 的版本号是 $version。两者要一致（标签多一个 v）。"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case $version in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # WebUI 和平台无关：单独构建一次，各平台的编译从这里取。Node.js 和 pnpm 不进编译程序的那些机器。
+  webui:
+    name: build the WebUI
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-webui
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: webui
+          path: web/dist
+          if-no-files-found: error
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: [check, webui]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # platform 是发布文件名里的平台名，要和节点自己报的一致：std::env::consts 的 OS-ARCH。
+          - { platform: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, linux_arch: x86_64 }
+          - { platform: linux-aarch64, os: ubuntu-latest, target: aarch64-unknown-linux-gnu, linux_arch: aarch64 }
+          - { platform: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { platform: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
+          - { platform: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # 发布的编译不用缓存：缓存是别的流水线写的，不该进到要签名的程序里。
+      - uses: ./.github/actions/release-toolchain
+        with:
+          targets: ${{ matrix.target }}
+          zigbuild: ${{ runner.os == 'Linux' }}
+      # controller 在编译时把 web/dist 嵌进程序；没有它的话发布的 controller 只有一个说明页。
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: webui
+          path: web/dist
+      - name: Build (Linux, portable glibc)
+        if: runner.os == 'Linux'
+        env:
+          LINUX_ARCH: ${{ matrix.linux_arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          scripts/build-linux.sh "$LINUX_ARCH"
+          echo "OUT_DIR=target/dist/$TARGET/dist" >> "$GITHUB_ENV"
+      - name: Build (Windows, macOS)
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --profile dist --locked --target "$TARGET" -p i3t -p i3t-controller-bin -p i3tctl
+          echo "OUT_DIR=target/$TARGET/dist" >> "$GITHUB_ENV"
+      - name: Name the programs after the platform
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          case $PLATFORM in windows-*) exe=.exe ;; *) exe= ;; esac
+          mkdir dist
+          for program in i3t i3t-controller i3tctl; do
+            cp "$OUT_DIR/$program$exe" "dist/$program-$PLATFORM$exe"
+          done
+          ls -l dist
+      # Windows 上的虚拟网卡要 Wintun 的 wintun.dll 放在 i3t.exe 旁边（它不进仓库，scripts/fetch-wintun.sh 取钉死的版本、核对摘要）。
+      # 发一个 zip：i3t.exe、wintun.dll 和 Wintun 的许可原文。单独的 i3t-windows-*.exe 照旧发，节点自己更新时只换它，DLL 留着。
+      - name: Windows archive with Wintun
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          case $PLATFORM in windows-x86_64) arch=amd64 ;; windows-aarch64) arch=arm64 ;; *) echo "::error::没有 $PLATFORM 的 Wintun"; exit 1 ;; esac
+          scripts/fetch-wintun.sh "$arch" wintun
+          cp "$OUT_DIR/i3t.exe" wintun/i3t.exe
+          "$(command -v python3 || command -v python)" -I -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED); [z.write(f'wintun/{name}', name) for name in ('i3t.exe', 'wintun.dll', 'wintun-LICENSE.txt')]; z.close()" "dist/i3t-$PLATFORM.zip"
+          ls -l dist
+      # 冒烟时要把 controller 启动起来，它要一个 PostgreSQL。
+      - uses: ./.github/actions/test-postgres
+        if: matrix.platform == 'linux-x86_64' || matrix.platform == 'windows-x86_64' || matrix.platform == 'macos-aarch64'
+      # 上传发布之前先对产物做冒烟：核对三个程序的版本号、确认 controller 确实嵌进了 WebUI（不是空占位页）、
+      # Linux 核对 GLIBC 符号版本不超过 2.28、Windows 核对 zip 归档内容完整。
+      - name: Smoke-test the built programs
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            py=$(command -v python)
+          else
+            py=$(command -v python3)
+          fi
+          case "$PLATFORM" in
+            linux-x86_64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --version "$VERSION" --check-webui --check-glibc 2.28
+              ;;
+            linux-aarch64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --no-run --check-glibc 2.28
+              ;;
+            windows-x86_64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --version "$VERSION" --check-webui --check-zip "dist/i3t-$PLATFORM.zip"
+              ;;
+            macos-aarch64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --version "$VERSION" --check-webui
+              ;;
+            macos-x86_64)
+              "$py" scripts/smoke-release.py --bin-dir "$OUT_DIR" --no-run
+              ;;
+            *)
+              echo "::error::未配置平台 $PLATFORM 的冒烟校验"
+              exit 1
+              ;;
+          esac
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  tool:
+    name: build the release tool
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # sign 会带着签名密钥运行这里编出来的程序，所以它和节点一样：钉死的编译器，锁文件里的依赖，不读缓存。
+      - uses: ./.github/actions/release-toolchain
+      # 和节点用同一份代码、同一个 I3T_RELEASE_EXTRA_KEY 编译，所以它"编译进去的公钥"就是这次发布的节点认的公钥。
+      - run: cargo build --release --locked -p i3t-release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: i3t-release
+          path: target/release/i3t-release
+          if-no-files-found: error
+
+
+  sign:
+    name: rehearse signing with a throwaway key
+    needs: [check, build, tool]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: i3t-release
+          path: tool
+      - name: Write, sign and verify the manifest
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          ls -l dist tool
+          chmod +x tool/i3t-release
+          umask 077
+          key="$RUNNER_TEMP/rehearsal.key"
+          trap 'rm -f "$key"' EXIT
+          pub=$(tool/i3t-release keygen --out "$key" | tr -d '[:space:]')
+          tool/i3t-release manifest --version "$VERSION" --dir dist --key "$key" --min-controller "$MIN_CONTROLLER" \
+            ${SECURITY_FLOOR:+--security-floor "$SECURITY_FLOOR"}
+          tool/i3t-release verify --dir dist --key "$pub"
+          if tool/i3t-release verify --dir dist >/dev/null 2>&1; then
+            echo "::error::built-in project keys unexpectedly accepted a throwaway signature"
+            exit 1
+          fi
+          covered=$(jq -r '[(.artifacts // {} | .[].file), (.files // {} | .[].file)] | unique | .[]' dist/manifest.json)
+          missing=0
+          for path in dist/*; do
+            name=$(basename "$path")
+            case "$name" in
+              manifest.json | manifest.json.sig) continue ;;
+            esac
+            if ! printf '%s\n' "$covered" | grep -Fqx -- "$name"; then
+              echo "::error::发布文件 $name 没有被签进 manifest.json"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
