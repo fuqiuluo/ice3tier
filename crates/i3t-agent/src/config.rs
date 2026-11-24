@@ -81,7 +81,7 @@ impl Config {
     /// 写文件失败。
     pub fn write_template_if_missing(path: &Path) -> anyhow::Result<()> {
         crate::state::ensure_not_reparse_or_symlink(path).with_context(|| (texts().create_config)(path))?;
-        match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        match crate::state::create_config_file(path) {
             Ok(mut file) => io::Write::write_all(&mut file, texts().template.as_bytes()).with_context(|| (texts().write_config)(path)),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(err) => Err(err).with_context(|| (texts().create_config)(path)),

@@ -403,6 +403,88 @@ httpd.serve_forever()
         }
     }
 
+    # Without the installer (the zip run by hand, `i3t service install`) the node is on its own.
+    Step 'the node itself refuses a %ProgramData%\i3t that ordinary users can write to or that one of them owns'
+    $node = Join-Path $dir 'i3t.exe'
+    # Made like this, it inherits from C:\ProgramData: Users may read it and add files and directories to it.
+    New-Item -ItemType Directory -Path $state | Out-Null
+    try {
+        foreach ($case in 'writable by Users', 'owned by Users') {
+            if ($case -eq 'owned by Users') {
+                & icacls.exe $state /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+                & icacls.exe $state /setowner '*S-1-5-32-545' | Out-Null
+                if ($LASTEXITCODE -ne 0) { Fail 'failed to set untrusted owner on test state directory' }
+            }
+            & cmd.exe /c "`"$node`" key > nul 2>&1"
+            if ($LASTEXITCODE -eq 0) { Fail "the node used a %ProgramData%\i3t $case" }
+            if (Test-Path -LiteralPath (Join-Path $state 'node.key')) { Fail "node.key was written into a %ProgramData%\i3t $case" }
+        }
+    } finally {
+        & icacls.exe $state /setowner '*S-1-5-32-544' | Out-Null
+        Remove-Item -LiteralPath $state -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Step 'the node creates a missing state directory closed to ordinary users, files included'
+    & cmd.exe /c "`"$node`" --state-dir `"$state`" key > nul 2>&1"
+    if ($LASTEXITCODE -ne 0) { Fail "the node could not create $state" }
+    try {
+        foreach ($path in $state, (Join-Path $state 'node.key')) {
+            $access = (& icacls.exe $path | Out-String)
+            if ($access -match 'BUILTIN\\Users|Authenticated Users|Everyone') { Fail "ordinary users can reach ${path}:`n$access" }
+            # Owned by Administrators as install.ps1 does it, not by whichever administrator ran the node.
+            $owner = (Get-Acl -LiteralPath $path).Owner
+            if ($owner -ne 'BUILTIN\Administrators') { Fail "$path is owned by $owner, not by Administrators" }
+        }
+    } finally {
+        Remove-Item -LiteralPath $state -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # A service account outside Administrators may run with a token that counts as elevated; the directory the node
+    # makes must still let that account in, or the node shuts itself out before writing node.key.
+    Step 'a node run as LOCAL SERVICE creates a state directory it can use itself'
+    $serviceRoot = Join-Path $env:SystemDrive ('i3t-local-service-' + [Guid]::NewGuid().ToString('N'))
+    $serviceState = Join-Path $serviceRoot 'state'
+    $serviceOut = Join-Path $serviceRoot 'out.txt'
+    $task = 'i3t-test-local-service'
+    New-Item -ItemType Directory -Path $serviceRoot | Out-Null
+    try {
+        & icacls.exe $serviceRoot /grant '*S-1-5-19:(OI)(CI)F' | Out-Null
+        if ($LASTEXITCODE -ne 0) { Fail 'failed to let LOCAL SERVICE into the test directory' }
+        Copy-Item -LiteralPath $node -Destination $serviceRoot
+        $serviceNode = Join-Path $serviceRoot 'i3t.exe'
+        $action = New-ScheduledTaskAction -Execute 'cmd.exe' `
+            -Argument "/c `"`"$serviceNode`" --state-dir `"$serviceState`" key > `"$serviceOut`" 2>&1`""
+        $principal = New-ScheduledTaskPrincipal -UserId 'LOCALSERVICE' -LogonType ServiceAccount
+        # The first run creates the directory and node.key; the second finds both and reads the key back. Each run
+        # gets a task of its own, so the result read is never the one left over from the run before.
+        foreach ($run in 'first', 'second') {
+            Remove-Item -LiteralPath $serviceOut -Force -ErrorAction SilentlyContinue
+            Register-ScheduledTask -TaskName "$task-$run" -Action $action -Principal $principal -Force | Out-Null
+            Start-ScheduledTask -TaskName "$task-$run"
+            # Done once the task is no longer running, its result is neither 0x41301 (running) nor 0x41303 (has not
+            # run yet), and the node has printed its key or its error.
+            $result = 0x41303
+            for ($i = 0; $i -lt 120; $i++) {
+                Start-Sleep -Milliseconds 500
+                $result = (Get-ScheduledTaskInfo -TaskName "$task-$run").LastTaskResult
+                $taskState = "$((Get-ScheduledTask -TaskName "$task-$run").State)"
+                $printed = (Test-Path -LiteralPath $serviceOut) -and ((Get-Item -LiteralPath $serviceOut).Length -gt 0)
+                if ($printed -and (@('Running', 'Queued') -notcontains $taskState) -and (@(0x41301, 0x41303) -notcontains $result)) { break }
+            }
+            if ($result -ne 0) {
+                Get-Content -LiteralPath $serviceOut -Encoding UTF8 -ErrorAction SilentlyContinue
+                Fail ("the $run run of the node as LOCAL SERVICE ended with 0x{0:X}" -f $result)
+            }
+        }
+        foreach ($path in $serviceState, (Join-Path $serviceState 'node.key')) {
+            $access = (& icacls.exe $path | Out-String)
+            if ($access -notmatch 'NT AUTHORITY\\LOCAL SERVICE') { Fail "LOCAL SERVICE is not let into ${path}:`n$access" }
+            if ($access -match 'BUILTIN\\Users|Authenticated Users|Everyone') { Fail "ordinary users can reach ${path}:`n$access" }
+        }
+    } finally {
+        foreach ($run in 'first', 'second') { Unregister-ScheduledTask -TaskName "$task-$run" -Confirm:$false -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $serviceRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     Step 'ok'
 } catch {
     Write-Host "`n--- failed; the node says:"

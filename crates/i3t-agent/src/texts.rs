@@ -30,6 +30,15 @@ pub(crate) struct Texts {
     pub(crate) not_an_address: fn(&str) -> String,
     pub(crate) create_state_dir: fn(&Path) -> String,
     pub(crate) restrict_state_dir: fn(&Path) -> String,
+    /// Windows 上已有的状态目录（或里面的一项）不能用：属主（SID）不可信。
+    #[cfg(windows)]
+    pub(crate) untrusted_owner: fn(&str) -> String,
+    /// Windows 上已有的状态目录（或里面的一项）不能用：这个账户（SID）能写或者能改权限。
+    #[cfg(windows)]
+    pub(crate) untrusted_writer: fn(&str) -> String,
+    /// Windows 上已有的状态目录（或里面的一项）不能用：没有访问控制列表。
+    #[cfg(windows)]
+    pub(crate) no_dacl: &'static str,
     pub(crate) parse_key: fn(&Path) -> String,
     pub(crate) read_key: fn(&Path) -> String,
     pub(crate) generate_key: &'static str,
@@ -100,6 +109,14 @@ static ZH: Texts = Texts {
     not_an_address: |text| format!("\"{text}\" 不是有效地址：请填写“地址:端口”（如 \"127.0.0.1:1080\"）或 \"off\""),
     create_state_dir: |path| format!("创建状态目录 {}", path.display()),
     restrict_state_dir: |path| format!("设置状态目录 {} 权限", path.display()),
+    #[cfg(windows)]
+    untrusted_owner: |sid| {
+        format!("属主为 {sid}，不是 SYSTEM、Administrators 或当前用户，可能是其他用户预先创建的：请检查后将其删除，再重新运行")
+    },
+    #[cfg(windows)]
+    untrusted_writer: |sid| format!("{sid} 可以写入或修改其权限，其中的内容可能已被改动：请检查后撤销该账户的权限或将其删除，再重新运行"),
+    #[cfg(windows)]
+    no_dacl: "没有访问控制列表，所有用户都可以写入，其中的内容可能已被改动：请检查后为其设置权限或将其删除，再重新运行",
     parse_key: |path| format!("无法解析私钥文件 {}", path.display()),
     read_key: |path| format!("读取私钥文件 {}", path.display()),
     generate_key: "生成节点私钥",
@@ -161,6 +178,20 @@ static EN: Texts = Texts {
     not_an_address: |text| format!("\"{text}\" isn't an address: write \"127.0.0.1:1080\" (address:port) or \"off\""),
     create_state_dir: |path| format!("Creating the state directory {}", path.display()),
     restrict_state_dir: |path| format!("Restricting the state directory {}", path.display()),
+    #[cfg(windows)]
+    untrusted_owner: |sid| {
+        format!(
+            "it is owned by {sid}, not by SYSTEM, Administrators or the current user, so another user may have created it: check it, delete it and run again"
+        )
+    },
+    #[cfg(windows)]
+    untrusted_writer: |sid| {
+        format!(
+            "{sid} may write to it or change its permissions, so what is inside may have been altered: check it, take that account's access away or delete it, and run again"
+        )
+    },
+    #[cfg(windows)]
+    no_dacl: "it has no access control list, so every user may write to it and what is inside may have been altered: check it, give it permissions or delete it, and run again",
     parse_key: |path| format!("Private key file {} unreadable", path.display()),
     read_key: |path| format!("Reading the private key file {}", path.display()),
     generate_key: "Generating the node key",
