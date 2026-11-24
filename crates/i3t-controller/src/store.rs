@@ -13,7 +13,7 @@
 //!
 //! - 连接失败（包括已连通端口但对端无响应）受总超时限制；刚重连失败后会在冷却期内跳过重连，期间读写立即失败
 //!   （[`StoreError::Disconnected`]），避免每次请求都等待完整超时。
-//! - 一条语句等回答有期限，过了就当这条连接坏了。
+//! - 一条语句等回答有期限，过了就当这条连接坏了。启动时执行的表结构迁移期限更长（[`MIGRATION_TIMEOUT`]）。
 //! - 其他连接持有锁时（例如外部事务正在修改同一行或锁表），单条语句最多等待 [`LOCK_TIMEOUT`]。刚触发锁超时后，在随后的同等
 //!   时长内不再等待：涉及被锁资源的语句立即失败，未受影响的资源仍正常写入。长期不释放的锁因此最多占用 controller 一半的等待时间，
 //!   且不会阻塞其他行的操作。
@@ -575,6 +575,10 @@ impl Drop for OpenTransaction<'_> {
     }
 }
 
+/// 执行一条迁移时等待响应的上限。迁移仅在启动时执行，此时没有调用方持有 controller 锁等待；在已有数据的库上
+/// 建索引、改表需要扫描整张表，库较大或磁盘较慢时可能超过单条语句平常的期限（见 [`session`]）。
+const MIGRATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// 库里还没有 controller 的表时怎么办。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
@@ -635,7 +639,8 @@ fn migrate_one(session: &Session, migrations: &[&str], supported: u32, missing: 
         return Err(StoreError::Empty);
     }
     let index = usize::try_from(found).expect("found 小于迁移的条数，条数本来就是 usize");
-    session.batch(migrations[index])?;
+    tracing::info!(version = found + 1, "正在升级数据库表结构");
+    session.batch_within(migrations[index], MIGRATION_TIMEOUT)?;
     session.execute("UPDATE schema_version SET version = $1", &[&Int(found + 1)])?;
     Ok(Some(found + 1))
 }
@@ -1129,6 +1134,19 @@ mod tests {
         let row: (i64, i64) = store.query_one("SELECT x, z FROM a", &[], |row| Ok((row.try_get(0)?, row.try_get(1)?))).unwrap();
         assert_eq!(row, (1, 7));
         store.execute("INSERT INTO b (y) VALUES ('new table')", &[]).unwrap();
+    }
+
+    #[test]
+    fn a_migration_may_take_longer_than_an_ordinary_statement() {
+        // 在已有数据的库上建索引要扫描整张表：迁移不受平常的期限约束，迁移之后的语句仍受约束。
+        let scratch = Scratch::new();
+        let session = Session::connect(&scratch.database().0).unwrap();
+        session.set_response_timeout(Duration::from_millis(500));
+        let slow = "SELECT pg_sleep(1.5); CREATE TABLE c (q BIGINT);";
+        migrate(&session, &[FIRST, slow], Missing::Create).unwrap();
+        assert!(matches!(session.batch("SELECT pg_sleep(1.5)"), Err(StoreError::Unresponsive(_))));
+        let store = Store::prepare(&scratch.database(), &[FIRST, slow], Missing::Create).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     #[test]

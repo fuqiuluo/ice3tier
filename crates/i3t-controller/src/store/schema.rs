@@ -10,7 +10,7 @@
 //! 列的写法：整数一律 `BIGINT`（编号、计数、Unix 秒的时间，虚拟 IP 也存成整数），开关是 `BOOLEAN`，
 //! 枚举和结构体按它们的 JSON 形式存在 `JSONB` 列里，地址存文本，公钥和哈希存 `BYTEA`。
 
-pub(super) const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+pub(super) const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql"), include_str!("migrations/0002_stats_by_step_at.sql")];
 
 #[cfg(test)]
 mod tests {

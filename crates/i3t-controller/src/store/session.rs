@@ -193,6 +193,14 @@ impl Session {
         self.finish(self.client.batch_execute(sql))
     }
 
+    /// 与 [`Self::batch`] 相同，但等待响应的上限为 `limit` 而非 [`RESPONSE_TIMEOUT`]。
+    pub(super) fn batch_within(&self, sql: &str, limit: Duration) -> Result<(), StoreError> {
+        let usual = self.response_timeout.replace(limit);
+        let result = self.batch(sql);
+        self.response_timeout.set(usual);
+        result
+    }
+
     /// 等别的连接放开锁最多等多久，过了就让那条语句失败。
     pub(super) fn set_lock_timeout(&self, timeout: Duration) -> Result<(), StoreError> {
         self.batch(&format!("SET lock_timeout = {}", timeout.as_millis().max(1)))
