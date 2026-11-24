@@ -1,6 +1,6 @@
-# 构建发布用的 WebUI（web/dist）：Node.js 的版本写死在下面，pnpm 的在 web/package.json 的 packageManager，
-# 依赖照 web/pnpm-lock.yaml 现下。不读也不写缓存：缓存是别的流水线写的，不该进到要签名的程序里。
-# 发布和每天的发布演练都用它。
+# 构建发布使用的 WebUI（web/dist）：Node.js 的版本固定在下方，pnpm 的版本取自 web/package.json 的 packageManager，
+# 依赖按 web/pnpm-lock.yaml 从 registry 下载。不读取也不写入缓存：缓存由其他流水线写入，不应进入待签名的程序。
+# 发布流程与每日的发布演练共用本 action。
 name: Build the WebUI
 description: Build web/dist with pinned Node.js and pnpm, from the lockfile and without any cache
 runs:

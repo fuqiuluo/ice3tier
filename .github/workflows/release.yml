@@ -3,8 +3,8 @@
 # 签名密钥只出现在 sign 这一个 job 的一个步骤里。那个 job 不检出代码、不编译、不运行第三方的 action，
 # 只运行前面编好的 i3t-release。没有配置密钥时照样编译和上传，但只建草稿，等人离线签完名再公开。
 #
-# 要签名的程序不随别处变：action 都钉在提交上，编译器和构建工具的版本写死
-# （.github/actions/release-toolchain、.github/actions/build-webui），不读任何缓存。
+# 待签名程序的构建输入全部固定：action 固定到提交，编译器与构建工具固定版本
+# （.github/actions/release-toolchain、.github/actions/build-webui），不读取任何缓存。
 name: Release
 
 on:
@@ -53,7 +53,7 @@ jobs:
             *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
-  # WebUI 和平台无关：单独构建一次，各平台的编译从这里取。Node.js 和 pnpm 不进编译程序的那些机器。
+  # WebUI 与平台无关：单独构建一次，各平台的编译任务下载其产物。Node.js 与 pnpm 不在编译程序的 runner 上运行。
   webui:
     name: build the WebUI
     needs: check
@@ -91,7 +91,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           zigbuild: ${{ runner.os == 'Linux' }}
-      # controller 在编译时把 web/dist 嵌进程序；没有它的话发布的 controller 只有一个说明页。
+      # controller 在编译时将 web/dist 嵌入程序；缺少它时发布的 controller 只有一个说明页。
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: webui
@@ -187,7 +187,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      # sign 会带着签名密钥运行这里编出来的程序，所以它和节点一样：钉死的编译器，锁文件里的依赖，不读缓存。
+      # sign 会在持有签名密钥的步骤中运行此处编译出的程序，因此它与节点程序采用相同的构建约束：
+      # 固定版本的编译器、锁文件中的依赖、不读取缓存。
       - uses: ./.github/actions/release-toolchain
       # 和节点用同一份代码、同一个 I3T_RELEASE_EXTRA_KEY 编译，所以它"编译进去的公钥"就是这次发布的节点认的公钥。
       - run: cargo build --release --locked -p i3t-release
@@ -201,8 +202,8 @@ jobs:
     name: sign the manifest
     needs: [check, build, tool]
     runs-on: ubuntu-latest
-    # 密钥放成这个环境的密钥，不要放成仓库的密钥：仓库的密钥，任何分支上的任何一条流水线都读得到。
-    # 再给这个环境配上"需要审批人"，并限定只有 v* 标签能用它：每次签名就要有人点一下才会进行，别的分支也用不了它。
+    # 签名密钥应配置为此环境的密钥，不要配置为仓库密钥：仓库密钥可被任意分支上的任意流水线读取。
+    # 同时为此环境启用"需要审批人"，并限定仅 v* 标签可使用：每次签名须经人工批准，其他分支无法使用该环境。
     environment: release-signing
     permissions: {}
     outputs:

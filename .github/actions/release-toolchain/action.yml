@@ -1,6 +1,6 @@
-# 发布用的编译器，版本写死：Rust 的版本在下面，zig 和 cargo-zigbuild 的版本和摘要在 scripts/zigbuild-requirements.txt。
-# 发布和每天的发布演练都从这里装，演练的就是发布时用的那一套。
-# 换版本：改这里或那份清单，手动跑一遍 Nightly，发布演练过了再合。
+# 发布构建使用的编译器，版本固定：Rust 的版本见下方，zig 与 cargo-zigbuild 的版本和摘要见 scripts/zigbuild-requirements.txt。
+# 发布流程与每日的发布演练共用本 action，演练所用的工具链与发布一致。
+# 升级版本：修改此处或该清单，手动运行一次 Nightly，发布演练通过后再合并。
 name: Release toolchain
 description: Install the exact Rust toolchain, and on request zig with cargo-zigbuild, that release builds use
 inputs:
@@ -15,7 +15,7 @@ inputs:
 runs:
   using: composite
   steps:
-    # 直接用 runner 上的 rustup，不经过别人的 action。
+    # 直接调用 runner 预装的 rustup，不引入第三方 action。
     - name: Install Rust
       shell: bash
       env:

@@ -33,7 +33,7 @@ jobs:
         run: python3 tests/e2e/test_llm.py
 
   # 提前演练 release.yml 的发布构型（dist profile + LTO + zigbuild glibc 2.28 + 跨架构目标 + 清单签名/校验），
-  # 不等到打 v* 标签时才暴露交叉编译或符号版本退化。编译器和 WebUI 的构建用的是发布的那两个 action，版本和发布时一样。
+  # 不等到打 v* 标签时才暴露交叉编译或符号版本退化。编译器安装与 WebUI 构建复用发布流程的两个 action，版本与发布一致。
   release-dryrun-linux:
     name: release dry-run (Linux x86_64 & aarch64, glibc 2.28)
     runs-on: ubuntu-latest
