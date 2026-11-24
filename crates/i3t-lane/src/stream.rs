@@ -216,6 +216,7 @@ struct State {
     send_refused: Option<StreamAborted>,
     /// 写入、flush 或 shutdown 正在等待的任务。对端叫停时要叫醒它，不然它会一直等一个不会再变得可写的 socket。
     send_waker: Option<Waker>,
+    /// 后台送出任务（[`flush_later`]）正在运行：[`push`] 交不完时不再另起一个。仅由该任务在持锁确认退出时清除。
     flushing: bool,
     halves: u8,
     raw_taken: bool,
@@ -632,26 +633,30 @@ fn push(shared: &Arc<Shared>, state: &mut State) {
 }
 
 /// 后台送出待发的密文。只在写的一方已经返回、没有人会再来推一把时才需要。
+///
+/// 退出的判定与清除 [`State::flushing`] 在同一次持锁内完成：若先释放锁再清除，期间 [`push`] 见其仍为真便不再启动新任务，
+/// 此时排入的密文（如回应对端的 SWITCH、写入的最后一段数据）在本任务退出后无人送出，流将一直停滞。
 async fn flush_later(shared: Arc<Shared>) {
     let revoked = wait_revoked(shared.revoked.clone());
     tokio::pin!(revoked);
+    let mut give_up = false;
     loop {
         {
             let mut state = shared.lock();
-            if shared.is_revoked() || state.halves == 0 || !matches!(state.drain_now(&shared.socket), Ok(false)) {
-                break;
+            if give_up || shared.is_revoked() || state.halves == 0 || !matches!(state.drain_now(&shared.socket), Ok(false)) {
+                state.flushing = false;
+                state.wake_sender();
+                return;
             }
         }
-        tokio::select! {
+        // 下列任一情况发生时不再送出：流已吊销、两个句柄均已丢弃（此后不会再有 push）、runtime 正在关闭。
+        give_up = tokio::select! {
             biased;
-            () = &mut revoked => break,
-            () = shared.closed.notified() => break,
-            ready = shared.socket.writable() => if ready.is_err() { break; },
-        }
+            () = &mut revoked => true,
+            () = shared.closed.notified() => true,
+            ready = shared.socket.writable() => ready.is_err(),
+        };
     }
-    let mut state = shared.lock();
-    state.flushing = false;
-    state.wake_sender();
 }
 
 impl AsyncRead for LaneRecv {
