@@ -79,6 +79,7 @@ pub use switch::NewSwitch;
 pub use test::KEEP_PER_PAIR;
 pub use token::{NewToken, RETENTION_SECS, TokenRecord, is_pending, token_at};
 
+use crate::error::error_chain;
 use codec::{Int, Read};
 use session::{CONNECT_TIMEOUT, Connecting, Params, Session, lock_timeout_sql};
 
@@ -611,9 +612,16 @@ impl OpenTransaction<'_> {
 
 impl Drop for OpenTransaction<'_> {
     fn drop(&mut self) {
-        if self.0.transaction.replace(Transaction::None) != Transaction::None {
-            // 撤销不了只会是连接断了或者已经被丢掉了，那样数据库自己会撤销这个事务。
-            let _ = self.0.on_session(|session| session.batch("ROLLBACK"));
+        if self.0.transaction.replace(Transaction::None) == Transaction::None {
+            return;
+        }
+        // 撤销失败时事务未必已结束：ROLLBACK 执行前被取消（57014）等错误不会使连接失效，事务却仍留在连接上且处于失败状态，
+        // 此后该连接上除撤销外的每条语句均被拒绝（25P02），而本 `Store` 已不再跟踪该事务，不会再次撤销。
+        // 因此无论失败原因如何均丢弃该连接：数据库随之撤销事务并释放其持有的锁，下一次读写建立新连接。
+        if let Err(error) = self.0.on_session(|session| session.batch("ROLLBACK"))
+            && self.0.session.borrow_mut().take().is_some()
+        {
+            tracing::warn!("撤销事务失败，已丢弃该数据库连接：{}", error_chain(&error));
         }
     }
 }
@@ -646,7 +654,7 @@ fn migrate(session: &Session, migrations: &[&str], missing: Missing) -> Result<(
             Ok(Some(version)) => tracing::info!(version, "数据库表结构已升级"),
             Ok(None) => return Ok(()),
             Err(error) => {
-                // 回滚失败只可能是连接已断开，此时数据库侧已自动回滚该事务。
+                // 回滚失败时事务可能仍留在连接上（例如 ROLLBACK 被取消）：调用方收到错误后即丢弃该连接，数据库随之撤销事务。
                 let _ = session.batch("ROLLBACK");
                 return Err(error);
             }
@@ -1427,6 +1435,141 @@ mod tests {
         assert_eq!((store.meta("a").unwrap(), store.meta("b").unwrap()), (None, None));
         store.atomically(|store| store.set_meta("a", b"3")).unwrap();
         assert_eq!(store.meta("a").unwrap().as_deref(), Some(b"3".as_slice()));
+    }
+
+    /// 代理替换 `ROLLBACK` 所用的语句：由数据库以 57014（语句被取消）报错，效果与 ROLLBACK 开始执行前被取消相同。
+    const CANCELLED_ROLLBACK: &str = "DO $$ BEGIN RAISE EXCEPTION '测试：ROLLBACK 执行前被取消' USING ERRCODE = 'query_canceled'; END $$\0";
+
+    /// 转发到 `database` 所指服务器的代理，经它连接的 `Store` 使用的仍是真实的数据库。`armed` 为真时，经它发出的下一条
+    /// `ROLLBACK` 被替换为 [`CANCELLED_ROLLBACK`]：连接仍然可用，事务未结束且处于失败状态，此后除撤销外的语句均被拒绝（25P02）。
+    fn proxy_cancelling_rollback(database: &Database, armed: Arc<std::sync::atomic::AtomicBool>) -> Database {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = database.0.clone();
+        let mut proxied = Config::new();
+        proxied.host("127.0.0.1").port(listener.local_addr().unwrap().port());
+        if let Some(user) = server.get_user() {
+            proxied.user(user);
+        }
+        if let Some(password) = server.get_password() {
+            proxied.password(password);
+        }
+        if let Some(dbname) = server.get_dbname() {
+            proxied.dbname(dbname);
+        }
+        if let Some(options) = server.get_options() {
+            proxied.options(options);
+        }
+        // 沿用测试服务器的建连期限（见 `Scratch`）：大量测试并发建连时，代理之后的服务器同样响应较慢。
+        if let Some(&timeout) = server.get_connect_timeout() {
+            proxied.connect_timeout(timeout);
+        }
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let client = client.unwrap();
+                client.set_nodelay(true).unwrap();
+                let armed = Arc::clone(&armed);
+                let port = server.get_ports().first().copied().unwrap_or(5432);
+                // 与 `tokio-postgres` 相同：写了地址时连接地址，否则连接主机。
+                let upstream = match (server.get_hostaddrs().first(), server.get_hosts().first()) {
+                    (Some(&address), _) => std::net::TcpStream::connect((address, port)).unwrap(),
+                    (None, Some(tokio_postgres::config::Host::Tcp(host))) => std::net::TcpStream::connect((host.as_str(), port)).unwrap(),
+                    #[cfg(unix)]
+                    (None, Some(tokio_postgres::config::Host::Unix(dir))) => {
+                        let upstream = std::os::unix::net::UnixStream::connect(dir.join(format!(".s.PGSQL.{port}"))).unwrap();
+                        let handles = [upstream.try_clone().unwrap(), upstream.try_clone().unwrap(), upstream];
+                        relay(client, handles, |stream| drop(stream.shutdown(std::net::Shutdown::Both)), armed);
+                        continue;
+                    }
+                    (None, None) => unreachable!("连接串至少写了主机或地址之一"),
+                };
+                upstream.set_nodelay(true).unwrap();
+                let handles = [upstream.try_clone().unwrap(), upstream.try_clone().unwrap(), upstream];
+                relay(client, handles, |stream| drop(stream.shutdown(std::net::Shutdown::Both)), armed);
+            }
+        });
+        Database(proxied)
+    }
+
+    /// 在 `client` 与服务器之间双向转发。`server` 是到服务器的同一条连接的三个句柄：读、写，以及客户端离开后用于 `close` 的一个。
+    fn relay<S>(client: std::net::TcpStream, server: [S; 3], close: fn(&S), armed: Arc<std::sync::atomic::AtomicBool>)
+    where
+        S: std::io::Read + std::io::Write + Send + 'static,
+    {
+        let [mut from_server, to_server, closer] = server;
+        let mut to_client = client.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut from_server, &mut to_client);
+            let _ = to_client.shutdown(std::net::Shutdown::Both);
+        });
+        std::thread::spawn(move || {
+            let _ = forward_requests(client, to_server, &armed);
+            close(&closer);
+        });
+    }
+
+    /// 将客户端发出的消息逐条转给服务器，`armed` 为真时把下一条 `ROLLBACK` 换成 [`CANCELLED_ROLLBACK`]。客户端关闭连接时返回。
+    fn forward_requests(
+        mut client: impl std::io::Read,
+        mut server: impl std::io::Write,
+        armed: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<()> {
+        let length = |bytes: [u8; 4]| usize::try_from(u32::from_be_bytes(bytes)).unwrap();
+        // 启动消息只有长度，没有类型字节。
+        let mut startup = vec![0; 4];
+        client.read_exact(&mut startup)?;
+        startup.resize(length(startup[..4].try_into().unwrap()), 0);
+        client.read_exact(&mut startup[4..])?;
+        server.write_all(&startup)?;
+        loop {
+            let mut head = [0; 5];
+            client.read_exact(&mut head)?;
+            let mut body = vec![0; length(head[1..].try_into().unwrap()) - 4];
+            client.read_exact(&mut body)?;
+            if head[0] == b'Q' && body == b"ROLLBACK\0" && armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                body = CANCELLED_ROLLBACK.as_bytes().to_vec();
+            }
+            let mut message = vec![head[0]];
+            message.extend_from_slice(&u32::try_from(body.len() + 4).unwrap().to_be_bytes());
+            message.extend_from_slice(&body);
+            server.write_all(&message)?;
+        }
+    }
+
+    #[test]
+    fn a_rollback_that_fails_on_a_working_connection_drops_the_connection_and_the_store_recovers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scratch = Scratch::new();
+        let armed = Arc::new(AtomicBool::new(false));
+        let mut store = Store::open(&proxy_cancelling_rollback(&scratch.database(), Arc::clone(&armed))).unwrap();
+        store.set_meta("k", b"v").unwrap();
+        let other = Store::open(&scratch.database()).unwrap();
+        let backend = store.backend();
+
+        // 事务修改一行后放弃；撤销它的 ROLLBACK 以 57014 失败，连接本身仍然可用。
+        armed.store(true, Ordering::SeqCst);
+        let outcome: Result<(), StoreError> = store.atomically(|store| {
+            store.set_meta("k", b"w")?;
+            Err(StoreError::Aborted)
+        });
+        assert!(matches!(outcome, Err(StoreError::Aborted)), "{outcome:?}");
+        assert!(!armed.load(Ordering::SeqCst), "ROLLBACK 应经代理发出并被替换");
+        assert!(store.session.borrow().is_none(), "撤销失败的连接应当即丢弃，否则此后每条语句均报 25P02");
+
+        // 数据库侧的连接随之结束，事务被撤销，修改未生效。
+        let still_there = format!("SELECT COUNT(*) FROM pg_stat_activity WHERE pid = {backend}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while number(&other, &still_there) != 0 {
+            assert!(Instant::now() < deadline, "被丢弃的连接仍留在数据库侧");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(other.meta("k").unwrap().as_deref(), Some(b"v".as_slice()));
+
+        // 下一次读写建立新连接，读写恢复正常。
+        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_ne!(store.backend(), backend);
+        store.atomically(|store| store.set_meta("k", b"x")).unwrap();
+        assert_eq!(other.meta("k").unwrap().as_deref(), Some(b"x".as_slice()));
     }
 
     #[test]
