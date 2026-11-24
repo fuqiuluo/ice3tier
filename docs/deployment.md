@@ -247,7 +247,7 @@ A backup is two files: a dump of the database, and the controller's key `control
  mv -f "$tmp/controller.dump" "$tmp/controller.key" .)
 ```
 
-The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them anew, readable by you only; keep them that way. They replace the previous backup in the directory only once both files have been read in full; if a step fails, the previous backup is left as it was. With the install script, the data directory belongs to the service user `i3t-controller`: backup and restore read and write the files in it as that user, not as root, which would follow a link put there in the place of a file. Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
+The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them anew, readable by you only; keep them that way. A failed run leaves the previous backup as it was. With the install script, the data directory belongs to the service user `i3t-controller`: backup and restore read and write the files in it as that user, not as root, which would follow a link put there in the place of a file. Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
 
 Restore on a new server, with the same public address as before.
 

@@ -162,20 +162,17 @@ chmod 755 "$work/backup"
 : > "$work/backup/controller.dump"
 : > "$work/backup/controller.key"
 chmod 644 "$work/backup/controller.dump" "$work/backup/controller.key"
-# 文档里的写法，docker compose 换成 compose：两个文件先在 umask 077 下写入同一目录中的临时目录，全部读出且非空后
-# 才一起替换；任一步失败则删除临时目录，上一次的备份保持不变。转储里有代理的密码，密钥就是 controller 的身份。
+# 文档里的命令，docker compose 换成 compose。转储里有代理的密码，密钥就是 controller 的身份：两个文件都只有属主可读。
 # 各步以 && 串联，不依赖 set -e：在 if 条件中或 || 左侧执行时，set -e 不生效。
-back_up() {
-    (
-        cd "$work/backup" || exit
-        umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
-        trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
-        compose exec -T postgres pg_dump --username i3t --format custom i3t > "$tmp/controller.dump" &&
-        compose exec -T controller cat /data/controller.key > "$tmp/controller.key" &&
-        [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
-        mv -f "$tmp/controller.dump" "$tmp/controller.key" .
-    )
-}
+back_up() (
+    cd "$work/backup" || exit
+    umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
+    trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
+    compose exec -T postgres pg_dump --username i3t --format custom i3t > "$tmp/controller.dump" &&
+    compose exec -T controller cat /data/controller.key > "$tmp/controller.key" &&
+    [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
+    mv -f "$tmp/controller.dump" "$tmp/controller.key" .
+)
 back_up
 for file in controller.dump controller.key; do
     [ -s "$work/backup/$file" ] || fail "the backup's $file is empty"
@@ -184,12 +181,9 @@ for file in controller.dump controller.key; do
 done
 
 step "a backup that fails halfway leaves the last one as it was"
-cp "$work/backup/controller.dump" "$work/last.dump"
-cp "$work/backup/controller.key" "$work/last.key"
+last=$(cd "$work/backup" && cksum controller.dump controller.key)
 last_backup_kept() { # 失败的步骤
-    for file in dump key; do
-        cmp -s "$work/last.$file" "$work/backup/controller.$file" || fail "$1 failed, and the last backup's controller.$file changed"
-    done
+    [ "$(cd "$work/backup" && cksum controller.dump controller.key)" = "$last" ] || fail "$1 failed, and the last backup changed"
     left=$(ls -A "$work/backup" | tr '\n' ' ')
     [ "$left" = "controller.dump controller.key " ] || fail "$1 failed, and the backup directory holds: $left"
 }
