@@ -11,8 +11,13 @@ use super::{Store, StoreError};
 /// 一对节点最多留多少个测试的结果，再多就删最老的。
 pub const KEEP_PER_PAIR: u32 = 20;
 
+/// 编号取行的 `id`：插入时结果中的编号为 0，此后不一定再更新。
+fn from_row(row: &Row) -> Read<TestView> {
+    Ok(TestView { id: row.try_get::<_, Unsigned>("id")?.0, ..row.try_get::<_, Json<TestView>>("view")?.0 })
+}
+
 impl Store {
-    /// 插入新发起的主动测试记录并返回生成的编号。`view` 中原有的编号无效，以返回值为准。
+    /// 插入新发起的主动测试记录并返回生成的编号。`view` 中的编号不作数，读取时以行的 `id` 为准。
     ///
     /// # Errors
     ///
@@ -47,8 +52,8 @@ impl Store {
         if i64::try_from(id).is_err() {
             return Ok(None);
         }
-        let sql = "SELECT view FROM tests WHERE id = $1 AND network_id = $2";
-        self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], |row| Ok(row.try_get::<_, Json<TestView>>(0)?.0))
+        let sql = "SELECT id, view FROM tests WHERE id = $1 AND network_id = $2";
+        self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], from_row)
     }
 
     /// 最近的测试，新的在前。`pair` 有值时只要这一对节点的（先后无所谓）。
@@ -57,17 +62,16 @@ impl Store {
     ///
     /// 读数据库失败。
     pub fn tests(&self, network: NetworkId, pair: Option<(NodeId, NodeId)>, limit: u32) -> Result<Vec<TestView>, StoreError> {
-        let read = |row: &Row| -> Read<TestView> { Ok(row.try_get::<_, Json<TestView>>(0)?.0) };
         match pair {
             Some((a, b)) => self.query(
-                "SELECT view FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2))
+                "SELECT id, view FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2))
                  ORDER BY id DESC LIMIT $4",
                 &[&SqlNetwork(network), &SqlNode(a), &SqlNode(b), &Int(limit)],
-                read,
+                from_row,
             ),
             None => {
-                let sql = "SELECT view FROM tests WHERE network_id = $1 ORDER BY id DESC LIMIT $2";
-                self.query(sql, &[&SqlNetwork(network), &Int(limit)], read)
+                let sql = "SELECT id, view FROM tests WHERE network_id = $1 ORDER BY id DESC LIMIT $2";
+                self.query(sql, &[&SqlNetwork(network), &Int(limit)], from_row)
             }
         }
     }
