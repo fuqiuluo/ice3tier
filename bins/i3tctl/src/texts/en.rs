@@ -94,6 +94,14 @@ const HELP: Help = Help {
     token_ip: "Preset virtual IP",
     token_successor_of: "Offline node to replace",
     token_delete: "Delete an enrollment token",
+    mcp_group: "The MCP server for AI agents",
+    mcp_token_group: "MCP tokens: the JWT an agent presents at the controller's MCP endpoint",
+    mcp_token_list: "List MCP tokens",
+    mcp_token_create: "Issue an MCP token. The JWT is shown only once. With --network it is limited to that network, otherwise to none",
+    mcp_token_name: "Who it is for; recorded with every change it makes",
+    mcp_token_scope: "Scopes, comma-separated or repeated: read, nodes:enroll, nodes:write, config:write, tests:run, updates:write, networks:write",
+    mcp_token_expires_in: "Lifetime, e.g. 12h, 30d; at most 90d",
+    mcp_token_revoke: "Revoke an MCP token: its next call is refused",
     rule_group: "Access rules",
     rule_list: "List rules",
     rule_add: "Create a rule: nodes in the two groups can reach each other",
@@ -196,6 +204,7 @@ const VALUES: Values = Values {
     count: "N",
     size: "SIZE",
     duration: "DURATION",
+    scope: "SCOPE",
     day: "DAY",
     ports: "PORTS",
     action: "ACTION",
@@ -407,6 +416,16 @@ const UI: Ui = Ui {
     no_tokens: "No enrollment tokens",
     token_created: |id, expires| format!("Enrollment token #{id}, expires {expires}. Shown only once:"),
     token_use: "On the joining machine: echo <TOKEN> | i3t join",
+    mcp_tokens_header: ["ID", "NAME", "STATE", "EXPIRES", "NETWORK", "SCOPES", "JTI"],
+    no_mcp_tokens: "No MCP tokens",
+    any_network: "any network",
+    only_network: |network| format!("network {network} only"),
+    mcp_token_created: |id, name, scopes, limit, expires| {
+        format!("MCP token #{id} ({name}), scopes {scopes}, {limit}, expires {expires}. Shown only once:")
+    },
+    mcp_token_use: "Give it to the client as the header Authorization: Bearer <TOKEN>. To add it to Claude Code:",
+    mcp_token_revoked: |id, name| format!("MCP token #{id} ({name}) revoked"),
+    by_mcp_token: |name, jti| format!("MCP token {name}, jti {jti}"),
     rules_header: ["ID", "SRC", "", "DST", "ENABLED", "NAME"],
     no_rules: "No rules",
     rule: "Rule",
@@ -641,6 +660,13 @@ fn log(entry: &LogEntry) -> Option<String> {
         action::NODE_EXIT_DISABLE => format!("Exit disabled on {}", node()),
         action::NODE_EXIT_WITHDRAWN => format!("{} withdrew its declaration; exit disabled", node()),
         action::NODE_FORWARD_WITHDRAWN => format!("{} withdrew its declaration; port forwards disabled: {}", node(), p.text("forwards")),
+        action::MCP_TOKEN_CREATE => {
+            let limit =
+                if p.has("network") { format!("network {} only", p.thing("network_name", "network")) } else { "any network".to_owned() };
+            format!("MCP token #{} issued ({}), scopes {}, {limit}", p.text("token"), p.text("name"), p.text("scopes"))
+        }
+        action::MCP_TOKEN_REVOKE => format!("MCP token #{} revoked ({})", p.text("token"), p.text("name")),
+        action::MCP_KEY_ROTATE => format!("MCP signing key changed, tokens issued before are void: {}", p.text("revoked")),
         action::TOKEN_CREATE => format!("Enrollment token #{} created ({}…)", p.text("token"), p.text("prefix")),
         action::TOKEN_DELETE => format!("Enrollment token #{} deleted", p.text("token")),
         action::RULE_CREATE => format!("Rule #{} created: {} {} {}", p.text("rule"), src(), arrow(), dst()),

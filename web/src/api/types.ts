@@ -113,6 +113,16 @@ export interface LogRef {
   id: number
 }
 
+/** 一次操作是谁做的。现在只有一种：一个 MCP 令牌（见 {@link McpTokenInfo}）。 */
+export interface LogActor {
+  /** 现在只有 `mcp`；比这个界面新的 controller 可能写别的。 */
+  kind: string
+  /** 令牌签发时起的名字。 */
+  name: string
+  /** 令牌的 `jti`：名字可以重复，它不会。令牌后来被撤销、过期清掉了，它还在这里。 */
+  jti: string
+}
+
 export interface LogEntry {
   id: number
   at: Timestamp
@@ -121,6 +131,16 @@ export interface LogEntry {
   detail: string
   /** 这条记录说的是哪些东西。这个字段出现之前的记录是 `[]`。 */
   refs: LogRef[]
+  /**
+   * 按名字给出的参数：只用 `action` 和它们就能把这条记录写成一句话。东西的名字是当时的名字。
+   * 这个字段出现之前的 controller 不给。
+   */
+  params?: Record<string, unknown>
+  /**
+   * 这次操作是经 MCP 做的话，是哪个令牌做的。管理员自己做的（管理令牌）、节点引起的、controller 自己做的都是 `null`；
+   * 这个字段出现之前的 controller 不给。
+   */
+  actor?: LogActor | null
 }
 
 /** `GET /log` 的查询参数，都可省略；几个条件同时写时要都满足。 */
@@ -587,6 +607,52 @@ export interface CreateEnrollToken {
 
 /** `token` 只在创建的应答里出现这一次。 */
 export interface CreatedEnrollToken extends EnrollTokenInfo {
+  token: string
+}
+
+/**
+ * MCP 令牌的一项权限。MCP 令牌是管理员签给 AI Agent（Claude Code、Codex、Cursor 这一类）的 JWT：
+ * Agent 带着它连 controller 的 MCP 端点，能做什么由里面的权限决定。
+ *
+ * `updates:write` 和 `networks:write` 管的是整个 controller 的事，不能签给只限一个网络的令牌。
+ */
+export type McpScope =
+  'read' | 'nodes:enroll' | 'nodes:write' | 'config:write' | 'tests:run' | 'updates:write' | 'networks:write'
+
+/** `unknown` 是比这个界面新的 controller 才有的取值。 */
+export type McpTokenState = 'active' | 'expired' | 'revoked' | 'unknown'
+
+/** 一个签出去的 MCP 令牌。里面没有 JWT 本身。 */
+export interface McpTokenInfo {
+  /** controller 里的编号，撤销时用它。 */
+  id: number
+  /** JWT 的 `jti`。操作记录里靠它认是哪一个令牌做的：名字可以重复，它不会。 */
+  jti: string
+  /** 签发时起的名字：给谁用的。 */
+  name: string
+  /** 一般是 {@link McpScope} 里的；比这个界面新的 controller 可能给别的。 */
+  scopes: string[]
+  /** 只能看到和操作这一个网络；`null` 表示不限。 */
+  network: NetworkId | null
+  created_at: Timestamp
+  expires_at: Timestamp
+  revoked_at: Timestamp | null
+  state: McpTokenState
+}
+
+export interface CreateMcpToken {
+  /** 给谁用的，最长 64 个字符。不要求唯一。 */
+  name: string
+  /** 至少一项。 */
+  scopes: McpScope[]
+  /** 写了就只能看到和操作这一个网络；这时不能带管整个 controller 的权限。 */
+  network?: NetworkId
+  /** 多少秒之后过期。必须写，最长 90 天。 */
+  expires_in_secs: number
+}
+
+/** `token` 是 JWT，只在签发的应答里出现这一次。 */
+export interface CreatedMcpToken extends McpTokenInfo {
   token: string
 }
 

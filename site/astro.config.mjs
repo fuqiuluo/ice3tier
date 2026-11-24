@@ -63,7 +63,7 @@ export default defineConfig({
         {
           label: '维护',
           translations: { en: 'Maintenance' },
-          items: ['maintain/upgrade', 'maintain/backup', 'maintain/admin-token', 'maintain/uninstall'],
+          items: ['maintain/upgrade', 'maintain/backup', 'maintain/admin-token', 'maintain/mcp', 'maintain/uninstall'],
         },
         {
           label: '开关与设置',

@@ -50,6 +50,11 @@ impl Client {
         }
     }
 
+    /// 管理 API 下面一个路径的完整地址，给人看的（MCP 端点的地址）。
+    pub fn url_of(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         decode(self.request(Method::GET, path, None::<&()>).await?)
     }

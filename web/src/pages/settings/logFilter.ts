@@ -1,5 +1,6 @@
 import { type LogEntry, type LogQuery, type LogRef, type LogRefKind, type NetworkId } from '@/api/types'
 import { t } from '@/i18n'
+import { formatList } from '@/lib/format'
 import { networkPath } from '@/pages/networks/context'
 
 /**
@@ -83,6 +84,71 @@ export function isFiltered(filter: LogFilter): boolean {
  */
 export function logActionLabel(action: string): string | null {
   return t.settings.log.actions[action] ?? null
+}
+
+/** 参数里的一个数（编号、个数）：非负的整数才算。 */
+function paramNumber(params: Record<string, unknown>, key: string): number | null {
+  const value = params[key]
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null
+}
+
+function paramText(params: Record<string, unknown>, key: string): string | null {
+  const value = params[key]
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+/**
+ * 只用 `action` 和 `params` 就写得出整句话的操作（MCP 令牌的几种），按当前的语言写。
+ * 这几种操作说的东西（MCP 令牌）不在 `refs` 里，光写操作的名字看不出是哪一个；参数里有它的编号、名字、权限。
+ *
+ * 别的操作、参数不全的记录返回 `null`，调用的地方写操作的名字。
+ */
+export function logSentence(entry: LogEntry): string | null {
+  const params = entry.params ?? {}
+  const say = t.settings.log.sentences
+  switch (entry.action) {
+    case 'mcp.token.create': {
+      const id = paramNumber(params, 'token')
+      const name = paramText(params, 'name')
+      const scopes = params.scopes
+      if (id === null || name === null || !Array.isArray(scopes)) return null
+      // 只限一个网络的写网络当时的名字；名字没有记下来时写编号。
+      const network = paramNumber(params, 'network')
+      const limit = network === null ? null : (paramText(params, 'network_name') ?? `#${network}`)
+      const codes = scopes.filter((scope): scope is string => typeof scope === 'string')
+      return say.mcpTokenCreate(id, name, formatList(codes), limit)
+    }
+    case 'mcp.token.revoke': {
+      const id = paramNumber(params, 'token')
+      const name = paramText(params, 'name')
+      return id === null || name === null ? null : say.mcpTokenRevoke(id, name)
+    }
+    case 'mcp.key.rotate': {
+      const revoked = paramNumber(params, 'revoked')
+      return revoked === null ? null : say.mcpKeyRotate(revoked)
+    }
+    default:
+      return null
+  }
+}
+
+/**
+ * 一条记录是谁做的，写成一小段：经 MCP 做的写"MCP 令牌"加令牌的名字；比界面新的 controller 报来的别的种类，
+ * 原样写种类和名字。管理员自己做的、节点引起的、controller 自己做的没有这一项，返回 `null`。
+ */
+export function actorLabel(entry: LogEntry): string | null {
+  const actor = entry.actor
+  if (actor === undefined || actor === null) return null
+  return actor.kind === 'mcp' ? t.settings.log.actor.mcp(actor.name) : `${actor.kind} ${actor.name}`
+}
+
+/**
+ * 界面给一条记录写的字之外，搜索还要找得到的：做这件事的令牌的 jti，和这条记录说的那个 MCP 令牌的 jti。
+ * 名字可以重复，jti 不会；它在界面上只在悬停时出现，照样要能搜到。
+ */
+export function logJtis(entry: LogEntry): string[] {
+  const issued = paramText(entry.params ?? {}, 'jti')
+  return [entry.actor?.jti, issued].filter((jti): jti is string => typeof jti === 'string' && jti !== '')
 }
 
 /** 在取回来的记录里找：界面写的那些字（操作的名字、对象）、操作的代码和 controller 的原话，不分大小写。 */

@@ -7,6 +7,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use i3t_lang::Lang;
+use i3t_model::admin::mcp::McpScope;
 use i3t_model::admin::stats::Series;
 use i3t_model::netmap::{Congestion, IpFamily, ListenerProtocol, Profile, ProxyProtocol, Reach, RoutingMode};
 use i3t_proto::flow::Class;
@@ -59,6 +60,8 @@ pub enum Command {
     Group(GroupCommand),
     #[command(subcommand)]
     Token(TokenCommand),
+    #[command(subcommand)]
+    Mcp(McpCommand),
     #[command(subcommand)]
     Rule(RuleCommand),
     #[command(subcommand)]
@@ -332,6 +335,29 @@ pub enum TokenCommand {
         successor_of: Option<String>,
     },
     Delete {
+        id: u32,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommand {
+    #[command(subcommand)]
+    Token(McpTokenCommand),
+}
+
+#[derive(Subcommand)]
+pub enum McpTokenCommand {
+    List,
+    // 只限哪个网络看全局的 `--network`：写了就只限它，没写就不限。
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long = "scope", required = true, value_delimiter = ',', value_parser = parse_scope)]
+        scopes: Vec<McpScope>,
+        #[arg(long)]
+        expires_in: Lifetime,
+    },
+    Revoke {
         id: u32,
     },
 }
@@ -762,6 +788,13 @@ fn parse_series(text: &str) -> Result<Series, String> {
     text.parse().map_err(|_| (texts().ui.must_be)(&SERIES.replace('|', ", ")))
 }
 
+/// MCP 令牌能有的权限。
+const SCOPES: &str = "read|nodes:enroll|nodes:write|config:write|tests:run|updates:write|networks:write";
+
+fn parse_scope(text: &str) -> Result<McpScope, String> {
+    text.parse().map_err(|_| (texts().ui.must_be)(&SCOPES.replace('|', ", ")))
+}
+
 /// 出口允许的端口：一组端口，或者 `any`。
 #[derive(Clone)]
 pub struct PortList(pub Option<Vec<u16>>);
@@ -911,6 +944,19 @@ fn describe(command: clap::Command, h: &Help, v: &Values) -> clap::Command {
                         .mut_arg("successor_of", |arg| node(arg.help(h.token_successor_of)))
                 })
                 .mut_subcommand("delete", |sub| sub.about(h.token_delete).mut_arg("id", id))
+        })
+        .mut_subcommand("mcp", |sub| {
+            sub.about(h.mcp_group).mut_subcommand("token", |sub| {
+                sub.about(h.mcp_token_group)
+                    .mut_subcommand("list", |sub| sub.about(h.mcp_token_list))
+                    .mut_subcommand("create", |sub| {
+                        sub.about(h.mcp_token_create)
+                            .mut_arg("name", |arg| arg.help(h.mcp_token_name).value_name(v.name))
+                            .mut_arg("scopes", |arg| arg.help(h.mcp_token_scope).value_name(v.scope))
+                            .mut_arg("expires_in", |arg| arg.help(h.mcp_token_expires_in).value_name(v.duration))
+                    })
+                    .mut_subcommand("revoke", |sub| sub.about(h.mcp_token_revoke).mut_arg("id", id))
+            })
         })
         .mut_subcommand("rule", |sub| {
             sub.about(h.rule_group)
@@ -1217,6 +1263,34 @@ mod tests {
         ));
         assert!(fails(&["token", "create", "--tag", "a"]));
         assert!(matches!(parse(&["token", "list", "--all"]).command, Command::Token(TokenCommand::List { all: true })));
+        let Command::Mcp(McpCommand::Token(McpTokenCommand::Create { name, scopes, expires_in })) = parse(&[
+            "mcp",
+            "token",
+            "create",
+            "--name",
+            "claude-code",
+            "--scope",
+            "read,nodes:enroll",
+            "--scope",
+            "config:write",
+            "--expires-in",
+            "30d",
+        ])
+        .command
+        else {
+            panic!("应该是 mcp token create")
+        };
+        assert_eq!((name.as_str(), expires_in.secs), ("claude-code", 30 * 86400));
+        assert_eq!(scopes, [McpScope::Read, McpScope::NodesEnroll, McpScope::ConfigWrite], "可以用逗号隔开，也可以写多次");
+        assert!(fails(&["mcp", "token", "create", "--name", "x", "--scope", "read"]), "过期时间必须写");
+        assert!(fails(&["mcp", "token", "create", "--name", "x", "--expires-in", "1d"]), "权限必须写");
+        assert!(fails(&["mcp", "token", "create", "--name", "x", "--scope", "root", "--expires-in", "1d"]), "没有这项权限");
+        assert!(fails(&["mcp", "token", "create", "--name", "x", "--scope", "unknown", "--expires-in", "1d"]));
+        assert!(matches!(
+            parse(&["mcp", "token", "revoke", "3"]).command,
+            Command::Mcp(McpCommand::Token(McpTokenCommand::Revoke { id: 3 }))
+        ));
+        assert!(matches!(parse(&["mcp", "token", "list"]).command, Command::Mcp(McpCommand::Token(McpTokenCommand::List))));
         assert!(matches!(parse(&["log", "--ref", "node:3", "--action", "node"]).command, Command::Log { .. }));
         assert!(matches!(parse(&["node", "listeners", "gw"]).command, Command::Node(NodeCommand::Listeners { .. })));
         assert!(fails(&["pair", "set", "a", "b", "--lane", "always"]), "ice3proxy 是代理的选项了，节点对上没有");

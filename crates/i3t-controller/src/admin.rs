@@ -6,6 +6,9 @@
 //! `/api/v1` 下面的请求都要带管理令牌（`Authorization: Bearer <令牌>`）。只有一个管理员，没有角色。
 //! 不要令牌的只有两样：WebUI 的静态文件（[`WebUi`]），和 `/metrics`。后者只有合计的数，没有节点的名字和地址，
 //! 这样抓指标的程序不用拿着能改一切的管理令牌。
+//!
+//! 例外是 MCP 端点（`/api/v1/mcp`，见 [`crate::mcp`]）：它认的是管理员签给 AI Agent 的 MCP 令牌，不认管理令牌。
+//! 反过来 MCP 令牌在别的路径上没有用，签发、列出、撤销它们（`/api/v1/mcp/tokens`）也只能用管理令牌。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,11 +24,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use i3t_model::admin::diag::{CreateTest, TestQuery};
+use i3t_model::admin::mcp::{CreateMcpToken, MCP_PATH};
 use i3t_model::admin::stats::SeriesQuery;
 use i3t_model::admin::{
     API_PREFIX, ApiError, CreateEnrollToken, CreateGroup, CreateNetwork, CreateProxy, CreateRule, ErrorBody, ErrorCode, ExitTestInput,
-    ForceUpdate, ForwardInput, GroupId, GroupMembers, LogRef, NetworkId, PairInput, RelayEnabled, RelaySettings, ResumeUpdate, Succeed,
-    UpdateGroup, UpdateNetwork, UpdateNode, UpdateProxy, UpdateRule, UpdateSettings,
+    ForceUpdate, ForwardInput, GroupId, GroupMembers, LogRef, NetworkId, Node, PairInput, RelayEnabled, RelaySettings, ResumeUpdate,
+    Succeed, UpdateGroup, UpdateNetwork, UpdateNode, UpdateProxy, UpdateRule, UpdateSettings,
 };
 use i3t_model::netmap::ExitRole;
 use i3t_proto::NodeId;
@@ -35,14 +39,14 @@ use serde::de::DeserializeOwned;
 
 use crate::controller::Controller;
 use crate::error::{Error, error_chain};
-use crate::reachability;
 use crate::server::blocking;
 use crate::store::LogFilter;
 use crate::webui::WebUi;
+use crate::{mcp, reachability};
 
 /// 操作记录一次最多取多少条，和不写 `limit` 时取多少条。
-const MAX_LOG_LIMIT: u32 = 1000;
-const DEFAULT_LOG_LIMIT: u32 = 100;
+pub(crate) const MAX_LOG_LIMIT: u32 = 1000;
+pub(crate) const DEFAULT_LOG_LIMIT: u32 = 100;
 
 type App = Arc<Controller>;
 type Reply = Result<Response, Failure>;
@@ -53,6 +57,8 @@ pub fn router(controller: Arc<Controller>, webui: &WebUi) -> Router {
     let api = Router::new()
         .route("/status", get(status))
         .route("/log", get(log))
+        .route(&format!("{MCP_PATH}/tokens"), get(list_mcp_tokens).post(create_mcp_token))
+        .route(&format!("{MCP_PATH}/tokens/{{id}}/revoke"), post(revoke_mcp_token))
         .route("/update", get(show_update).patch(set_update))
         .route("/update/check", post(check_update))
         .route("/update/resume", post(resume_update))
@@ -102,7 +108,12 @@ pub fn router(controller: Arc<Controller>, webui: &WebUi) -> Router {
         .layer(middleware::from_fn_with_state(Arc::clone(&controller), require_admin))
         .with_state(Arc::clone(&controller));
 
-    let router = Router::new().route("/metrics", get(metrics)).with_state(controller).nest(API_PREFIX, api);
+    // MCP 端点不在上面那一层里：它自己验 MCP 令牌，管理令牌的检查轮不到它。
+    let router = Router::new()
+        .route("/metrics", get(metrics))
+        .route(&format!("{API_PREFIX}{MCP_PATH}"), mcp::endpoint())
+        .with_state(controller)
+        .nest(API_PREFIX, api);
     webui.attach(router)
 }
 
@@ -128,44 +139,51 @@ impl Failure {
 
 impl From<Error> for Failure {
     fn from(error: Error) -> Self {
-        let code = error.code();
-        let status = match code {
-            ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
-            ErrorCode::NotFound => StatusCode::NOT_FOUND,
-            ErrorCode::InvalidRequest | ErrorCode::AddressOutOfRange | ErrorCode::ExitIsNode | ErrorCode::CredentialsIncomplete => {
-                StatusCode::BAD_REQUEST
-            }
-            ErrorCode::NameTaken
-            | ErrorCode::NameCoolingDown
-            | ErrorCode::AddressTaken
-            | ErrorCode::AddressCoolingDown
-            | ErrorCode::RangeOverlaps
-            | ErrorCode::RangeExhausted
-            | ErrorCode::RangeNotSuperset
-            | ErrorCode::NetworkNotEmpty
-            | ErrorCode::NotDeclared
-            | ErrorCode::ForwardTargetOff
-            | ErrorCode::PredecessorOnline
-            | ErrorCode::Conflict
-            | ErrorCode::NodeOffline
-            | ErrorCode::CannotSelfUpdate
-            | ErrorCode::NoUpdate
-            | ErrorCode::TooSoon
-            | ErrorCode::Busy
-            | ErrorCode::ExitNotEnabled
-            | ErrorCode::AccessDenied => StatusCode::CONFLICT,
-            // `ErrorCode` 以后可能加新的值；这里没有专门对应的一律按内部错误报。
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        if status == StatusCode::INTERNAL_SERVER_ERROR {
-            tracing::error!("管理请求失败：{}", error_chain(&error));
-            // 内部错误的细节只进日志，不发给调用方；只说是哪个环节。
-            let message = "controller 内部错误，详情请查看 controller 日志".to_owned();
-            return Self::new(status, ErrorCode::Internal, error.what().as_deref(), message);
-        }
-        tracing::info!(?code, reason = %error, "拒绝管理请求");
-        Self { status, code, message: error.to_string(), what: error.what(), field: error.field().map(str::to_owned) }
+        let (status, error) = api_error(&error);
+        Self { status, code: error.code, message: error.message, what: error.what, field: error.field }
     }
+}
+
+/// controller 的一个错误在管理 API 里的样子：HTTP 状态码，和应答体里的那一段。内部错误的细节记进日志，不在里面。
+/// MCP 的工具出错时给的也是这一段。
+pub(crate) fn api_error(error: &Error) -> (StatusCode, ApiError) {
+    let code = error.code();
+    let status = match code {
+        ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+        ErrorCode::NotFound => StatusCode::NOT_FOUND,
+        ErrorCode::InvalidRequest | ErrorCode::AddressOutOfRange | ErrorCode::ExitIsNode | ErrorCode::CredentialsIncomplete => {
+            StatusCode::BAD_REQUEST
+        }
+        ErrorCode::NameTaken
+        | ErrorCode::NameCoolingDown
+        | ErrorCode::AddressTaken
+        | ErrorCode::AddressCoolingDown
+        | ErrorCode::RangeOverlaps
+        | ErrorCode::RangeExhausted
+        | ErrorCode::RangeNotSuperset
+        | ErrorCode::NetworkNotEmpty
+        | ErrorCode::NotDeclared
+        | ErrorCode::ForwardTargetOff
+        | ErrorCode::PredecessorOnline
+        | ErrorCode::Conflict
+        | ErrorCode::NodeOffline
+        | ErrorCode::CannotSelfUpdate
+        | ErrorCode::NoUpdate
+        | ErrorCode::TooSoon
+        | ErrorCode::Busy
+        | ErrorCode::ExitNotEnabled
+        | ErrorCode::AccessDenied => StatusCode::CONFLICT,
+        // `ErrorCode` 以后可能加新的值；这里没有专门对应的一律按内部错误报。
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::error!("管理请求失败：{}", error_chain(error));
+        // 内部错误的细节只进日志，不发给调用方；只说是哪个环节。
+        let message = "controller 内部错误，详情请查看 controller 日志".to_owned();
+        return (status, ApiError { code: ErrorCode::Internal, message, what: error.what(), field: None });
+    }
+    tracing::info!(?code, reason = %error, "拒绝管理请求");
+    (status, ApiError { code, message: error.to_string(), what: error.what(), field: error.field().map(str::to_owned) })
 }
 
 impl IntoResponse for Failure {
@@ -282,7 +300,7 @@ fn data_field(text: &str) -> Option<String> {
 }
 
 /// serde 的说法里用反引号括起来的字段名：`` missing field `from` ``。
-fn named_field(text: &str) -> Option<String> {
+pub(crate) fn named_field(text: &str) -> Option<String> {
     let (_, rest) = text.split_once("field `")?;
     rest.split_once('`').map(|(name, _)| name.to_owned())
 }
@@ -444,6 +462,19 @@ async fn log(State(app): State<App>, Query(query): Query<LogQuery>) -> Reply {
     ok(&app, move |controller| controller.oplog_filtered(&filter)).await
 }
 
+async fn list_mcp_tokens(State(app): State<App>) -> Reply {
+    ok(&app, Controller::mcp_tokens).await
+}
+
+async fn create_mcp_token(State(app): State<App>, Body(request): Body<CreateMcpToken>) -> Reply {
+    created(&app, move |controller| controller.create_mcp_token(&request)).await
+}
+
+/// 撤销不是删除：令牌还在列表里，标成撤销的。所以是一个 POST，应答是撤销之后的样子。
+async fn revoke_mcp_token(State(app): State<App>, Path(id): Path<u32>) -> Reply {
+    ok(&app, move |controller| controller.revoke_mcp_token(id)).await
+}
+
 async fn node_listeners(State(app): State<App>, Path((network, node)): Path<(NetworkId, NodeId)>) -> Reply {
     ok(&app, move |controller| controller.node_listeners(network, node)).await
 }
@@ -549,9 +580,14 @@ async fn enable_relay(
     Body(settings): Body<RelaySettings>,
 ) -> Reply {
     let node = blocking(&app, move |controller| controller.enable_relay(network, node, settings)).await?;
+    Ok(Json(relay_enabled(node).await).into_response())
+}
+
+/// 启用了 relay 的节点，加上从 controller 这边试连它的地址的结果。
+pub(crate) async fn relay_enabled(node: Node) -> RelayEnabled {
     let addresses: Vec<SocketAddr> = node.relay.iter().flat_map(|relay| &relay.addresses).map(|entry| entry.address).collect();
     let reachability = reachability::check(&addresses, &addresses).await;
-    Ok(Json(RelayEnabled { node, reachability }).into_response())
+    RelayEnabled { node, reachability }
 }
 
 async fn series(State(app): State<App>, Path(network): Path<NetworkId>, Query(query): Query<SeriesQuery>) -> Reply {

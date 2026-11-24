@@ -282,6 +282,8 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 
 备份时的管理令牌照样能用。只要公网地址仍然指向 controller，节点会自己连回来。备份之后才加入的节点要用新的令牌重新加入。
 
+签过 [MCP 令牌](#让-ai-agent-管理网络mcp) 的话，数据目录里还有一把签它们的密钥 `mcp.key`。想让它们在恢复之后接着能用，把它和 `controller.key` 一起备份、一起放回去：上面的命令里 `controller.key` 的那一行照样再写一行 `mcp.key`。没有它也能恢复：controller 生成一把新的，原来签出去的 MCP 令牌全部作废，重新签发就行。
+
 ### 管理令牌丢了
 
 ```sh
@@ -297,6 +299,71 @@ sudo systemctl start i3t-controller
 ```
 
 它会打印一个新的令牌，原来的作废。
+
+### 让 AI Agent 管理网络（MCP）
+
+controller 自己就是一个 MCP Server。Claude Code、Codex、Cursor 这类 AI Agent 连上来以后，能查看网络，也能做管理操作：对它说「把这台机器加进 home 网络，放进 servers 分组」，它自己去建注册令牌、给出安装命令、确认节点上线。它能做什么，由你签给它的令牌决定。
+
+**签一个 MCP 令牌。** 在 Web 界面的「设置 → MCP」里签，或者在服务器上执行（用 Docker 装的，前面加 `docker compose exec controller`）：
+
+```sh
+i3tctl mcp token create --name claude-code --scope read,nodes:enroll --expires-in 30d
+```
+
+令牌只显示这一次。`--name` 是给谁用的，它做的每一处改动都记着这个名字。有效期必须写，最长 90 天。加上 `--network <网络>`，它就只能看到和操作这一个网络。`--scope` 是权限，只给用得着的：
+
+| 权限             | 能做的                                                                                                   |
+| ---------------- | -------------------------------------------------------------------------------------------------------- |
+| `read`           | 只读：状态、网络、节点、路由和路径、出口、访问检查、测试结果、统计、操作记录，以及分组、规则、代理、端口转发、节点对的设置 |
+| `nodes:enroll`   | 添加节点：建、列、删注册令牌，查一个注册令牌加入了哪个节点、在不在线                                     |
+| `nodes:write`    | 改节点、删节点、继任、开关中继和出口                                                                     |
+| `config:write`   | 分组和成员、访问规则、代理、端口转发、节点对的设置                                                       |
+| `tests:run`      | 发起和取消测试                                                                                           |
+| `updates:write`  | 更新设置、检查更新、强制更新。管的是整个 controller，不能给只限一个网络的令牌                            |
+| `networks:write` | 建、改、删网络。管的是整个 controller，不能给只限一个网络的令牌                                          |
+
+没有 `config:write` 的令牌看不到代理的密码。
+
+**配进客户端。** MCP 端点是管理 API 地址上的 `/api/v1/mcp`，令牌放在请求头 `Authorization: Bearer <MCP 令牌>` 里：
+
+```sh
+# Claude Code
+claude mcp add --transport http ice3tier http://127.0.0.1:20332/api/v1/mcp --header "Authorization: Bearer <MCP 令牌>"
+
+# Codex：令牌从环境变量里读
+export I3T_MCP_TOKEN=<MCP 令牌>
+codex mcp add ice3tier --url http://127.0.0.1:20332/api/v1/mcp --bearer-token-env-var I3T_MCP_TOKEN
+```
+
+别的客户端在它的 MCP 配置里填这个地址和这个请求头。比如 Cursor 的 `mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "ice3tier": {
+      "url": "http://127.0.0.1:20332/api/v1/mcp",
+      "headers": { "Authorization": "Bearer <MCP 令牌>" }
+    }
+  }
+}
+```
+
+MCP 端点和 Web 界面在同一个地址上：只监听服务器的 `127.0.0.1:20332`，明文 HTTP。Agent 在别的机器上时，和打开 Web 界面一样先用 SSH 转发端口，地址照旧写 `127.0.0.1`。用 `--admin-listen` 把管理 API 放到别的地址上，MCP 端点也跟着暴露出去。
+
+**查看和撤销。**
+
+```sh
+i3tctl mcp token list
+i3tctl mcp token revoke <编号>   # 它的下一次调用就被拒绝
+i3tctl log                        # 经 MCP 做的改动后面注明是哪个令牌做的
+```
+
+还要知道的：
+
+- MCP 令牌只在 MCP 端点上有用，不能当管理令牌用。签发、列出、撤销令牌只能用管理令牌，Agent 自己做不了，也就没法给自己加权限。
+- 删节点、删规则这类工具都标明了会删东西（MCP 的 `destructiveHint`），客户端可以据此在执行之前先问你。让 Agent 改东西的时候，自己看一眼它要调什么，别把会删东西的工具设成自动放行。
+- 签令牌的是数据目录里的 `mcp.key`，不是 `controller.key`。要让签出去的令牌全部作废：停 controller，删掉 `mcp.key`，再启动。它会生成一把新的，原来签的令牌都不再认，列表里标成已撤销。
+- 认的 MCP 协议版本是 2025-03-26、2025-06-18、2025-11-25 和 2026-07-28，传输是 Streamable HTTP。不做 OAuth：令牌由你签好、配进客户端。
 
 ### 卸载
 
@@ -354,7 +421,7 @@ sh install.sh --from . --token <注册令牌>
 
 | 内容                    | 位置                                                                                 |
 | ----------------------- | ------------------------------------------------------------------------------------ |
-| controller 的数据       | `/var/lib/i3t-controller`（`controller.key`、`database.url`、更新包的缓存）          |
+| controller 的数据       | `/var/lib/i3t-controller`（`controller.key`、`mcp.key`、`database.url`、更新包的缓存） |
 | controller 的设置       | `/etc/i3t/controller.env`（`I3T_PUBLIC_ADDR`、`I3T_CONTROLLER_ARGS`）                |
 | controller 和命令行程序 | `/usr/local/bin/i3t-controller`、`/usr/local/bin/i3tctl`                             |
 | 节点的状态和设置        | `/var/lib/i3t`（设置在 `config.toml` 里）                                            |
@@ -377,4 +444,4 @@ sh install.sh --from . --token <注册令牌>
 | `--from <目录>`             | 用本地目录里的程序安装，不下载                         |
 | `--uninstall`、`--purge`    | 删掉服务和程序；加 `--purge` 连状态和设置一起删        |
 
-controller 的数据目录里是它的密钥 `controller.key` 和更新包的缓存；网络、节点和设置都在数据库里。数据库的连接串写成 `postgres://用户:密码@主机[:端口]/库名`，也可以写成 `host=… user=… dbname=…` 的形式。`i3t-controller` 先看选项 `--database-url`，再看环境变量 `I3T_DATABASE_URL`，最后读数据目录里只有一行的 `database.url` 文件。连接串里有密码，所以最好用环境变量或者文件，不要写在命令行上。
+controller 的数据目录里是它的密钥 `controller.key`、签 MCP 令牌的密钥 `mcp.key` 和更新包的缓存；网络、节点和设置都在数据库里。数据库的连接串写成 `postgres://用户:密码@主机[:端口]/库名`，也可以写成 `host=… user=… dbname=…` 的形式。`i3t-controller` 先看选项 `--database-url`，再看环境变量 `I3T_DATABASE_URL`，最后读数据目录里只有一行的 `database.url` 文件。连接串里有密码，所以最好用环境变量或者文件，不要写在命令行上。

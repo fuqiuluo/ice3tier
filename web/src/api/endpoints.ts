@@ -1,11 +1,13 @@
-import { request } from './client'
+import { MCP_PATH, request } from './client'
 import {
   type AccessCheck,
   type AccessGraph,
   type BackboneView,
   type CreatedEnrollToken,
+  type CreatedMcpToken,
   type CreateEnrollToken,
   type CreateGroup,
+  type CreateMcpToken,
   type CreateNetwork,
   type CreateRule,
   type CreateTest,
@@ -22,6 +24,7 @@ import {
   type GroupMembers,
   type LogEntry,
   type LogQuery,
+  type McpTokenInfo,
   type Network,
   type NetworkId,
   type Node,
@@ -177,4 +180,11 @@ export const api = {
   checkUpdate: () => request<UpdateOverview>('POST', '/update/check'),
   resumeUpdate: (body: ResumeUpdate) => request<UpdateOverview>('POST', '/update/resume', { body }),
   forceUpdateAll: (body: ForceUpdate) => request<ForcedUpdates>('POST', '/update/force', { body }),
+
+  /** 签过的 MCP 令牌，按编号排：还能用的、过期的、撤销的都在（过期 30 天之后清掉）。 */
+  mcpTokens: () => request<McpTokenInfo[]>('GET', `${MCP_PATH}/tokens`),
+  /** 签发一个 MCP 令牌。JWT 只在这一次的应答里。 */
+  createMcpToken: (body: CreateMcpToken) => request<CreatedMcpToken>('POST', `${MCP_PATH}/tokens`, { body }),
+  /** 撤销：它的下一次调用就被拒绝。已经撤销的再撤销一次什么也不做。 */
+  revokeMcpToken: (id: number) => request<McpTokenInfo>('POST', `${MCP_PATH}/tokens/${id}/revoke`),
 }

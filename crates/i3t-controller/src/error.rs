@@ -309,6 +309,8 @@ pub enum Entity {
     /// 全网矩阵。
     Matrix,
     Group,
+    /// 签给 AI Agent 的 MCP 令牌。
+    McpToken,
 }
 
 impl Entity {
@@ -328,6 +330,7 @@ impl Entity {
             Self::Test => "test",
             Self::Matrix => "matrix",
             Self::Group => "group",
+            Self::McpToken => "mcp_token",
         }
     }
 }
@@ -347,6 +350,7 @@ impl fmt::Display for Entity {
             Self::Test => "测试",
             Self::Matrix => "全网矩阵",
             Self::Group => "分组",
+            Self::McpToken => "MCP 令牌",
         })
     }
 }

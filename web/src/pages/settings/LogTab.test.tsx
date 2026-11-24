@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
 
@@ -260,4 +260,205 @@ describe('操作记录', () => {
       )
     })
   }
+
+  /** 经 MCP 改了一个节点；签发、撤销 MCP 令牌；换了签名密钥。最后一条是参数出现之前的 controller 记的。 */
+  const MCP_ENTRIES: LogEntry[] = [
+    {
+      id: 15,
+      at: 1_794_000_500,
+      network: 1,
+      action: 'node.update',
+      detail: '节点 #2 laptop 改名',
+      refs: [{ kind: 'node', id: 2 }],
+      params: { node: 2, name: 'laptop' },
+      actor: { kind: 'mcp', name: 'claude-code', jti: 'jti-claude' },
+    },
+    {
+      id: 14,
+      at: 1_794_000_400,
+      network: 1,
+      action: 'mcp.token.create',
+      detail: '签发 MCP 令牌 #3（claude-code）',
+      refs: [],
+      params: {
+        token: 3,
+        name: 'claude-code',
+        jti: 'jti-claude',
+        scopes: ['read', 'nodes:enroll'],
+        network: 1,
+        network_name: 'home',
+        expires_at: 1_796_592_000,
+      },
+      actor: null,
+    },
+    {
+      id: 13,
+      at: 1_794_000_300,
+      network: null,
+      action: 'mcp.token.create',
+      detail: '签发 MCP 令牌 #4（cursor）',
+      refs: [],
+      params: {
+        token: 4,
+        name: 'cursor',
+        jti: 'jti-cursor',
+        scopes: ['read'],
+        network: null,
+        network_name: null,
+        expires_at: 1_796_592_000,
+      },
+      actor: null,
+    },
+    {
+      id: 12,
+      at: 1_794_000_200,
+      network: null,
+      action: 'mcp.token.revoke',
+      detail: '撤销 MCP 令牌 #4（cursor）',
+      refs: [],
+      params: { token: 4, name: 'cursor', jti: 'jti-cursor' },
+      actor: null,
+    },
+    {
+      id: 11,
+      at: 1_794_000_100,
+      network: null,
+      action: 'mcp.key.rotate',
+      detail: '签 MCP 令牌的密钥换了，原来签的 2 个令牌全部作废',
+      refs: [],
+      params: { revoked: 2 },
+      actor: null,
+    },
+    {
+      id: 10,
+      at: 1_794_000_000,
+      network: null,
+      action: 'mcp.token.revoke',
+      detail: '撤销 MCP 令牌 #1（old）',
+      refs: [],
+    },
+  ]
+
+  function setupMcp() {
+    return fakeApi({
+      'GET /log': serveFrom(MCP_ENTRIES),
+      'GET /networks': [NETWORK],
+      'GET /networks/1/nodes': [makeNode(2, 'laptop')],
+    })
+  }
+
+  for (const locale of ['zh-CN', 'en'] as const) {
+    it(`经 MCP 做的操作注明是哪个令牌做的，悬停或聚焦看 jti；别的操作不注（${locale}）`, async () => {
+      setLocale(locale, { remember: false })
+      setupMcp()
+      renderWithApp(<LogTab />, { route: '/settings/log' })
+      const row = await screen.findByTestId('log-row-15')
+      const actor = within(row).getByTestId('log-actor')
+      expect(actor).toHaveTextContent(t.settings.log.actor.mcp('claude-code'))
+      // 操作和对象照旧写。
+      expect(within(row).getByTestId('log-action')).toHaveTextContent(t.settings.log.actions['node.update'])
+      expect(within(row).getByTestId('log-detail')).toHaveTextContent('节点 #2 laptop 改名')
+      // 键盘聚焦和悬停一样弹出说明，不用等悬停的那一下延迟。
+      act(() => actor.focus())
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(t.settings.log.actor.jti('jti-claude'))
+      // 管理员自己签发、撤销令牌的那几条不注。
+      for (const id of [14, 13, 12, 11, 10]) {
+        expect(within(screen.getByTestId(`log-row-${id}`)).queryByTestId('log-actor')).not.toBeInTheDocument()
+      }
+    })
+
+    it(`MCP 令牌的几种操作按参数写成整句话，不再重复 controller 的原话（${locale}）`, async () => {
+      setLocale(locale, { remember: false })
+      setupMcp()
+      renderWithApp(<LogTab />, { route: '/settings/log' })
+      const say = t.settings.log.sentences
+      const scopes = ['read', 'nodes:enroll'].join(t.common.listSeparator)
+      const action = (id: number) => within(screen.getByTestId(`log-row-${id}`)).getByTestId('log-action')
+      await screen.findByTestId('log-row-14')
+      expect(action(14)).toHaveTextContent(say.mcpTokenCreate(3, 'claude-code', scopes, 'home'))
+      expect(action(13)).toHaveTextContent(say.mcpTokenCreate(4, 'cursor', 'read', null))
+      expect(action(12)).toHaveTextContent(say.mcpTokenRevoke(4, 'cursor'))
+      expect(action(11)).toHaveTextContent(say.mcpKeyRotate(2))
+      for (const id of [14, 13, 12, 11]) {
+        expect(within(screen.getByTestId(`log-row-${id}`)).queryByTestId('log-detail')).not.toBeInTheDocument()
+      }
+      // 没有参数的旧记录：写操作的名字，原话照旧作补充。
+      expect(action(10)).toHaveTextContent(t.settings.log.actions['mcp.token.revoke'])
+      expect(within(screen.getByTestId('log-row-10')).getByTestId('log-detail')).toHaveTextContent(
+        '撤销 MCP 令牌 #1（old）',
+      )
+    })
+  }
+
+  it('写出来的句子：只限一个网络的写网络的名字，不限的写不限', () => {
+    const say = t.settings.log.sentences
+    expect(say.mcpTokenCreate(3, 'claude-code', 'read', 'home')).toBe(
+      '签发 MCP 令牌 #3（claude-code），权限 read，只限网络 home',
+    )
+    expect(say.mcpTokenCreate(3, 'claude-code', 'read', null)).toBe(
+      '签发 MCP 令牌 #3（claude-code），权限 read，不限网络',
+    )
+    setLocale('en', { remember: false })
+    expect(say.mcpTokenCreate(3, 'claude-code', 'read, nodes:enroll', 'home')).toBe(
+      'MCP token #3 issued (claude-code), scopes read, nodes:enroll, network home only',
+    )
+    expect(say.mcpTokenCreate(3, 'claude-code', 'read', null)).toBe(
+      'MCP token #3 issued (claude-code), scopes read, any network',
+    )
+    expect(say.mcpTokenRevoke(3, 'claude-code')).toBe('MCP token #3 revoked (claude-code)')
+    expect(say.mcpKeyRotate(1)).toBe('MCP signing key changed; 1 token issued before is void')
+    expect(say.mcpKeyRotate(2)).toBe('MCP signing key changed; 2 tokens issued before are void')
+  })
+
+  it('搜索找得到做这件事的令牌：按名字，按 jti（签发它的那一条也算）', async () => {
+    const user = userEvent.setup()
+    setupMcp()
+    renderWithApp(<LogTab />, { route: '/settings/log' })
+    await screen.findByTestId('log-row-15')
+    const search = screen.getByRole('searchbox', { name: s.searchPlaceholder })
+    await user.type(search, 'jti-claude')
+    expect(screen.getByTestId('log-count')).toHaveTextContent(`${t.common.rowsTotal(2)} / 6`)
+    expect(screen.getByTestId('log-row-15')).toBeVisible()
+    expect(screen.getByTestId('log-row-14')).toBeVisible()
+    await user.clear(search)
+    await user.type(search, s.actor.mcp('claude-code'))
+    expect(screen.getByTestId('log-count')).toHaveTextContent(`${t.common.rowsTotal(1)} / 6`)
+    await user.clear(search)
+    await user.type(search, 'nodes:enroll')
+    expect(screen.getByTestId('log-count')).toHaveTextContent(`${t.common.rowsTotal(1)} / 6`)
+    expect(screen.getByTestId('log-row-14')).toBeVisible()
+  })
+
+  it('按操作筛的下拉里有 MCP 令牌这一类', async () => {
+    const user = userEvent.setup()
+    const api = setupMcp()
+    renderWithApp(<LogTab />, { route: '/settings/log' })
+    await screen.findByTestId('log-row-15')
+    const select = screen.getByRole('combobox', { name: s.filterAction })
+    expect(within(select).getByRole('option', { name: s.actions['mcp.token.create'] })).toHaveValue('mcp.token.create')
+    expect(within(select).getByRole('option', { name: s.actions['mcp.key.rotate'] })).toHaveValue('mcp.key.rotate')
+    await user.selectOptions(select, s.kindAll(s.kinds.mcp))
+    await waitFor(() => expect(api.callsTo('GET /log').at(-1)?.query.get('action')).toBe('mcp'))
+    expect(await screen.findByTestId('log-count')).toHaveTextContent(t.common.rowsTotal(5))
+    expect(screen.queryByTestId('log-row-15')).not.toBeInTheDocument()
+  })
+
+  it('比界面新的 controller 报来的别的种类的操作者：原样写种类和名字', async () => {
+    fakeApi({
+      'GET /log': [
+        {
+          id: 1,
+          at: 1_794_000_000,
+          network: null,
+          action: 'network.create',
+          detail: '',
+          refs: [],
+          actor: { kind: 'oidc', name: 'alice', jti: 'x' },
+        },
+      ],
+      'GET /networks': [NETWORK],
+    })
+    renderWithApp(<LogTab />, { route: '/settings/log' })
+    expect(within(await screen.findByTestId('log-row-1')).getByTestId('log-actor')).toHaveTextContent('oidc alice')
+  })
 })

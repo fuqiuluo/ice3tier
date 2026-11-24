@@ -122,6 +122,14 @@ pub struct Help {
     pub token_ip: &'static str,
     pub token_successor_of: &'static str,
     pub token_delete: &'static str,
+    pub mcp_group: &'static str,
+    pub mcp_token_group: &'static str,
+    pub mcp_token_list: &'static str,
+    pub mcp_token_create: &'static str,
+    pub mcp_token_name: &'static str,
+    pub mcp_token_scope: &'static str,
+    pub mcp_token_expires_in: &'static str,
+    pub mcp_token_revoke: &'static str,
     pub rule_group: &'static str,
     pub rule_list: &'static str,
     pub rule_add: &'static str,
@@ -227,6 +235,8 @@ pub struct Values {
     pub count: &'static str,
     pub size: &'static str,
     pub duration: &'static str,
+    /// MCP 令牌的权限。
+    pub scope: &'static str,
     pub day: &'static str,
     pub ports: &'static str,
     pub action: &'static str,
@@ -464,6 +474,19 @@ pub struct Ui {
     pub no_tokens: &'static str,
     pub token_created: fn(u32, &str) -> String,
     pub token_use: &'static str,
+    pub mcp_tokens_header: [&'static str; 7],
+    pub no_mcp_tokens: &'static str,
+    /// MCP 令牌不限网络时"网络"那一栏写什么。
+    pub any_network: &'static str,
+    /// MCP 令牌只限一个网络：网络的名字。
+    pub only_network: fn(&str) -> String,
+    /// 刚签发的 MCP 令牌：编号、名字、权限、限不限网络、过期时间。
+    pub mcp_token_created: fn(u32, &str, &str, &str, &str) -> String,
+    /// 怎么把它配进客户端，后面跟着一行命令。
+    pub mcp_token_use: &'static str,
+    pub mcp_token_revoked: fn(u32, &str) -> String,
+    /// 操作记录里注明一条操作是经 MCP 做的：令牌的名字和 jti。
+    pub by_mcp_token: fn(&str, &str) -> String,
     pub rules_header: [&'static str; 6],
     pub no_rules: &'static str,
     pub rule: &'static str,
@@ -646,7 +669,16 @@ mod tests {
 
     fn entry(action: &str, params: Value) -> LogEntry {
         let Value::Object(params) = params else { panic!("参数要是对象") };
-        LogEntry { id: 1, at: 0, network: None, action: action.to_owned(), detail: "原话".to_owned(), refs: Vec::new(), params }
+        LogEntry {
+            id: 1,
+            at: 0,
+            network: None,
+            action: action.to_owned(),
+            detail: "原话".to_owned(),
+            refs: Vec::new(),
+            params,
+            actor: None,
+        }
     }
 
     /// controller 记的每一种操作，带着它的参数。
@@ -722,6 +754,11 @@ mod tests {
             ("test.cancel", json!({ "test": 7, "a": 1, "a_name": "nas", "b": 2, "b_name": "laptop" })),
             ("test.matrix", json!({ "matrix": 1, "nodes": 3, "pairs": 3, "testing": 2 })),
             ("test.matrix.cancel", json!({ "matrix": 1 })),
+            ("mcp.token.create", json!({
+                "token": 3, "name": "claude-code", "jti": "abc", "scopes": ["read", "nodes:enroll"], "network": 1, "network_name": "home", "expires_at": 9
+            })),
+            ("mcp.token.revoke", json!({ "token": 3, "name": "claude-code", "jti": "abc" })),
+            ("mcp.key.rotate", json!({ "revoked": 2 })),
         ]
         .into_iter()
         .map(|(action, params)| entry(action, params))
@@ -744,6 +781,13 @@ mod tests {
         assert!(members.contains("boxes") && members.contains("laptop") && members.contains("#7"), "{members}");
         let rule = (zh::TEXTS.log)(find("rule.create")).unwrap();
         assert!(rule.contains("All") && rule.contains("servers"), "规则写分组的名字：{rule}");
+        let issued = (en::TEXTS.log)(find("mcp.token.create")).unwrap();
+        assert!(issued.contains("claude-code") && issued.contains("read,nodes:enroll") && issued.contains("home"), "{issued}");
+        let mut unlimited = find("mcp.token.create").clone();
+        unlimited.params.insert("network".to_owned(), Value::Null);
+        unlimited.params.insert("network_name".to_owned(), Value::Null);
+        assert!((zh::TEXTS.log)(&unlimited).unwrap().contains("不限网络"));
+        assert!((en::TEXTS.log)(&unlimited).unwrap().contains("any network"));
         let changed = (zh::TEXTS.log)(find("node.update")).unwrap();
         assert!(changed.contains("自动更新关"), "{changed}");
         assert!((en::TEXTS.log)(find("node.update")).unwrap().contains("automatic updates off"));

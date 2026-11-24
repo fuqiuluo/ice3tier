@@ -6,6 +6,7 @@ use std::path::Path;
 
 use i3t_model::admin::{CreateNetwork, action};
 
+use crate::controller::mcp::MCP_KEY_FILE;
 use crate::controller::{Controller, KEY_FILE};
 use crate::error::Error;
 use crate::store::{Database, Scratch, Store, StoreError};
@@ -76,7 +77,7 @@ fn an_empty_database_gets_no_admin_token_and_no_tables() {
     let refused = Controller::reset_admin_token(&data, &elsewhere.database()).unwrap_err();
     assert!(matches!(refused, Error::Store(StoreError::Empty)), "{refused:?}");
     assert!(matches!(Store::open_existing(&elsewhere.database()), Err(StoreError::Empty)), "没有建表");
-    assert_eq!(listing(&data), [KEY_FILE]);
+    assert_eq!(listing(&data), [KEY_FILE, MCP_KEY_FILE]);
 }
 
 #[test]
@@ -185,7 +186,7 @@ fn a_first_start_that_cannot_reach_the_database_leaves_no_key_behind() {
     let scratch = Scratch::new();
     let opened = Controller::open(&data, &scratch.database(), ADDR.to_owned()).unwrap();
     assert!(opened.admin_token.is_some());
-    assert_eq!(listing(&data), [KEY_FILE]);
+    assert_eq!(listing(&data), [KEY_FILE, MCP_KEY_FILE]);
 }
 
 #[test]

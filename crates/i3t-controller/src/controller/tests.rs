@@ -4,6 +4,7 @@ mod addresses;
 mod admin_token;
 mod groups;
 mod limits;
+mod mcp;
 mod model;
 mod netmaps;
 mod ordering;

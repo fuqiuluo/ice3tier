@@ -4,9 +4,10 @@ const count = (n: number, one: string, many: string) => (n === 1 ? `1 ${one}` : 
 
 export const settings: Messages['settings'] = {
   title: 'Settings',
-  subtitle: 'Sign-in, node updates and activity log',
+  subtitle: 'Sign-in, MCP tokens, node updates and activity log',
   tabsLabel: 'Settings sections',
   tabSession: 'Sign-in',
+  tabMcp: 'MCP tokens',
   tabLog: 'Activity log',
   tabAbout: 'About',
 
@@ -18,6 +19,93 @@ export const settings: Messages['settings'] = {
     resetTitle: 'Reset admin token',
     resetService:
       'Run on the machine the controller is on. The new token is printed in the terminal; the old one stops working.',
+  },
+
+  mcp: {
+    endpointTitle: 'MCP endpoint',
+    endpointBody:
+      'The controller has a built-in MCP server. AI agents (Claude Code, Codex, Cursor and the like) connect to this address with an MCP token; its scopes decide what it may do.',
+    title: 'MCP tokens',
+    body: 'A token is shown only once, when it is issued. After revoking, its next call is refused.',
+    issue: 'Issue token',
+    loadFailed: "Couldn't load MCP tokens",
+    emptyTitle: 'No MCP tokens yet',
+    emptyBody: 'Issue a token and give it to the agent that will connect',
+    colName: 'Name',
+    colState: 'State',
+    colScopes: 'Scopes',
+    colNetwork: 'Network',
+    colExpires: 'Expires',
+    state: {
+      active: 'Active',
+      expired: 'Expired',
+      revoked: 'Revoked',
+    },
+    revokedAt: (time) => `Revoked ${time}`,
+    anyNetwork: 'Any network',
+    networkGone: (id) => `Network #${id}`,
+    remaining: (remaining) => `${remaining} left`,
+    scopeNames: {
+      read: 'Read-only',
+      'nodes:enroll': 'Add nodes',
+      'nodes:write': 'Manage nodes',
+      'config:write': 'Change configuration',
+      'tests:run': 'Run tests',
+      'updates:write': 'Node updates',
+      'networks:write': 'Manage networks',
+    },
+    scopeHints: {
+      read: 'View status, networks, nodes, routes and paths, exits, access checks, test results, statistics, the activity log and all configuration (proxies without passwords)',
+      'nodes:enroll': 'Create, list and revoke enrollment tokens; see which node joined with one',
+      'nodes:write': 'Change and delete nodes, replace nodes, switch relays and exits on and off',
+      'config:write': 'Groups and members, policies, proxies, port forwards, node-pair settings',
+      'tests:run': 'Start and cancel tests',
+      'updates:write': 'Change update settings, check for updates, order node updates',
+      'networks:write': 'Create, change and delete networks',
+    },
+    scopeTip: (name, hint) => `${name}: ${hint}`,
+    revoke: 'Revoke',
+    revokeFor: (name) => `Revoke ${name}`,
+    revokeTitle: (name) => `Revoke MCP token ${name}?`,
+    revokeBody: "The agent using it is refused on its next call. This can't be undone; issue a new token instead.",
+    revokeConfirm: 'Revoke token',
+    revoked: (name) => `MCP token ${name} revoked`,
+
+    dialog: {
+      title: 'Issue MCP token',
+      submit: 'Issue',
+      name: 'Name',
+      nameHint: 'Who it is for. Recorded with every change it makes',
+      namePlaceholder: 'claude-code',
+      network: 'Network',
+      networkHint: 'With a network chosen, the token sees and changes only that network',
+      scopes: 'Scopes',
+      globalOnly: 'Acts on the whole controller; only for tokens not limited to a network',
+      lifetime: 'Expires in',
+      lifetimeHint: (days) => `At most ${days} days; issue a new token after it expires`,
+    },
+
+    issued: {
+      title: 'MCP token issued',
+      summary: (name, scopes, network, expires) =>
+        `${name} · scopes ${scopes} · ${network === null ? 'any network' : `network ${network} only`} · expires ${expires}`,
+      token: 'Token',
+      copyToken: 'Copy token',
+      shownOnce: 'Shown only once; it cannot be viewed again after closing',
+      claude: 'Add to Claude Code',
+      copyCommand: 'Copy command',
+      otherClients: (endpoint) => `Other clients: URL ${endpoint}, header Authorization: Bearer <token>`,
+    },
+
+    errors: {
+      nameMalformed: (max) => `At most ${max} characters, no control characters`,
+      scopesEmpty: 'Select at least one scope',
+      scopesGlobal:
+        'Node updates and Manage networks act on the whole controller and cannot go to a token limited to one network',
+      scopesUnknown: 'The controller does not know one of the scopes',
+      networkGone: 'Network not found',
+      lifetime: (days) => `At most ${days} days`,
+    },
   },
 
   log: {
@@ -48,8 +136,13 @@ export const settings: Messages['settings'] = {
       forward: (id) => `Forward #${id}`,
     },
     refsLabel: 'Related objects',
+    actor: {
+      mcp: (name) => `MCP token ${name}`,
+      jti: (jti) => `JTI ${jti}`,
+    },
     kinds: {
       admin: 'Admin token',
+      mcp: 'MCP token',
       network: 'Network',
       node: 'Node',
       token: 'Enrollment token',
@@ -63,6 +156,9 @@ export const settings: Messages['settings'] = {
     },
     actions: {
       'admin.token': 'Admin token reset',
+      'mcp.token.create': 'MCP token issued',
+      'mcp.token.revoke': 'MCP token revoked',
+      'mcp.key.rotate': 'MCP signing key changed',
       'network.create': 'Network created',
       'network.update': 'Network updated',
       'network.delete': 'Network deleted',
@@ -109,6 +205,13 @@ export const settings: Messages['settings'] = {
       'update.resume': 'Updates resumed',
       'update.force': 'Node update ordered',
       'update.force_all': 'Update of all nodes ordered',
+    },
+    sentences: {
+      mcpTokenCreate: (id, name, scopes, network) =>
+        `MCP token #${id} issued (${name}), scopes ${scopes}, ${network === null ? 'any network' : `network ${network} only`}`,
+      mcpTokenRevoke: (id, name) => `MCP token #${id} revoked (${name})`,
+      mcpKeyRotate: (revoked) =>
+        `MCP signing key changed; ${revoked === 1 ? '1 token issued before is void' : `${revoked} tokens issued before are void`}`,
     },
     loaded: (n) => `${count(n, 'entry', 'entries')} loaded`,
     emptyTitle: 'No activity yet',

@@ -97,6 +97,17 @@ impl NodeKey {
         Signature(bytes)
     }
 
+    /// 原样给 `message` 签名，不加前缀和用途标签：签名的格式由别的规范定死时用（JWT 的 `EdDSA`，RFC 8037）。
+    ///
+    /// 只给专门做这一件事的密钥用。同一把密钥又拿去 [`sign`](Self::sign) 的话，这里签出来的东西没有用途标签隔着，
+    /// 所以节点密钥和 controller 的密钥都不这样用。
+    #[must_use]
+    pub fn sign_raw(&self, message: &[u8]) -> Signature {
+        let signature = self.pair.sign(message);
+        let bytes: [u8; Signature::LEN] = signature.as_ref().try_into().expect("Ed25519 签名固定是 64 字节，这是算法的定义");
+        Signature(bytes)
+    }
+
     /// 从私钥派生一把对称密钥。同一把私钥、同一个 `purpose` 每次得到的都一样，不同的 `purpose` 互不相干，
     /// 知道其中一把也推不出私钥和别的。
     ///
@@ -157,6 +168,15 @@ pub fn verify(key: &PublicKey, purpose: &str, message: &[u8], signature: &Signat
     UnparsedPublicKey::new(&ED25519, key.as_bytes()).verify(&signed_bytes(purpose, message), signature.as_bytes()).map_err(|_| BadSignature)
 }
 
+/// 验证 `signature` 是 `key` 的主人原样对 `message` 签的（[`NodeKey::sign_raw`]）。
+///
+/// # Errors
+///
+/// 签名不对：消息被改过，或者不是这把密钥签的。
+pub fn verify_raw(key: &PublicKey, message: &[u8], signature: &Signature) -> Result<(), BadSignature> {
+    UnparsedPublicKey::new(&ED25519, key.as_bytes()).verify(message, signature.as_bytes()).map_err(|_| BadSignature)
+}
+
 /// 真正被签名的字节：固定前缀、用途标签的长度和内容、消息。标签带长度，所以"标签 + 消息"的拼接没有歧义。
 fn signed_bytes(purpose: &str, message: &[u8]) -> Vec<u8> {
     let purpose_len = u8::try_from(purpose.len()).expect("用途标签是代码里写死的短字符串，不会超过 255 字节");
@@ -195,6 +215,19 @@ mod tests {
         assert_eq!(verify(&other.public(), "probe", b"hello", &signature), Err(BadSignature));
         assert_eq!(verify(&key.public(), "relay-session", b"hello", &signature), Err(BadSignature));
         assert_eq!(verify(&key.public(), "probe", b"hello!", &signature), Err(BadSignature));
+    }
+
+    #[test]
+    fn a_raw_signature_verifies_only_as_raw_with_the_same_key_and_message() {
+        let key = NodeKey::generate().unwrap();
+        let other = NodeKey::generate().unwrap();
+        let signature = key.sign_raw(b"header.payload");
+        assert_eq!(verify_raw(&key.public(), b"header.payload", &signature), Ok(()));
+        assert_eq!(verify_raw(&other.public(), b"header.payload", &signature), Err(BadSignature));
+        assert_eq!(verify_raw(&key.public(), b"header.payloae", &signature), Err(BadSignature));
+        // 带用途的签名和原样的签名互不相认。
+        assert_eq!(verify(&key.public(), "jwt", b"header.payload", &signature), Err(BadSignature));
+        assert_eq!(verify_raw(&key.public(), b"header.payload", &key.sign("jwt", b"header.payload")), Err(BadSignature));
     }
 
     #[test]

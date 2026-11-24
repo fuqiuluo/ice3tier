@@ -122,7 +122,7 @@ test('策略、代理、端口转发、节点对、设置：都不横向滚动',
     await expect(page.locator('main h1').first()).toBeVisible()
     await expectNoSidewaysScroll()
   }
-  for (const tab of ['session', 'updates', 'log', 'about']) {
+  for (const tab of ['session', 'mcp', 'updates', 'log', 'about']) {
     await page.goto(`${controller.baseUrl}/settings/${tab}`)
     await expect(page.locator('main h1').first()).toBeVisible()
     await expectNoSidewaysScroll()

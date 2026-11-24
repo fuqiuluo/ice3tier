@@ -9,6 +9,7 @@
 //! | [`node_server`]、[`frame`] | 节点协议的服务端和分帧 |
 //! | [`addr_server`] | 地址查询的应答 |
 //! | [`admin`] | 管理 API：路由和处理函数；HTTP 的服务端在 `admin_server` 里 |
+//! | `mcp` | 给 AI Agent 用的 MCP Server，挂在管理 API 的监听上；它的工具调的是管理 API 的那些操作 |
 //! | [`release`] | 发布源：从哪里取发布清单和节点的更新包 |
 //! | [`webui`] | WebUI 的静态文件从哪里来 |
 //! | [`Server`] | 把上面这些装在一起跑 |
@@ -44,6 +45,7 @@ mod error;
 pub mod frame;
 mod gate;
 mod geo;
+mod mcp;
 pub mod netmap;
 mod node_addresses;
 pub mod node_server;
@@ -56,6 +58,6 @@ pub mod store;
 mod sync;
 pub mod webui;
 
-pub use controller::{ALPN, Admitted, Controller, Opened, RouteAnswers, TickFailed, Timing};
+pub use controller::{ALPN, Admitted, Controller, McpGrant, McpRefusal, Opened, RouteAnswers, TickFailed, Timing};
 pub use error::{Capability, Entity, Error, Rejection};
 pub use server::{ServeOptions, Server};

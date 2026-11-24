@@ -7,6 +7,7 @@ mod en;
 mod zh;
 
 use i3t_model::admin::diag::{CellState, ItemState, MatrixState, TestState};
+use i3t_model::admin::mcp::McpTokenState;
 use i3t_model::admin::{
     AddressSource, ApiError, ExitHealth, ForwardStatus, LaneBlock, NodeWarning, PackageState, PathSource, ProxyStatus, ReachCause,
     ReleaseCause, SkipCause, TokenState, UpdateWait,
@@ -68,6 +69,7 @@ pub struct Codes {
     /// 出口连接目标的方式：`直连`、`经上游代理`。
     pub exit_via: fn(ExitVia) -> &'static str,
     pub token_state: fn(TokenState) -> &'static str,
+    pub mcp_token_state: fn(McpTokenState) -> &'static str,
     /// 一个代理现在能不能用，一短句：`监听在 127.0.0.1:1080`、`出口离线`。
     pub proxy_status: fn(&ProxyStatus) -> String,
     pub exit_health: fn(ExitHealth) -> &'static str,

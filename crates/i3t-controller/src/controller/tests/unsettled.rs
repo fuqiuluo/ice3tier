@@ -148,6 +148,65 @@ fn an_admin_token_changed_by_a_commit_whose_answer_was_lost_is_the_one_in_force(
 }
 
 #[test]
+fn an_mcp_token_revoked_by_a_commit_whose_answer_was_lost_is_refused_at_once_and_stays_revoked() {
+    use i3t_model::admin::mcp::{CreateMcpToken, McpScope, McpTokenState};
+
+    use super::super::McpRefusal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let lab = Lab::around(Controller::open(dir.path(), &database, ADDR.to_owned()).unwrap().controller);
+    let request = |name: &str| CreateMcpToken { name: name.to_owned(), scopes: vec![McpScope::Read], network: None, expires_in_secs: 3600 };
+    let revoked = lab.controller.create_mcp_token(&request("revoked")).unwrap();
+    let kept = lab.controller.create_mcp_token(&request("kept")).unwrap();
+
+    let stalled = stall_commits(&database, "UPDATE", "mcp_tokens");
+    be_impatient(&lab);
+    let error = lab.controller.revoke_mcp_token(revoked.info.id).unwrap_err();
+    assert!(is_unknown(&error), "{error:?}");
+    // 不知道撤销成了没有：先按撤销了算。管理员要的就是它别再能用，宁可多算。
+    assert_eq!(lab.controller.mcp_grant(&revoked.token).unwrap_err(), McpRefusal::Revoked);
+    assert!(lab.controller.mcp_grant(&kept.token).is_ok(), "别的令牌不受影响");
+
+    // 数据库里后来也是撤销了的，重启之后还是。
+    stalled.release();
+    tick_until_settled(&lab);
+    assert_eq!(lab.controller.mcp_grant(&revoked.token).unwrap_err(), McpRefusal::Revoked);
+    assert!(lab.controller.mcp_grant(&kept.token).is_ok());
+    let states: Vec<_> = lab.controller.mcp_tokens().unwrap().into_iter().map(|token| token.state).collect();
+    assert_eq!(states, [McpTokenState::Revoked, McpTokenState::Active]);
+    drop(lab);
+    let reopened = Controller::open(dir.path(), &database, ADDR.to_owned()).unwrap().controller;
+    assert_eq!(reopened.mcp_grant(&revoked.token).unwrap_err(), McpRefusal::Revoked);
+    assert!(reopened.mcp_grant(&kept.token).is_ok());
+}
+
+#[test]
+fn an_mcp_token_issued_by_a_commit_whose_answer_was_lost_is_listed_so_that_it_can_be_revoked() {
+    use i3t_model::admin::mcp::{CreateMcpToken, McpScope, McpTokenState};
+
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = Scratch::new();
+    let database = scratch.database();
+    let lab = Lab::around(Controller::open(dir.path(), &database, ADDR.to_owned()).unwrap().controller);
+
+    // 签发的提交没有回答：JWT 没有交出去，谁手上都没有它。
+    let stalled = stall_commits(&database, "INSERT", "mcp_tokens");
+    be_impatient(&lab);
+    let request = CreateMcpToken { name: "lost".to_owned(), scopes: vec![McpScope::Read], network: None, expires_in_secs: 3600 };
+    let error = lab.controller.create_mcp_token(&request).unwrap_err();
+    assert!(is_unknown(&error), "{error:?}");
+
+    // 库里后来有这一条：列表里看得到，撤销得了，内存里的那一份也跟上了。
+    stalled.release();
+    tick_until_settled(&lab);
+    let tokens = lab.controller.mcp_tokens().unwrap();
+    assert_eq!(tokens.iter().map(|token| (token.name.as_str(), token.state)).collect::<Vec<_>>(), [("lost", McpTokenState::Active)]);
+    assert_eq!(lab.controller.revoke_mcp_token(tokens[0].id).unwrap().state, McpTokenState::Revoked);
+}
+
+#[test]
 fn a_commit_whose_answer_was_lost_and_that_did_not_count_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let scratch = Scratch::new();

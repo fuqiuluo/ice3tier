@@ -38,7 +38,7 @@ Files `install.sh` creates:
 
 | What | Where |
 | --- | --- |
-| Controller data | `/var/lib/i3t-controller` (`controller.key`, `database.url`, update cache) |
+| Controller data | `/var/lib/i3t-controller` (`controller.key`, `mcp.key`, `database.url`, update cache) |
 | Controller settings | `/etc/i3t/controller.env` (`I3T_PUBLIC_ADDR`, `I3T_CONTROLLER_ARGS`) |
 | Controller and command line programs | `/usr/local/bin/i3t-controller`, `/usr/local/bin/i3tctl` |
 | Node state and settings | `/var/lib/i3t` (settings in `config.toml`) |

@@ -9,6 +9,12 @@ export const API_PREFIX = '/api/v1'
 export const METRICS_PATH = '/metrics'
 
 /**
+ * MCP 端点在 `API_PREFIX` 下面的路径：AI Agent 连的是它。它认的是 MCP 令牌，不认管理令牌；
+ * 签发、列出、撤销 MCP 令牌的接口在它下面（`/mcp/tokens`），只认管理令牌。
+ */
+export const MCP_PATH = '/mcp'
+
+/**
  * 一次失败的请求。
  *
  * `code` 给程序看：服务器给的错误码原样放在这里；连不上时是 `network`；应答不是约定的格式时是 `http_<状态码>`。

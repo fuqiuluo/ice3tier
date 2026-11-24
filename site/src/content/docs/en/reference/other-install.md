@@ -54,7 +54,7 @@ echo <enrollment-token> | i3t join
 i3t run
 ```
 
-The controller's data directory holds its key `controller.key` and the cache of update packages; networks, nodes and settings are in a PostgreSQL database, version 16 or newer. The connection string has the form `postgres://USER:PASSWORD@HOST[:PORT]/DBNAME`; the `host=… user=… dbname=…` form works too. `i3t-controller` takes it from the option `--database-url`, then from the environment variable `I3T_DATABASE_URL`, then from a one-line file `database.url` in the data directory. It contains the password, so prefer the environment variable or the file over the command line. The connection to the database is not encrypted: keep the database on the same machine or on a trusted private network.
+The controller's data directory holds its key `controller.key`, the key that signs MCP tokens `mcp.key`, and the cache of update packages; networks, nodes and settings are in a PostgreSQL database, version 16 or newer. The connection string has the form `postgres://USER:PASSWORD@HOST[:PORT]/DBNAME`; the `host=… user=… dbname=…` form works too. `i3t-controller` takes it from the option `--database-url`, then from the environment variable `I3T_DATABASE_URL`, then from a one-line file `database.url` in the data directory. It contains the password, so prefer the environment variable or the file over the command line. The connection to the database is not encrypted: keep the database on the same machine or on a trusted private network.
 
 Raw systemd units and the polkit rule are in [`deploy/systemd`](https://github.com/fuqiuluo/ice3tier/tree/main/deploy/systemd) and [`deploy/polkit`](https://github.com/fuqiuluo/ice3tier/tree/main/deploy/polkit).
 

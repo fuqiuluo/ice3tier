@@ -71,6 +71,30 @@ export function resetTokenCommands(dataDir: string): string[] {
   return [`sudo systemctl stop ${unit}`, `sudo -u ${user} ${program} ${args}`, `sudo systemctl start ${unit}`]
 }
 
+/** 写在命令里不用引号的地址：`http://host:8443/api/v1/mcp`。IPv6 的字面地址带方括号，shell 会当成通配。 */
+const URL_SAFE = /^[A-Za-z0-9_.:=+/-]+$/
+
+/** 这个 controller 的 MCP Server 在客户端里叫什么。 */
+const MCP_SERVER_NAME = 'ice3tier'
+
+/**
+ * 把这个 controller 的 MCP 端点加进 Claude Code 的那一行：
+ * `claude mcp add --transport http ice3tier <端点> --header "Authorization: Bearer <JWT>"`。
+ *
+ * JWT 是三段 base64url 中间加点，写在双引号里不会被 shell 误解；万一不是这样的字符，
+ * 整个请求头改用单引号包起来，不让它变成另一条命令。
+ */
+export function claudeMcpAddCommand(endpoint: string, token: string): string {
+  const header = `Authorization: Bearer ${token}`
+  return [
+    'claude mcp add --transport http',
+    MCP_SERVER_NAME,
+    URL_SAFE.test(endpoint) ? endpoint : quote(endpoint, false),
+    '--header',
+    SHELL_SAFE.test(token) ? `"${header}"` : quote(header, false),
+  ].join(' ')
+}
+
 /** 令牌还没生成时，命令里令牌的位置上显示的占位符。它只给人看，不会被复制走，所以不加引号。 */
 export interface TokenPlaceholder {
   placeholder: string

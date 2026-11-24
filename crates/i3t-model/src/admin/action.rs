@@ -6,6 +6,13 @@
 /// 生成了新的管理令牌。
 pub const ADMIN_TOKEN: &str = "admin.token";
 
+/// 签发了一个 MCP 令牌。
+pub const MCP_TOKEN_CREATE: &str = "mcp.token.create";
+/// 撤销了一个 MCP 令牌。
+pub const MCP_TOKEN_REVOKE: &str = "mcp.token.revoke";
+/// controller 换了签 MCP 令牌的密钥，原来签的全部作废。
+pub const MCP_KEY_ROTATE: &str = "mcp.key.rotate";
+
 pub const NETWORK_CREATE: &str = "network.create";
 pub const NETWORK_UPDATE: &str = "network.update";
 pub const NETWORK_DELETE: &str = "network.delete";

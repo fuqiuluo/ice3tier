@@ -614,3 +614,108 @@ async fn active_tests_and_the_matrix_are_run_and_shown_from_the_command_line() {
     let cancelled = fixture.ok(&["tests", "matrix", "--cancel"]).await;
     assert!(cancelled.starts_with("全网矩阵 #1  已取消"), "{cancelled}");
 }
+
+/// 经真的 HTTP 向 MCP 端点发一个 JSON-RPC 请求，返回状态码和应答体。
+async fn mcp(fixture: &Fixture, jwt: &str, method: &str, params: Value) -> (u16, Value) {
+    let url = format!("http://{}/api/v1/mcp", fixture.admin);
+    let message = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(jwt)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .json(&message)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn mcp_tokens_are_issued_listed_and_revoked_from_the_command_line_and_open_the_mcp_endpoint() {
+    let fixture = Fixture::start().await;
+    fixture.ok(&["network", "create", "home"]).await;
+    fixture.ok(&["network", "create", "lab"]).await;
+
+    // 签发：说清楚签的是什么，JWT 只显示这一次，后面是配进 Claude Code 的那一行。没写 --network 就不限网络。
+    let said =
+        fixture.ok(&["mcp", "token", "create", "--name", "claude-code", "--scope", "read,nodes:enroll", "--expires-in", "30d"]).await;
+    assert!(Fixture::has_line(&said, &["MCP 令牌 #1（claude-code）", "权限 read,nodes:enroll", "不限网络", "仅显示这一次"]), "{said}");
+    let jwt =
+        said.lines().map(str::trim).find(|line| line.starts_with("eyJ") && line.matches('.').count() == 2).expect("要有 JWT").to_owned();
+    let add =
+        format!("claude mcp add --transport http ice3tier http://{}/api/v1/mcp --header \"Authorization: Bearer {jwt}\"", fixture.admin);
+    assert!(said.contains(&add), "{said}");
+
+    // 写了 --network 就只限它；这时不能带管整个 controller 的权限。过期时间有上限。
+    let bound = fixture
+        .json(&["--network", "lab", "mcp", "token", "create", "--name", "codex", "--scope", "config:write", "--expires-in", "12h"])
+        .await;
+    assert_eq!(
+        (&bound["id"], &bound["network"], &bound["scopes"], &bound["state"]),
+        (&json!(2), &json!(2), &json!(["config:write"]), &json!("active"))
+    );
+    assert_eq!(bound["expires_at"].as_u64().unwrap() - bound["created_at"].as_u64().unwrap(), 12 * 3600);
+    let global = ["--network", "lab", "mcp", "token", "create", "--name", "x", "--scope", "networks:write", "--expires-in", "1d"];
+    let refused = fixture.fails(&global).await;
+    assert!(refused.contains("networks:write") && refused.contains("invalid_request"), "{refused}");
+    let too_long = fixture.fails(&["mcp", "token", "create", "--name", "x", "--scope", "read", "--expires-in", "91d"]).await;
+    assert!(too_long.contains("90 天"), "{too_long}");
+
+    // 列表里有它们，没有 JWT。
+    let listed = fixture.ok(&["mcp", "token", "list"]).await;
+    assert!(Fixture::has_line(&listed, &["1", "claude-code", "有效", "不限网络", "read,nodes:enroll"]), "{listed}");
+    assert!(Fixture::has_line(&listed, &["2", "codex", "有效", "lab", "config:write"]), "{listed}");
+    assert!(!listed.contains(&jwt) && !listed.contains("eyJ"), "{listed}");
+    let english = fixture.english(&["mcp", "token", "list"]).await;
+    assert!(Fixture::has_line(&english, &["claude-code", "active", "any network"]), "{english}");
+
+    // 签出来的 JWT 真的打得开 MCP 端点（走的是真的 HTTP 监听），做的改动记在它头上。
+    let (status, initialized) = mcp(&fixture, &jwt, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} })).await;
+    assert_eq!((status, &initialized["result"]["serverInfo"]["name"]), (200, &json!("ice3tier")), "{initialized}");
+    let (status, listed_tools) = mcp(&fixture, &jwt, "tools/list", json!({})).await;
+    let names: Vec<&str> = listed_tools["result"]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+    assert!(
+        status == 200 && names.contains(&"node_list") && names.contains(&"enroll_token_create") && !names.contains(&"node_delete"),
+        "{names:?}"
+    );
+    let call = json!({ "name": "enroll_token_create", "arguments": { "network": 1 } });
+    let (status, called) = mcp(&fixture, &jwt, "tools/call", call).await;
+    assert_eq!((status, &called["result"]["isError"]), (200, &json!(false)), "{called}");
+    let (status, _) = mcp(&fixture, &jwt, "tools/call", json!({ "name": "node_delete", "arguments": { "network": 1, "node": 1 } })).await;
+    assert_eq!(status, 403);
+    let log = fixture.ok(&["log", "--action", "token.create"]).await;
+    let jti = fixture.json(&["mcp", "token", "list"]).await[0]["jti"].as_str().unwrap().to_owned();
+    assert!(Fixture::has_line(&log, &["新建注册令牌 #1", &format!("MCP 令牌 claude-code，jti {jti}")]), "{log}");
+    let english = fixture.english(&["log", "--action", "token.create"]).await;
+    assert!(Fixture::has_line(&english, &["Enrollment token #1 created", &format!("MCP token claude-code, jti {jti}")]), "{english}");
+    let issued = fixture.ok(&["log", "--action", "mcp"]).await;
+    assert!(Fixture::has_line(&issued, &["签发 MCP 令牌 #2（codex）", "权限 config:write", "只限网络 lab"]), "{issued}");
+    assert!(
+        Fixture::has_line(&issued, &["签发 MCP 令牌 #1（claude-code）", "不限网络"]) && !issued.contains("jti"),
+        "签发是管理员做的：{issued}"
+    );
+    fixture.english(&["log", "--action", "mcp"]).await;
+
+    // 它不是管理令牌：拿它当管理令牌用被拒绝，管理令牌也打不开 MCP 端点。
+    let url = format!("http://{}", fixture.admin);
+    let as_admin = fixture.command().args(["--url", &url, "--token", &jwt, "status"]).output().await.unwrap();
+    assert!(!as_admin.status.success() && text(&as_admin.stderr).contains("unauthorized"), "{}", text(&as_admin.stderr));
+    assert_eq!(mcp(&fixture, &fixture.token, "tools/list", json!({})).await.0, 401);
+
+    // 撤销之后的下一次调用就被拒绝，列表里标成撤销的。
+    assert_eq!(fixture.ok(&["mcp", "token", "revoke", "1"]).await.trim(), "MCP 令牌 #1（claude-code）已撤销");
+    assert_eq!(mcp(&fixture, &jwt, "tools/list", json!({})).await.0, 401);
+    let listed = fixture.ok(&["mcp", "token", "list"]).await;
+    assert!(Fixture::has_line(&listed, &["1", "claude-code", "已撤销"]) && Fixture::has_line(&listed, &["2", "codex", "有效"]), "{listed}");
+    assert_eq!(fixture.json(&["mcp", "token", "revoke", "2"]).await["state"], "revoked");
+    assert!(fixture.english(&["mcp", "token", "revoke", "2"]).await.contains("MCP token #2 (codex) revoked"));
+    let missing = fixture.fails(&["mcp", "token", "revoke", "99"]).await;
+    assert!(missing.contains("not_found"), "{missing}");
+    let revoked = fixture.ok(&["log", "--action", "mcp.token.revoke"]).await;
+    assert!(
+        Fixture::has_line(&revoked, &["撤销 MCP 令牌 #1（claude-code）"]) && revoked.matches("mcp.token.revoke").count() == 2,
+        "{revoked}"
+    );
+}

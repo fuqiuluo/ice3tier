@@ -10,12 +10,13 @@ import { useDocumentTitle } from '@/lib/useDocumentTitle'
 
 import { AboutTab } from './AboutTab'
 import { LogTab } from './LogTab'
+import { McpTab } from './McpTab'
 import { SessionTab } from './SessionTab'
 import { UpdatesTab } from './UpdatesTab'
 
 const s = t.settings
 
-const TAB_IDS = ['session', 'updates', 'log', 'about'] as const
+const TAB_IDS = ['session', 'mcp', 'updates', 'log', 'about'] as const
 type TabId = (typeof TAB_IDS)[number]
 
 /** 分区的名字在渲染时现取，换了语言就是新的。 */
@@ -23,6 +24,8 @@ function tabLabel(id: TabId): string {
   switch (id) {
     case 'session':
       return s.tabSession
+    case 'mcp':
+      return s.tabMcp
     case 'updates':
       return t.updates.tab
     case 'log':
@@ -55,6 +58,7 @@ export function SettingsPage() {
         }))}
       >
         {active === 'session' ? <SessionTab /> : null}
+        {active === 'mcp' ? <McpTab /> : null}
         {active === 'updates' ? <UpdatesTab /> : null}
         {active === 'log' ? <LogTab /> : null}
         {active === 'about' ? <AboutTab /> : null}

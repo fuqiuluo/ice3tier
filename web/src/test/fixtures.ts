@@ -4,6 +4,7 @@ import {
   type ExitView,
   type Forward,
   type MatrixEntry,
+  type McpTokenInfo,
   type Node,
   type NodeUpdate,
   type PairView,
@@ -158,6 +159,22 @@ export function makeToken(id: number, extra: Partial<EnrollTokenInfo> = {}): Enr
     state: 'pending',
     used_at: null,
     used_by: null,
+    ...extra,
+  }
+}
+
+/** 一个还能用的、不限网络的只读 MCP 令牌。 */
+export function makeMcpToken(id: number, name: string, extra: Partial<McpTokenInfo> = {}): McpTokenInfo {
+  return {
+    id,
+    jti: `jti-${id}`,
+    name,
+    scopes: ['read'],
+    network: null,
+    created_at: 1_794_000_000,
+    expires_at: 1_796_592_000,
+    revoked_at: null,
+    state: 'active',
     ...extra,
   }
 }

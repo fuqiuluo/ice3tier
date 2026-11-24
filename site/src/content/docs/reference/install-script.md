@@ -38,7 +38,7 @@ Windows 用 `install.ps1`，选项写成环境变量，只对这一次执行有�
 
 | 内容 | 位置 |
 | --- | --- |
-| controller 的数据 | `/var/lib/i3t-controller`（`controller.key`、`database.url`、更新包的缓存） |
+| controller 的数据 | `/var/lib/i3t-controller`（`controller.key`、`mcp.key`、`database.url`、更新包的缓存） |
 | controller 的设置 | `/etc/i3t/controller.env`（`I3T_PUBLIC_ADDR`、`I3T_CONTROLLER_ARGS`） |
 | controller 和命令行程序 | `/usr/local/bin/i3t-controller`、`/usr/local/bin/i3tctl` |
 | 节点的状态和设置 | `/var/lib/i3t`（设置在 `config.toml` 里） |

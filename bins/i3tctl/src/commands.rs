@@ -5,6 +5,7 @@ use std::net::Ipv4Addr;
 
 use anyhow::{Context, anyhow, bail};
 use i3t_model::admin::diag::{CreateTest, MatrixRun, MatrixState, TestState, TestView};
+use i3t_model::admin::mcp::{CreateMcpToken, MCP_PATH, McpTokenInfo};
 use i3t_model::admin::{
     CreateEnrollToken, CreateGroup, CreateNetwork, CreateProxy, CreateRule, Direction, ExitTestInput, ForceUpdate, Forward, ForwardInput,
     Group, GroupId, GroupMembers, Network, NetworkId, Node, PairInput, RelaySettings, ResumeUpdate, Succeed, UpdateGroup, UpdateNetwork,
@@ -19,8 +20,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::cli::{
-    AccessCommand, Cli, Command, ExitCommand, ForwardCommand, GroupCommand, NetworkCommand, NetworkSettings, NodeCommand, PairCommand,
-    ProxyCommand, RelayCommand, RuleCommand, TestItemArg, TestsCommand, TokenCommand, UpdateCommand,
+    AccessCommand, Cli, Command, ExitCommand, ForwardCommand, GroupCommand, McpCommand, McpTokenCommand, NetworkCommand, NetworkSettings,
+    NodeCommand, PairCommand, ProxyCommand, RelayCommand, RuleCommand, TestItemArg, TestsCommand, TokenCommand, UpdateCommand,
 };
 use crate::client::{Client, decode};
 use crate::render;
@@ -50,6 +51,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Exit(command) => session.exit_command(command).await,
         Command::Group(command) => session.group_command(command).await,
         Command::Token(command) => session.token_command(command).await,
+        Command::Mcp(McpCommand::Token(command)) => session.mcp_token_command(command).await,
         Command::Rule(command) => session.rule_command(command).await,
         Command::Proxy(command) => session.proxy_command(command).await,
         Command::Forward(command) => session.forward_command(command).await,
@@ -559,6 +561,34 @@ impl Session {
                 self.delete(&format!("{tokens}/{id}")).await?;
                 self.done(&(texts().ui.token_deleted)(id));
                 Ok(())
+            }
+        }
+    }
+
+    async fn mcp_token_command(&self, command: McpTokenCommand) -> anyhow::Result<()> {
+        let tokens = format!("{MCP_PATH}/tokens");
+        match command {
+            McpTokenCommand::List => {
+                let networks: Vec<Network> = if self.json { Vec::new() } else { self.client.get("/networks").await? };
+                self.show_list(self.get(&tokens).await?, |tokens| render::mcp_tokens(tokens, &networks))
+            }
+            McpTokenCommand::Create { name, scopes, expires_in } => {
+                // `--network` 写了就只限它，没写就不限。不像别的命令那样"只有一个网络就是它"：不替管理员把令牌收窄。
+                let network = match self.network.as_deref().filter(|reference| !reference.is_empty()) {
+                    Some(reference) => Some(pick_network(self.client.get("/networks").await?, reference)?),
+                    None => None,
+                };
+                let request =
+                    CreateMcpToken { name, scopes, network: network.as_ref().map(|network| network.id), expires_in_secs: expires_in.secs };
+                let endpoint = self.client.url_of(MCP_PATH);
+                let network = network.map(|network| network.name);
+                self.show(self.send(Method::POST, &tokens, &request).await?, |created| {
+                    render::created_mcp_token(created, network.as_deref(), &endpoint);
+                })
+            }
+            McpTokenCommand::Revoke { id } => {
+                let revoked = self.client.request(Method::POST, &format!("{tokens}/{id}/revoke"), None::<&()>).await?;
+                self.show(revoked, |token: &McpTokenInfo| println!("{}", (texts().ui.mcp_token_revoked)(token.id, &token.name)))
             }
         }
     }

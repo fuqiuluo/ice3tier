@@ -94,6 +94,14 @@ const HELP: Help = Help {
     token_ip: "预设的虚拟 IP",
     token_successor_of: "要继任的已下线节点",
     token_delete: "删除注册令牌",
+    mcp_group: "给 AI Agent 用的 MCP Server",
+    mcp_token_group: "MCP 令牌：Agent 连 controller 的 MCP 端点时带的 JWT",
+    mcp_token_list: "MCP 令牌列表",
+    mcp_token_create: "签发 MCP 令牌。JWT 只显示这一次。写了 --network 就只限这一个网络，没写不限",
+    mcp_token_name: "给谁用的，会记在它做的每一条操作上",
+    mcp_token_scope: "权限，用逗号隔开或者写多次：read、nodes:enroll、nodes:write、config:write、tests:run、updates:write、networks:write",
+    mcp_token_expires_in: "有效期，如 12h、30d，最长 90d",
+    mcp_token_revoke: "撤销 MCP 令牌：它的下一次调用就被拒绝",
     rule_group: "访问规则",
     rule_list: "规则列表",
     rule_add: "新建规则：两个分组的节点互相可以访问",
@@ -196,6 +204,7 @@ const VALUES: Values = Values {
     count: "数",
     size: "大小",
     duration: "时长",
+    scope: "权限",
     day: "日",
     ports: "端口",
     action: "动作",
@@ -407,6 +416,16 @@ const UI: Ui = Ui {
     no_tokens: "没有注册令牌",
     token_created: |id, expires| format!("注册令牌 #{id}，将于 {expires} 过期。仅显示这一次："),
     token_use: "在待加入节点上执行：echo <令牌> | i3t join",
+    mcp_tokens_header: ["编号", "名字", "状态", "过期", "网络", "权限", "JTI"],
+    no_mcp_tokens: "没有 MCP 令牌",
+    any_network: "不限网络",
+    only_network: |network| format!("只限网络 {network}"),
+    mcp_token_created: |id, name, scopes, limit, expires| {
+        format!("MCP 令牌 #{id}（{name}），权限 {scopes}，{limit}，将于 {expires} 过期。仅显示这一次：")
+    },
+    mcp_token_use: "配进客户端时作为请求头 Authorization: Bearer <令牌>。在 Claude Code 里添加：",
+    mcp_token_revoked: |id, name| format!("MCP 令牌 #{id}（{name}）已撤销"),
+    by_mcp_token: |name, jti| format!("MCP 令牌 {name}，jti {jti}"),
     rules_header: ["编号", "源", "", "目的", "启用", "名字"],
     no_rules: "没有规则",
     rule: "规则",
@@ -627,6 +646,13 @@ fn log(entry: &LogEntry) -> Option<String> {
         action::NODE_EXIT_DISABLE => format!("停用出口：{}", node()),
         action::NODE_EXIT_WITHDRAWN => format!("{} 撤回声明，出口已停用", node()),
         action::NODE_FORWARD_WITHDRAWN => format!("{} 撤回声明，{} 条端口转发已停用", node(), p.text("forwards")),
+        action::MCP_TOKEN_CREATE => {
+            let limit =
+                if p.has("network") { format!("只限网络 {}", p.thing("network_name", "network")) } else { "不限网络".to_owned() };
+            format!("签发 MCP 令牌 #{}（{}），权限 {}，{limit}", p.text("token"), p.text("name"), p.text("scopes"))
+        }
+        action::MCP_TOKEN_REVOKE => format!("撤销 MCP 令牌 #{}（{}）", p.text("token"), p.text("name")),
+        action::MCP_KEY_ROTATE => format!("签 MCP 令牌的密钥换了，原来签的令牌全部作废：{} 个", p.text("revoked")),
         action::TOKEN_CREATE => format!("新建注册令牌 #{}（{}…）", p.text("token"), p.text("prefix")),
         action::TOKEN_DELETE => format!("删除注册令牌 #{}", p.text("token")),
         action::RULE_CREATE => format!("新建规则 #{} {} {} {}", p.text("rule"), src(), arrow(), dst()),

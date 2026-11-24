@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildJoinCommand,
+  claudeMcpAddCommand,
   declareCommand,
   declareConfig,
   downloadCommands,
@@ -72,6 +73,36 @@ describe('加入网络的命令', () => {
     expect(buildJoinCommand('a b; rm -rf ~', NO_DECLARATIONS)).toBe(`echo 'a b; rm -rf ~' | sudo i3t join`)
     expect(buildJoinCommand(`it's`, NO_DECLARATIONS)).toBe(`echo 'it'\\''s' | sudo i3t join`)
     expect(buildJoinCommand('a "b"', NO_DECLARATIONS, 'windows')).toBe('echo "a `"b`"" | .\\i3t.exe join')
+  })
+})
+
+describe('把 MCP 端点加进 Claude Code 的命令', () => {
+  const ENDPOINT = 'https://ctl.example.com:8443/api/v1/mcp'
+  const JWT = 'eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJjbGF1ZGUtY29kZSJ9.c2lnbmF0dXJl_x-9'
+
+  it('claude mcp add --transport http ice3tier <端点> --header "Authorization: Bearer <JWT>"', () => {
+    expect(claudeMcpAddCommand(ENDPOINT, JWT)).toBe(
+      `claude mcp add --transport http ice3tier ${ENDPOINT} --header "Authorization: Bearer ${JWT}"`,
+    )
+  })
+
+  it('始终是一行', () => {
+    expect(claudeMcpAddCommand(ENDPOINT, JWT)).not.toMatch(/[\r\n]/)
+  })
+
+  it('IPv6 的字面地址带方括号，加引号，不让 shell 当成通配', () => {
+    expect(claudeMcpAddCommand('http://[::1]:8443/api/v1/mcp', JWT)).toBe(
+      `claude mcp add --transport http ice3tier 'http://[::1]:8443/api/v1/mcp' --header "Authorization: Bearer ${JWT}"`,
+    )
+  })
+
+  it('令牌里带着 shell 会误解的字符时，请求头改用单引号，不让它变成另一条命令', () => {
+    expect(claudeMcpAddCommand(ENDPOINT, 'a"; rm -rf ~; "')).toBe(
+      `claude mcp add --transport http ice3tier ${ENDPOINT} --header 'Authorization: Bearer a"; rm -rf ~; "'`,
+    )
+    expect(claudeMcpAddCommand(ENDPOINT, '$(id)')).toBe(
+      `claude mcp add --transport http ice3tier ${ENDPOINT} --header 'Authorization: Bearer $(id)'`,
+    )
   })
 })
 

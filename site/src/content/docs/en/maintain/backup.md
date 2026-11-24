@@ -71,3 +71,9 @@ A backup made with an earlier version of this guide is root's, and you cannot re
 Put the key in place before the controller starts: on a database that already belongs to a controller, it refuses to start without that controller's key rather than make a new one.
 
 The admin token from the time of the backup keeps working. Nodes reconnect by themselves as long as the public address still leads to the controller. Nodes that joined after the backup was made have to join again with a new token.
+
+## The key of the MCP tokens
+
+If you have issued [MCP tokens](../mcp/), the data directory also holds the key that signs them, `mcp.key`. To keep them working after a restore, back it up and put it back together with `controller.key`: repeat the `controller.key` line of the commands above for `mcp.key`.
+
+A restore works without it too: the controller generates a new key, the MCP tokens issued before stop working, and you issue new ones.

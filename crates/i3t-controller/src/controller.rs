@@ -11,6 +11,7 @@ mod enrollment;
 mod exit_test;
 mod forwards;
 mod groups;
+mod mcp;
 mod metrics;
 mod naming;
 mod networks;
@@ -59,6 +60,7 @@ use crate::store::{DIGEST_LEN, Database, GroupRecord, LogFilter, NetworkRecord, 
 use crate::sync::NodeSync;
 use crate::{node_addresses, secret};
 
+pub use mcp::{McpGrant, McpRefusal};
 pub use protocol::Admitted;
 pub(crate) use publish::Seeds;
 pub use routes::RouteAnswers;
@@ -128,6 +130,10 @@ pub struct Controller {
     timing: Timing,
     /// 管理令牌的哈希。每个管理请求都要查它，所以不放在大锁里。`Inner` 手上也有一份。
     admin_token: Arc<Mutex<Option<[u8; DIGEST_LEN]>>>,
+    /// 签 MCP 令牌的密钥和签过的令牌。每次 MCP 调用都要查它，所以也不放在大锁里。`Inner` 手上也有一份。
+    mcp: Arc<mcp::McpAuth>,
+    /// 墙上时钟，和 `Inner` 用的是同一个：验 MCP 令牌过没过期时不拿大锁。
+    clock: Arc<Clock>,
     inner: Mutex<Inner>,
     /// 有延后的下发时叫醒后台任务。`Inner` 手上也有一份。
     wake: Arc<Notify>,
@@ -151,7 +157,7 @@ pub struct Opened {
 pub(crate) struct Inner {
     pub(crate) store: Store,
     pub(crate) timing: Timing,
-    pub(crate) clock: Clock,
+    pub(crate) clock: Arc<Clock>,
     /// 每个节点的 netmap 下发到了哪一步。存储里有的节点这里都有。
     pub(crate) sync: BTreeMap<NodeId, NodeSync>,
     /// 现在连着的节点。
@@ -177,6 +183,8 @@ pub(crate) struct Inner {
     pub(crate) out_of_step: bool,
     /// 管理令牌的哈希，和 [`Controller::is_admin_token`] 查的是同一个。照数据库补齐时按库里记的改它。
     pub(crate) admin_token: Arc<Mutex<Option<[u8; DIGEST_LEN]>>>,
+    /// 签过的 MCP 令牌，和 [`Controller::mcp_grant`] 查的是同一份。照数据库补齐时按库里记的重建它。
+    pub(crate) mcp: Arc<mcp::McpAuth>,
     /// 各个节点最近上报的路由表。节点离线之后留着，界面上显示成过期的；controller 重启就没有了。
     pub(crate) routes: BTreeMap<NodeId, routes::Reported>,
     /// 出口和用出口的节点报的计数，算健康和交叉核对用。节点离线之后留着；controller 重启就没有了。
@@ -247,7 +255,7 @@ pub(crate) struct Deferred {
 impl Controller {
     /// 打开数据目录和数据库：第一次启动时生成 controller 的密钥，在库里建表，生成管理令牌。
     ///
-    /// 数据目录里只有 controller 的密钥和更新包的缓存；网络、节点和各项设置都在 `database` 里。
+    /// 数据目录里只有 controller 的密钥、签 MCP 令牌的密钥和更新包的缓存；网络、节点和各项设置都在 `database` 里。
     /// 两样要配着用：节点认的是这把密钥，库里记的是这把密钥名下的节点。库里记着它是哪把密钥的，
     /// 对不上的不开：拿错了数据目录、连错了库，或者恢复时忘了把密钥放回来，都不会悄悄变成另一个 controller。
     ///
@@ -260,14 +268,16 @@ impl Controller {
     pub fn open(data_dir: &Path, database: &Database, public_addr: String) -> Result<Opened, Error> {
         fs::create_dir_all(data_dir).map_err(|source| Error::Io { path: data_dir.to_owned(), source })?;
         // 先连数据库，再碰密钥：连不上的话不在数据目录里留下一把新生成的密钥。
-        let store = Store::open(database)?;
+        let mut store = Store::open(database)?;
         let key = bound_key(&store, &data_dir.join(KEY_FILE))?;
+        let mcp_key = mcp::bound_mcp_key(&mut store, &data_dir.join(mcp::MCP_KEY_FILE), Clock::default().now())?;
         // 早先的版本把数据存在数据目录里的这个文件里。现在不读它了：升级上来的人看到一个空的 controller 时，日志里有原因。
         let old = data_dir.join(OLD_DATABASE_FILE);
         if old.exists() {
             tracing::warn!(path = %old.display(), "数据目录里有旧版本的数据库文件：这个版本的数据在 PostgreSQL 里，不再读它，里面的数据也不会搬过来");
         }
-        let mut controller = Self::new(store, key, public_addr, Timing::default())?.with_release_cache(data_dir.join(update::CACHE_DIR));
+        let mut controller =
+            Self::assemble(store, key, mcp_key, public_addr, Timing::default())?.with_release_cache(data_dir.join(update::CACHE_DIR));
         controller.data_dir = Some(data_dir.to_owned());
         let admin_token = if controller.has_admin_token() { None } else { Some(controller.issue_admin_token()?) };
         Ok(Opened { controller, admin_token })
@@ -275,11 +285,20 @@ impl Controller {
 
     /// 在一个已经打开的存储上建 controller。不生成管理令牌。
     ///
+    /// 签 MCP 令牌的密钥是现生成的一把，只在内存里：这样建的 controller 不从数据目录来（测试），没有地方存它。
+    ///
     /// # Errors
     ///
-    /// 读存储失败。
-    pub fn new(mut store: Store, key: NodeKey, public_addr: String, timing: Timing) -> Result<Self, Error> {
+    /// 读存储失败，或者随机数源不可用。
+    pub fn new(store: Store, key: NodeKey, public_addr: String, timing: Timing) -> Result<Self, Error> {
+        let mcp_key = NodeKey::generate().map_err(Error::KeyGeneration)?;
+        Self::assemble(store, key, mcp_key, public_addr, timing)
+    }
+
+    fn assemble(mut store: Store, key: NodeKey, mcp_key: NodeKey, public_addr: String, timing: Timing) -> Result<Self, Error> {
         let admin_token = Arc::new(Mutex::new(admin_token_hash(&store)?));
+        let mcp = Arc::new(mcp::McpAuth::load(&store, mcp_key, &key.public())?);
+        let clock = Arc::new(Clock::default());
         let version: Version = env!("CARGO_PKG_VERSION").parse().expect("Cargo 保证包的版本号是合法的语义化版本");
         let updates = update::Updates::load(&store, version)?;
         let wake = Arc::new(Notify::new());
@@ -287,7 +306,7 @@ impl Controller {
         let mut inner = Inner {
             store,
             timing,
-            clock: Clock::default(),
+            clock: Arc::clone(&clock),
             sync: BTreeMap::new(),
             live: BTreeMap::new(),
             no_udp: BTreeMap::new(),
@@ -298,6 +317,7 @@ impl Controller {
             flush_after: None,
             out_of_step: false,
             admin_token: Arc::clone(&admin_token),
+            mcp: Arc::clone(&mcp),
             routes: BTreeMap::new(),
             usage: usage::Usage::default(),
             route_queries: BTreeMap::new(),
@@ -317,6 +337,8 @@ impl Controller {
             data_dir: None,
             timing,
             admin_token,
+            mcp,
+            clock,
             inner: Mutex::new(inner),
             wake,
             release_wake: Notify::new(),
@@ -652,10 +674,13 @@ impl Inner {
         let backing_off = failures.database_wide || self.flush_after.is_some_and(|after| now < after);
         if !backing_off && self.last_purge.is_none_or(|last| now.duration_since(last) >= PURGE_INTERVAL) {
             self.last_purge = Some(now);
-            // 两张表各清各的：一张出错不耽误另一张。
+            // 几张表各清各的：一张出错不耽误另一张。
             failures.keep(self.store.purge_expired_tokens(wall).map(drop).map_err(Error::from));
             if !failures.database_wide {
                 failures.keep(self.store.purge_cooldowns(wall).map(drop).map_err(Error::from));
+            }
+            if !failures.database_wide {
+                failures.keep(self.purge_mcp_tokens(wall));
             }
         }
         // 不管是哪一样遇到的，都退避一会儿：重算也先不碰数据库。
@@ -842,7 +867,7 @@ fn bound_key(store: &Store, path: &Path) -> Result<NodeKey, Error> {
     let key = match (read_key(path)?, &recorded) {
         (Some(key), _) => key,
         (None, Some(_)) => return Err(Error::KeyMissing { path: path.to_owned() }),
-        (None, None) => create_key(path)?,
+        (None, None) => create_key(path, "生成了 controller 的密钥")?,
     };
     let public = key.public();
     let recorded = match recorded {
@@ -864,12 +889,13 @@ fn read_key(path: &Path) -> Result<Option<NodeKey>, Error> {
     }
 }
 
-fn create_key(path: &Path) -> Result<NodeKey, Error> {
+/// 生成一把密钥，写进 `path`。`said` 是日志里说的那句话。
+fn create_key(path: &Path, said: &str) -> Result<NodeKey, Error> {
     let key = NodeKey::generate().map_err(Error::KeyGeneration)?;
     create_private_file(path)
         .and_then(|file| write_synced(file, key.to_pem().as_bytes()))
         .map_err(|source| Error::Io { path: path.to_owned(), source })?;
-    tracing::info!(path = %path.display(), public = %key.public(), "生成了 controller 的密钥");
+    tracing::info!(path = %path.display(), public = %key.public(), "{said}");
     Ok(key)
 }
 

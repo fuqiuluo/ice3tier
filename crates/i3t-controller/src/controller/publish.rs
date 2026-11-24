@@ -185,7 +185,7 @@ impl Inner {
         Ok(settled.pending.then(|| now + RETRY_DELAY))
     }
 
-    /// 照数据库现在的样子把内存里跟着它的状态补齐：数据库里已经没有的节点断开、忘掉，管理令牌按库里记的来，
+    /// 照数据库现在的样子把内存里跟着它的状态补齐：数据库里已经没有的节点断开、忘掉，管理令牌和签过的 MCP 令牌按库里记的来，
     /// 每个网络的 netmap 重算一遍（内容没变的不会下发）。做到一半出错的话下次从头再做，重做没有坏处。
     fn catch_up_with_store(&mut self) -> Result<(), Error> {
         let networks = self.store.networks()?;
@@ -200,6 +200,7 @@ impl Inner {
             self.forget_node(node);
         }
         *self.admin_token.lock().expect("admin token mutex poisoned") = admin_token_hash(&self.store)?;
+        self.mcp.reload(&self.store)?;
         for network in networks {
             match self.refresh(network.id, Seeds::All, None) {
                 Ok(()) => {}

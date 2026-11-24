@@ -1,5 +1,5 @@
 import { keepPreviousData, useInfiniteQuery, useQueries, useQuery } from '@tanstack/react-query'
-import { Filter, History, Search, X } from 'lucide-react'
+import { Bot, Filter, History, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
@@ -9,6 +9,7 @@ import { Pagination } from '@/components/pagination'
 import { EmptyState, ErrorState, NoMatches, SkeletonRows } from '@/components/states'
 import { RelativeTime } from '@/components/status'
 import { RowsTotal, Table, TableFooter, Td, Th, Toolbar, Tr } from '@/components/table'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardHeader } from '@/components/ui/card'
 import { fieldBase, NativeSelect } from '@/components/ui/input'
@@ -20,6 +21,7 @@ import { cn } from '@/lib/utils'
 
 import {
   actionKind,
+  actorLabel,
   EMPTY_LOG_FILTER,
   hasServerFilter,
   isFiltered,
@@ -28,6 +30,8 @@ import {
   type LogFilter,
   logFilterToParams,
   logFilterToQuery,
+  logJtis,
+  logSentence,
   matchesSearch,
   parseLogFilter,
   refTarget,
@@ -111,6 +115,24 @@ function Refs({ entry, names, networks, onFilter }: RefsProps) {
 }
 
 /**
+ * 经 MCP 做的操作旁边注明是哪个令牌做的：一枚小标签写令牌的名字，悬停看它的 jti（名字可以重复，jti 不会）。
+ * 管理员自己做的、节点引起的、controller 自己做的不注。
+ */
+function Actor({ entry }: { entry: LogEntry }) {
+  const label = actorLabel(entry)
+  const jti = entry.actor?.jti
+  if (label === null || jti === undefined) return null
+  return (
+    <Tooltip content={s.actor.jti(jti)}>
+      <Badge tone="accent" tabIndex={0} data-testid="log-actor">
+        <Bot aria-hidden />
+        {label}
+      </Badge>
+    </Tooltip>
+  )
+}
+
+/**
  * 操作记录，分页显示。网络、操作、对象交给 controller 筛；搜索在取回来的全部记录里找。
  * 筛选条件和页码写在地址里，改了条件回到第一页。
  *
@@ -119,6 +141,8 @@ function Refs({ entry, names, networks, onFilter }: RefsProps) {
  *
  * 每一行先写界面自己按 `action` 和 `refs` 写的话（操作的名字、对象的链接），按当前的语言；
  * controller 记下的说明（`detail`，中文原话）放在下面一行，字小一号，作为补充。
+ * 界面自己写得出整句话的操作（`logSentence`，MCP 令牌的几种）写那一句，原话说的是同一件事，不再重复。
+ * 经 MCP 做的操作后面注明是哪个令牌做的。
  */
 export function LogTab() {
   const [params, setParams] = useSearchParams()
@@ -159,9 +183,13 @@ export function LogTab() {
     matchesSearch(
       entry,
       filter.search,
-      [logActionLabel(entry.action) ?? '', ...shownRefs(entry).map((ref) => refLabel(ref, names, allNetworks))].join(
-        ' ',
-      ),
+      [
+        logActionLabel(entry.action) ?? '',
+        logSentence(entry) ?? '',
+        ...shownRefs(entry).map((ref) => refLabel(ref, names, allNetworks)),
+        actorLabel(entry) ?? '',
+        ...logJtis(entry),
+      ].join(' '),
     ),
   )
   const { page, pages, rows } = paginate(matched, readPage(params), PAGE_SIZE)
@@ -282,36 +310,40 @@ export function LogTab() {
             </thead>
             <tbody>
               {log.isPending ? <SkeletonRows columns={3} rows={6} /> : null}
-              {rows.map((entry) => (
-                <Tr key={entry.id} data-testid={`log-row-${entry.id}`}>
-                  <Td cell="inline" className="align-top text-[13px] whitespace-nowrap text-muted-foreground">
-                    <RelativeTime at={entry.at} />
-                  </Td>
-                  <Td cell="inline" className="align-top text-[13px]">
-                    {networkLabel(entry.network)}
-                  </Td>
-                  <Td cell="full" className="text-[13px]">
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-                      <span className="font-medium" data-testid="log-action">
-                        {logActionLabel(entry.action) ?? (
-                          <code className="font-mono text-xs font-normal">{entry.action}</code>
-                        )}
-                      </span>
-                      <Refs
-                        entry={entry}
-                        names={names}
-                        networks={allNetworks}
-                        onFilter={(ref) => setFilter({ ...filter, ref, network: entry.network ?? filter.network })}
-                      />
-                    </div>
-                    {entry.detail !== '' ? (
-                      <p className="mt-1 text-xs break-words text-muted-foreground" data-testid="log-detail">
-                        {entry.detail}
-                      </p>
-                    ) : null}
-                  </Td>
-                </Tr>
-              ))}
+              {rows.map((entry) => {
+                const sentence = logSentence(entry)
+                return (
+                  <Tr key={entry.id} data-testid={`log-row-${entry.id}`}>
+                    <Td cell="inline" className="align-top text-[13px] whitespace-nowrap text-muted-foreground">
+                      <RelativeTime at={entry.at} />
+                    </Td>
+                    <Td cell="inline" className="align-top text-[13px]">
+                      {networkLabel(entry.network)}
+                    </Td>
+                    <Td cell="full" className="text-[13px]">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                        <span className="font-medium" data-testid="log-action">
+                          {sentence ?? logActionLabel(entry.action) ?? (
+                            <code className="font-mono text-xs font-normal">{entry.action}</code>
+                          )}
+                        </span>
+                        <Refs
+                          entry={entry}
+                          names={names}
+                          networks={allNetworks}
+                          onFilter={(ref) => setFilter({ ...filter, ref, network: entry.network ?? filter.network })}
+                        />
+                        <Actor entry={entry} />
+                      </div>
+                      {sentence === null && entry.detail !== '' ? (
+                        <p className="mt-1 text-xs break-words text-muted-foreground" data-testid="log-detail">
+                          {entry.detail}
+                        </p>
+                      ) : null}
+                    </Td>
+                  </Tr>
+                )
+              })}
             </tbody>
           </Table>
           {log.isSuccess && !hasNextPage && matched.length === 0 ? (

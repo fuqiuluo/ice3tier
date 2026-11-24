@@ -9,6 +9,7 @@
 //! - `Update*` 里的字段都可以省略，省略表示不改。个别字段可以写 `null`，表示清掉这项设置，见各字段的说明。
 //! - 注册令牌的明文只在创建它的那一次应答里出现（[`CreatedEnrollToken`]），controller 只存哈希。
 //!   代理的密码不一样：controller 原样存着，[`Proxy`] 里每次都给，管理员可以再看、再复制。
+//! - 签给 AI Agent 的 MCP 令牌在 [`mcp`] 里：它们只在 MCP 端点上有用，管理 API 的别的路径不认。
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -34,6 +35,7 @@ use crate::update::{FailureKind, SelfUpdateBlocker, UpdateCause, UpdateStatus, U
 
 pub mod action;
 pub mod diag;
+pub mod mcp;
 pub mod stats;
 
 /// 管理 API 所有路径的前缀。
@@ -1646,6 +1648,29 @@ pub struct LogEntry {
     /// 这个字段出现之前的记录是空的。
     #[serde(default)]
     pub params: serde_json::Map<String, serde_json::Value>,
+    /// 这次操作是经 MCP 做的话，是哪个令牌做的。管理员自己做的（管理令牌）、节点引起的、controller 自己做的都是 `null`；
+    /// 这个字段出现之前的记录也是。
+    #[serde(default)]
+    pub actor: Option<LogActor>,
+}
+
+/// 一次操作是谁做的。现在只有一种：一个 MCP 令牌（见 [`mcp`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogActor {
+    pub kind: ActorKind,
+    /// 令牌签发时起的名字（JWT 的 `sub`）。
+    pub name: String,
+    /// JWT 的 `jti`：名字可以重复，它不会。令牌后来被撤销、过期清掉了，它还在这里。
+    pub jti: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    /// 一个 MCP 令牌。
+    Mcp,
+    #[serde(other)]
+    Unknown,
 }
 
 /// 操作记录里提到的一样东西。东西后来被删掉了，编号还在。

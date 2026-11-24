@@ -1,6 +1,7 @@
 //! 控制面状态码与原因码的中文文案。
 
 use i3t_model::admin::diag::{CellState, ItemState, MatrixState, TestState};
+use i3t_model::admin::mcp::McpTokenState;
 use i3t_model::admin::{
     AddressSource, ApiError, ExitHealth, ForwardStatus, LaneBlock, NodeWarning, PackageState, PathSource, ProxyStatus, ReachCause,
     ReleaseCause, SkipCause, TokenState, UpdateWait,
@@ -46,6 +47,7 @@ pub(super) static CODES: Codes = Codes {
     exit_test_cause,
     exit_via,
     token_state,
+    mcp_token_state,
     proxy_status,
     exit_health,
     path_source,
@@ -417,6 +419,15 @@ const fn token_state(state: TokenState) -> &'static str {
         TokenState::Used => "已使用",
         TokenState::Expired => "已过期",
         TokenState::Unknown => "未知",
+    }
+}
+
+const fn mcp_token_state(state: McpTokenState) -> &'static str {
+    match state {
+        McpTokenState::Active => "有效",
+        McpTokenState::Expired => "已过期",
+        McpTokenState::Revoked => "已撤销",
+        McpTokenState::Unknown => "未知",
     }
 }
 

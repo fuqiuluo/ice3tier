@@ -1,6 +1,12 @@
-//! 操作记录：何时改了什么，说的是哪些东西。
+//! 操作记录：何时改了什么，说的是哪些东西，是谁做的。
+//!
+//! "是谁做的"不经参数一层层传下来：经 MCP 调用 controller 的那段代码先用 [`acting_as`] 说明自己替谁做事，
+//! 这期间这个线程上记的每一条都带着它。controller 的方法是同步的，一次调用从头到尾在一个线程上，所以这样不会记错人；
+//! 好处是几十个管理操作一个都不用改。没有说明的（管理令牌做的、节点引起的、后台做的）不带。
 
-use i3t_model::admin::{LogEntry, LogRef, NetworkId, Timestamp};
+use std::cell::RefCell;
+
+use i3t_model::admin::{LogActor, LogEntry, LogRef, NetworkId, Timestamp};
 use serde_json::{Map, Value as JsonValue};
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
@@ -25,6 +31,24 @@ pub struct LogFilter {
 /// 最多留这么多条，再多就从最老的删起。个人用的 controller 一年也攒不到这个数。
 const KEEP: u32 = 10_000;
 
+thread_local! {
+    /// 这个线程现在替谁做事（见 [`acting_as`]）。
+    static ACTOR: RefCell<Option<LogActor>> = const { RefCell::new(None) };
+}
+
+/// 执行 `work`，这期间这个线程上记的操作都算是 `actor` 做的。`work` 结束（或者恐慌）之后恢复原样。
+pub(crate) fn acting_as<T>(actor: LogActor, work: impl FnOnce() -> T) -> T {
+    /// 丢弃时把原来的放回去。
+    struct Restore(Option<LogActor>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTOR.with(|current| *current.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(ACTOR.with(|current| current.borrow_mut().replace(actor)));
+    work()
+}
+
 fn from_row(row: &Row) -> Read<LogEntry> {
     Ok(LogEntry {
         id: row.try_get::<_, Unsigned>("id")?.0,
@@ -34,6 +58,7 @@ fn from_row(row: &Row) -> Read<LogEntry> {
         detail: row.try_get("detail")?,
         refs: row.try_get::<_, Json<Vec<LogRef>>>("refs")?.0,
         params: row.try_get::<_, Json<Map<String, JsonValue>>>("params")?.0,
+        actor: row.try_get::<_, Option<Json<LogActor>>>("actor")?.map(|actor| actor.0),
     })
 }
 
@@ -75,9 +100,10 @@ impl Store {
         // 说明文本可能包含外部输入（如节点上报的更新失败原因、管理员填写的发布源）：文本列不支持 NUL 字符，此处过滤 NUL
         // 以避免整条记录及所在事务失败。`params` 为 JSONB，已单独做相同处理。
         let (action, detail) = (without_nul(action), without_nul(detail));
+        let actor = ACTOR.with(|current| current.borrow().clone());
         self.execute(
-            "INSERT INTO oplog (at, network_id, action, detail, refs, params) VALUES ($1, $2, $3, $4, $5, $6)",
-            &[&Unsigned(at), &network.map(SqlNetwork), &action, &detail, &Json(refs), &Json(&params)],
+            "INSERT INTO oplog (at, network_id, action, detail, refs, params, actor) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[&Unsigned(at), &network.map(SqlNetwork), &action, &detail, &Json(refs), &Json(&params), &actor.as_ref().map(Json)],
         )?;
         // 按条数删，不按编号算：编号是序列发的，撤销了的事务也占着号，编号差了一万不等于有一万条。
         // 记录数不足 KEEP 条时，子查询无结果，不执行任何删除。
@@ -168,6 +194,32 @@ mod tests {
         let entry = store.oplog(1).unwrap().remove(0);
         assert_eq!((entry.action.as_str(), entry.detail.as_str()), ("node.update", "节点说：坏了"));
         assert_eq!(entry.params["reason"], "坏了");
+    }
+
+    #[test]
+    fn entries_written_while_acting_as_someone_carry_who_it_was_and_the_others_do_not() {
+        use i3t_model::admin::ActorKind;
+        let store = Store::temporary();
+        let actor = |name: &str| LogActor { kind: ActorKind::Mcp, name: name.to_owned(), jti: format!("jti-{name}") };
+        store.log(1, None, "before", "", json!({})).unwrap();
+        acting_as(actor("outer"), || {
+            store.log(2, None, "outer", "", json!({})).unwrap();
+            acting_as(actor("inner"), || store.log(3, None, "inner", "", json!({})).unwrap());
+            store.log(4, None, "outer again", "", json!({})).unwrap();
+        });
+        // 做到一半恐慌了也恢复原样：这个线程接着替别人干活时不会记在它头上。
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| acting_as(actor("gone"), || panic!("做到一半出错"))));
+        assert!(panicked.is_err());
+        store.log(5, None, "after", "", json!({})).unwrap();
+        // 别的线程不受影响。
+        acting_as(actor("here"), || {
+            std::thread::scope(|scope| scope.spawn(|| ACTOR.with(|current| assert!(current.borrow().is_none()))).join().unwrap())
+        });
+
+        let names: Vec<Option<String>> =
+            store.oplog(10).unwrap().into_iter().rev().map(|entry| entry.actor.map(|actor| actor.name)).collect();
+        assert_eq!(names, [None, Some("outer".to_owned()), Some("inner".to_owned()), Some("outer".to_owned()), None]);
+        assert_eq!(store.oplog(10).unwrap()[2].actor, Some(actor("inner")));
     }
 
     #[test]

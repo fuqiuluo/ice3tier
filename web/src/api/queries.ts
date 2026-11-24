@@ -43,6 +43,8 @@ export const keys = {
   tests: (network: NetworkId) => ['n', network, 'tests'] as const,
   /** 更新的设置和现状是全局的，不在某个网络下面。 */
   update: ['update'] as const,
+  /** MCP 令牌也是全局的：签给谁、限不限网络都记在令牌上。 */
+  mcpTokens: ['mcp', 'tokens'] as const,
   /** 所有网络下的查询：全局的修改（全部更新、暂停和继续）会改到每个网络里的节点。 */
   everyNetwork: ['n'] as const,
 }
@@ -181,6 +183,8 @@ export const q = {
   /** 有更新正在进行时页面会把轮询调勤（`WAITING_INTERVAL`），见 `pages/settings/updates`。 */
   update: (interval: number = LIVE_INTERVAL) =>
     queryOptions({ queryKey: keys.update, queryFn: api.updateOverview, refetchInterval: interval }),
+  /** MCP 令牌到了时间自己过期，也可能在别处（`i3tctl`）被撤销，跟着轮询。 */
+  mcpTokens: () => queryOptions({ queryKey: keys.mcpTokens, queryFn: api.mcpTokens, refetchInterval: LIVE_INTERVAL }),
 }
 
 export function createQueryClient(): QueryClient {
@@ -214,6 +218,7 @@ interface ActionOptions<TData, TVars> {
  *
  * `network` 写 `'all'` 时作废全部网络下的查询：更新的全局操作会改到每个网络里的节点。
  * 更新的现状（`keys.update`）总是跟着作废：改一个节点也会改变按更新情况数出来的数。
+ * MCP 令牌的列表（`keys.mcpTokens`）也是：删掉一个网络，只限它的令牌跟着没有了。
  */
 export function useAction<TData, TVars = void>(
   network: NetworkId | 'all' | null,
@@ -231,6 +236,7 @@ export function useAction<TData, TVars = void>(
         client.invalidateQueries({ queryKey: ['log'] }),
         client.invalidateQueries({ queryKey: keys.status }),
         client.invalidateQueries({ queryKey: keys.update }),
+        client.invalidateQueries({ queryKey: keys.mcpTokens }),
       ]
       if (network === 'all') pending.push(client.invalidateQueries({ queryKey: keys.everyNetwork }))
       else if (network !== null) pending.push(client.invalidateQueries({ queryKey: keys.scope(network) }))

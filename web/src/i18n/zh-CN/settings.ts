@@ -4,12 +4,13 @@
  */
 const known = <T extends Record<string, string>>(map: T) => map as T & Partial<Record<string, string>>
 
-/** 设置：登录、操作记录、关于。 */
+/** 设置：登录、MCP 令牌、操作记录、关于。 */
 export const settings = {
   title: '设置',
-  subtitle: '登录、节点更新和操作记录',
+  subtitle: '登录、MCP 令牌、节点更新和操作记录',
   tabsLabel: '设置分区',
   tabSession: '登录',
+  tabMcp: 'MCP 令牌',
   tabLog: '操作记录',
   tabAbout: '关于',
 
@@ -20,6 +21,96 @@ export const settings = {
     signOut: '退出登录',
     resetTitle: '重置管理令牌',
     resetService: '在 controller 所在的机器上执行。新令牌打印在终端里，旧令牌作废。',
+  },
+
+  /** MCP 令牌：管理员签给 AI Agent 的 JWT。签发、列出、撤销。 */
+  mcp: {
+    endpointTitle: 'MCP 端点',
+    endpointBody:
+      'controller 内置 MCP Server。AI Agent（Claude Code、Codex、Cursor 等）带着 MCP 令牌连接这个地址，能做什么由令牌的权限决定。',
+    title: 'MCP 令牌',
+    body: '令牌只在签发时显示一次。撤销后，它的下一次调用即被拒绝。',
+    issue: '签发令牌',
+    loadFailed: '无法加载 MCP 令牌',
+    emptyTitle: '还没有 MCP 令牌',
+    emptyBody: '签发一个令牌，交给要连接的 Agent',
+    colName: '名字',
+    colState: '状态',
+    colScopes: '权限',
+    colNetwork: '网络',
+    colExpires: '过期时间',
+    state: known({
+      active: '有效',
+      expired: '已过期',
+      revoked: '已撤销',
+    }),
+    revokedAt: (time: string) => `撤销于 ${time}`,
+    anyNetwork: '不限网络',
+    networkGone: (id: number) => `网络 #${id}`,
+    remaining: (remaining: string) => `还剩 ${remaining}`,
+    /** 每项权限的名字；代码（`nodes:enroll`）各语言一样，直接写。 */
+    scopeNames: known({
+      read: '只读',
+      'nodes:enroll': '添加节点',
+      'nodes:write': '管理节点',
+      'config:write': '修改配置',
+      'tests:run': '运行测试',
+      'updates:write': '节点更新',
+      'networks:write': '管理网络',
+    }),
+    scopeHints: known({
+      read: '查看状态、网络、节点、路由和路径、出口、访问检查、测试结果、统计、操作记录和各项配置（代理不含密码）',
+      'nodes:enroll': '新建、查看、吊销注册令牌，查询用令牌加入的节点',
+      'nodes:write': '修改和删除节点、继任、启用和停用中继与出口',
+      'config:write': '分组和成员、策略、代理、端口转发、节点对的设置',
+      'tests:run': '发起和取消测试',
+      'updates:write': '修改更新设置、检查更新、立即更新节点',
+      'networks:write': '新建、修改、删除网络',
+    }),
+    scopeTip: (name: string, hint: string) => `${name}：${hint}`,
+    revoke: '撤销',
+    revokeFor: (name: string) => `撤销 ${name}`,
+    revokeTitle: (name: string) => `撤销 MCP 令牌 ${name}？`,
+    revokeBody: '使用它的 Agent 下一次调用即被拒绝。撤销后无法恢复，需重新签发。',
+    revokeConfirm: '撤销令牌',
+    revoked: (name: string) => `MCP 令牌 ${name} 已撤销`,
+
+    dialog: {
+      title: '签发 MCP 令牌',
+      submit: '签发',
+      name: '名字',
+      nameHint: '给谁用的。它做的每一次修改都会记上这个名字',
+      namePlaceholder: 'claude-code',
+      network: '网络',
+      networkHint: '选了网络，令牌只能看到和操作这一个网络',
+      scopes: '权限',
+      globalOnly: '作用于整个 controller，只能签给不限网络的令牌',
+      lifetime: '有效期',
+      lifetimeHint: (days: number) => `最长 ${days} 天，到期后需重新签发`,
+    },
+
+    issued: {
+      title: 'MCP 令牌已签发',
+      /** `network` 是 `null` 表示不限网络。 */
+      summary: (name: string, scopes: string, network: string | null, expires: string) =>
+        `${name} · 权限 ${scopes} · ${network === null ? '不限网络' : `只限网络 ${network}`} · ${expires} 过期`,
+      token: '令牌',
+      copyToken: '复制令牌',
+      shownOnce: '只显示这一次，关闭后无法再查看',
+      claude: '添加到 Claude Code',
+      copyCommand: '复制命令',
+      otherClients: (endpoint: string) => `其他客户端：地址 ${endpoint}，请求头 Authorization: Bearer <令牌>`,
+    },
+
+    /** controller 拒绝签发时，写在对应那一项下面的话。 */
+    errors: {
+      nameMalformed: (max: number) => `最多 ${max} 个字符，不能包含控制字符`,
+      scopesEmpty: '至少选择一项权限',
+      scopesGlobal: '节点更新和管理网络作用于整个 controller，不能签给只限一个网络的令牌',
+      scopesUnknown: 'controller 不认识其中的权限',
+      networkGone: '网络不存在',
+      lifetime: (days: number) => `有效期最长 ${days} 天`,
+    },
   },
 
   log: {
@@ -50,8 +141,14 @@ export const settings = {
       forward: (id: number) => `转发 #${id}`,
     },
     refsLabel: '相关对象',
+    /** 经 MCP 做的操作，旁边注明是哪个令牌做的。 */
+    actor: {
+      mcp: (name: string) => `MCP 令牌 ${name}`,
+      jti: (jti: string) => `JTI ${jti}`,
+    },
     kinds: known({
       admin: '管理令牌',
+      mcp: 'MCP 令牌',
       network: '网络',
       node: '节点',
       token: '注册令牌',
@@ -65,6 +162,9 @@ export const settings = {
     }),
     actions: known({
       'admin.token': '重置管理令牌',
+      'mcp.token.create': '签发 MCP 令牌',
+      'mcp.token.revoke': '撤销 MCP 令牌',
+      'mcp.key.rotate': '更换 MCP 签名密钥',
       'network.create': '新建网络',
       'network.update': '修改网络',
       'network.delete': '删除网络',
@@ -112,6 +212,13 @@ export const settings = {
       'update.force': '立即更新节点',
       'update.force_all': '立即更新全部节点',
     }),
+    /** 只用操作和它的参数就写得出整句话的几种操作（MCP 令牌的）。`network` 是 `null` 表示不限网络。 */
+    sentences: {
+      mcpTokenCreate: (id: number, name: string, scopes: string, network: string | null) =>
+        `签发 MCP 令牌 #${id}（${name}），权限 ${scopes}，${network === null ? '不限网络' : `只限网络 ${network}`}`,
+      mcpTokenRevoke: (id: number, name: string) => `撤销 MCP 令牌 #${id}（${name}）`,
+      mcpKeyRotate: (revoked: number) => `MCP 签名密钥已更换，此前签发的 ${revoked} 个令牌全部作废`,
+    },
     loaded: (n: number) => `已加载 ${n} 条`,
     emptyTitle: '还没有操作记录',
     noMatches: '没有匹配的记录',

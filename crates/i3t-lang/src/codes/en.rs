@@ -1,6 +1,7 @@
 //! 控制面的代码的英文写法。
 
 use i3t_model::admin::diag::{CellState, ItemState, MatrixState, TestState};
+use i3t_model::admin::mcp::McpTokenState;
 use i3t_model::admin::{
     AddressSource, ApiError, ErrorCode, ExitHealth, ForwardStatus, LaneBlock, NodeWarning, PackageState, PathSource, ProxyStatus,
     ReachCause, ReleaseCause, SkipCause, TokenState, UpdateWait,
@@ -46,6 +47,7 @@ pub(super) static CODES: Codes = Codes {
     exit_test_cause,
     exit_via,
     token_state,
+    mcp_token_state,
     proxy_status,
     exit_health,
     path_source,
@@ -347,6 +349,7 @@ fn api_error(error: &ApiError) -> String {
         Some("node") => "node",
         Some("group") => "group",
         Some("token") => "enrollment token",
+        Some("mcp_token") => "MCP token",
         Some("rule") => "rule",
         Some("proxy") => "proxy",
         Some("forward") => "port forward",
@@ -522,6 +525,15 @@ const fn token_state(state: TokenState) -> &'static str {
         TokenState::Used => "used",
         TokenState::Expired => "expired",
         TokenState::Unknown => "unknown",
+    }
+}
+
+const fn mcp_token_state(state: McpTokenState) -> &'static str {
+    match state {
+        McpTokenState::Active => "active",
+        McpTokenState::Expired => "expired",
+        McpTokenState::Revoked => "revoked",
+        McpTokenState::Unknown => "unknown",
     }
 }
 

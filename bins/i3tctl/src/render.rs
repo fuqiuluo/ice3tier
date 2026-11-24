@@ -5,6 +5,7 @@
 use i3t_lang::codes::Codes;
 use i3t_lang::table::{Fields, Table};
 use i3t_lang::{Lang, NONE, optional};
+use i3t_model::admin::mcp::{CreatedMcpToken, McpTokenInfo};
 use i3t_model::admin::stats::{SeriesView, Unit};
 use i3t_model::admin::{
     AccessCheck, AccessGraph, BackboneView, CreatedEnrollToken, DeletedGroup, Direction, EnrollTokenInfo, ExitTestView, ExitView,
@@ -140,6 +141,11 @@ pub fn log(entries: &[LogEntry]) {
     let mut table = Table::new(&t.log_header);
     for entry in entries {
         let said = (texts().log)(entry).unwrap_or_else(|| entry.detail.clone());
+        // 经 MCP 做的操作后面注明是哪个令牌做的；管理员自己做的不注。
+        let said = match &entry.actor {
+            Some(actor) => lang.paren(&said, &(t.by_mcp_token)(&actor.name, &actor.jti)),
+            None => said,
+        };
         table.row(vec![entry.id.to_string(), lang.time(entry.at), optional(entry.network), entry.action.clone(), said]);
     }
     print_table(&table, t.none_found);
@@ -951,6 +957,42 @@ pub fn created_token(created: &CreatedEnrollToken) {
     println!("{}\n", (t.token_created)(created.info.id, &lang.time(created.info.expires_at)));
     println!("    {}\n", created.token);
     println!("{}", t.token_use);
+}
+
+/// MCP 令牌的列表。`networks` 用来把只限的网络写成名字。
+pub fn mcp_tokens(tokens: &[McpTokenInfo], networks: &[Network]) {
+    let (t, lang, codes) = context();
+    let mut table = Table::new(&t.mcp_tokens_header);
+    for token in tokens {
+        let network = token
+            .network
+            .map(|id| networks.iter().find(|network| network.id == id).map_or_else(|| format!("#{id}"), |network| network.name.clone()));
+        table.row(vec![
+            token.id.to_string(),
+            token.name.clone(),
+            (codes.mcp_token_state)(token.state).to_owned(),
+            lang.time(token.expires_at),
+            network.unwrap_or_else(|| t.any_network.to_owned()),
+            scope_names(token),
+            token.jti.clone(),
+        ]);
+    }
+    print_table(&table, t.no_mcp_tokens);
+}
+
+fn scope_names(token: &McpTokenInfo) -> String {
+    token.scopes.iter().map(|scope| scope.as_str()).collect::<Vec<_>>().join(",")
+}
+
+/// 刚签发的 MCP 令牌：它是什么，JWT（只显示这一次），和怎么配进客户端。`endpoint` 是 MCP 端点的地址。
+pub fn created_mcp_token(created: &CreatedMcpToken, network: Option<&str>, endpoint: &str) {
+    let (t, lang, _) = context();
+    let info = &created.info;
+    let limit = network.map_or_else(|| t.any_network.to_owned(), |network| (t.only_network)(network));
+    println!("{}\n", (t.mcp_token_created)(info.id, &info.name, &scope_names(info), &limit, &lang.time(info.expires_at)));
+    println!("    {}\n", created.token);
+    println!("{}\n", t.mcp_token_use);
+    println!("    claude mcp add --transport http ice3tier {endpoint} --header \"Authorization: Bearer {}\"", created.token);
 }
 
 pub fn rules(rules: &[Rule]) {

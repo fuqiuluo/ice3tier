@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'vitest'
 
 import { type LogEntry } from '@/api/types'
+import { t } from '@/i18n'
 
 import {
+  actorLabel,
   EMPTY_LOG_FILTER,
   hasServerFilter,
   isFiltered,
   logFilterToParams,
   logFilterToQuery,
+  logJtis,
   logPathFor,
+  logSentence,
   matchesSearch,
   parseLogFilter,
   parseRef,
@@ -93,6 +97,65 @@ describe('搜索只在取回的记录里找', () => {
     expect(matchesSearch(entry, 'credential.revoke', '吊销凭据')).toBe(true)
     expect(matchesSearch(entry, 'tablet', '吊销凭据')).toBe(false)
     expect(matchesSearch(entry, '  ', '吊销凭据')).toBe(true)
+  })
+})
+
+describe('MCP 令牌的操作按参数写成一句话', () => {
+  const entry = (action: string, params?: Record<string, unknown>): LogEntry => ({
+    id: 1,
+    at: 1,
+    network: null,
+    action,
+    detail: '',
+    refs: [],
+    params,
+  })
+  const say = t.settings.log.sentences
+
+  it('签发：编号、名字、权限、限不限网络', () => {
+    const params = { token: 3, name: 'claude-code', jti: 'abc', scopes: ['read', 'nodes:enroll'], expires_at: 9 }
+    expect(logSentence(entry('mcp.token.create', { ...params, network: 1, network_name: 'home' }))).toBe(
+      say.mcpTokenCreate(3, 'claude-code', 'read、nodes:enroll', 'home'),
+    )
+    expect(logSentence(entry('mcp.token.create', { ...params, network: null, network_name: null }))).toBe(
+      say.mcpTokenCreate(3, 'claude-code', 'read、nodes:enroll', null),
+    )
+    // 网络的名字没有记下来：写编号。
+    expect(logSentence(entry('mcp.token.create', { ...params, network: 7 }))).toBe(
+      say.mcpTokenCreate(3, 'claude-code', 'read、nodes:enroll', '#7'),
+    )
+  })
+
+  it('撤销、换签名密钥', () => {
+    expect(logSentence(entry('mcp.token.revoke', { token: 3, name: 'claude-code', jti: 'abc' }))).toBe(
+      say.mcpTokenRevoke(3, 'claude-code'),
+    )
+    expect(logSentence(entry('mcp.key.rotate', { revoked: 2 }))).toBe(say.mcpKeyRotate(2))
+  })
+
+  it('参数不全、写法不对的，和别的操作：不写句子，由调用的地方写操作的名字', () => {
+    expect(logSentence(entry('mcp.token.create'))).toBeNull()
+    expect(logSentence(entry('mcp.token.create', { token: 3, name: 'x' }))).toBeNull()
+    expect(logSentence(entry('mcp.token.create', { token: '3', name: 'x', scopes: [] }))).toBeNull()
+    expect(logSentence(entry('mcp.token.revoke', { token: 3 }))).toBeNull()
+    expect(logSentence(entry('mcp.key.rotate', { revoked: 'many' }))).toBeNull()
+    expect(logSentence(entry('node.update', { node: 2, name: 'laptop' }))).toBeNull()
+  })
+
+  it('谁做的：MCP 令牌写它的名字；没有就不写；不认识的种类原样写', () => {
+    const by = (actor: LogEntry['actor']): LogEntry => ({ ...entry('node.update'), actor })
+    expect(actorLabel(by({ kind: 'mcp', name: 'claude-code', jti: 'abc' }))).toBe(
+      t.settings.log.actor.mcp('claude-code'),
+    )
+    expect(actorLabel(by(null))).toBeNull()
+    expect(actorLabel(entry('node.update'))).toBeNull()
+    expect(actorLabel(by({ kind: 'oidc', name: 'alice', jti: 'x' }))).toBe('oidc alice')
+  })
+
+  it('搜索用的 jti：做这件事的令牌的，和这条记录说的那个令牌的', () => {
+    expect(logJtis({ ...entry('node.update'), actor: { kind: 'mcp', name: 'a', jti: 'abc' } })).toEqual(['abc'])
+    expect(logJtis(entry('mcp.token.revoke', { token: 3, name: 'a', jti: 'def' }))).toEqual(['def'])
+    expect(logJtis(entry('node.update', { node: 2 }))).toEqual([])
   })
 })
 

@@ -71,3 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/fuqiuluo/ice3tier/main/deploy/insta
 密钥要在 controller 启动之前放好：库已经是某个 controller 的了，没有它的密钥 controller 不启动，也不会生成一把新的。
 
 备份时的管理令牌照样能用。只要公网地址仍然指向 controller，节点会自己连回来。备份之后才加入的节点要用新的令牌重新加入。
+
+## MCP 令牌的密钥
+
+签过 [MCP 令牌](../mcp/) 的话，数据目录里还有一把签它们的密钥 `mcp.key`。想让它们在恢复之后接着能用，把它和 `controller.key` 一起备份、一起放回去：上面的命令里 `controller.key` 的那一行照样再写一行 `mcp.key`。
+
+没有它也能恢复：controller 生成一把新的，原来签出去的 MCP 令牌全部作废，重新签发就行。

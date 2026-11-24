@@ -1,5 +1,6 @@
 import { t } from '@/i18n'
-import { MAX_GROUP_NAME_LEN } from '@/lib/validate'
+import { MCP_MAX_LIFETIME_DAYS } from '@/lib/mcp'
+import { MAX_GROUP_NAME_LEN, MAX_TITLE_LEN } from '@/lib/validate'
 
 import { ApiError, errorDetail, errorMessage } from './client'
 import { type KnownErrorCode } from './types'
@@ -50,6 +51,35 @@ export function groupNameFailure(error: unknown): FormFailure<'name'> | null {
               ? t.validate.groupCharset
               : null
       if (message !== null) return { field: 'name', message, detail: null }
+    }
+  }
+  return formFailure(error, {})
+}
+
+/** 签发 MCP 令牌的表单里的几项。`lifetime` 是请求里的 `expires_in_secs`。 */
+export type McpTokenField = 'name' | 'scopes' | 'network' | 'lifetime'
+
+/**
+ * 签发 MCP 令牌被拒绝时：controller 说了是请求里的哪一项（`field`），就写在那一项下面，
+ * 按 `what` 用界面自己的话写；说不清是哪一项的写在表单底部。
+ */
+export function mcpTokenFailure(error: unknown): FormFailure<McpTokenField> | null {
+  if (error instanceof ApiError) {
+    const e = t.settings.mcp.errors
+    const at = (field: McpTokenField, message: string): FormFailure<McpTokenField> => ({ field, message, detail: null })
+    switch (error.field) {
+      case 'name':
+        return at('name', error.what === 'empty' ? t.validate.titleRequired : e.nameMalformed(MAX_TITLE_LEN))
+      case 'scopes':
+        return at(
+          'scopes',
+          error.what === 'empty' ? e.scopesEmpty : error.what === 'not_allowed' ? e.scopesGlobal : e.scopesUnknown,
+        )
+      case 'network':
+        // 选的网络在这期间被删掉了。
+        return at('network', error.code === 'not_found' ? e.networkGone : errorMessage(error))
+      case 'expires_in_secs':
+        return at('lifetime', e.lifetime(MCP_MAX_LIFETIME_DAYS))
     }
   }
   return formFailure(error, {})

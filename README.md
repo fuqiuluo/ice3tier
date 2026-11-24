@@ -29,6 +29,7 @@ ice3tier connects the machines you own into one private network. Every node gets
 - **Port forwarding.** Forward a port on one node to a service on another node or on that node's LAN.
 - **Group-based access control.** One kind of rule: nodes in group A may reach nodes in group B.
 - **Central management.** One controller with a web UI and a CLI. Run several isolated networks side by side.
+- **Hand it to an AI agent.** The controller is an MCP server. Issue a scoped token and an agent such as Claude Code or Codex can look at the network, add nodes, and change groups and rules. See the [deployment guide](docs/deployment.md#let-an-ai-agent-manage-the-network-mcp).
 - **Signed self-updates.** Nodes fetch, verify, install and restart into new releases, and roll back if the new version fails to start.
 
 ## How it works

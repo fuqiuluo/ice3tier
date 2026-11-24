@@ -150,7 +150,7 @@ impl Controller {
         inner.network_view(&updated)
     }
 
-    /// 删掉一个空的网络，连同它的分组、规则、凭据和注册令牌。
+    /// 删掉一个空的网络，连同它的分组、规则、凭据、注册令牌和只限它的 MCP 令牌。
     ///
     /// # Errors
     ///
@@ -169,7 +169,9 @@ impl Controller {
             store.log_refs(now, None, action::NETWORK_DELETE, &format!("删除网络 {}", network.name), &refs, params)?;
             tracing::info!(network = %id, name = %network.name, "删除网络");
             Ok(())
-        })
+        })?;
+        inner.mcp.forget_network(id);
+        Ok(())
     }
 }
 
