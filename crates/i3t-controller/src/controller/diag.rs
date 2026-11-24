@@ -377,14 +377,14 @@ impl Inner {
             }
             // 测试记录与操作记录在同一事务内写入，失败时不会残留记录。
             self.store.atomically(|store| {
-                store.insert_test(&mut view)?;
+                view.id = store.insert_test(&view)?;
                 Self::log_test(store, &view)
             })?;
             return Ok(view);
         }
         // 插进去的这一行和操作记录在一个事务里：出错时存储里没有这个测试，矩阵再排这一对时不会多出一条"没做完"的。
         self.store.atomically(|store| {
-            store.insert_test(&mut view)?;
+            view.id = store.insert_test(&view)?;
             Self::log_test(store, &view)
         })?;
         let window = window_secs(&items, &view.request);
@@ -785,26 +785,22 @@ mod tests {
 
     #[test]
     fn a_test_is_listed_under_its_own_id_before_any_report_and_after_a_restart() {
-        let (lab, network, a, b) = two_nodes();
-        let view = lab.controller.start_test(network, &request(&a, &b)).unwrap();
+        let (mut lab, network, a, b) = two_nodes();
+        let offline = lab.join_offline(network, &[], Declared::default());
+        let running = lab.controller.start_test(network, &request(&a, &b)).unwrap().id;
+        let blocked = lab.controller.start_test(network, &CreateTest { b: offline, ..request(&a, &b) }).unwrap().id;
         let listed = |lab: &Lab| -> Vec<(u64, TestState)> {
             lab.controller.tests(network, &TestQuery::default()).unwrap().iter().map(|view| (view.id, view.state)).collect()
         };
-        assert_eq!(listed(&lab), [(view.id, TestState::Running)], "两端都还没有上报");
-        // 存储的结果自第一次写入起即带有这一行的编号。
-        lab.controller.lock().store.execute_batch(
-            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM tests WHERE (view->>'id')::bigint <> id) THEN RAISE EXCEPTION '结果中的编号与行不符'; END IF; END $$",
-        );
+        // 存储里两个测试的结果都还没有更新过：一个两端都还没有上报，一个开始时就已结束。
+        assert_eq!(listed(&lab), [(blocked, TestState::Failed), (running, TestState::Running)]);
 
         // controller 重启：进行中的测试只剩存储里的那一行。
         lab.controller.lock().diag.running.clear();
-        assert_eq!(listed(&lab), [(view.id, TestState::Failed)]);
-        assert_eq!(lab.controller.test(network, view.id).unwrap().id, view.id);
-
-        // 早先的版本留下的记录，结果中的编号是 0：按行的编号读出。
-        lab.controller.lock().store.execute_batch("UPDATE tests SET view = jsonb_set(view, '{id}', '0')");
-        assert_eq!(listed(&lab), [(view.id, TestState::Failed)]);
-        assert_eq!(lab.controller.test(network, view.id).unwrap().id, view.id);
+        assert_eq!(listed(&lab), [(blocked, TestState::Failed), (running, TestState::Failed)]);
+        for id in [running, blocked] {
+            assert_eq!(lab.controller.test(network, id).unwrap().id, id);
+        }
     }
 
     #[test]

@@ -12,27 +12,20 @@ use super::{Store, StoreError};
 pub const KEEP_PER_PAIR: u32 = 20;
 
 impl Store {
-    /// 插入新发起的主动测试记录。编号由数据库生成，写入 `view.id` 后与结果一同存储；`view` 中原有的编号被覆盖。
+    /// 插入新发起的主动测试记录并返回生成的编号。`view` 中原有的编号无效，以返回值为准；
+    /// 存入的结果中的编号也不作数，读取时以行的编号为准（见 [`read_test`]）。
     ///
     /// # Errors
     ///
     /// 写数据库失败，包括两个节点有一个不存在。
-    pub fn insert_test(&self, view: &mut TestView) -> Result<(), StoreError> {
-        // 先取得编号再插入，使存储的结果自第一次写入起即带有正确的编号。
-        view.id =
-            self.query_one("SELECT nextval(pg_get_serial_sequence('tests', 'id'))", &[], |row| Ok(row.try_get::<_, Unsigned>(0)?.0))?;
-        self.execute(
-            "INSERT INTO tests (id, network_id, node_a, node_b, started_at, view) VALUES ($1, $2, $3, $4, $5, $6)",
-            &[
-                &Unsigned(view.id),
-                &SqlNetwork(view.network),
-                &SqlNode(view.a.id),
-                &SqlNode(view.b.id),
-                &Unsigned(view.started_at),
-                &Json(&*view),
-            ],
+    pub fn insert_test(&self, view: &TestView) -> Result<u64, StoreError> {
+        let id = self.query_one(
+            "INSERT INTO tests (network_id, node_a, node_b, started_at, view) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            &[&SqlNetwork(view.network), &SqlNode(view.a.id), &SqlNode(view.b.id), &Unsigned(view.started_at), &Json(view)],
+            |row| Ok(row.try_get::<_, Unsigned>(0)?.0),
         )?;
-        self.prune_tests(view.network, view.a.id, view.b.id)
+        self.prune_tests(view.network, view.a.id, view.b.id)?;
+        Ok(id)
     }
 
     /// 换上一个测试的最新结果。
@@ -90,7 +83,8 @@ impl Store {
     }
 }
 
-/// 读出一行 `id, view`。编号以行的 `id` 为准：早先的版本在测试结束前未将编号写入结果，期间重启留下的记录中编号为 0。
+/// 读出一行 `id, view`。编号以行的 `id` 为准：编号在插入时才由数据库生成，插入的结果中编号为 0，
+/// 此后更新结果时才写入实际编号。无法执行的测试，以及收到上报之前 controller 即已重启的测试，不会再更新。
 fn read_test(row: &Row) -> Read<TestView> {
     let id = row.try_get::<_, Unsigned>(0)?.0;
     Ok(TestView { id, ..row.try_get::<_, Json<TestView>>(1)?.0 })
