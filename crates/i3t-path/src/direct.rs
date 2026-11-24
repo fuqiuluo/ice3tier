@@ -744,23 +744,25 @@ impl DirectPath {
         addr.port() != 0 && !unusable && (self.loopback || !ip.is_loopback())
     }
 
-    /// 记下一个候选地址。返回它是不是新的。
+    /// 记下一个候选地址。返回它是不是新的：原来没有，或者原来只在信标里见过。
     fn learn(&mut self, addr: SocketAddr, now: Instant) -> bool {
         if !self.can_probe(addr) {
             return false;
         }
         if let Some(candidate) = self.candidate_mut(addr) {
             candidate.refreshed = now;
-            // 别处也说到了它，不再只是信标里的线索。
-            candidate.sighted_only = false;
-            return false;
+            // 别处也说到了它，不再只是信标里的线索。头一次这样说到时，和新来的一个候选一样算：
+            // 信标先到一步，不该让对端上报这个地址时少了"候选变了、立刻重试"的那一下。
+            return std::mem::replace(&mut candidate.sighted_only, false);
         }
         if self.candidates.len() >= MAX_CANDIDATES {
-            // 满了就挤掉最久没有出现的一个；对端上报的和在用的不动。
+            // 满了就挤掉一个：先挤只在信标里见过的，没有了再挤最久没有出现的；对端上报的和在用的不动。
             let active = self.active.as_ref().map(|active| active.addr);
             let evictable =
                 self.candidates.iter().enumerate().filter(|(_, candidate)| !candidate.reported && Some(candidate.addr) != active);
-            let Some((oldest, _)) = evictable.min_by_key(|(_, candidate)| candidate.refreshed) else { return false };
+            let Some((oldest, _)) = evictable.min_by_key(|(_, candidate)| (!candidate.sighted_only, candidate.refreshed)) else {
+                return false;
+            };
             self.candidates.swap_remove(oldest);
         }
         self.candidates.push(Candidate::new(addr, false, now));
@@ -1694,6 +1696,64 @@ mod tests {
         // 对端签了名的探测从这个地址来过之后，它就是一个普通的候选了。
         path.on_ping(lan, start + MS);
         assert_eq!(path.charge(lan, start + MS), Some(true));
+    }
+
+    #[test]
+    fn a_full_table_gives_up_addresses_known_only_from_beacons_first() {
+        let start = Instant::now();
+        let reported = addr("203.0.113.7:20330");
+        let mut path = DirectPath::new();
+        path.set_reported(&[reported], start);
+        // 探测里来的 11 个，然后是信标里来的 4 个：表满了，信标里的那几个最新。
+        let pinged: Vec<SocketAddr> = (1..=11u16).map(|port| SocketAddr::from(([198, 51, 100, 1], port))).collect();
+        for from in &pinged {
+            path.on_ping(*from, start + MS * u32::from(from.port()));
+        }
+        for port in 1..=4 {
+            path.on_lan_sighting(SocketAddr::from(([192, 168, 1, 66], port)), start + Duration::from_secs(1), &policy(&[]));
+        }
+        assert_eq!(path.candidates.len(), MAX_CANDIDATES);
+        let has = |path: &DirectPath, addr: SocketAddr| path.candidates.iter().any(|candidate| candidate.addr == addr);
+        let sighted_only = |path: &DirectPath| path.candidates.iter().filter(|candidate| candidate.sighted_only).count();
+
+        // 又有一个地址来了对端的探测：让出位置的是信标里的线索，不是更早从探测里得知的地址。
+        let newcomer = addr("198.51.100.2:9");
+        path.on_ping(newcomer, start + Duration::from_secs(2));
+        assert!(has(&path, newcomer) && has(&path, reported));
+        assert!(pinged.iter().all(|from| has(&path, *from)), "别处学来的候选一个都没有少");
+        assert_eq!(sighted_only(&path), 3);
+
+        // 信标里的挤完了，才轮到最久没有出现的那个。
+        for port in 10..=13 {
+            path.on_ping(SocketAddr::from(([198, 51, 100, 2], port)), start + Duration::from_secs(3));
+        }
+        assert_eq!((sighted_only(&path), path.candidates.len()), (0, MAX_CANDIDATES));
+        assert!(!has(&path, pinged[0]) && has(&path, pinged[1]) && has(&path, reported));
+    }
+
+    #[test]
+    fn an_address_first_seen_in_a_beacon_still_counts_as_new_when_the_peer_reports_it() {
+        let start = Instant::now();
+        let lan = addr("192.168.1.7:20330");
+        let mut path = DirectPath::new();
+        path.poll(start, &policy(&[]));
+        assert!(path.on_lan_sighting(lan, start + MS, &policy(&[])).is_some());
+        // 探测没有得到回答，这一次尝试失败了，正在退避。
+        path.poll(start + PUNCH_ATTEMPT, &policy(&[]));
+        assert!(matches!(path.punch, Punch::Backoff { round: 0, .. }));
+
+        // 对端自己上报了这个地址：候选端点变了，立刻从头试，和信标没有先到一步时一样。
+        let reported = start + PUNCH_ATTEMPT + 10 * MS;
+        assert!(path.set_reported(&[lan], reported), "要算作新的地址");
+        let step = path.poll(reported, &policy(&[]));
+        assert_eq!((signals(&step.actions).len(), pings(&step.actions).len()), (1, 1), "{step:?}");
+        // 同一份 netmap 再来一次不算，正在进行的尝试不被打断。
+        let attempt = path.punch;
+        assert!(!path.set_reported(&[lan], reported + MS));
+        assert_eq!(path.punch, attempt);
+        // 信标再来也不让它变回"只在信标里见过"。
+        path.on_lan_sighting(lan, reported + 2 * MS, &policy(&[]));
+        assert!(!path.set_reported(&[lan], reported + 3 * MS));
     }
 
     #[test]

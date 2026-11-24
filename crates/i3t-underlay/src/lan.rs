@@ -253,6 +253,9 @@ enum Segment {
 }
 
 /// 本机听信标的一块网卡上的一个地址和它的前缀长度，也就是一个直连的网段。
+///
+/// 只看网卡地址自己的前缀，不看路由表。IPv6 地址全由 DHCPv6 分配、没有自动配置的地址的网络里，网卡上的地址是 /128，
+/// 同一个链路上的邻居不在这样的"网段"里，那里的 IPv6 信标不认；IPv4 的信标照常。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Subnet {
     addr: IpAddr,
