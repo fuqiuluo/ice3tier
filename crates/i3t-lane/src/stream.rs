@@ -216,7 +216,7 @@ struct State {
     send_refused: Option<StreamAborted>,
     /// 写入、flush 或 shutdown 正在等待的任务。对端叫停时要叫醒它，不然它会一直等一个不会再变得可写的 socket。
     send_waker: Option<Waker>,
-    /// 后台送出任务（[`flush_later`]）正在运行：[`push`] 交不完时不再另起一个。仅由该任务在持锁确认退出时清除。
+    /// 后台送出任务（[`flush_later`]）正在运行：[`push`] 未能将待发密文全部写入内核时不再启动新任务。仅由该任务在持锁确认退出时清除。
     flushing: bool,
     halves: u8,
     raw_taken: bool,
