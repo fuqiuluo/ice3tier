@@ -1,4 +1,5 @@
-//! 版本怎么谈，以及和没升级的节点（`i3t-lane/1`）之间两边各自开的 passthrough 流怎么走（issue #34）。
+//! 版本怎么谈，以及和没升级的节点（`i3t-lane/1`）之间两边各自开的 passthrough 流怎么走（issue #34）；
+//! 另含需要查看流内部状态的用例，例如被对端叫停后发送方向如何结束（issue #75）。
 //!
 //! 没升级的节点用这里的帧层照它的样子写出来：它只提供 `i3t-lane/1`；它开 passthrough 的流时 OPENING 是 [`Mode::Early`]，
 //! 那条记录之后紧跟着不加密的字节。
@@ -10,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use i3t_conn::{Payload, RecvStream, SendStream};
+use i3t_conn::{Payload, RecvStream, SendStream, StreamAborted, StreamCode};
 use i3t_crypto::NodeKey;
 use i3t_crypto::tls::Identity;
 use i3t_proto::flow::{Class, Open, Origin, Reason, Reply, Status, Target};
@@ -26,7 +27,7 @@ use crate::error::LaneError;
 use crate::frame::{Frame, Mode, Purpose};
 use crate::lane::{self, ALPN, ALPN_V1, Dial, Lane, Version};
 use crate::status::Book;
-use crate::stream::{LaneRecv, LaneSend};
+use crate::stream::{LaneRecv, LaneSend, RecvState, SendState};
 
 /// 升级了的节点提供的版本，和 [`lane::client_config`]、[`lane::server_config`] 里的一样。
 const NEW: &[&[u8]] = &[ALPN, ALPN_V1];
@@ -102,6 +103,40 @@ async fn read_to_end(recv: &mut LaneRecv) -> io::Result<Vec<u8>> {
     let mut all = Vec::new();
     tokio::time::timeout(PATIENCE, recv.read_to_end(&mut all)).await.expect("读等得太久")?;
     Ok(all)
+}
+
+/// 两个升级了的节点之间的一条流：发起方写完 OPEN 并以 `payload` 结束头，接受方读完 OPEN。返回（发起方的，接受方的）。
+async fn stream_on(dialled: Lane, accepted: Lane, payload: Payload) -> ((LaneSend, LaneRecv), (LaneSend, LaneRecv)) {
+    let (mut send, recv) = initiate(dialled);
+    send.write_all(b"OPEN").await.unwrap();
+    send.end_header(payload);
+    let (far_send, mut far_recv, _) = respond(accepted).await;
+    let mut open = [0; 4];
+    far_recv.read_exact(&mut open).await.unwrap();
+    far_recv.end_header();
+    ((send, recv), (far_send, far_recv))
+}
+
+/// 持续写入 `send`，直至无法继续写入：连续两次、间隔一段时间均无法写入才算写满（刚写入的数据仍在传输时，发送缓冲会腾出少量空间）。
+#[cfg(target_os = "linux")]
+async fn fill_until_stuck(send: &mut LaneSend) {
+    let chunk = vec![7; 16 * 1024];
+    let mut stuck = 0;
+    while stuck < 2 {
+        if tokio::time::timeout(Duration::from_millis(100), send.write_all(&chunk)).await.is_ok() {
+            stuck = 0;
+        } else {
+            stuck += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// `send` 已被对端以 `code` 叫停：不交出原始句柄，写入返回叫停的原因码。
+async fn assert_refused(send: &mut LaneSend, code: u32, what: &str) {
+    assert!(send.take_raw().is_none(), "{what}：被叫停的方向不得交出原始句柄");
+    let error = send.write_all(b"more").await.expect_err("被叫停的方向写入应失败");
+    assert_eq!(StreamAborted::of(&error), Some(StreamAborted::Stopped(StreamCode(code))), "{what}");
 }
 
 #[tokio::test]
@@ -241,17 +276,7 @@ async fn the_read_side_stays_in_the_stream_while_the_answering_switch_is_still_q
     let mut open = [0; 4];
     far_recv.read_exact(&mut open).await.unwrap();
     far_recv.end_header();
-    // 写到写不动为止：连着两次、隔一会儿都写不进去才算满了（刚写进去的还在路上时，发送缓冲会腾出一点地方）。
-    let chunk = vec![7; 16 * 1024];
-    let mut stuck = 0;
-    while stuck < 2 {
-        if tokio::time::timeout(Duration::from_millis(100), send.write_all(&chunk)).await.is_ok() {
-            stuck = 0;
-        } else {
-            stuck += 1;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
+    fill_until_stuck(&mut send).await;
 
     far_send.write_all(b"REPLY").await.unwrap();
     far_send.end_header(Payload::Passthrough);
@@ -288,6 +313,129 @@ async fn the_read_side_stays_in_the_stream_while_the_answering_switch_is_still_q
     .await
     .expect("回应写完之后接收方向应该交得出去");
     tokio::time::timeout(PATIENCE, far).await.expect("接受方没有等到发起方的 SWITCH").unwrap();
+}
+
+/// 被对端叫停（STOP）的发送方向，flush 与 shutdown 均返回叫停的原因码，且不发出 close_notify 与 FIN：对端已不再读取，
+/// 此前写入的数据未必全部送达，不能按正常结束处理（issue #75）。发起方与接受方各被叫停一次。
+#[tokio::test]
+async fn a_stopped_direction_neither_flushes_nor_shuts_down_cleanly() {
+    for initiator_stopped in [true, false] {
+        let (dialled, accepted) = ends(NEW, NEW).await;
+        let (initiator, responder) = stream_on(dialled, accepted, Payload::Sealed).await;
+        let ((mut send, mut recv), (mut peer_send, mut peer_recv)) =
+            if initiator_stopped { (initiator, responder) } else { (responder, initiator) };
+        peer_recv.stop(StreamCode(9));
+        peer_send.write_all(b"REPLY").await.unwrap();
+        peer_send.shutdown().await.unwrap();
+        // STOP 排在 REPLY 之前：读完 REPLY 时本端已处理 STOP。
+        assert_eq!(read_to_end(&mut recv).await.unwrap(), b"REPLY");
+        let endings = [("flush", send.flush().await), ("shutdown", send.shutdown().await), ("再次 shutdown", send.shutdown().await)];
+        for (what, ended) in endings {
+            let error = ended.expect_err("被叫停的方向不能按正常结束处理");
+            assert_eq!(
+                StreamAborted::of(&error),
+                Some(StreamAborted::Stopped(StreamCode(9))),
+                "{what}，被叫停的是发起方：{initiator_stopped}"
+            );
+        }
+        assert!(matches!(send.shared.lock().send, SendState::Sealed), "被叫停的方向不得发出 close_notify 与 FIN");
+    }
+}
+
+/// 已正常结束的发送方向，之后才收到对端的 STOP：再次 shutdown 与 flush 仍然成功，与其他流实现一致（issue #75）。
+#[tokio::test]
+async fn a_finished_direction_still_shuts_down_cleanly_after_a_late_stop() {
+    let (dialled, accepted) = ends(NEW, NEW).await;
+    let ((mut send, mut recv), (mut far_send, mut far_recv)) = stream_on(dialled, accepted, Payload::Sealed).await;
+    send.shutdown().await.unwrap();
+    // 接受方尚未读到 close_notify 即叫停：STOP 照常发出。
+    far_recv.stop(StreamCode(9));
+    far_send.write_all(b"REPLY").await.unwrap();
+    far_send.shutdown().await.unwrap();
+    assert_eq!(read_to_end(&mut recv).await.unwrap(), b"REPLY");
+    assert_eq!(send.shared.lock().send_refused, Some(StreamAborted::Stopped(StreamCode(9))), "STOP 应已送达");
+    send.shutdown().await.expect("已正常结束的方向，再次 shutdown 仍应成功");
+    send.flush().await.expect("已正常结束的方向，flush 仍应成功");
+}
+
+/// 被叫停的方向不再离开 TLS，也不交出原始的发送方向：交出后写入绕过 [`LaneSend`]，叫停的原因随之丢失（issue #75）。
+#[tokio::test]
+async fn a_stopped_direction_does_not_leave_tls_or_hand_itself_out() {
+    // 接受方先被叫停，随后才要切换。发起方的方向仍在 TLS 内（等待接受方的 SWITCH），STOP 可以发出。
+    let (dialled, accepted) = ends(NEW, NEW).await;
+    let ((mut send, mut recv), (mut far_send, mut far_recv)) = stream_on(dialled, accepted, Payload::Passthrough).await;
+    recv.stop(StreamCode(4));
+    send.write_all(b"!").await.unwrap();
+    // STOP 排在这个字节之前。
+    far_recv.read_exact(&mut [0; 1]).await.unwrap();
+    far_send.end_header(Payload::Passthrough);
+    assert!(matches!(far_send.shared.lock().send, SendState::Sealed), "被叫停的接受方不再切换");
+    assert_refused(&mut far_send, 4, "接受方被叫停后切换").await;
+
+    // 发起方先被叫停，随后才收到接受方的 SWITCH：不再回应切换。
+    let (dialled, accepted) = ends(NEW, NEW).await;
+    let ((mut send, mut recv), (mut far_send, mut far_recv)) = stream_on(dialled, accepted, Payload::Passthrough).await;
+    far_recv.stop(StreamCode(4));
+    far_send.write_all(b"REPLY").await.unwrap();
+    far_send.end_header(Payload::Passthrough);
+    far_send.write_all(b"!").await.unwrap();
+    let mut reply = [0; 5];
+    recv.read_exact(&mut reply).await.unwrap();
+    recv.end_header();
+    // SWITCH 之后的原始字节：读到时 SWITCH 已处理。
+    recv.read_exact(&mut [0; 1]).await.unwrap();
+    assert!(matches!(recv.shared.lock().recv, RecvState::Raw(_)), "接受方的方向应已离开 TLS");
+    assert!(matches!(send.shared.lock().send, SendState::Sealed), "被叫停的发起方不回应 SWITCH");
+    assert_refused(&mut send, 4, "发起方被叫停后收到 SWITCH").await;
+
+    // 接受方已经切换，之后才收到 STOP（发起方尚未读到它的 SWITCH）：方向已是原始字节，同样不交出。
+    let (dialled, accepted) = ends(NEW, NEW).await;
+    let ((mut send, mut recv), (mut far_send, mut far_recv)) = stream_on(dialled, accepted, Payload::Passthrough).await;
+    far_send.end_header(Payload::Passthrough);
+    recv.stop(StreamCode(4));
+    send.write_all(b"!").await.unwrap();
+    far_recv.read_exact(&mut [0; 1]).await.unwrap();
+    assert!(matches!(far_send.shared.lock().send, SendState::Raw));
+    assert_refused(&mut far_send, 4, "接受方切换后被叫停").await;
+}
+
+/// 发送缓冲已满、本端阻塞在 flush 或 shutdown 时，对端发来 STOP 或 ABORT：立即返回叫停的原因码。对端已不再读取，socket 不会再变为可写；
+/// 若继续等待，Linux 上会一直等到 `TCP_USER_TIMEOUT`，其他系统上则无限期等待（issue #75）。
+///
+/// 只在 Linux 上运行，原因同上一个测试。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_flush_or_shutdown_stuck_on_a_full_socket_ends_once_the_peer_stops_or_aborts() {
+    use socket2::SockRef;
+
+    for (abort, shutdown) in [(false, false), (false, true), (true, false), (true, true)] {
+        let what = format!("{}，对端{}", if shutdown { "shutdown" } else { "flush" }, if abort { "重置" } else { "叫停" });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        SockRef::from(&listener).set_recv_buffer_size(4096).unwrap();
+        let (dialled, accepted) = ends_on(listener, NEW, NEW).await;
+        SockRef::from(&*dialled.socket).set_send_buffer_size(4096).unwrap();
+        let ((mut send, mut recv), (mut far_send, mut far_recv)) = stream_on(dialled, accepted, Payload::Sealed).await;
+        fill_until_stuck(&mut send).await;
+        // 接收方向持续读取：STOP 与 ABORT 由它处理。
+        let reading = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = recv.read_to_end(&mut sink).await;
+        });
+        let ending = async { if shutdown { send.shutdown().await } else { send.flush().await } };
+        tokio::pin!(ending);
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut ending).await.is_err(), "{what}：发送缓冲已满，应等待 socket 可写");
+        if abort {
+            far_send.reset(StreamCode(9));
+        } else {
+            far_recv.stop(StreamCode(9));
+        }
+        let error = tokio::time::timeout(PATIENCE, ending)
+            .await
+            .unwrap_or_else(|_| panic!("{what}：收到之后仍在等待 socket 可写"))
+            .expect_err("被叫停的方向不能按正常结束处理");
+        assert_eq!(StreamAborted::of(&error), Some(StreamAborted::Stopped(StreamCode(9))), "{what}");
+        reading.abort();
+    }
 }
 
 /// 出口：只数见过几个请求，然后拒绝。

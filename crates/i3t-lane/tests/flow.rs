@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{Hop, Pair, quick, wait_for};
-use i3t_conn::{RecvStream, SendStream};
+use i3t_conn::{RecvStream, SendStream, StreamAborted, StreamCode};
 use i3t_flow::engine::Splicer;
 use i3t_flow::testing::{client_hello, server_hello};
 use i3t_flow::{End, FlowError, Handler, Request};
@@ -387,6 +387,39 @@ async fn the_flow_layer_does_not_complete_a_reply_with_bytes_from_outside_tls() 
         i3t_flow::open(&*pair.entry.lanes, pair.exit.id, &open_request(), &client_hello(b""), i3t_flow::Carriage::Lane).await.unwrap();
     let error = pending.established().await.expect_err("REPLY 的后一半不在 TLS 里，不能当作对端答应了");
     assert!(matches!(error, FlowError::Read(_)), "{error:?}");
+    drop(responder.await.unwrap());
+}
+
+/// 出口回完应答并叫停上传之后，客户端才结束上传：入口的搬运不能算作正常结束，客户端写入的数据对端并未全部读取（issue #75）。
+#[tokio::test]
+async fn an_upload_the_exit_stopped_does_not_end_clean_when_the_client_finishes_later() {
+    let pair = Pair::new(quick()).await;
+    pair.ready(1).await;
+    let exit = Arc::clone(&pair.exit.lanes);
+    let responder = tokio::spawn(async move {
+        use i3t_conn::Acceptor;
+        let incoming = exit.accept().await.unwrap();
+        let (mut send, mut recv) = (incoming.send, incoming.recv);
+        let _open = stand_in::read_header(&mut recv, i3t_proto::flow::Opening::decode).await;
+        let mut reply = Vec::new();
+        Reply::ok().encode(&mut reply);
+        send.write_all(&reply).await.unwrap();
+        recv.stop(StreamCode(6));
+        send.write_all(b"answer").await.unwrap();
+        send.shutdown().await.unwrap();
+        (send, recv)
+    });
+    let (mut client, client_side) = tcp_pair().await;
+    let lanes = Arc::clone(&pair.entry.lanes);
+    let peer = pair.exit.id;
+    let relay = tokio::spawn(async move { through_flow(&lanes, peer, client_side, b"").await });
+    // 客户端读完应答时，入口已处理排在应答之前的 STOP；此后客户端才结束上传。
+    let (answer, end) = drain(&mut client).await;
+    end.unwrap();
+    assert_eq!(answer, b"answer");
+    client.shutdown().await.unwrap();
+    let end = timeout(PATIENCE, relay).await.expect("入口的搬运应结束").unwrap();
+    assert!(matches!(end, End::Aborted(StreamAborted::Stopped(StreamCode(6)))), "{end:?}");
     drop(responder.await.unwrap());
 }
 

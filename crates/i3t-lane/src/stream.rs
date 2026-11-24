@@ -26,14 +26,15 @@
 //! |---|---|
 //! | [`SendStream::reset`]，这个方向还在 TLS 里 | ABORT 帧（带原因码），随后 FIN；两个方向都丢弃之后等对端关掉再关，那时发 RST |
 //! | [`SendStream::reset`]，这个方向已经是原始字节 | RST（Linux 上立刻发，别处在关闭时） |
-//! | [`RecvStream::stop`]，本端发送方向仍在 TLS 内 | STOP 帧（带原因码），对端后续写入失败；lane 不断开，本端发送继续 |
+//! | [`RecvStream::stop`]，本端发送方向仍在 TLS 内 | STOP 帧（带原因码），对端此后的写入、flush 与 shutdown 均失败；lane 不断开，本端发送继续 |
 //! | [`RecvStream::stop`]，本端的发送方向已经不在 TLS 里 | RST |
 //! | 没有 `shutdown` 就丢弃发送方向 | 同 `reset` |
 //!
 //! lane 从开流起就设成"关闭时发 RST"，只有两个方向都正常结束才改回去，所以任务被取消、进程退出也一样。
 //! macOS 上会在发送方向正常关闭、发送 FIN 时即恢复正常关闭：该平台在双向关闭后无法再修改 `SO_LINGER`（见 `i3t_underlay::tcp_reset`）。
 //! 收到的 RST 在读写时是一个不带原因码的连接错误（分不清是对端重置了流，还是路上断了），ABORT 帧是带原因码的
-//! [`StreamAborted::Reset`]，STOP 帧让本端之后的写返回 [`StreamAborted::Stopped`]。
+//! [`StreamAborted::Reset`]，STOP 帧让本端此后的写入、flush 与 shutdown 均返回 [`StreamAborted::Stopped`]（ABORT 帧同样如此）：
+//! 对端已不再读取，此前写入的数据未必全部送达，不能按正常结束处理，该方向也不再离开 TLS。已正常结束的方向不受影响。
 //!
 //! 发了 ABORT 帧的一端不在丢弃时马上关：Windows 收到 RST 时把还没读走的数据扔掉，紧跟在 ABORT 后面的 RST
 //! 会让对端连 ABORT 和原因码一起丢掉。所以它先发 FIN，把对端还在路上的数据收下扔掉，等对端关掉（最多
@@ -211,9 +212,9 @@ struct State {
     recv: RecvState,
     /// 本端已读完对端流头（已调用 [`RecvStream::end_header`] 或移交原始接收方向）：此后接收方向离开 TLS 时可继续读取原始字节。
     header_read: bool,
-    /// 对端叫停了本端的发送（STOP），或者异常结束了整条流（ABORT）：本端之后的写都返回它。
+    /// 对端叫停了本端的发送（STOP），或者异常结束了整条流（ABORT）：本端此后的写入、flush 与 shutdown 均返回它（[`State::check_refused`]）。
     send_refused: Option<StreamAborted>,
-    /// 写在等的任务。对端叫停时要叫醒它，不然它会一直等一个不会再变得可写的 socket。
+    /// 写入、flush 或 shutdown 正在等待的任务。对端叫停时要叫醒它，不然它会一直等一个不会再变得可写的 socket。
     send_waker: Option<Waker>,
     flushing: bool,
     halves: u8,
@@ -383,8 +384,9 @@ impl State {
                 sealed.take_output(&mut self.out);
                 self.send = SendState::Sealed;
             }
+            // 已被对端叫停的方向不再离开 TLS：此后的写入均会失败，切换已无意义。
             (SendState::Sealed, Role::Responder)
-                if payload == Payload::Passthrough && self.mode.is_some_and(|mode| mode != Mode::Sealed) =>
+                if payload == Payload::Passthrough && self.mode.is_some_and(|mode| mode != Mode::Sealed) && self.send_refused.is_none() =>
             {
                 self.switch();
             }
@@ -412,7 +414,8 @@ impl State {
     ///
     /// 发起方此时若已收到接受方的 SWITCH（接受方检查目标响应后先期切换），则回发 SWITCH，使本端发送方向同步退出 TLS。
     /// 必须等待流头读完：接受方在 REPLY 尚未结束时切换属于违反协议，此时不跟随切换，发送方向保持在 TLS 内，以便重置时通过 ABORT 携带原因码。
-    /// 已处于关闭或重置流程的方向亦不跟随切换。回应帧排入待发密文缓冲区，由调用方随后写出（[`push`]）。
+    /// 已处于关闭或重置流程、或已被对端叫停的方向亦不跟随切换（叫停了本端的接受方不再读取，无须回应）。
+    /// 回应帧排入待发密文缓冲区，由调用方随后写出（[`push`]）。
     fn finish_header(&mut self) {
         self.header_read = true;
         if let RecvState::Leaving { sealed, raw } = &mut self.recv {
@@ -423,7 +426,7 @@ impl State {
             };
             self.recv = RecvState::Raw(pending);
             // 发起方的接收方向只会因为接受方的 SWITCH 离开 TLS（[`Mode::Mutual`]）；接受方的（没升级的发起方、或者发起方的回应）不用回。
-            if self.role == Role::Initiator && matches!(self.send, SendState::Sealed) {
+            if self.role == Role::Initiator && matches!(self.send, SendState::Sealed) && self.send_refused.is_none() {
                 self.switch();
             }
         }
@@ -459,9 +462,22 @@ impl State {
         Ok(true)
     }
 
+    /// 对端已叫停本端发送方向（[`State::send_refused`]）且该方向尚未正常结束时，返回叫停的原因。
+    ///
+    /// 已正常结束的方向不受影响：结束前写入的数据均已交给内核，close_notify 与 FIN 也已发出，与其他流实现一致。
+    fn check_refused(&self) -> io::Result<()> {
+        match self.send_refused {
+            Some(refused) if !matches!(self.send, SendState::Finished) => Err(refused.into()),
+            _ => Ok(()),
+        }
+    }
+
     /// 把待发的密文交给内核，交不完就等 socket 可写。
+    ///
+    /// 对端叫停本端发送方向后不再等待，直接返回叫停的原因：对端已不再读取，socket 可能不会再变为可写。
     fn poll_drain(&mut self, socket: &TcpStream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
+            self.check_refused()?;
             if self.drain_now(socket)? {
                 return Poll::Ready(Ok(()));
             }
@@ -710,9 +726,7 @@ impl AsyncWrite for LaneSend {
         let shared = &this.shared;
         let mut state = shared.lock();
         shared.check_revoked(&mut this.wait_revoked, cx)?;
-        if let Some(refused) = state.send_refused {
-            return Poll::Ready(Err(refused.into()));
-        }
+        state.check_refused()?;
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -780,6 +794,8 @@ impl AsyncWrite for LaneSend {
         let mut state = shared.lock();
         shared.check_revoked(&mut this.wait_revoked, cx)?;
         loop {
+            // 被对端叫停的方向不发 close_notify 与 FIN：对端未必收全了之前写入的数据，不能报告正常结束。
+            state.check_refused()?;
             match state.send {
                 SendState::Header(_) => state.end_header(Payload::Sealed),
                 SendState::Sealed => {
@@ -819,7 +835,7 @@ impl SendStream for LaneSend {
     ///   选了 [`Payload::Passthrough`] 时这个方向还留在 TLS 里，等接受方的 SWITCH：收到时（在读的那一侧）回一个 SWITCH，
     ///   之后这个方向是原始字节，[`take_raw`](SendStream::take_raw) 交得出来。对端是没升级的节点时按 sealed 送出。
     /// - 接受方：发起方选了 passthrough、并且这里也传 [`Payload::Passthrough`] 时，发一个 SWITCH，之后这个方向是原始字节；
-    ///   别的情况什么都不做，这个方向留在 TLS 里。在这之前可以已经发过任意多的数据（流层先加密地送出目标的 ServerHello）。
+    ///   别的情况（包括这个方向已被对端叫停）什么都不做，这个方向留在 TLS 里。在这之前可以已经发过任意多的数据（流层先加密地送出目标的 ServerHello）。
     ///
     /// 不用等：密文立刻交给内核，交不完的由后台送出。头已经结束之后再调用没有效果。
     ///
@@ -834,13 +850,14 @@ impl SendStream for LaneSend {
         push(&self.shared, &mut state);
     }
 
-    /// 这个方向已经离开 TLS 时，把它交出去，让调用方直接写 socket（见 [`RawWrite`]）。还在 TLS 里、已经结束或者已经交出去时返回 `None`。
+    /// 这个方向已经离开 TLS 时，把它交出去，让调用方直接写 socket（见 [`RawWrite`]）。还在 TLS 里、已经结束、已被对端叫停或者已经交出去时
+    /// 返回 `None`：被叫停的方向交出去之后，写入将绕过这里，叫停的原因随之丢失。
     ///
     /// 交出去之后这个 [`LaneSend`] 不再能写，丢弃它也不会重置流。
     fn take_raw(&mut self) -> Option<RawWrite> {
         let shared = &self.shared;
         let mut state = shared.lock();
-        if shared.is_revoked() || !matches!(state.send, SendState::Raw) || state.aborted {
+        if shared.is_revoked() || !matches!(state.send, SendState::Raw) || state.aborted || state.send_refused.is_some() {
             return None;
         }
         state.send = SendState::Handed;
