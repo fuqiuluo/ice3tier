@@ -4,6 +4,7 @@
   "version": "0.1.34",
   "type": "module",
   "license": "MIT OR Apache-2.0",
+  "packageManager": "pnpm@10.34.9",
   "engines": {
     "node": ">=22"
   },

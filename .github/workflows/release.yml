@@ -2,6 +2,9 @@
 #
 # 签名密钥只出现在 sign 这一个 job 的一个步骤里。那个 job 不检出代码、不编译、不运行第三方的 action，
 # 只运行前面编好的 i3t-release。没有配置密钥时照样编译和上传，但只建草稿，等人离线签完名再公开。
+#
+# 要签名的程序不随别处变：action 都钉在提交上，编译器和构建工具的版本写死
+# （.github/actions/release-toolchain、.github/actions/build-webui），不读任何缓存。
 name: Release
 
 on:
@@ -29,8 +32,10 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/release-toolchain
       - name: Compare the tag with the version of the node program
         id: version
         env:
@@ -48,9 +53,25 @@ jobs:
             *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
+  # WebUI 和平台无关：单独构建一次，各平台的编译从这里取。Node.js 和 pnpm 不进编译程序的那些机器。
+  webui:
+    name: build the WebUI
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-webui
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: webui
+          path: web/dist
+          if-no-files-found: error
+
   build:
     name: build (${{ matrix.platform }})
-    needs: check
+    needs: [check, webui]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -62,34 +83,25 @@ jobs:
           - { platform: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
           - { platform: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # 发布的编译不用缓存：缓存是别的流水线写的，不该进到要签名的程序里。
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/release-toolchain
         with:
           targets: ${{ matrix.target }}
-      # controller 在编译时把 web/dist 嵌进程序，所以要先把 WebUI 构建出来；没有它的话发布的 controller 只有一个说明页。
-      - uses: pnpm/action-setup@v4
+          zigbuild: ${{ runner.os == 'Linux' }}
+      # controller 在编译时把 web/dist 嵌进程序；没有它的话发布的 controller 只有一个说明页。
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          version: 10
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-      - name: Build the WebUI
-        working-directory: web
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
+          name: webui
+          path: web/dist
       - name: Build (Linux, portable glibc)
         if: runner.os == 'Linux'
         env:
           LINUX_ARCH: ${{ matrix.linux_arch }}
           TARGET: ${{ matrix.target }}
         run: |
-          python3 -m venv "$RUNNER_TEMP/zig"
-          "$RUNNER_TEMP/zig/bin/pip" install ziglang cargo-zigbuild
-          export PATH="$RUNNER_TEMP/zig/bin:$PATH"
           scripts/build-linux.sh "$LINUX_ARCH"
           echo "OUT_DIR=target/dist/$TARGET/dist" >> "$GITHUB_ENV"
       - name: Build (Windows, macOS)
@@ -161,7 +173,7 @@ jobs:
               exit 1
               ;;
           esac
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bin-${{ matrix.platform }}
           path: dist/*
@@ -172,11 +184,14 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # sign 会带着签名密钥运行这里编出来的程序，所以它和节点一样：钉死的编译器，锁文件里的依赖，不读缓存。
+      - uses: ./.github/actions/release-toolchain
       # 和节点用同一份代码、同一个 I3T_RELEASE_EXTRA_KEY 编译，所以它"编译进去的公钥"就是这次发布的节点认的公钥。
       - run: cargo build --release --locked -p i3t-release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: i3t-release
           path: target/release/i3t-release
@@ -186,18 +201,19 @@ jobs:
     name: sign the manifest
     needs: [check, build, tool]
     runs-on: ubuntu-latest
-    # 给这个环境配上"需要审批人"，每次签名就要有人点一下才会进行。密钥可以放成这个环境的密钥，也可以放成仓库的密钥。
+    # 密钥放成这个环境的密钥，不要放成仓库的密钥：仓库的密钥，任何分支上的任何一条流水线都读得到。
+    # 再给这个环境配上"需要审批人"，并限定只有 v* 标签能用它：每次签名就要有人点一下才会进行，别的分支也用不了它。
     environment: release-signing
     permissions: {}
     outputs:
       signed: ${{ steps.sign.outputs.signed }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: bin-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: i3t-release
           path: tool
@@ -239,7 +255,7 @@ jobs:
             fi
           done
           [ "$missing" -eq 0 ]
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.sign.outputs.signed == 'true'
         with:
           name: manifest
@@ -255,12 +271,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: bin-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: needs.sign.outputs.signed == 'true'
         with:
           name: manifest
@@ -298,8 +314,10 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: bin-linux-*
           path: dist

@@ -1,0 +1,39 @@
+# 发布用的编译器，版本写死：Rust 的版本在下面，zig 和 cargo-zigbuild 的版本和摘要在 scripts/zigbuild-requirements.txt。
+# 发布和每天的发布演练都从这里装，演练的就是发布时用的那一套。
+# 换版本：改这里或那份清单，手动跑一遍 Nightly，发布演练过了再合。
+name: Release toolchain
+description: Install the exact Rust toolchain, and on request zig with cargo-zigbuild, that release builds use
+inputs:
+  targets:
+    description: Rust targets to add, separated by commas or spaces
+    required: false
+    default: ""
+  zigbuild:
+    description: Set to true to also install zig and cargo-zigbuild (the Linux builds link against an old glibc with them)
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    # 直接用 runner 上的 rustup，不经过别人的 action。
+    - name: Install Rust
+      shell: bash
+      env:
+        RUST_VERSION: "1.100.0"
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        flags=()
+        for target in ${TARGETS//,/ }; do
+          flags+=(--target "$target")
+        done
+        rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update "${flags[@]}"
+        rustup default "$RUST_VERSION"
+        rustc --version --verbose
+    - name: Install zig and cargo-zigbuild
+      if: inputs.zigbuild == 'true'
+      shell: bash
+      run: |
+        python3 -m venv "$RUNNER_TEMP/zigbuild"
+        "$RUNNER_TEMP/zigbuild/bin/pip" install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps \
+          -r "$GITHUB_WORKSPACE/scripts/zigbuild-requirements.txt"
+        echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 构建能在较旧的 Linux 发行版上运行的可执行文件（要求 glibc 2.28 及以上，约等于 2018 年之后的系统）。
 #
-# 需要先装好 zig 和 cargo-zigbuild，例如：pip install ziglang cargo-zigbuild
+# 需要先装好 zig 和 cargo-zigbuild。发布用的版本和摘要在 scripts/zigbuild-requirements.txt：
+#   pip install --require-hashes --only-binary=:all: --no-deps -r scripts/zigbuild-requirements.txt
 #
 #   scripts/build-linux.sh [x86_64|aarch64]
 #
@@ -14,7 +15,7 @@ case $arch in
     *) echo "不支持的架构：$arch（可以写 x86_64 或 aarch64）" >&2; exit 1 ;;
 esac
 
-command -v cargo-zigbuild >/dev/null || { echo "找不到 cargo-zigbuild。安装：pip install ziglang cargo-zigbuild" >&2; exit 1; }
+command -v cargo-zigbuild >/dev/null || { echo "找不到 cargo-zigbuild。安装：pip install --require-hashes --only-binary=:all: --no-deps -r scripts/zigbuild-requirements.txt" >&2; exit 1; }
 
 cd "$(dirname "$0")/.."
 target="$arch-unknown-linux-gnu"
