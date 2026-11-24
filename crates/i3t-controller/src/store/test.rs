@@ -11,9 +11,13 @@ use super::{Store, StoreError};
 /// 一对节点最多留多少个测试的结果，再多就删最老的。
 pub const KEEP_PER_PAIR: u32 = 20;
 
+/// 编号取行的 `id`：插入时结果中的编号为 0，此后不一定再更新。
+fn from_row(row: &Row) -> Read<TestView> {
+    Ok(TestView { id: row.try_get::<_, Unsigned>("id")?.0, ..row.try_get::<_, Json<TestView>>("view")?.0 })
+}
+
 impl Store {
-    /// 插入新发起的主动测试记录并返回生成的编号。`view` 中原有的编号无效，以返回值为准；
-    /// 存入的结果中的编号也不作数，读取时以行的编号为准（见 [`read_test`]）。
+    /// 插入新发起的主动测试记录并返回生成的编号。`view` 中的编号不作数，读取时以行的 `id` 为准。
     ///
     /// # Errors
     ///
@@ -49,7 +53,7 @@ impl Store {
             return Ok(None);
         }
         let sql = "SELECT id, view FROM tests WHERE id = $1 AND network_id = $2";
-        self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], read_test)
+        self.query_opt(sql, &[&Unsigned(id), &SqlNetwork(network)], from_row)
     }
 
     /// 最近的测试，新的在前。`pair` 有值时只要这一对节点的（先后无所谓）。
@@ -63,11 +67,11 @@ impl Store {
                 "SELECT id, view FROM tests WHERE network_id = $1 AND ((node_a = $2 AND node_b = $3) OR (node_a = $3 AND node_b = $2))
                  ORDER BY id DESC LIMIT $4",
                 &[&SqlNetwork(network), &SqlNode(a), &SqlNode(b), &Int(limit)],
-                read_test,
+                from_row,
             ),
             None => {
                 let sql = "SELECT id, view FROM tests WHERE network_id = $1 ORDER BY id DESC LIMIT $2";
-                self.query(sql, &[&SqlNetwork(network), &Int(limit)], read_test)
+                self.query(sql, &[&SqlNetwork(network), &Int(limit)], from_row)
             }
         }
     }
@@ -81,13 +85,6 @@ impl Store {
         )?;
         Ok(())
     }
-}
-
-/// 读出一行 `id, view`。编号以行的 `id` 为准：编号在插入时才由数据库生成，插入的结果中编号为 0，
-/// 此后更新结果时才写入实际编号。无法执行的测试，以及收到上报之前 controller 即已重启的测试，不会再更新。
-fn read_test(row: &Row) -> Read<TestView> {
-    let id = row.try_get::<_, Unsigned>(0)?.0;
-    Ok(TestView { id, ..row.try_get::<_, Json<TestView>>(1)?.0 })
 }
 
 #[cfg(test)]

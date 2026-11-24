@@ -375,18 +375,10 @@ impl Inner {
                 host.state = ItemState::Skipped;
                 host.problem.clone_from(&blocker);
             }
-            // 测试记录与操作记录在同一事务内写入，失败时不会残留记录。
-            self.store.atomically(|store| {
-                view.id = store.insert_test(&view)?;
-                Self::log_test(store, &view)
-            })?;
+            self.store_new_test(&mut view)?;
             return Ok(view);
         }
-        // 插进去的这一行和操作记录在一个事务里：出错时存储里没有这个测试，矩阵再排这一对时不会多出一条"没做完"的。
-        self.store.atomically(|store| {
-            view.id = store.insert_test(&view)?;
-            Self::log_test(store, &view)
-        })?;
+        self.store_new_test(&mut view)?;
         let window = window_secs(&items, &view.request);
         let (id, paths) = (view.id, view.request.via.clone());
         let order = |peer: NodeId, role| TestOrder { test: id, peer, role, items, paths: paths.clone(), window_secs: window };
@@ -413,6 +405,14 @@ impl Inner {
                 Ok(self.diag.running.get(&id).map_or(started, Running::current))
             }
         }
+    }
+
+    /// 插入测试记录并取得编号，与操作记录在一个事务里：出错时存储里没有这个测试，矩阵再排这一对时不会多出一条"没做完"的。
+    fn store_new_test(&mut self, view: &mut TestView) -> Result<(), Error> {
+        self.store.atomically(|store| {
+            view.id = store.insert_test(view)?;
+            Self::log_test(store, view)
+        })
     }
 
     fn log_test(store: &Store, view: &TestView) -> Result<(), Error> {
@@ -789,15 +789,15 @@ mod tests {
         let offline = lab.join_offline(network, &[], Declared::default());
         let running = lab.controller.start_test(network, &request(&a, &b)).unwrap().id;
         let blocked = lab.controller.start_test(network, &CreateTest { b: offline, ..request(&a, &b) }).unwrap().id;
-        let listed = |lab: &Lab| -> Vec<(u64, TestState)> {
+        let listed = || -> Vec<(u64, TestState)> {
             lab.controller.tests(network, &TestQuery::default()).unwrap().iter().map(|view| (view.id, view.state)).collect()
         };
         // 存储里两个测试的结果都还没有更新过：一个两端都还没有上报，一个开始时就已结束。
-        assert_eq!(listed(&lab), [(blocked, TestState::Failed), (running, TestState::Running)]);
+        assert_eq!(listed(), [(blocked, TestState::Failed), (running, TestState::Running)]);
 
         // controller 重启：进行中的测试只剩存储里的那一行。
         lab.controller.lock().diag.running.clear();
-        assert_eq!(listed(&lab), [(blocked, TestState::Failed), (running, TestState::Failed)]);
+        assert_eq!(listed(), [(blocked, TestState::Failed), (running, TestState::Failed)]);
         for id in [running, blocked] {
             assert_eq!(lab.controller.test(network, id).unwrap().id, id);
         }
