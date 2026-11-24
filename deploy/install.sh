@@ -1416,12 +1416,16 @@ controller_log_level_is_set() {
 }
 
 # Whether the service is still running the start with invocation ID `$1` (systemd starts it again when it exits).
+# Without an ID to compare with, a start that systemd made since cannot be told from this one: that is not taken to be
+# the same start.
 controller_still_in_start() {
-    [ "$($SUDO systemctl show -p ActiveState --value i3t-controller 2>/dev/null || true)" = active ] \
+    [ -n "$1" ] \
+        && [ "$($SUDO systemctl show -p ActiveState --value i3t-controller 2>/dev/null || true)" = active ] \
         && [ "$($SUDO systemctl show -p InvocationID --value i3t-controller 2>/dev/null || true)" = "$1" ]
 }
 
-# Restarts the controller service and watches this start in its log, for up to 30 seconds.
+# Restarts the controller service and watches this start in its log, for up to 30 seconds. A controller that does not
+# come up in that time ends the script with an error.
 #
 # Whether to show the one-time admin token is read off what the controller actually printed, not guessed from files:
 # it prints one whenever it starts on a database that has no controller yet. That is a new install, but also an
@@ -1474,8 +1478,18 @@ restart_controller() {
         fi
         return
     fi
-    printf '%s\n' "$out"
-    warn "i3t-controller did not come up; check: sudo journalctl -u i3t-controller --no-pager"
+    # What this start printed. The admin token is printed before the controller binds its ports, so a start that fails
+    # after that (the port is taken, say) has shown it here.
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out" >&2
+    fi
+    # The install did not do what it was asked to: the exit status says so too, for whoever runs this script from
+    # automation. The service is left as it is, enabled and started again by systemd: a run with the cause fixed (another
+    # --database-url, say) stops it before it changes anything.
+    if [ "$failed" -eq 1 ]; then
+        die "i3t-controller did not come up; check: sudo journalctl -u i3t-controller --no-pager"
+    fi
+    die "i3t-controller did not come up within ${patience} seconds; check: sudo journalctl -u i3t-controller --no-pager"
 }
 
 # Whether /etc/i3t/controller.env says which database to use (someone put it there by hand: this script never does).

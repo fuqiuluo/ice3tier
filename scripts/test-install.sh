@@ -652,8 +652,12 @@ if [ "$os" = "Linux" ]; then
     sudo mkdir -p /etc/systemd/system/i3t-controller.service.d
     printf '[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestartSec=100ms\n' \
         | sudo tee /etc/systemd/system/i3t-controller.service.d/restart-fast.conf >/dev/null
-    sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 \
-        --database-url postgres://i3t@127.0.0.1:1/i3t >"$work/ctl-nodb.out" 2>&1 || true
+    # The install did not give a running controller: its exit status says so, for automation that goes by it.
+    if sh "$repo/deploy/install.sh" --from "$dir" --controller --public-addr 127.0.0.1:20331 \
+        --database-url postgres://i3t@127.0.0.1:1/i3t >"$work/ctl-nodb.out" 2>&1; then
+        fail "a controller that could not start was installed without an error: $(cat "$work/ctl-nodb.out")"
+    fi
+    grep -q 'did not come up' "$work/ctl-nodb.out" || fail "the install did not fail on the controller: $(cat "$work/ctl-nodb.out")"
     [ -z "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-nodb.out")" ] || fail "a token without a database?"
     sudo test ! -e /var/lib/i3t-controller/controller.key || fail "a key was created although the database could not be reached"
     retry_database=$(new_database install_retry)
@@ -681,6 +685,15 @@ if [ "$os" = "Linux" ]; then
     fi
     [ -n "$(sed -n 's/^    \([A-Za-z0-9_-]\{43\}\)$/\1/p' "$work/ctl-quiet.out")" ] \
         || fail "the first start with a quiet log did not show the admin token: $(cat "$work/ctl-quiet.out")"
+
+    step "with that log level, a controller that cannot start still fails the install"
+    # It says why it gives up whatever the log level. Nothing listens on port 1.
+    if sh "$repo/deploy/install.sh" --from "$dir" --controller --database-url postgres://i3t@127.0.0.1:1/i3t \
+        >"$work/ctl-quiet-nodb.out" 2>&1; then
+        fail "a controller with a quiet log that could not start was installed without an error: $(cat "$work/ctl-quiet-nodb.out")"
+    fi
+    grep -q 'did not come up' "$work/ctl-quiet-nodb.out" \
+        || fail "the install did not fail on the controller: $(cat "$work/ctl-quiet-nodb.out")"
     sudo sh "$repo/deploy/install.sh" --uninstall --controller --purge >/dev/null
 
     step "this script installs release 0.1.34, which takes no database, even from a noexec temporary directory"
