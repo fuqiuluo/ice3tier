@@ -123,7 +123,9 @@ async fn fill_until_stuck(send: &mut LaneSend) {
     let chunk = vec![7; 16 * 1024];
     let mut stuck = 0;
     while stuck < 2 {
-        if tokio::time::timeout(Duration::from_millis(100), send.write_all(&chunk)).await.is_ok() {
+        // 写入出错时立即失败：若只看是否超时，`Ok(Err(_))` 会不断清零计数，循环不会结束。
+        if let Ok(written) = tokio::time::timeout(Duration::from_millis(100), send.write_all(&chunk)).await {
+            written.expect("写满之前写入不应失败");
             stuck = 0;
         } else {
             stuck += 1;
