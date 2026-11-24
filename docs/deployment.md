@@ -231,18 +231,23 @@ A backup is two files: a dump of the database, and the controller's key `control
 
 ```sh
 # Docker
-(set -e; umask 077; rm -f controller.dump controller.key
- docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
- docker compose exec -T controller cat /data/controller.key > controller.key)
+(umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
+ trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
+ docker compose exec -T postgres pg_dump --username i3t --format custom i3t > "$tmp/controller.dump" &&
+ docker compose exec -T controller cat /data/controller.key > "$tmp/controller.key" &&
+ [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
+ mv -f "$tmp/controller.dump" "$tmp/controller.key" .)
 
 # Install script
-(set -e; umask 077; rm -f controller.dump
- sudo -u i3t-controller sh -c 'url=$(cat /var/lib/i3t-controller/database.url) && [ -n "$url" ] && exec pg_dump --format custom --dbname="$url"' > controller.dump
- rm -f controller.key
- sudo -u i3t-controller cat /var/lib/i3t-controller/controller.key > controller.key)
+(umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
+ trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
+ sudo -u i3t-controller sh -c 'url=$(cat /var/lib/i3t-controller/database.url) && [ -n "$url" ] && exec pg_dump --format custom --dbname="$url"' > "$tmp/controller.dump" &&
+ sudo -u i3t-controller cat /var/lib/i3t-controller/controller.key > "$tmp/controller.key" &&
+ [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
+ mv -f "$tmp/controller.dump" "$tmp/controller.key" .)
 ```
 
-The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them anew, readable by you only; keep them that way. With the install script, the data directory belongs to the service user `i3t-controller`: backup and restore read and write the files in it as that user, not as root, which would follow a link put there in the place of a file. Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
+The dump holds all networks, nodes and settings and the admin token. Both files are secrets: the dump has the proxy passwords in it, and the key is the controller's identity. The commands above write them anew, readable by you only; keep them that way. They replace the previous backup in the directory only once both files have been read in full; if a step fails, the previous backup is left as it was. With the install script, the data directory belongs to the service user `i3t-controller`: backup and restore read and write the files in it as that user, not as root, which would follow a link put there in the place of a file. Both files are needed: nodes trust this key, and the database lists the nodes enrolled under it.
 
 Restore on a new server, with the same public address as before.
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # 照 deploy/docker/compose.yaml 把 controller 和它的 PostgreSQL 起来，把部署文档里写的几件事真的做一遍：
 # 第一次启动打出管理令牌，管理 API 和 i3tctl 能用，数据库不听网络，数据库重启之后 controller 自己连回去，
-# 重新生成管理令牌，备份（pg_dump 加密钥，两个文件都只有自己可读），在一套全新的卷上恢复；
+# 重新生成管理令牌，备份（pg_dump 加密钥，两个文件都只有自己可读；中途失败时上一次的备份保持不变），在一套全新的卷上恢复；
 # 忘了把密钥放回来时 controller 不肯启动。最后把容器和卷都删掉。
 #
 # 用的是本机已经有的镜像 ghcr.io/fuqiuluo/ice3tier-controller:latest，先建出来：
@@ -162,20 +162,47 @@ chmod 755 "$work/backup"
 : > "$work/backup/controller.dump"
 : > "$work/backup/controller.key"
 chmod 644 "$work/backup/controller.dump" "$work/backup/controller.key"
-# 文档里的写法：两个文件在 umask 077 下重新写出来，有一步不成就停。转储里有代理的密码，密钥就是 controller 的身份。
-(
-    cd "$work/backup"
-    set -e
-    umask 077
-    rm -f controller.dump controller.key
-    compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
-    compose exec -T controller cat /data/controller.key > controller.key
-)
-[ -s "$work/backup/controller.dump" ] && [ -s "$work/backup/controller.key" ] || fail "the backup is empty"
+# 文档里的写法，docker compose 换成 compose：两个文件先在 umask 077 下写入同一目录中的临时目录，全部读出且非空后
+# 才一起替换；任一步失败则删除临时目录，上一次的备份保持不变。转储里有代理的密码，密钥就是 controller 的身份。
+# 各步以 && 串联，不依赖 set -e：在 if 条件中或 || 左侧执行时，set -e 不生效。
+back_up() {
+    (
+        cd "$work/backup" || exit
+        umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
+        trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
+        compose exec -T postgres pg_dump --username i3t --format custom i3t > "$tmp/controller.dump" &&
+        compose exec -T controller cat /data/controller.key > "$tmp/controller.key" &&
+        [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
+        mv -f "$tmp/controller.dump" "$tmp/controller.key" .
+    )
+}
+back_up
 for file in controller.dump controller.key; do
+    [ -s "$work/backup/$file" ] || fail "the backup's $file is empty"
     mode=$(stat -c '%a' "$work/backup/$file" 2>/dev/null || stat -f '%Lp' "$work/backup/$file")
     [ "$mode" = 600 ] || fail "$file is readable by others (mode $mode)"
 done
+
+step "a backup that fails halfway leaves the last one as it was"
+cp "$work/backup/controller.dump" "$work/last.dump"
+cp "$work/backup/controller.key" "$work/last.key"
+last_backup_kept() { # 失败的步骤
+    for file in dump key; do
+        cmp -s "$work/last.$file" "$work/backup/controller.$file" || fail "$1 failed, and the last backup's controller.$file changed"
+    done
+    left=$(ls -A "$work/backup" | tr '\n' ' ')
+    [ "$left" = "controller.dump controller.key " ] || fail "$1 failed, and the backup directory holds: $left"
+}
+# 转储已读出、密钥读取失败（controller 已停止）：两个文件均不替换。
+compose stop controller
+if back_up 2>"$work/backup.err"; then fail "the backup went through without the controller's key"; fi
+grep -q controller "$work/backup.err" || fail "the backup did not fail on the key: $(cat "$work/backup.err")"
+last_backup_kept "reading the key"
+# 数据库已停止：第一步即失败。
+compose stop postgres
+if back_up 2>"$work/backup.err"; then fail "the backup went through without the database"; fi
+grep -q postgres "$work/backup.err" || fail "the backup did not fail on the dump: $(cat "$work/backup.err")"
+last_backup_kept "the dump"
 
 step "restore on new volumes"
 compose down --volumes --timeout 5

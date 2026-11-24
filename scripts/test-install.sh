@@ -417,27 +417,61 @@ if [ "$os" = "Linux" ]; then
         sleep 1
     done
 
-    step "back up and restore with the commands of the deployment guide"
+    step "back up with the commands of the deployment guide"
     mkdir "$work/backup"
     # Left over from an older backup and readable by everyone: the new files must not inherit that.
     : > "$work/backup/controller.dump"
     : > "$work/backup/controller.key"
     chmod 644 "$work/backup/controller.dump" "$work/backup/controller.key"
     # Run in a directory the service user cannot enter, as an admin's home directory may be. The files are read as the
-    # service user and written by this one: the redirections are meant to be outside sudo.
-    (
-        cd "$work/backup"
-        set -e; umask 077; rm -f controller.dump
-        # shellcheck disable=SC2016,SC2024
-        sudo -u i3t-controller sh -c 'url=$(cat /var/lib/i3t-controller/database.url) && [ -n "$url" ] && exec pg_dump --format custom --dbname="$url"' > controller.dump
-        rm -f controller.key
-        # shellcheck disable=SC2024
-        sudo -u i3t-controller cat /var/lib/i3t-controller/controller.key > controller.key
-    )
+    # service user and written by this one: the redirections are meant to be outside sudo. They go to a new directory
+    # beside the last backup first and replace it together once both are there and not empty. The steps are chained
+    # with && rather than left to set -e, which does nothing inside an `if` or before `||`.
+    # shellcheck disable=SC2016,SC2024
+    back_up() {
+        (
+            cd "$work/backup" || exit
+            umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
+            trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
+            sudo -u i3t-controller sh -c 'url=$(cat /var/lib/i3t-controller/database.url) && [ -n "$url" ] && exec pg_dump --format custom --dbname="$url"' > "$tmp/controller.dump" &&
+            sudo -u i3t-controller cat /var/lib/i3t-controller/controller.key > "$tmp/controller.key" &&
+            [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
+            mv -f "$tmp/controller.dump" "$tmp/controller.key" .
+        )
+    }
+    back_up
     for file in controller.dump controller.key; do
         [ "$(stat -c '%a %U' "$work/backup/$file")" = "600 $(id -un)" ] || fail "the backup's $file is not this user's and private"
         [ -s "$work/backup/$file" ] || fail "the backup's $file is empty"
     done
+
+    step "a backup that fails halfway leaves the last one as it was"
+    cp "$work/backup/controller.dump" "$work/last.dump"
+    cp "$work/backup/controller.key" "$work/last.key"
+    last_backup_kept() { # the step that failed
+        for file in dump key; do
+            cmp -s "$work/last.$file" "$work/backup/controller.$file" || fail "$1 failed, and the last backup's controller.$file changed"
+        done
+        left=$(ls -A "$work/backup" | tr '\n' ' ')
+        [ "$left" = "controller.dump controller.key " ] || fail "$1 failed, and the backup directory holds: $left"
+    }
+    # The dump is read and the key is not: neither file is replaced.
+    key_mode=$(sudo stat -c '%a' /var/lib/i3t-controller/controller.key)
+    sudo -u i3t-controller chmod 000 /var/lib/i3t-controller/controller.key
+    if back_up 2>"$work/backup.err"; then fail "the backup went through without the controller's key"; fi
+    sudo -u i3t-controller chmod "$key_mode" /var/lib/i3t-controller/controller.key
+    grep -q 'controller\.key' "$work/backup.err" || fail "the backup did not fail on the key: $(cat "$work/backup.err")"
+    last_backup_kept "reading the key"
+    # pg_dump cannot reach the database.
+    # shellcheck disable=SC2024
+    sudo -u i3t-controller cat /var/lib/i3t-controller/database.url > "$work/database.url"
+    printf 'postgres://i3t@127.0.0.1:1/i3t\n' | sudo -u i3t-controller sh -c 'cat > "$1"' sh /var/lib/i3t-controller/database.url
+    if back_up 2>"$work/backup.err"; then fail "the backup went through without the database"; fi
+    sudo -u i3t-controller sh -c 'cat > "$1"' sh /var/lib/i3t-controller/database.url < "$work/database.url"
+    grep -q 'pg_dump' "$work/backup.err" || fail "the backup did not fail on pg_dump: $(cat "$work/backup.err")"
+    last_backup_kept "the dump"
+
+    step "restore with the commands of the deployment guide"
     # Into another empty database on this server.
     restored_database=$(new_database install_restored)
     pg_restore --no-owner --dbname "$restored_database" "$work/backup/controller.dump" \

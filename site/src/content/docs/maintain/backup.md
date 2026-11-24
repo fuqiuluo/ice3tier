@@ -10,21 +10,26 @@ description: 备份 controller 的数据，在原来的或新的服务器上恢�
 用 Docker 装的：
 
 ```sh
-(set -e; umask 077; rm -f controller.dump controller.key
- docker compose exec -T postgres pg_dump --username i3t --format custom i3t > controller.dump
- docker compose exec -T controller cat /data/controller.key > controller.key)
+(umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
+ trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
+ docker compose exec -T postgres pg_dump --username i3t --format custom i3t > "$tmp/controller.dump" &&
+ docker compose exec -T controller cat /data/controller.key > "$tmp/controller.key" &&
+ [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
+ mv -f "$tmp/controller.dump" "$tmp/controller.key" .)
 ```
 
 用安装脚本装的：
 
 ```sh
-(set -e; umask 077; rm -f controller.dump
- sudo -u i3t-controller sh -c 'url=$(cat /var/lib/i3t-controller/database.url) && [ -n "$url" ] && exec pg_dump --format custom --dbname="$url"' > controller.dump
- rm -f controller.key
- sudo -u i3t-controller cat /var/lib/i3t-controller/controller.key > controller.key)
+(umask 077; tmp=$(mktemp -d ./controller.backup.XXXXXX) || exit
+ trap 'rm -rf "$tmp"' EXIT; trap 'exit 1' HUP INT TERM
+ sudo -u i3t-controller sh -c 'url=$(cat /var/lib/i3t-controller/database.url) && [ -n "$url" ] && exec pg_dump --format custom --dbname="$url"' > "$tmp/controller.dump" &&
+ sudo -u i3t-controller cat /var/lib/i3t-controller/controller.key > "$tmp/controller.key" &&
+ [ -s "$tmp/controller.dump" ] && [ -s "$tmp/controller.key" ] &&
+ mv -f "$tmp/controller.dump" "$tmp/controller.key" .)
 ```
 
-转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令把它们重新写出来，只有你自己可读，保存时也别放宽。用安装脚本装的，数据目录归服务的用户 `i3t-controller`，备份和恢复都以它的身份读写里面的文件，不用 root：那里的文件可能被换成了链接，root 会跟着它读写别处。
+转储里有全部的网络、节点和设置，以及管理令牌。两个文件都是秘密：转储里有代理的密码，密钥就是 controller 的身份。上面的命令把它们重新写出来，只有你自己可读，保存时也别放宽。两个文件都完整读出之后，才替换目录里上一次的备份；中途有一步失败，上一次的备份保持原样。用安装脚本装的，数据目录归服务的用户 `i3t-controller`，备份和恢复都以它的身份读写里面的文件，不用 root：那里的文件可能被换成了链接，root 会跟着它读写别处。
 
 :::caution
 两个文件缺一不可：节点认的是这把密钥，数据库里记着在它名下加入的节点。
