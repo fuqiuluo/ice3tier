@@ -22,6 +22,7 @@ use i3t_model::control::{BackboneRow, ExitTestResult, PathDetail, Route, RouteAn
 use i3t_proto::NodeId;
 use tokio::sync::oneshot;
 
+use super::switchboard::Answer;
 use super::{Controller, Inner, Live};
 use crate::error::Error;
 use crate::relay_reach::ReachIndex;
@@ -70,12 +71,57 @@ impl ReportedKind {
     }
 }
 
-/// 一条发出去、还在等回答的查询。
+/// 一条发出去、还在等回答的查询（记在 [`Switchboard`](super::switchboard::Switchboard) 里）。
 #[derive(Debug)]
 pub(crate) struct PendingQuery {
     /// 被查询的目标节点，仅接受该节点返回的应答。
     node: NodeId,
     reply: Reply,
+}
+
+impl PendingQuery {
+    pub(super) const fn new(node: NodeId, reply: Reply) -> Self {
+        Self { node, reply }
+    }
+
+    pub(super) const fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// 问的人已经不等了。
+    pub(super) fn is_abandoned(&self) -> bool {
+        match &self.reply {
+            Reply::Route(reply) => reply.is_closed(),
+            Reply::Backbone(reply) => reply.is_closed(),
+            Reply::ExitTest(reply) => reply.is_closed(),
+        }
+    }
+
+    /// 把 `from` 的回答交给问的人。回答的节点或种类和查询对不上时原样交还查询，它接着等。
+    pub(super) fn answer(self, from: NodeId, answer: Answer) -> Result<(), Self> {
+        if from != self.node {
+            return Err(self);
+        }
+        // 问的人等不及已经走了也没有关系：发送失败的结果不用看。
+        match (self.reply, answer) {
+            (Reply::Route(reply), Answer::Route(answer)) => {
+                let _unread = reply.send(answer);
+            }
+            (Reply::Backbone(reply), Answer::Backbone(rows)) => {
+                let _unread = reply.send(rows);
+            }
+            (Reply::ExitTest(reply), Answer::ExitTest(result)) => {
+                let _unread = reply.send(result);
+            }
+            (
+                reply @ (Reply::Route(_) | Reply::Backbone(_) | Reply::ExitTest(_)),
+                Answer::Route(_) | Answer::Backbone(_) | Answer::ExitTest(_),
+            ) => {
+                return Err(Self { node: self.node, reply });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 回答交给谁。问的是什么，答的就得是什么。
@@ -85,16 +131,6 @@ pub(super) enum Reply {
     Backbone(oneshot::Sender<Vec<BackboneRow>>),
     /// 出口测试（`exit_test` 模块）。
     ExitTest(oneshot::Sender<ExitTestResult>),
-}
-
-impl Reply {
-    fn is_closed(&self) -> bool {
-        match self {
-            Self::Route(reply) => reply.is_closed(),
-            Self::Backbone(reply) => reply.is_closed(),
-            Self::ExitTest(reply) => reply.is_closed(),
-        }
-    }
 }
 
 /// 一个节点对骨干矩阵查询的回答，还在路上。
@@ -378,60 +414,18 @@ impl Inner {
         Some(answer)
     }
 
-    /// 给节点发一条查询，记下谁在等回答。发送失败时返回 `None`。
+    /// 给节点发一条查询，记下谁在等回答。回答不经 controller 的锁交给问的人（见 [`Switchboard::answered`]）。
+    /// 发送失败时返回 `None`。
+    ///
+    /// [`Switchboard::answered`]: super::switchboard::Switchboard::answered
     pub(super) fn query(&mut self, node: NodeId, message: impl FnOnce(u64) -> ToNode, reply: Reply) -> Option<()> {
-        // 顺带清理调用方已放弃等待的查询：若节点长期不应答，这些条目不会自行移除。
-        self.route_queries.retain(|_, pending| !pending.reply.is_closed());
         let request = self.next_request();
-        if !self.send(node, message(request)) {
+        let sent = self.switchboard().query(node, request, message(request), reply);
+        if !self.delivered(node, sent) {
             return None;
         }
         self.counters.route_queries += 1;
-        self.route_queries.insert(request, PendingQuery { node, reply });
         Some(())
-    }
-
-    /// 节点回答了一条路由查询。
-    pub(super) fn route_answered(&mut self, node: NodeId, request: u64, answer: RouteAnswer) {
-        if let Some(Reply::Route(reply)) = self.take_query(node, request, |reply| matches!(reply, Reply::Route(_))) {
-            // 问的人等不及已经走了也没有关系。
-            let _dropped = reply.send(answer);
-        }
-    }
-
-    /// 节点回答了一条骨干矩阵的查询。
-    pub(super) fn backbone_answered(&mut self, node: NodeId, request: u64, rows: Vec<BackboneRow>) {
-        if let Some(Reply::Backbone(reply)) = self.take_query(node, request, |reply| matches!(reply, Reply::Backbone(_))) {
-            // 问的人等不及已经走了也没有关系。
-            let _dropped = reply.send(rows);
-        }
-    }
-
-    /// 出口节点回答了一个出口测试。
-    pub(super) fn exit_test_answered(&mut self, node: NodeId, request: u64, result: ExitTestResult) {
-        if let Some(Reply::ExitTest(reply)) = self.take_query(node, request, |reply| matches!(reply, Reply::ExitTest(_))) {
-            // 问的人等不及已经走了也没有关系。
-            let _dropped = reply.send(result);
-        }
-    }
-
-    /// 取出 `node` 对第 `request` 号查询对应的应答通道。若来源节点不符或应答类型不匹配则忽略并继续等待原请求。
-    fn take_query(&mut self, node: NodeId, request: u64, expected: impl Fn(&Reply) -> bool) -> Option<Reply> {
-        let Some(pending) = self.route_queries.remove(&request) else {
-            tracing::debug!(%node, request, "忽略查询应答：未找到对应的待处理请求（可能已超时放弃）");
-            return None;
-        };
-        if pending.node != node || !expected(&pending.reply) {
-            tracing::debug!(%node, asked = %pending.node, request, "忽略查询应答：应答节点或应答类型与请求不匹配");
-            self.route_queries.insert(request, pending);
-            return None;
-        }
-        Some(pending.reply)
-    }
-
-    /// 节点不在线了：发给它的查询不会有回答了。
-    pub(super) fn drop_route_queries(&mut self, node: NodeId) {
-        self.route_queries.retain(|_, pending| pending.node != node);
     }
 
     fn path_leg(&self, from: &NodeRecord, to: &NodeRecord, answer: Option<RouteAnswer>) -> PathLeg {

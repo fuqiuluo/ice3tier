@@ -2,6 +2,7 @@
 //!
 //! 这里的"节点"不走 TLS，直接调用节点协议在 controller 一侧的入口，所以测的是规则和下发，不是连接本身。
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
@@ -157,11 +158,25 @@ impl Lab {
             match next_due {
                 // 还有排着的下发没到时间：等到那时再看。
                 Some(due) => std::thread::sleep(due.saturating_duration_since(Instant::now())),
-                None if received == 0 && pending == 0 => return,
+                None if received == 0 && pending == 0 => {
+                    self.assert_peers_shared(members);
+                    return;
+                }
                 None => {}
             }
         }
         panic!("50 轮之后还在变化：下发没有收敛");
+    }
+
+    /// 转发信令时用的对端（`Switchboard`）和每个在线成员最近收到的 netmap 里写着的一致。
+    fn assert_peers_shared(&self, members: &[&mut Member]) {
+        let inner = self.controller.lock();
+        let switchboard = inner.switchboard();
+        for member in members.iter().filter(|member| switchboard.is_current(member.session)) {
+            let received: BTreeSet<NodeId> =
+                member.snapshots.last().map(|netmap| netmap.peers.iter().map(|peer| peer.id).collect()).unwrap_or_default();
+            assert_eq!(switchboard.peers_of(member.id), Some(&received), "{} 的连接上记着的对端和它收到的 netmap 不一致", member.id);
+        }
     }
 
     pub(crate) fn netmap(&self, node: NodeId) -> Netmap {

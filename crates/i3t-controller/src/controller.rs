@@ -1,7 +1,8 @@
 //! controller 的核心：存储之上的全部规则，和每个节点的 netmap 的下发。
 //!
-//! [`Controller`] 的方法都是同步的，内部只有一把锁：一次操作要么完整地做完（写存储、重算受影响的 netmap、
-//! 放进各个节点的发送队列），要么不做。节点协议和管理 API 只是它的两个入口。
+//! [`Controller`] 的方法都是同步的，状态都在一把锁里：一次操作要么完整地做完（写存储、重算受影响的 netmap、
+//! 放进各个节点的发送队列），要么不做。节点协议和管理 API 只是它的两个入口。不读写存储的节点消息（转发信令、交回查询的回答、
+//! 取更新包）用到的那一小部分另外加锁，数据库卡住时不跟着等（见 [`switchboard`]）。
 //!
 //! 方法里有数据库读写，重算一个大网络也要花时间，所以异步代码要经 `spawn_blocking` 调用它们。
 
@@ -24,6 +25,7 @@ mod rollout;
 mod routes;
 mod rules;
 mod stats;
+mod switchboard;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
@@ -43,12 +45,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use i3t_crypto::{NodeKey, tls};
 use i3t_model::Netmap;
 use i3t_model::admin::{LogEntry, NetworkId, Node, RelayView, Status, Timestamp, action};
-use i3t_model::control::{
-    ForwardReport, LaneReport, ListenerReport, PeerUse, PerformanceReport, ProxyReport, RelayUse, ToNode, VnetReport,
-};
+use i3t_model::control::{ForwardReport, LaneReport, ListenerReport, PeerUse, PerformanceReport, ProxyReport, RelayUse, VnetReport};
 use i3t_model::update::{UpdateStatus, Version};
 use i3t_proto::{NodeId, PublicKey};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 
 use crate::error::{Entity, Error, error_chain};
 use crate::gate::Throttle;
@@ -58,8 +58,9 @@ use crate::relay_reach::{self, ReachIndex};
 use crate::store::{DIGEST_LEN, Database, GroupRecord, LogFilter, NetworkRecord, NodeRecord, Store, StoreError};
 use crate::sync::NodeSync;
 use crate::{node_addresses, secret};
+use switchboard::Switchboard;
 
-pub use protocol::Admitted;
+pub use protocol::{Admitted, Waits};
 pub(crate) use publish::Seeds;
 pub use routes::RouteAnswers;
 
@@ -129,6 +130,8 @@ pub struct Controller {
     /// 管理令牌的哈希。每个管理请求都要查它，所以不放在大锁里。`Inner` 手上也有一份。
     admin_token: Arc<Mutex<Option<[u8; DIGEST_LEN]>>>,
     inner: Mutex<Inner>,
+    /// 不读写存储的节点消息用到的状态，不放在大锁里（见 [`switchboard`]）。`Inner` 手上也有一份。
+    switchboard: Arc<Mutex<Switchboard>>,
     /// 有延后的下发时叫醒后台任务。`Inner` 手上也有一份。
     wake: Arc<Notify>,
     /// 有包要取时叫醒取包的后台任务。
@@ -177,12 +180,12 @@ pub(crate) struct Inner {
     pub(crate) out_of_step: bool,
     /// 管理令牌的哈希，和 [`Controller::is_admin_token`] 查的是同一个。照数据库补齐时按库里记的改它。
     pub(crate) admin_token: Arc<Mutex<Option<[u8; DIGEST_LEN]>>>,
+    /// 和 [`Controller`] 手上的是同一个。先拿着这把大锁、再拿它的锁（见 [`switchboard`]）。
+    switchboard: Arc<Mutex<Switchboard>>,
     /// 各个节点最近上报的路由表。节点离线之后留着，界面上显示成过期的；controller 重启就没有了。
     pub(crate) routes: BTreeMap<NodeId, routes::Reported>,
     /// 出口和用出口的节点报的计数，算健康和交叉核对用。节点离线之后留着；controller 重启就没有了。
     pub(crate) usage: usage::Usage,
-    /// 已经发给节点、还在等回答的路由查询。
-    pub(crate) route_queries: BTreeMap<u64, routes::PendingQuery>,
     /// 进行中的主动测试和全网矩阵。
     pub(crate) diag: diag::Diag,
     /// 节点更新：已知的发布、包、设置、轮次。
@@ -203,7 +206,6 @@ pub(crate) struct Live {
     /// 连接的序号。旧连接收尾时靠它知道自己已经被新连接顶替了。
     pub(crate) conn: u64,
     pub(crate) network: NetworkId,
-    pub(crate) outbox: mpsc::Sender<ToNode>,
     pub(crate) mapping_varies: Option<bool>,
     pub(crate) flows: u32,
     pub(crate) tx_bytes: u64,
@@ -284,6 +286,7 @@ impl Controller {
         let updates = update::Updates::load(&store, version)?;
         let wake = Arc::new(Notify::new());
         store.wake_on_unsettled_commit(Arc::clone(&wake));
+        let switchboard = Arc::new(Mutex::new(Switchboard::default()));
         let mut inner = Inner {
             store,
             timing,
@@ -298,9 +301,9 @@ impl Controller {
             flush_after: None,
             out_of_step: false,
             admin_token: Arc::clone(&admin_token),
+            switchboard: Arc::clone(&switchboard),
             routes: BTreeMap::new(),
             usage: usage::Usage::default(),
-            route_queries: BTreeMap::new(),
             diag: diag::Diag::default(),
             updates,
             counters: metrics::Counters::default(),
@@ -318,6 +321,7 @@ impl Controller {
             timing,
             admin_token,
             inner: Mutex::new(inner),
+            switchboard,
             wake,
             release_wake: Notify::new(),
             check_wake: Notify::new(),
@@ -494,6 +498,11 @@ impl Controller {
         self.inner.lock().expect("controller state mutex poisoned")
     }
 
+    /// 不读写存储的节点消息用到的状态（见 [`switchboard`]）。不拿大锁。
+    fn switchboard(&self) -> MutexGuard<'_, Switchboard> {
+        self.switchboard.lock().expect("switchboard mutex poisoned")
+    }
+
     /// 还没有别人拿着这个 controller 的时候直接改它里面的东西，给 `with_…` 这几个装配用的方法用。
     fn inner_mut(&mut self) -> &mut Inner {
         self.inner.get_mut().expect("controller state mutex poisoned")
@@ -535,6 +544,11 @@ impl Controller {
 }
 
 impl Inner {
+    /// 不读写存储的节点消息用到的状态（见 [`switchboard`]）。拿着它时不读写存储，也不再去拿别的锁。
+    pub(crate) fn switchboard(&self) -> MutexGuard<'_, Switchboard> {
+        self.switchboard.lock().expect("switchboard mutex poisoned")
+    }
+
     pub(crate) fn require_network(&self, id: NetworkId) -> Result<NetworkRecord, Error> {
         self.store.network(id)?.ok_or(Error::NotFound(Entity::Network))
     }
