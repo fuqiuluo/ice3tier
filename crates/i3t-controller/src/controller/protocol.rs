@@ -494,9 +494,17 @@ impl Inner {
         }
         self.routes_reported(id, std::mem::take(&mut report.routes), std::mem::take(&mut report.route_kinds), report.routes_full);
 
-        let Some(mut node) = self.store.node(id)? else { return Ok(()) };
+        let Some(node) = self.store.node(id)? else { return Ok(()) };
         self.stats_reported(&node, &report);
-        self.switches_reported(&node, &report.switches)?;
+        // 换路只记进界面上的历史：记不下时照样处理这份上报的其余部分（更新进度、relay 探测、端点与挂靠），错误最后交回。
+        let switched = self.switches_reported(&node, &report.switches);
+        let applied = self.state_reported(node, report);
+        first_failure(applied, switched)
+    }
+
+    /// 记下上报里的状态：代理与转发、更新进度、挂靠与 relay 探测、虚拟网卡、本地地址、端点。`node` 是这个节点在存储里的记录。
+    fn state_reported(&mut self, mut node: NodeRecord, report: Report) -> Result<(), Error> {
+        let id = node.id;
         let Report { run, exit, exits, proxies, listeners, forwards, .. } = report;
         self.usage_reported(&node, UsageReport { run, exit, exits, proxies, listeners, forwards });
         let report = Report { exits: Vec::new(), proxies: Vec::new(), listeners: Vec::new(), forwards: Vec::new(), exit: None, ..report };
