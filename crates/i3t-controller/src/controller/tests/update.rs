@@ -1164,3 +1164,90 @@ fn update_metrics_follow_the_rollout() {
     }
     assert!(metrics.contains("i3t_controller_snapshots_sent_total "));
 }
+
+const WINDOWS: &str = "windows-x86_64";
+
+/// 发布 `NEW`（Linux 的包内容为 `linux_program`，另有一个 Windows 的包），两个平台各有一个节点等待更新：
+/// 两个包都排队待取，尚未取回。返回的节点须保持在线。不经 `Fleet::node`：它在上报后会取回全部的包。
+fn two_packages_wanted(fleet: &mut Fleet, linux_program: &[u8]) -> Vec<Member> {
+    fleet.publisher.publish(NEW, &[(LINUX, linux_program), (WINDOWS, b"the windows program")]);
+    fleet.controller().check_release().unwrap();
+    let members = [LINUX, WINDOWS]
+        .into_iter()
+        .map(|platform| {
+            let member = fleet.lab.join_as(fleet.network, &Hello { platform: platform.to_owned(), ..modern_hello(OLD) });
+            member.report_update(fleet.controller(), UpdateStatus::Idle);
+            member
+        })
+        .collect();
+    assert_eq!(cached_platforms(fleet.controller()), Vec::<String>::new(), "两个平台的包均应处于待下载状态");
+    members
+}
+
+/// 已取回的包所属的平台。
+fn cached_platforms(controller: &Controller) -> Vec<String> {
+    let release = controller.update_overview().unwrap().release.unwrap();
+    release.packages.into_iter().filter(|package| package.state == PackageState::Cached).map(|package| package.platform).collect()
+}
+
+#[test]
+fn fetch_next_package_takes_one_package_per_call() {
+    let mut fleet = Fleet::new();
+    let _members = two_packages_wanted(&mut fleet, b"the new program");
+    // 平台按名称排序，Linux 的包先取。
+    assert!(fleet.controller().fetch_next_package().unwrap());
+    assert_eq!(cached_platforms(fleet.controller()), [LINUX]);
+    assert!(fleet.controller().fetch_next_package().unwrap());
+    assert_eq!(cached_platforms(fleet.controller()), [LINUX, WINDOWS]);
+    assert!(!fleet.controller().fetch_next_package().unwrap(), "已没有待取的包");
+}
+
+/// 停服时进行中的下载照常完成，后台任务不再开始下一个平台的下载。
+///
+/// Linux 的包（先取）换成命名管道：测试写入之前下载一直阻塞，以此在下载进行中发出停服信号。
+#[cfg(unix)]
+#[tokio::test]
+async fn the_background_task_starts_no_new_download_after_shutdown() {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use tokio::sync::{oneshot, watch};
+
+    let program: &[u8] = b"the new program";
+    let mut fleet = Fleet::new();
+    let _members = two_packages_wanted(&mut fleet, program);
+    let pipe = fleet.publisher.program_path(NEW, LINUX);
+    fs::remove_file(&pipe).unwrap();
+    let made = std::process::Command::new("mkfifo").arg(&pipe).status().unwrap();
+    assert!(made.success(), "mkfifo 失败：{made}");
+
+    // 发布源与缓存目录须保留到测试结束。
+    let Fleet { lab, publisher: _publisher, cache: _cache, .. } = fleet;
+    let controller = Arc::new(lab.controller);
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(crate::server::follow_releases(Arc::clone(&controller), stopped));
+
+    // 写端的 open 在下载打开读端之后才返回。放在单独的线程上：下载始终未开始时测试因超时失败，而不是一直挂起。
+    let (opened, wait_opened) = oneshot::channel();
+    std::thread::spawn(move || {
+        // 发送失败说明测试已结束，无需处理。
+        let _ = opened.send(fs::OpenOptions::new().write(true).open(&pipe));
+    });
+    let opened = tokio::time::timeout(Duration::from_secs(10), wait_opened).await.expect("Linux 的包未在 10 秒内开始下载");
+    let mut writer = opened.unwrap().unwrap();
+
+    stop.send(true).unwrap();
+    task.await.unwrap();
+
+    // 停服之后放行进行中的下载。
+    writer.write_all(program).unwrap();
+    drop(writer);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cached_platforms(&controller).is_empty() {
+        assert!(Instant::now() < deadline, "放行后 Linux 的包未在 10 秒内下载完成");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // 后台任务若仍在取包，Windows 的包（普通文件）会紧接着下载完成。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cached_platforms(&controller), [LINUX], "停服之后不应再开始下一个平台的下载");
+}
