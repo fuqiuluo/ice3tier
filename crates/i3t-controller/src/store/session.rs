@@ -69,8 +69,11 @@ const GOODBYE: Duration = Duration::from_secs(1);
 ///
 /// `tokio-postgres` 依次尝试每个主机，以及主机名解析出的每个地址；端口连接失败或超时（`connect_timeout`）后换下一个地址，
 /// 端口连上之后的启动握手与认证却没有期限，所以整个建连另由这里的期限兜底。按地址分配：只按主机分配的话，排在前面、
-/// 丢弃连接请求的地址（例如主机名同时有 IPv6 和 IPv4 地址，而 IPv6 不通）就会用完全部期限，后面可用的地址轮不到。
+/// 丢弃连接请求的地址（例如主机名同时有 IPv6 和 IPv4 地址，而 IPv6 不通）就会用完全部期限，后面可用的地址无法得到尝试。
 /// 端口连上之后不再响应的地址仍会一直占用期限，`tokio-postgres` 不会换下一个地址。
+///
+/// 地址个数由驱动线程先解析一次得出（[`addresses`]），期限从开始解析时算起：解析无响应时总耗时不会因此加倍。
+/// `tokio-postgres` 建连时还会再解析一次，主机名的解析因此多一次往返。
 pub(super) fn connect_limit(config: &Config, addresses: u32) -> Duration {
     per_address(config).saturating_mul(addresses.max(1))
 }
@@ -202,9 +205,10 @@ impl Session {
                 }
             };
             runtime.block_on(async move {
+                let began = tokio::time::Instant::now();
                 let limit = connect_limit(&config, addresses(&config).await);
                 // 到了期限就丢掉这次建连：套接字随之关掉，这条线程退出。
-                let failed = match tokio::time::timeout(limit, config.connect(NoTls)).await {
+                let failed = match tokio::time::timeout_at(began + limit, config.connect(NoTls)).await {
                     Ok(Ok((client, connection))) => {
                         let mut connection = pin!(connection);
                         match set_up(&client, connection.as_mut(), setup.as_deref()).await {

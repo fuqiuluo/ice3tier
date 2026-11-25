@@ -3,7 +3,7 @@
 //! 按进程的线程数判断，所以单独一个测试程序：同一个程序里别的测试同时运行时会干扰计数。线程数从 `/proc` 读取，只在 Linux 上运行。
 
 #![cfg(target_os = "linux")]
-// clippy.toml 里的 allow-unwrap-in-tests 只认 `#[test]` 函数本身，认不出这里的辅助函数。
+// clippy.toml 里的 allow-unwrap-in-tests 只认 `#[test]` 函数本身，无法识别这里的辅助函数。
 #![allow(clippy::unwrap_used, reason = "整个文件都是测试代码，出错就该直接失败")]
 
 mod common;

@@ -1743,8 +1743,9 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     /// 在 `address` 上放一个从不接受连接、连接队列已满的监听：之后的连接请求被丢弃，与地址不通相同。
-    /// 这台机器上做不到（没有这个地址，或者队列满时直接拒绝）时返回 `None`。
+    /// 这台机器上无法构造这种情况（没有这个地址，或者队列满时直接拒绝）时返回 `None`。
     fn dropping_connections_on(runtime: &tokio::runtime::Runtime, address: std::net::SocketAddr) -> Option<impl Sized> {
         let _entered = runtime.enter();
         let socket = if address.is_ipv6() { tokio::net::TcpSocket::new_v6() } else { tokio::net::TcpSocket::new_v4() }.ok()?;
@@ -1761,13 +1762,15 @@ mod tests {
         None
     }
 
+    // Windows 在连接队列满时回应拒绝，客户端还会重发几次连接请求才报错，上面的探测会把它误当成丢弃；不在 Windows 上运行。
+    #[cfg(not(windows))]
     #[test]
     fn an_address_that_drops_connection_requests_leaves_time_for_the_next_address_of_the_same_host() {
         use std::net::ToSocketAddrs as _;
         use std::sync::atomic::AtomicBool;
 
         let scratch = Scratch::new();
-        // 代理只听 127.0.0.1；同一端口的 IPv6 回环不通。`localhost` 先解析出 ::1、再解析出 127.0.0.1 的机器上，
+        // 代理仅监听 127.0.0.1；同一端口的 IPv6 回环不通。`localhost` 先解析出 ::1、再解析出 127.0.0.1 的机器上，
         // 这和主机名同时有 IPv6、IPv4 地址而 IPv6 被防火墙丢弃时一样。
         let proxied = proxy_cancelling_rollback(&scratch.database(), Arc::new(AtomicBool::new(false)));
         let port = proxied.0.get_ports()[0];
@@ -1781,7 +1784,8 @@ mod tests {
         }
 
         let mut config = Config::new();
-        config.host("localhost").port(port).connect_timeout(Duration::from_secs(3));
+        // 每个地址 5 秒：::1 用完它的一份之后，127.0.0.1 还有一份，足以经代理连上测试库。
+        config.host("localhost").port(port).connect_timeout(Duration::from_secs(5));
         if let Some(user) = proxied.0.get_user() {
             config.user(user);
         }
@@ -1907,6 +1911,8 @@ mod tests {
 
     #[test]
     fn a_host_written_only_as_an_address_is_a_host() {
+        use std::net::ToSocketAddrs as _;
+
         // 只写 `hostaddr`、不写 `host`：不是"没有主机"，照样去连。
         let database: Database = "hostaddr=127.0.0.1 port=1 user=i3t password=s3cret dbname=controller".parse().expect("只写了地址");
         let printed = format!("{database:?}");
@@ -1923,7 +1929,10 @@ mod tests {
         assert_eq!(addresses("hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), 2);
         assert_eq!(addresses("host=a.example,b.example hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), 2);
         assert_eq!(addresses("host=127.0.0.1,192.0.2.1 user=i3t"), 2);
-        assert!(addresses("host=localhost user=i3t") >= 1);
+        let localhost = ("localhost", 5432).to_socket_addrs().map_or(1, Iterator::count).clamp(1, 8);
+        assert_eq!(addresses("host=localhost user=i3t"), u32::try_from(localhost).unwrap(), "主机名按解析出的地址数计");
+        #[cfg(unix)]
+        assert_eq!(addresses("host=/tmp user=i3t"), 1, "Unix 套接字算一个");
         let config = "hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3".parse::<Database>().unwrap().0;
         assert_eq!(session::connect_limit(&config, 2), Duration::from_secs(6));
         assert_eq!(session::connect_limit(&config, 0), Duration::from_secs(3), "至少一份");
