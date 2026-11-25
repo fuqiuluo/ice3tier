@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser};
@@ -32,11 +32,11 @@ const LOG_ENV: &str = "I3T_LOG";
 /// 安装脚本把连接串写在这里（只有 controller 的用户读得了），所以只凭数据目录就能启动、就能重新生成管理令牌。
 const DATABASE_URL_FILE: &str = "database.url";
 
-/// 服务停止后，关闭运行时时等待阻塞线程上未完成调用的最长时间。
+/// 服务停止后关闭运行时，等待阻塞线程上未完成调用的最长时间。
 ///
-/// 数据库读写等短调用在此期限内正常完成。从发布源检查版本、下载更新包的调用可能持续数分钟，若一直等待，停服会超出
-/// Docker Compose（默认 10 秒）或 systemd 的期限而被强制终止。超过期限后进程直接退出：下载未完成的文件使用临时名称，
-/// 下次重新下载。
+/// 从发布源检查版本、下载更新包的调用可能持续数分钟，若一直等待，停服会超出 Docker Compose（默认 10 秒）或 systemd 的
+/// 期限而被强制终止。数据库读写通常在此期限内完成。超过期限后进程直接退出：未提交的事务由数据库撤销，下载未完成的文件
+/// 使用临时名称，下次重新下载。管理 API 与节点连接的收尾在此之前另有期限（目前各 3 秒，同时开始），停服合计约 6 秒。
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 // 帮助的文字在文字目录里（`texts`），由 `command` 按语言装上去，所以这里不写文档注释：clap 会把它们当成说明。
@@ -124,8 +124,12 @@ fn main() -> ExitCode {
 fn block_on<F: Future>(future: F) -> io::Result<F::Output> {
     let runtime = tokio::runtime::Runtime::new()?;
     let output = runtime.block_on(future);
+    let closing = Instant::now();
     // 直接 drop 运行时会无限期等待全部阻塞调用结束。
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    if closing.elapsed() >= RUNTIME_SHUTDOWN_GRACE {
+        tracing::warn!("停服时仍有阻塞调用（如发布源检查、更新包下载）在 {RUNTIME_SHUTDOWN_GRACE:?} 内未完成，已放弃等待");
+    }
     Ok(output)
 }
 
@@ -279,7 +283,6 @@ fn abort_on_panic() {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
 
     use tokio::sync::oneshot;
 
