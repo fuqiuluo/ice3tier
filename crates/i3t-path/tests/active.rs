@@ -92,7 +92,8 @@ async fn a_direct_test_finds_the_path_measures_every_probe_and_needs_the_peer_to
         let summary = report.summary();
         assert_eq!((summary.sent, summary.answered, summary.loss_permille), (20, 20, 0), "{report:?}");
         assert_eq!((report.peer_received, report.same_path), (Some(20), 20));
-        assert!(summary.min_us <= summary.avg_us && summary.avg_us <= summary.p95_us, "{summary:?}");
+        // 平均值可以高于 p95：20 个样本里只要有一个很慢的，就能把平均值抬到第 19 个之上。
+        assert!(summary.min_us <= summary.avg_us && summary.min_us <= summary.p95_us, "{summary:?}");
         assert!(summary.avg_us.is_some_and(|avg| avg < 50_000), "回环上的往返不到 50ms：{summary:?}");
         assert!(report.peer_addr.is_some());
 
