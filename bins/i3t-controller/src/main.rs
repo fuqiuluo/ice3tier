@@ -7,11 +7,12 @@
 
 mod texts;
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser};
@@ -30,6 +31,14 @@ const LOG_ENV: &str = "I3T_LOG";
 /// 数据库的连接串也可以放在数据目录里的这个文件里，`--database-url` 和环境变量都没有给时读它。
 /// 安装脚本把连接串写在这里（只有 controller 的用户读得了），所以只凭数据目录就能启动、就能重新生成管理令牌。
 const DATABASE_URL_FILE: &str = "database.url";
+
+/// 服务停止后关闭运行时，等待阻塞线程上未完成调用的最长时间。
+///
+/// 从发布源检查版本（最长约 1 分钟）、下载更新包（可能持续数分钟）的调用若一直等待，停服会超出 Docker Compose
+/// （默认 10 秒）或 systemd 的期限而被强制终止。数据库读写通常在此期限内完成。超过期限后进程直接退出：
+/// 未提交的事务由数据库撤销，下载未完成的文件使用临时名称，下次重新下载。管理 API 与节点连接的收尾在此之前
+/// 另有期限（目前各 3 秒，同时开始），停服最长约 6 秒。
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 // 帮助的文字在文字目录里（`texts`），由 `command` 按语言装上去，所以这里不写文档注释：clap 会把它们当成说明。
 #[derive(Parser)]
@@ -91,8 +100,17 @@ fn main() -> ExitCode {
     let outcome = if args.reset_admin_token {
         reset_admin_token(&args)
     } else {
-        match tokio::runtime::Runtime::new() {
-            Ok(runtime) => runtime.block_on(serve(args)),
+        match block_on(serve(args), RUNTIME_SHUTDOWN_GRACE) {
+            Ok(stopped) => {
+                if stopped.abandoned_blocking {
+                    tracing::warn!("停服时仍有阻塞调用（如发布源检查、更新包下载）在 {RUNTIME_SHUTDOWN_GRACE:?} 内未完成，已放弃等待");
+                }
+                // 在运行时关闭之后输出：关闭期间残留的阻塞调用仍可能输出日志。
+                if stopped.output.is_ok() {
+                    tracing::info!("controller 已停止");
+                }
+                stopped.output
+            }
             Err(error) => {
                 eprintln!("i3t-controller: {}", lang.labelled(texts::texts().start_runtime, &error.to_string()));
                 return ExitCode::FAILURE;
@@ -108,6 +126,28 @@ fn main() -> ExitCode {
     }
 }
 
+/// [`block_on`] 的结果。
+struct Stopped<T> {
+    output: T,
+    /// 关闭运行时达到期限时仍有阻塞调用未完成，已放弃等待。
+    abandoned_blocking: bool,
+}
+
+/// 在新建的多线程运行时上运行 `future` 直至完成，再关闭运行时，最多等待 `grace`。
+///
+/// # Errors
+///
+/// 无法创建运行时。
+fn block_on<F: Future>(future: F, grace: Duration) -> io::Result<Stopped<F::Output>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let output = runtime.block_on(future);
+    let closing = Instant::now();
+    // 直接 drop 运行时会无限期等待全部阻塞调用结束。
+    runtime.shutdown_timeout(grace);
+    // tokio 不返回是否超时，因此按耗时判断。阻塞调用恰好在期限到达时结束的情况也记为放弃，概率极小。
+    Ok(Stopped { output, abandoned_blocking: closing.elapsed() >= grace })
+}
+
 /// 日志写到标准错误。`default` 是没有设 [`LOG_ENV`] 时的级别。
 fn init_logging(default: &str) {
     let filter = EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new(default));
@@ -117,6 +157,7 @@ fn init_logging(default: &str) {
 
 /// 解析数据库连接配置：优先使用 `--database-url`（或对应环境变量），未提供时读取数据目录中的 [`DATABASE_URL_FILE`]。
 /// 解析失败时仅报告错误原因而不输出连接串，避免泄露密码。
+/// 连接串指向公网地址时告警：到数据库的连接不加密（见 [`Database`]）。
 fn database(data_dir: &Path, given: Option<&str>) -> anyhow::Result<Database> {
     let t = texts::texts();
     // 空的环境变量当作没有给。
@@ -133,7 +174,16 @@ fn database(data_dir: &Path, given: Option<&str>) -> anyhow::Result<Database> {
             }
         }
     };
-    text.parse().map_err(|error| anyhow::Error::new(error).context(t.read_database_url))
+    let database: Database = text.parse().map_err(|error| anyhow::Error::new(error).context(t.read_database_url))?;
+    let public = database.public_addrs();
+    if !public.is_empty() {
+        tracing::warn!(
+            database = ?public,
+            "数据库位于公网地址：到数据库的连接既不加密也不验证对端，链路上的第三方可读取、篡改 controller 的数据，\
+             并可冒充数据库获取其密码。应将数据库部署在本机或可信内网中"
+        );
+    }
+    Ok(database)
 }
 
 /// 重新生成管理令牌，打在标准输出上。不需要对外地址，也不会在写错的目录或者空的库里建出一个新的 controller。
@@ -199,9 +249,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     if !args.admin_listen.ip().is_loopback() {
         tracing::warn!(admin = %args.admin_listen, "管理 API 没有绑在回环地址上：它是明文 HTTP，管理令牌会在网络上明文传输");
     }
-    server.run(shutdown_signal()).await.context(t.run_failed)?;
-    tracing::info!("controller 已停止");
-    Ok(())
+    server.run(shutdown_signal()).await.context(t.run_failed)
 }
 
 /// 等 Ctrl-C；在 Unix 上也等 SIGTERM（systemd 和容器停服务时发的是它）。
@@ -253,4 +301,62 @@ fn abort_on_panic() {
         default_hook(info);
         std::process::abort();
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    /// 测试用的期限：足以让短调用完成，又不使测试久等。
+    const GRACE: Duration = Duration::from_millis(500);
+
+    /// 在运行时上启动一个阻塞调用，等它开始执行后即返回，不等待其结束（与停服时被取消的后台任务一致）。
+    /// 未开始执行的阻塞调用在运行时关闭时会被直接丢弃，所以必须等它开始。
+    async fn start_blocking(call: impl FnOnce() + Send + 'static) {
+        let (started, wait_started) = oneshot::channel();
+        drop(tokio::task::spawn_blocking(move || {
+            // 发送失败说明等待方已不在，无需处理。
+            let _ = started.send(());
+            call();
+        }));
+        wait_started.await.expect("阻塞调用在开始执行前被丢弃");
+    }
+
+    #[test]
+    fn stopping_waits_for_short_blocking_calls() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        let call = move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+        };
+        let stopped = block_on(start_blocking(call), GRACE).unwrap();
+        assert!(finished.load(Ordering::SeqCst), "关闭运行时未等待 100 毫秒的阻塞调用完成");
+        assert!(!stopped.abandoned_blocking, "阻塞调用已在期限 {GRACE:?} 内完成，却记为放弃等待");
+    }
+
+    #[test]
+    fn stopping_gives_up_on_long_blocking_calls() {
+        let (release, wait_release) = mpsc::channel::<()>();
+        let (done, wait_done) = mpsc::channel();
+        let call = move || {
+            // 关闭运行时之后由测试放行。最多阻塞 20 秒：关闭运行时若一直等待，测试以失败结束，不会一直挂起。
+            let _ = wait_release.recv_timeout(Duration::from_secs(20));
+            // 发送失败说明测试已结束，无需处理。
+            let _ = done.send(());
+        };
+        let started = Instant::now();
+        let stopped = block_on(start_blocking(call), GRACE).unwrap();
+        let elapsed = started.elapsed();
+        drop(release);
+        assert!(elapsed < GRACE + Duration::from_secs(5), "关闭运行时等待了 {elapsed:?}，超出期限 {GRACE:?}");
+        assert!(stopped.abandoned_blocking, "阻塞调用在期限 {GRACE:?} 内未完成，却未记为放弃等待");
+        // 放行后阻塞线程随即结束，不留到测试进程退出。
+        wait_done.recv_timeout(Duration::from_secs(5)).expect("放行后阻塞调用未在 5 秒内结束");
+    }
 }

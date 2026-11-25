@@ -7,7 +7,8 @@
 //! - 节点自身会重新校验签名并决定是否安装。即使 controller 被攻破，也只能阻止节点更新，无法篡改节点程序。
 //!
 //! 查发布源和取包都要走网络，不能拿着 controller 的锁做。所以这两件事是"拿锁取出要做什么 → 放开锁去做 → 再拿锁记下结果"三段，
-//! 入口是 [`Controller::check_release`] 和 [`Controller::fetch_packages`]，由后台任务和管理 API 在阻塞线程上调用。
+//! 入口均在阻塞线程上调用：[`Controller::check_release`] 由后台任务和管理 API 调用，[`Controller::fetch_next_package`]
+//! 由后台任务逐个调用（[`Controller::fetch_packages`] 一次取完全部待取的包）。
 //!
 //! 设置、已知的发布和被暂停的版本存在数据库里，重启之后还在。管理员强制的更新、relay 的轮次和下发过的版本只在内存里：
 //! controller 重启之后，还没有做完的强制更新要重新点。
@@ -354,15 +355,27 @@ impl Controller {
     ///
     /// 读写存储失败。取包本身的失败不在这里：原因记在那个平台的包上，下次查发布源时再试。
     pub fn fetch_packages(&self) -> Result<(), Error> {
-        loop {
-            let Some(job) = self.lock().next_fetch() else { return Ok(()) };
-            let outcome = job.run();
-            let mut inner = self.lock();
-            let finished = inner.fetch_finished(&job, outcome);
-            // 出错时也要叫醒：还有别的平台的包排着的话，取包的任务等的就是这一声。
-            self.wake_if_needed(&inner);
-            finished?;
-        }
+        while self.fetch_next_package()? {}
+        Ok(())
+    }
+
+    /// 取回一个有节点要用、尚未取回的包。阻塞到取完，期间不持有 controller 的锁。返回是否处理了一个包（下载失败也算），
+    /// 没有待取的包时返回 `false`。
+    ///
+    /// 后台任务逐个调用：停服时任务被取消，进行中的下载继续，不再开始下一个平台的下载。
+    ///
+    /// # Errors
+    ///
+    /// 读写存储失败。下载本身的失败不作为错误返回：原因记录在该平台的包上，下次检查发布源时重试。
+    pub(crate) fn fetch_next_package(&self) -> Result<bool, Error> {
+        let Some(job) = self.lock().next_fetch() else { return Ok(false) };
+        let outcome = job.run();
+        let mut inner = self.lock();
+        let finished = inner.fetch_finished(&job, outcome);
+        // 出错时也要叫醒：还有别的平台的包排着的话，取包的任务等的就是这一声。
+        self.wake_if_needed(&inner);
+        finished?;
+        Ok(true)
     }
 
     /// 等到有包要取。

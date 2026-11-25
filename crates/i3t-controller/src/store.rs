@@ -62,12 +62,13 @@ mod token;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-use tokio_postgres::config::SslMode;
+use tokio_postgres::config::{Host, SslMode};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Config, Row};
 
@@ -87,6 +88,7 @@ pub use test::KEEP_PER_PAIR;
 pub use token::{NewToken, RETENTION_SECS, TokenRecord, is_pending, token_at};
 
 use crate::error::error_chain;
+use crate::relay_reach::is_public;
 use codec::{Int, Read};
 pub use session::STATEMENT_TIMEOUT;
 use session::{CONNECT_TIMEOUT, Connecting, Params, Session, lock_timeout_sql, statement_timeout_sql};
@@ -127,11 +129,15 @@ const KEEPALIVE_RETRIES: u32 = 3;
 /// `tokio-postgres` 自己的保活间隔。连接串里没有改它的话，这里换成 [`DEAD_PEER_TIMEOUT`]。
 const LIBRARY_KEEPALIVE_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// 连接串里没有写端口时连接的端口，与 `tokio-postgres` 相同。
+const DEFAULT_PORT: u16 = 5432;
+
 /// 连到哪个 PostgreSQL 数据库。从连接串来，两种写法都认：
 /// `postgres://用户:密码@主机:端口/库名`，或者 `host=… user=… dbname=…`（主机可以是放 Unix 套接字的目录）。
 ///
 /// 不支持 TLS：数据库要和 controller 在同一台机器或者一个可信的内网里。连接串要求 TLS（`sslmode=require`）时
 /// 不收，而不是悄悄不加密地连。
+/// 连接串指向公网地址时，controller 启动时告警（见 [`Database::public_addrs`]）。
 #[derive(Clone)]
 pub struct Database(Config);
 
@@ -167,6 +173,27 @@ impl FromStr for Database {
             config.tcp_user_timeout(DEAD_PEER_TIMEOUT);
         }
         Ok(Self(config))
+    }
+}
+
+impl Database {
+    /// 连接串中经 TCP 连接、位于公网上的地址。到数据库的连接既不加密也不验证对端，这些地址与 controller 之间的网络
+    /// 通常不受部署者控制。与 `tokio-postgres` 建连时相同：写了地址（`hostaddr`）时只看地址，否则解析主机名。
+    /// 解析会阻塞；解析失败的主机略过，建连时自会报错。
+    pub fn public_addrs(&self) -> Vec<SocketAddr> {
+        let (hosts, hostaddrs, ports) = (self.0.get_hosts(), self.0.get_hostaddrs(), self.0.get_ports());
+        (0..hosts.len().max(hostaddrs.len()))
+            .flat_map(|index| {
+                let port = ports.get(index).or(ports.first()).copied().unwrap_or(DEFAULT_PORT);
+                match (hostaddrs.get(index), hosts.get(index)) {
+                    (Some(&ip), _) => vec![SocketAddr::new(ip, port)],
+                    (None, Some(Host::Tcp(name))) => (name.as_str(), port).to_socket_addrs().map(Vec::from_iter).unwrap_or_default(),
+                    // Unix 套接字只通往本机。下标小于两者中较长的长度，不会两样都没有。
+                    _ => Vec::new(),
+                }
+            })
+            .filter(|addr| is_public(addr.ip()))
+            .collect()
     }
 }
 
@@ -1877,5 +1904,29 @@ mod tests {
         for fine in ["postgres://i3t@db.example/controller?sslmode=disable", "postgres://i3t@db.example/controller?sslmode=prefer"] {
             assert!(fine.parse::<Database>().is_ok(), "{fine}");
         }
+    }
+
+    #[test]
+    fn only_tcp_addresses_on_the_public_internet_count_as_public() {
+        let public = |text: &str| text.parse::<Database>().unwrap().public_addrs();
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        for nearby in [
+            "postgres://i3t@127.0.0.1/i3t",
+            "postgres://i3t@localhost/i3t",
+            "postgres://i3t@[::1]:5433/i3t",
+            "postgres://i3t@10.0.0.5/i3t",
+            "postgres://i3t@192.168.1.2/i3t",
+            "postgres://i3t@100.101.102.103/i3t",
+            "postgres://i3t@[fd7a:115c:a1e0::1]/i3t",
+            // 写了地址时只看地址，不解析主机名。
+            "host=db.example hostaddr=10.0.0.5 user=i3t",
+        ] {
+            assert!(public(nearby).is_empty(), "{nearby}");
+        }
+        #[cfg(unix)]
+        assert!(public("host=/run/postgresql user=i3t").is_empty());
+        assert_eq!(public("postgres://i3t@203.0.113.5/i3t"), [addr("203.0.113.5:5432")]);
+        assert_eq!(public("host=localhost hostaddr=203.0.113.5 port=6543 user=i3t"), [addr("203.0.113.5:6543")]);
+        assert_eq!(public("host=10.0.0.5,2001:db8::5 port=5432,6543 user=i3t"), [addr("[2001:db8::5]:6543")]);
     }
 }
