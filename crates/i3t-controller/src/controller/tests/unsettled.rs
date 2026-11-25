@@ -56,6 +56,12 @@ fn be_impatient_for(lab: &Lab, timeout: Duration) {
     lab.controller.lock().store.set_response_timeout(timeout);
 }
 
+/// 提交未收到响应后，存储层暂停一段时间才重连（见 `Store::went_unanswered`）。等待暂停结束：此后的读写可以正常连接数据库，
+/// 而那次提交在数据库侧仍处于阻塞状态。
+fn after_the_reconnect_pause() {
+    std::thread::sleep(crate::store::RECONNECT_PAUSE.0);
+}
+
 fn is_unknown(error: &Error) -> bool {
     matches!(error, Error::Store(StoreError::CommitUnknown(_)))
 }
@@ -289,6 +295,7 @@ fn a_test_cancel_whose_answer_was_lost_stays_a_cancel_whatever_happens_next() {
         be_impatient(&lab);
         let cancelled = lab.controller.cancel_test(network, test).expect("提交未收到响应：按已提交处理，正常返回");
         assert!(lab.controller.lock().store.has_unsettled_commits(), "{next:?}：取消的提交确实未收到响应");
+        after_the_reconnect_pause();
         assert_eq!(cancelled.state, TestState::Cancelled);
         // 提交仍处于阻塞状态，数据库侧尚未完成。
         match next {
@@ -339,6 +346,7 @@ fn a_test_whose_creation_answer_was_lost_runs_and_its_result_is_stored_in_its_ow
     be_impatient(&lab);
     let started = lab.controller.start_test(network, &test_between(&a, &b)).expect("提交未收到响应：按已提交处理，正常开始");
     assert!(lab.controller.lock().store.has_unsettled_commits(), "创建测试记录的提交确实未收到响应");
+    after_the_reconnect_pause();
     assert_eq!(started.state, TestState::Running);
     a.receive();
     b.receive();
@@ -371,6 +379,7 @@ fn a_matrix_pair_whose_creation_answer_was_lost_is_tested_once() {
     be_impatient(&lab);
     let run = lab.controller.start_matrix(network).unwrap();
     assert!(lab.controller.lock().store.has_unsettled_commits(), "创建测试记录的提交确实未收到响应");
+    after_the_reconnect_pause();
     assert_eq!(run.cells[0].state, CellState::Running, "该节点对正常开始，不重新排队：{:?}", run.cells);
     let test = run.cells[0].test.unwrap();
 
@@ -397,6 +406,7 @@ fn a_test_whose_creation_answer_is_still_unknown_is_cancelled_only_once_the_answ
     be_impatient(&lab);
     let started = lab.controller.start_test(network, &test_between(&a, &b)).expect("提交未收到响应：按已提交处理，正常开始");
     assert_eq!(unsettled_commits(&lab), 1, "创建测试记录的提交确实未收到响应");
+    after_the_reconnect_pause();
     // 该行在数据库侧可能尚未创建：此时写入的取消不会生效，测试却会随之结束。
     let refused = lab.controller.cancel_test(network, started.id);
     assert!(matches!(refused, Err(Error::Busy(_))), "查明提交结果之前不写入该测试的记录：{refused:?}");
@@ -471,6 +481,7 @@ fn a_matrix_round_also_stops_at_a_pair_that_ends_at_once_when_its_creation_answe
     // 已超过两次测试之间的间隔，尚未超过 a 与 b 之间测试的时间窗。
     lab.controller.lock().tests_tick(Instant::now() + MIN_INTERVAL + Duration::from_secs(1));
     assert_eq!(unsettled_commits(&lab), 1, "结束一对后即结束本轮调度，未继续写入下一对");
+    after_the_reconnect_pause();
     let run = lab.controller.matrix(network).unwrap();
     let mut ends = [cell(&run, a, d).0, cell(&run, b, d).0];
     ends.sort_unstable_by_key(|state| *state == CellState::Pending);
@@ -503,6 +514,7 @@ fn a_matrix_cancel_whose_answer_was_lost_cancels_the_matrix_and_is_logged_once()
     be_impatient(&lab);
     let run = lab.controller.cancel_matrix(network).expect("提交未收到响应：按已提交处理，正常取消");
     assert_eq!(unsettled_commits(&lab), 1, "记录取消的提交确实未收到响应");
+    after_the_reconnect_pause();
     // 提交可能仍阻塞在数据库中：各测试的结果已确定为取消，本次不写入（每次写入均需持有 controller 锁等待一次完整的响应超时），
     // 交由后台任务处理。
     let elsewhere = Store::open(&database).unwrap();
@@ -609,6 +621,7 @@ fn a_lost_commit_while_scheduling_one_matrix_holds_back_the_other_matrices_for_t
     }
     // 先调度的矩阵开始一对时提交未收到响应，随即开始退避：本轮不再调度另一个网络的矩阵。
     assert_eq!(unsettled_commits(&lab), 1, "本轮仅开始了一对");
+    after_the_reconnect_pause();
     let mut states: Vec<CellState> = networks.iter().map(|(network, _)| lab.controller.matrix(*network).unwrap().cells[0].state).collect();
     states.sort_unstable_by_key(|state| *state == CellState::Pending);
     assert_eq!(states, [CellState::Running, CellState::Pending]);
@@ -641,6 +654,7 @@ fn a_lost_commit_while_a_node_s_tests_end_leaves_its_other_results_to_the_backgr
     // x 离线：先写入的测试结束后，矩阵开始 y 与 z 组成的节点对，其提交未收到响应并开始退避。
     lab.controller.disconnect(x.session);
     assert_eq!(unsettled_commits(&lab), 1, "y 与 z 组成的节点对已开始");
+    after_the_reconnect_pause();
     let elsewhere = Store::open(&database).unwrap();
     let mut stored: Vec<TestState> = ended.iter().map(|&test| elsewhere.test(network, test).unwrap().unwrap().state).collect();
     stored.sort_unstable_by_key(|state| *state == TestState::Running);
@@ -686,6 +700,7 @@ fn a_test_whose_order_cannot_be_delivered_after_a_lost_commit_writes_no_other_re
     let request = CreateTest { a: a.id, b: b_id, items: None, throughput: false, via: Vec::new() };
     let started = lab.controller.start_test(network, &request).expect("提交未收到响应：按已提交处理，正常返回");
     assert_eq!(unsettled_commits(&lab), 1, "创建测试记录的提交未收到响应");
+    after_the_reconnect_pause();
     assert_ne!(started.state, TestState::Running, "指令无法下发的测试在此结束");
     // 提交可能仍阻塞在数据库中：b 参与的另一个测试的结果已经确定，本次不写入。
     let elsewhere = Store::open(&database).unwrap();

@@ -8,9 +8,12 @@
 //! 握手和成员资格核验分别按来源地址记账（[`crate::gate`]）。握手名额满了挤掉老连接，核验名额满了让新来的稍后重试。
 //! 连上之后 [`CLIENT_HELLO_TIMEOUT`] 之内要收到 TLS 的 ClientHello，从连上算起 [`Timing::handshake_timeout`] 之内要完成握手并发来第一条消息。
 //!
-//! 报到之后，每条连接由三个任务配合：读取任务读帧并记下最近一次收到消息的时刻，处理任务按顺序把消息交给 controller，
-//! 连接自身的循环负责发送、心跳和存活判定。controller 处理消息可能因等锁或等数据库而耗时较长，此时只有处理任务被阻塞：
-//! 心跳照常发送，收到的消息照常计入存活，不会因处理慢而把仍在说话的节点判为离线。
+//! 报到之后，每条连接由三个任务配合：读取任务读帧并记下最近一次收到消息的时刻，处理任务把需要排队的消息分两队、各自按顺序交给
+//! controller，连接自身的循环负责发送、心跳和存活判定。controller 处理消息可能因等锁或等数据库而耗时较长，此时只有处理任务被阻塞：
+//! 心跳照常发送，收到的消息照常计入存活，不会因处理慢而把仍在通信的节点判为离线。
+//!
+//! 不读写存储的消息不排在同一个节点卡在数据库上的上报后面（见 [`Controller::waits`]）：信令和查询的应答由读取任务直接处理，
+//! 取更新包单独排一队，处理任务同时处理这一队和其余的消息。
 //!
 //! [`Timing::handshake_timeout`]: crate::Timing::handshake_timeout
 
@@ -22,7 +25,7 @@ use std::time::Duration;
 
 use i3t_crypto::tls;
 use i3t_model::control::{MAX_FRAME_LEN, ToController, ToNode};
-use i3t_proto::{NodeId, PublicKey};
+use i3t_proto::PublicKey;
 use tokio::io::{AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -31,7 +34,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tokio_rustls::LazyConfigAcceptor;
 use tokio_rustls::server::TlsStream;
 
-use crate::controller::{Admitted, Controller};
+use crate::controller::{Admitted, Controller, Waits};
 use crate::error::{Rejection, error_chain};
 use crate::frame::{FrameError, read_frame, write_frame};
 use crate::gate::{Gate, Limits, Pass, Throttle};
@@ -52,7 +55,7 @@ pub const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 const ACCEPT_ERROR_LOG_EVERY: Duration = Duration::from_secs(10);
 /// 每个节点的发送队列有多少格。满了说明节点不读，controller 会断开它。
 const OUTBOX_CAPACITY: usize = 64;
-/// 每条连接上已收到、等待 controller 处理的消息最多积压多少条。满了之后暂停读取，直到处理任务跟上。
+/// 每条连接上已收到、等待 controller 处理的消息，每一队最多积压多少条。满了之后暂停读取，直到处理任务跟上。
 const INBOUND_CAPACITY: usize = 16;
 /// 报到失败的应答很小，写入和关闭合计最多占用名额这么久。之前的核验耗时另计。
 const ADMISSION_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -184,18 +187,28 @@ impl Connection {
         let Established { session, reader, mut writer, mut outbox } = established;
         let timing = self.controller.timing();
         let (heard, last_heard) = watch::channel(Some(Instant::now()));
-        let (inbound, queue) = mpsc::channel(INBOUND_CAPACITY);
-        let mut reader = Owned(spawn_reader(reader, session.node, heard, inbound));
-        let mut worker = Owned(spawn_worker(Arc::clone(&self.controller), session, self.remote.ip(), queue));
+        let (inbound, queues) = inbound();
+        let remote = self.remote.ip();
+        let mut reader = Owned(spawn_reader(reader, Arc::clone(&self.controller), session, remote, heard, inbound));
+        let mut worker = Owned(spawn_worker(Arc::clone(&self.controller), session, remote, queues));
         // 处理任务在连接结束之前就结束时的结果。
         let mut worker_ended = None;
+        // 读取任务直接处理一部分消息（见 [`Waits::Nothing`]），它在处理时的 panic 和处理任务里的一样对待。
+        let mut reader_panic = None;
         let mut last_sent = Instant::now();
 
         // 第二项：连接是否因读取结束而结束。是的话，节点在关闭连接之前发来的消息仍要处理完。
         let (reason, read_to_end) = loop {
             let silent_until = silent_since(*last_heard.borrow()) + timing.liveness_timeout;
             tokio::select! {
-                ended = &mut reader.0 => break (ended.unwrap_or_else(|_| "读取任务意外结束".to_owned()), true),
+                ended = &mut reader.0 => match ended {
+                    Ok(reason) => break (reason, true),
+                    // 读取任务只在被丢弃时取消，那是在这个循环之后：这里只会是 panic。
+                    Err(error) => {
+                        reader_panic = error.try_into_panic().ok();
+                        break ("读取任务意外结束".to_owned(), false);
+                    }
+                },
                 ended = &mut worker.0, if worker_ended.is_none() => {
                     let failed = ended.is_err();
                     worker_ended = Some(ended);
@@ -243,10 +256,10 @@ impl Connection {
             None => None,
         };
         drop(worker);
-        let panic = match worker_ended {
+        let panic = reader_panic.or_else(|| match worker_ended {
             Some(Err(err)) => err.try_into_panic().ok(),
             Some(Ok(())) | None => None,
-        };
+        });
         // controller 里的 panic 是 bug，收尾之后照原样传出去（见 [`blocking`]）。panic 时 controller 的锁可能已经中毒，
         // 不再去拿它记离线（那会再 panic 一次、盖住原来的那个）：发送队列的接收端随这里退出而关闭，之后给它发消息时会断开它。
         if let Some(panic) = panic {
@@ -298,34 +311,65 @@ async fn handshake(tls: Arc<rustls::ServerConfig>, stream: TcpStream) -> Result<
     }
 }
 
-/// 读取任务：读帧，记下收到的时刻（`heard`），把要处理的消息按顺序放进队列 `inbound`。返回连接结束的原因。
+/// 收到的消息里要排队处理的两队：取更新包的一队（[`Waits::File`]），其余的一队（[`Waits::Store`]）。各自按收到的顺序处理。
+struct Inbound {
+    files: mpsc::Sender<ToController>,
+    store: mpsc::Sender<ToController>,
+}
+
+/// [`Inbound`] 的另一头，交给处理任务。
+struct Queues {
+    files: mpsc::Receiver<ToController>,
+    store: mpsc::Receiver<ToController>,
+}
+
+fn inbound() -> (Inbound, Queues) {
+    let (files, files_queue) = mpsc::channel(INBOUND_CAPACITY);
+    let (store, store_queue) = mpsc::channel(INBOUND_CAPACITY);
+    (Inbound { files, store }, Queues { files: files_queue, store: store_queue })
+}
+
+/// 读取任务：读帧，记下收到的时刻（`heard`），什么都不等的消息（[`Waits::Nothing`]）当场处理，其余的按顺序放进 `inbound`
+/// 的两队之一。返回连接结束的原因。
 ///
 /// 读一帧不能被打断（长度和内容分两次读），所以不能直接放在 `select!` 里。心跳只说明节点还在，不进队列，也不占用 controller 的锁；
 /// 无法解析的帧（通常为更高版本节点发来的未知消息类型）同样计入存活，跳过即可。
 ///
-/// 队列满时暂停读取，直到处理任务跟上，期间 `heard` 为 `None`（见 [`silent_since`]）。
+/// 一队满时暂停读取，直到处理任务跟上，期间 `heard` 为 `None`（见 [`silent_since`]）。这时后面的信令和回答也要等：
+/// 每一队能积压 [`INBOUND_CAPACITY`] 条，节点每 10 秒上报一次，积满要等 controller 卡住很久。
 fn spawn_reader(
     mut reader: Reader,
-    node: NodeId,
+    controller: Arc<Controller>,
+    session: Admitted,
+    remote: IpAddr,
     heard: watch::Sender<Option<Instant>>,
-    inbound: mpsc::Sender<ToController>,
+    inbound: Inbound,
 ) -> JoinHandle<String> {
     const WORKER_GONE: &str = "处理节点消息的任务意外结束";
+    let node = session.node;
     tokio::spawn(async move {
         loop {
             match read_frame(&mut reader, MAX_FRAME_LEN).await {
                 Ok(Some(message)) => {
                     heard.send_replace(Some(Instant::now()));
-                    if matches!(message, ToController::Heartbeat) {
-                        continue;
-                    }
-                    let message = match inbound.try_send(message) {
+                    let queue = match Controller::waits(&message) {
+                        // 只拿一把很短的锁，不进阻塞线程池：那里可能挤满了等 controller 的锁的任务。
+                        Waits::Nothing => {
+                            if let Err(err) = controller.handle(session, remote, message) {
+                                tracing::error!(%node, "处理节点的消息时出错：{}", error_chain(&err));
+                            }
+                            continue;
+                        }
+                        Waits::File => &inbound.files,
+                        Waits::Store => &inbound.store,
+                    };
+                    let message = match queue.try_send(message) {
                         Ok(()) => continue,
                         Err(mpsc::error::TrySendError::Full(message)) => message,
                         Err(mpsc::error::TrySendError::Closed(_)) => return WORKER_GONE.to_owned(),
                     };
                     heard.send_replace(None);
-                    if inbound.send(message).await.is_err() {
+                    if queue.send(message).await.is_err() {
                         return WORKER_GONE.to_owned();
                     }
                     heard.send_replace(Some(Instant::now()));
@@ -341,16 +385,23 @@ fn spawn_reader(
     })
 }
 
-/// 处理任务：按收到的顺序把消息逐条交给 controller 处理。队列的发送端全部关闭且队列为空时结束；controller 处理消息时 panic 也会结束。
-fn spawn_worker(controller: Arc<Controller>, session: Admitted, remote: IpAddr, mut queue: mpsc::Receiver<ToController>) -> JoinHandle<()> {
+/// 处理任务：两队消息同时处理，每一队按收到的顺序逐条交给 controller，一队卡住（等锁、等数据库、读文件）不耽误另一队。
+/// 两队的发送端都关闭且队列都处理完时结束；controller 处理消息时 panic 也会结束。
+fn spawn_worker(controller: Arc<Controller>, session: Admitted, remote: IpAddr, queues: Queues) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(message) = queue.recv().await {
-            let handled = blocking(&controller, move |controller| controller.handle(session, remote, message)).await;
-            if let Err(err) = handled {
-                tracing::error!(node = %session.node, "处理节点的消息时出错：{}", error_chain(&err));
-            }
-        }
+        let Queues { files, store } = queues;
+        tokio::join!(handle_queue(&controller, session, remote, files), handle_queue(&controller, session, remote, store));
     })
+}
+
+/// 按顺序处理一队消息，直到队列的发送端关闭、队列处理完。
+async fn handle_queue(controller: &Arc<Controller>, session: Admitted, remote: IpAddr, mut queue: mpsc::Receiver<ToController>) {
+    while let Some(message) = queue.recv().await {
+        let handled = blocking(controller, move |controller| controller.handle(session, remote, message)).await;
+        if let Err(err) = handled {
+            tracing::error!(node = %session.node, "处理节点的消息时出错：{}", error_chain(&err));
+        }
+    }
 }
 
 impl AdmissionError {

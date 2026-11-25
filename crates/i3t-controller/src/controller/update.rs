@@ -19,7 +19,7 @@
 //! 让谁更新、强不强制都不看它，人看了自己决定。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use i3t_model::admin::{
@@ -214,15 +214,6 @@ impl Updates {
         self.forced.remove(&node);
         self.offered.remove(&node);
         self.relay_turns.retain(|_, turn| turn.holder != node);
-    }
-
-    /// 当前发布里 `platform` 的包在缓存里的位置；还没有取回来时是 `None`。
-    pub(crate) fn cached_package(&self, version: &Version, platform: &str) -> Option<(&Path, &Artifact)> {
-        let release = self.release.as_ref().filter(|release| release.manifest.version == *version)?;
-        match self.packages.get(platform) {
-            Some(Package::Cached(path)) => Some((path, release.manifest.artifacts.get(platform)?)),
-            Some(Package::Wanted | Package::Fetching | Package::Failed(_)) | None => None,
-        }
     }
 }
 
@@ -566,6 +557,7 @@ impl Inner {
                     )?;
                     self.updates.release = Some(release.clone());
                     self.updates.packages.clear();
+                    self.switchboard().new_release(version.clone());
                     // 仅当前发布版本可能被暂停，清理其他版本的历史下发记录。
                     self.updates.offered.retain(|_, offered| *offered == version);
                     if let Some(cache_dir) = &self.updates.cache_dir {
@@ -624,6 +616,7 @@ impl Inner {
         let package = match outcome {
             Ok(path) => {
                 tracing::info!(version = %job.version, platform = %job.platform, path = %path.display(), "更新包下载并校验完成");
+                self.switchboard().package_cached(&job.version, &job.platform, path.clone(), job.artifact.size);
                 Package::Cached(path)
             }
             Err(failure) => {

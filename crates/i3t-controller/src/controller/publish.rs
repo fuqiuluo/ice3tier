@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use i3t_model::admin::NetworkId;
 use i3t_model::control::ToNode;
 use i3t_proto::NodeId;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc;
 
-use super::{Deferred, Failures, Inner, admin_token_hash};
+use super::switchboard::Undelivered;
+use super::{Admitted, Deferred, Failures, Inner, Live, admin_token_hash};
 use crate::access::AccessMap;
 use crate::error::Error;
 use crate::netmap::{NetworkView, Relation};
@@ -201,7 +202,8 @@ impl Inner {
         let gone: BTreeSet<NodeId> = self.sync.keys().chain(self.live.keys()).filter(|node| !known.contains(node)).copied().collect();
         for node in gone {
             tracing::info!(%node, "节点已不存在于数据库中，正在吊销");
-            self.send(node, ToNode::Revoked);
+            let revoked = self.switchboard().revoke(node);
+            self.delivered(node, revoked);
             self.forget_node(node);
         }
         *self.admin_token.lock().expect("admin token mutex poisoned") = admin_token_hash(&self.store)?;
@@ -311,7 +313,8 @@ impl Inner {
         if (changed || force) && self.is_online(id) {
             netmap.version = version;
             tracing::debug!(node = %id, version, peers = netmap.peers.len(), relays = netmap.relays.len(), "下发 netmap");
-            if self.send(id, ToNode::Snapshot(Box::new(netmap))) {
+            let sent = self.switchboard().send_netmap(id, netmap);
+            if self.delivered(id, sent) {
                 self.counters.snapshots_sent += 1;
                 // 消息已进入发送队列，先更新内存中的已发送版本号以匹配后续节点确认；存储写入失败仅导致持久化值滞后，下次下发时会补写。
                 let sync = self.sync.entry(id).or_default();
@@ -327,15 +330,56 @@ impl Inner {
     ///
     /// 队列是有界的：满了说明这个节点不读，继续攒只会占内存，所以直接断开它。它重连之后会拿到最新的 netmap。
     pub(crate) fn send(&mut self, node: NodeId, message: ToNode) -> bool {
-        let Some(live) = self.live.get(&node) else { return false };
-        let reason = match live.outbox.try_send(message) {
-            Ok(()) => return true,
-            Err(TrySendError::Full(_)) => "节点发送队列已满（对端未及时读取）",
-            Err(TrySendError::Closed(_)) => "节点连接已关闭",
+        let sent = self.switchboard().send(node, message);
+        self.delivered(node, sent)
+    }
+
+    /// 处理放入节点发送队列的结果（[`Self::send`]）：无法放入（队列已满、连接已关闭）时断开该节点。
+    pub(crate) fn delivered(&mut self, node: NodeId, sent: Result<(), Undelivered>) -> bool {
+        match sent {
+            Ok(()) => true,
+            // 不持有本锁时消息无法放入，连接已从 `Switchboard` 去掉，`live` 中仍有记录：同样断开。
+            Err(Undelivered::Offline) if self.live.contains_key(&node) => {
+                tracing::warn!(%node, "节点的连接此前因消息无法放入发送队列而去掉，断开节点");
+                self.drop_session(node);
+                false
+            }
+            Err(Undelivered::Offline) => false,
+            Err(undelivered @ (Undelivered::Full | Undelivered::Closed)) => {
+                tracing::warn!(%node, reason = undelivered.reason(), "断开节点");
+                self.drop_session(node);
+                false
+            }
+        }
+    }
+
+    /// 不持有本锁时因消息无法放入发送队列而去掉了连接的节点（见 `Switchboard::send`）：将它们记为离线。
+    /// 去掉连接的一方会唤醒后台任务（`Controller::on_switchboard`），后台每一轮都核对一遍。
+    pub(crate) fn drop_lost_sessions(&mut self) {
+        let lost: Vec<NodeId> = {
+            let switchboard = self.switchboard();
+            self.live
+                .iter()
+                .filter(|(node, live)| !switchboard.is_current(Admitted { node: **node, conn: live.conn }))
+                .map(|(node, _)| *node)
+                .collect()
         };
-        tracing::warn!(%node, reason, "断开节点");
-        self.drop_session(node);
-        false
+        for node in lost {
+            tracing::warn!(%node, "节点的连接因消息无法放入发送队列而去掉，断开节点");
+            self.drop_session(node);
+        }
+    }
+
+    /// 节点上线：登记它的连接。之前的连接被顶替，它的发送队列随之关闭，那条连接自己会结束。返回被顶替的连接。
+    pub(crate) fn go_online(&mut self, node: NodeId, live: Live, outbox: mpsc::Sender<ToNode>) -> Option<Live> {
+        self.switchboard().connect(node, live.conn, outbox);
+        self.live.insert(node, live)
+    }
+
+    /// 去掉节点的连接（`live` 和发送队列），发给它的查询不会再有回答。返回去掉的连接。
+    pub(crate) fn go_offline(&mut self, node: NodeId) -> Option<Live> {
+        self.switchboard().disconnect(node);
+        self.live.remove(&node)
     }
 
     /// 节点不再在线：去掉它的连接，记下最近在线的时间，并且不再等它确认。
@@ -344,7 +388,7 @@ impl Inner {
     /// 节点参与的测试的结果同样交由后台任务写入（见 [`Inner::tests_node_gone`]）。
     pub(crate) fn drop_session(&mut self, node: NodeId) {
         let now = Instant::now();
-        let Some(live) = self.live.remove(&node) else { return };
+        let Some(live) = self.go_offline(node) else { return };
         // 注册时那一条连接不算"最近在线"。
         if !live.enrolling
             && !self.backing_off(now)
@@ -356,7 +400,6 @@ impl Inner {
                 self.back_off();
             }
         }
-        self.drop_route_queries(node);
         self.stop_waiting_for(live.network, node);
         self.tests_node_gone(node, now);
     }

@@ -11,6 +11,7 @@ mod proxies;
 mod routes;
 mod stats;
 mod store_failures;
+mod switchboard;
 mod unsettled;
 mod update;
 

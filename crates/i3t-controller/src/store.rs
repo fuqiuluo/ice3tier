@@ -15,6 +15,13 @@
 //!   建连本身受总超时限制（包括已连通端口但对端无响应）；刚重连失败后会在冷却期内跳过重连，期间读写立即失败
 //!   （[`StoreError::Disconnected`]）。
 //! - 一条语句等回答有期限，过了就当这条连接坏了。启动时执行的表结构迁移期限更长（[`MIGRATION_TIMEOUT`]）。
+//!   语句未收到响应后暂停一段时间再重连，期间读写立即失败（[`StoreError::Disconnected`]）：数据库可能接受新连接却不响应语句
+//!   （同步备库掉线时写入持续等待复制确认、存储 I/O 停顿），立即重连会使下一个调用方再次等满期限。连续无响应时暂停时长逐次增加
+//!   （见 [`Store::went_unanswered`]）。
+//! - 数据库执行一条语句另有服务端期限（`statement_timeout`，[`STATEMENT_TIMEOUT`]），长于等待响应的期限：本端放弃等待后，数据库最晚
+//!   在此时取消该语句，避免其长期占用锁。提交阶段（推迟执行的约束检查与触发器、等待同步复制确认）不受此期限约束。
+//!   连接串、角色或数据库已设置的值保持不变。
+//! - 数据库响应慢、但每条语句均在期限内返回时，一次持锁内的多条语句分别等待，总时长没有上限。
 //! - 其他连接持有锁时（例如外部事务正在修改同一行或锁表），单条语句最多等待 [`LOCK_TIMEOUT`]。刚触发锁超时后，在随后的同等
 //!   时长内不再等待：涉及被锁资源的语句立即失败，未受影响的资源仍正常写入。长期不释放的锁因此最多占用 controller 一半的等待时间，
 //!   且不会阻塞其他行的操作。
@@ -81,7 +88,8 @@ pub use token::{NewToken, RETENTION_SECS, TokenRecord, is_pending, token_at};
 
 use crate::error::error_chain;
 use codec::{Int, Read};
-use session::{CONNECT_TIMEOUT, Connecting, Params, Session, lock_timeout_sql};
+pub use session::STATEMENT_TIMEOUT;
+use session::{CONNECT_TIMEOUT, Connecting, Params, Session, lock_timeout_sql, statement_timeout_sql};
 
 /// SHA-256 的长度。令牌和 netmap 的摘要都是它。
 pub const DIGEST_LEN: usize = 32;
@@ -93,8 +101,11 @@ pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_LOCK_WAIT: Duration = Duration::from_millis(1);
 
 /// 重连失败后的最小、最大退避间隔。具体时长取决于本次建连耗时：立即被拒绝的可较快重试，耗时触达超时的则退避更久，
-/// 避免在数据库不可达期间反复建连。
-const RECONNECT_PAUSE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(30));
+/// 避免在数据库不可达期间反复建连。语句无响应后的暂停（[`Store::went_unanswered`]）也在此范围内。
+pub(crate) const RECONNECT_PAUSE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(30));
+
+/// 上一次语句无响应引起的暂停结束后，在此时长之内再次出现语句无响应，即视为连续（见 [`Store::went_unanswered`]）。
+const UNANSWERED_MEMORY: Duration = Duration::from_secs(60);
 
 /// 原本可用的连接断开后，一次后台重连开始后调用方合计最多等待多久。数据库可达时重连通常在毫秒级完成，此期间内完成则
 /// 调用方无感知；超出后调用方立即返回，不再等待。调用方持有 controller 锁等待，因此需远短于节点的存活期限。
@@ -190,6 +201,26 @@ enum Transaction {
     Failed,
 }
 
+/// 连续无响应的语句：第几次，以及因此暂停到何时。
+#[derive(Debug, Clone, Copy)]
+struct Unanswered {
+    count: u32,
+    until: Instant,
+}
+
+impl Unanswered {
+    /// 在 `now` 又有一条语句等待 `waited` 后仍未收到响应。距上一次（`last`）暂停结束不到 [`UNANSWERED_MEMORY`] 时继续计数，
+    /// 否则重新计数。第 n 次暂停 `waited × (n − 1)`，限制在 [`RECONNECT_PAUSE`] 范围内。
+    fn after(last: Option<Self>, now: Instant, waited: Duration) -> Self {
+        let count = match last {
+            Some(last) if now.saturating_duration_since(last.until) < UNANSWERED_MEMORY => last.count.saturating_add(1),
+            Some(_) | None => 1,
+        };
+        let pause = waited.saturating_mul(count - 1).clamp(RECONNECT_PAUSE.0, RECONNECT_PAUSE.1);
+        Self { count, until: now + pause }
+    }
+}
+
 pub struct Store {
     database: Database,
     /// 当前活跃的连接。一旦检测到失效便立即丢弃并置空，而非等到下次建连才替换：丢弃会关闭套接字，促使数据库侧尽快回滚
@@ -206,6 +237,8 @@ pub struct Store {
     impatient: Cell<bool>,
     /// 刚试过没连上：到这个时刻之前不再去连。
     reconnect_after: Cell<Option<Instant>>,
+    /// 最近连续无响应的语句，以及因此暂停到何时（见 [`Store::went_unanswered`]）。
+    unanswered: Cell<Option<Unanswered>>,
     /// 提交发出去了、回答没有回来的事务的编号（[`StoreError::CommitUnknown`]）：还不知道它们后来算没算数。
     unsettled: RefCell<Vec<String>>,
     /// 出了上面这样的事务时叫醒谁，见 [`Store::wake_on_unsettled_commit`]。
@@ -213,6 +246,9 @@ pub struct Store {
     /// 测试用：有几条语句是把等锁的期限等满了才失败的。
     #[cfg(test)]
     lock_waits: Cell<usize>,
+    /// 测试用：重连之后的连接上，一条语句等回答只等这么久（见 [`Store::set_reconnected_response_timeout`]）。
+    #[cfg(test)]
+    response_timeout: Cell<Option<Duration>>,
     /// 测试用的数据库：和这个 `Store` 一起丢掉。写在 `session` 后面，先关连接再删。
     #[cfg(any(test, feature = "testing"))]
     scratch: Option<Scratch>,
@@ -255,6 +291,8 @@ impl Store {
         let session = Session::connect(&database.0)?;
         session.set_lock_timeout(LOCK_TIMEOUT)?;
         migrate(&session, migrations, missing)?;
+        // 迁移可能要很久（见 [`MIGRATION_TIMEOUT`]），做完了再设语句的服务端期限。
+        session.batch(&statement_timeout_sql())?;
         Ok(Self {
             database: database.clone(),
             session: RefCell::new(Some(session)),
@@ -264,10 +302,13 @@ impl Store {
             impatient_until: Cell::new(None),
             impatient: Cell::new(false),
             reconnect_after: Cell::new(None),
+            unanswered: Cell::new(None),
             unsettled: RefCell::default(),
             unsettled_wake: None,
             #[cfg(test)]
             lock_waits: Cell::new(0),
+            #[cfg(test)]
+            response_timeout: Cell::new(None),
             #[cfg(any(test, feature = "testing"))]
             scratch: None,
         })
@@ -381,6 +422,12 @@ impl Store {
         self.session.borrow().as_ref().expect("连接还在").set_response_timeout(timeout);
     }
 
+    /// 测试用：之后重连的每一条连接上，一条语句等回答只等这么久。
+    #[cfg(test)]
+    pub(crate) fn set_reconnected_response_timeout(&self, timeout: Duration) {
+        self.response_timeout.set(Some(timeout));
+    }
+
     /// 测试用：数据库那边照看现在这条连接的进程。
     #[cfg(test)]
     pub(crate) fn backend(&self) -> i32 {
@@ -480,12 +527,29 @@ impl Store {
         if session.is_closed() {
             *current = None;
         }
+        if let Err(StoreError::Unresponsive(waited)) = &result {
+            self.went_unanswered(*waited);
+        }
         result
+    }
+
+    /// 一条语句等待 `waited` 后仍未收到响应，连接已丢弃：暂停一段时间再重连，期间读写立即失败。
+    ///
+    /// 仅该连接失效（网络中途断开而未被察觉、对端地址变更）时，数据库仍可正常使用，暂停 [`RECONNECT_PAUSE`] 的下限即可。
+    /// 这次暂停同时使同一次持锁中后续的读写立即失败，不会在重连后再次等满期限。上一次暂停结束后 [`UNANSWERED_MEMORY`] 之内
+    /// 再次出现语句无响应时，通常是数据库接受新连接但不响应语句：第 n 次暂停 `waited × (n − 1)`，限制在 [`RECONNECT_PAUSE`]
+    /// 范围内，持锁的调用方因此不会逐个等满期限。
+    fn went_unanswered(&self, waited: Duration) {
+        let now = Instant::now();
+        let unanswered = Unanswered::after(self.unanswered.get(), now, waited);
+        self.unanswered.set(Some(unanswered));
+        let pause = unanswered.until.saturating_duration_since(now);
+        tracing::warn!(?waited, count = unanswered.count, ?pause, "数据库语句无响应，已丢弃该连接，暂停后再重连");
     }
 
     /// 若当前无可用连接则建立新连接。建连在驱动线程上进行，调用方只在建连开始后的一小段时间内等待（[`RECONNECT_WAIT`]，
     /// 上一次重连失败后为 [`RETRY_WAIT`]）：期间连上则照常返回；仍未连上则返回 [`StoreError::Reconnecting`]，建连继续进行，
-    /// 由之后的调用接收结果。近期重连失败后的退避窗口内不发起建连，直接返回 [`StoreError::Disconnected`]。
+    /// 由之后的调用接收结果。近期重连失败或语句无响应后的暂停期内不发起建连，直接返回 [`StoreError::Disconnected`]。
     fn reconnect_if_closed(&self) -> Result<(), StoreError> {
         // 收到的结果已经过时时重新开始一次：失败发生在较早之前、退避期已过，或者连上之后无人来取、连接在等待期间已断开。
         for _ in 0..2 {
@@ -501,12 +565,17 @@ impl Store {
             let (attempt, patience) = match connecting.as_mut() {
                 Some(reconnect) => reconnect,
                 None => {
+                    // 语句无响应后的暂停尚未结束。暂停结束后的首次重连不视为重试：此前连接可用，按原本可用的连接断开时的时限等待。
+                    if self.unanswered.get().is_some_and(|unanswered| Instant::now() < unanswered.until) {
+                        return Err(StoreError::Disconnected);
+                    }
                     let retry = match self.reconnect_after.get() {
                         Some(after) if Instant::now() < after => return Err(StoreError::Disconnected),
                         Some(_) => true,
                         None => false,
                     };
-                    match Session::start(&self.database.0, Some(lock_timeout_sql(self.lock_patience.get()))) {
+                    let setup = format!("{}; {}", lock_timeout_sql(self.lock_patience.get()), statement_timeout_sql());
+                    match Session::start(&self.database.0, Some(setup)) {
                         Ok(attempt) => connecting.insert((attempt, if retry { RETRY_WAIT } else { RECONNECT_WAIT })),
                         Err(error) => {
                             self.reconnect_after.set(Some(Instant::now() + RECONNECT_PAUSE.0));
@@ -522,6 +591,10 @@ impl Store {
             *connecting = None;
             match outcome {
                 Ok(session) if !session.is_closed() => {
+                    #[cfg(test)]
+                    if let Some(timeout) = self.response_timeout.get() {
+                        session.set_response_timeout(timeout);
+                    }
                     *self.session.borrow_mut() = Some(session);
                     self.reconnect_after.set(None);
                     self.impatient.set(false);
@@ -720,8 +793,8 @@ pub enum StoreError {
     Connect(#[source] tokio_postgres::Error),
     #[error("连接数据库超时（已等待 {} 秒，含已建立 TCP 连接但对端无响应的情况）", .0.as_secs())]
     ConnectTimedOut(Duration),
-    /// 连接已断开且近期重连失败：将在短暂间隔后再次尝试重连，期间的读写请求直接返回此错误。
-    #[error("数据库连接已断开且近期重连失败，请稍后重试")]
+    /// 连接已断开，且近期重连失败或语句无响应：将在短暂间隔后再次尝试重连，期间的读写请求直接返回此错误。
+    #[error("数据库连接已断开，且近期重连失败或语句无响应，请稍后重试")]
     Disconnected,
     /// 连接已断开，重连正在后台进行且未在调用方可等待的时间（[`RECONNECT_WAIT`]、[`RETRY_WAIT`]）内完成：
     /// 期间的读写请求直接返回此错误。
@@ -950,7 +1023,126 @@ mod tests {
         let error = store.execute("SELECT pg_sleep(30)", &[]).unwrap_err();
         assert!(matches!(error, StoreError::Unresponsive(_)) && error.is_database_wide(), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "下一次读写换了一条新连接");
+
+        // 紧接着的读写（例如同一次持锁里的下一步）不重连、不再等一次：立即失败。
+        let started = Instant::now();
+        assert!(matches!(store.meta("k"), Err(StoreError::Disconnected)));
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+
+        // 只是这一条连接没回答，数据库照常：暂停最短的一段之后换一条新连接。
+        std::thread::sleep(RECONNECT_PAUSE.0);
+        assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"v".as_slice()), "换了一条新连接");
+    }
+
+    /// 接受连接、响应新连接上的初始设置，之后不响应任何语句的"数据库"：同步备库掉线时写入无法得到复制确认、
+    /// 存储 I/O 停顿时就是这样。每一条连接都收着不关。
+    fn server_that_answers_only_the_setup() -> Database {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut chunk = [0; 1024];
+                // 启动消息；"认证通过"，"可以发语句了"；初始设置；"SET"，"可以发语句了"。
+                if stream.read(&mut chunk).is_err()
+                    || stream.write_all(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I").is_err()
+                    || stream.read(&mut chunk).is_err()
+                    || stream.write_all(b"C\0\0\0\x08SET\0Z\0\0\0\x05I").is_err()
+                {
+                    continue;
+                }
+                held.push(stream);
+            }
+        });
+        format!("postgres://i3t@127.0.0.1:{port}/i3t").parse().unwrap()
+    }
+
+    #[test]
+    fn a_database_that_takes_connections_but_answers_no_statements_does_not_hold_up_every_caller() {
+        let scratch = Scratch::new();
+        let mut store = Store::open(&scratch.database()).unwrap();
+        store.set_meta("k", b"v").unwrap();
+        let limit = Duration::from_millis(300);
+        store.set_reconnected_response_timeout(limit);
+        let real = std::mem::replace(&mut store.database, server_that_answers_only_the_setup());
+        assert!(store.execute("SELECT pg_terminate_backend(pg_backend_pid())", &[]).is_err());
+
+        // 调用方逐个到来（每个都持有 controller 的锁）。每次重连都很快成功，语句却始终未收到响应：
+        // 没有暂停的话每个调用方都要等满期限，这段时间里几乎一直有人在等。
+        let period = Duration::from_secs(4);
+        let started = Instant::now();
+        let (mut held, mut unanswered) = (Duration::ZERO, 0);
+        while started.elapsed() < period {
+            let call = Instant::now();
+            let error = store.meta("k").unwrap_err();
+            assert!(error.is_database_wide(), "{error:?}");
+            if matches!(error, StoreError::Unresponsive(_)) {
+                unanswered += 1;
+                held += call.elapsed();
+            } else {
+                assert!(call.elapsed() < limit, "暂停期间立即失败：{:?}", call.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!((2..=4).contains(&unanswered), "每次无响应之后均暂停一段时间：{unanswered} 次");
+        assert!(held < period / 2, "等回答的时间不到一半：{held:?}");
+
+        // 数据库恢复：暂停过后照常。
+        store.database = real;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let value = loop {
+            match store.meta("k") {
+                Ok(value) => break value,
+                Err(error) => assert!(error.is_database_wide() && Instant::now() < deadline, "应当重新连上：{error:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(value.as_deref(), Some(b"v".as_slice()));
+    }
+
+    #[test]
+    fn the_pause_after_an_unanswered_statement_grows_while_they_keep_coming_and_starts_over_later() {
+        let waited = Duration::from_secs(15);
+        let pause = |unanswered: Unanswered, at: Instant| unanswered.until - at;
+        let start = Instant::now();
+        let first = Unanswered::after(None, start, waited);
+        assert_eq!(pause(first, start), RECONNECT_PAUSE.0, "首次无响应通常只是这一条连接失效");
+        // 暂停一结束就有调用方重连，又等了一次。
+        let at = first.until + waited;
+        let second = Unanswered::after(Some(first), at, waited);
+        assert_eq!(pause(second, at), waited);
+        // 暂停结束之后隔了一阵才又有读写，仍算连续。
+        let at = second.until + Duration::from_secs(40);
+        let third = Unanswered::after(Some(second), at, waited);
+        assert_eq!(pause(third, at), RECONNECT_PAUSE.1, "不超过最长的暂停");
+        let at = third.until + waited;
+        let fourth = Unanswered::after(Some(third), at, waited);
+        assert_eq!(pause(fourth, at), RECONNECT_PAUSE.1, "此后保持最长的暂停");
+        let at = fourth.until + UNANSWERED_MEMORY;
+        assert_eq!(pause(Unanswered::after(Some(fourth), at, waited), at), RECONNECT_PAUSE.0, "间隔很久的一次重新计数");
+    }
+
+    #[test]
+    fn statements_get_a_server_side_time_limit_unless_one_is_already_set() {
+        let scratch = Scratch::new();
+        let limit =
+            |store: &Store| store.query_one("SELECT current_setting('statement_timeout')", &[], |row| row.try_get::<_, String>(0)).unwrap();
+        let store = Store::open(&scratch.database()).unwrap();
+        assert_eq!(limit(&store), "20s");
+        assert!(store.execute("SELECT pg_terminate_backend(pg_backend_pid())", &[]).is_err());
+        assert_eq!(limit(&store), "20s", "重连之后的连接上也设");
+
+        // 连接串里设了的（哪怕是 0，也就是不限）照旧。测试库的 schema 也写在 options 里，加在它后面。
+        let mut database = scratch.database();
+        let options = format!("{} -c statement_timeout=0", database.0.get_options().unwrap_or_default());
+        database.0.options(&options);
+        let store = Store::open(&database).unwrap();
+        assert_eq!(limit(&store), "0");
+        assert!(store.execute("SELECT pg_terminate_backend(pg_backend_pid())", &[]).is_err());
+        assert_eq!(limit(&store), "0");
     }
 
     #[test]
@@ -980,6 +1172,8 @@ mod tests {
         }
         other.set_lock_timeout(Duration::from_millis(500));
         other.set_meta("k", b"x").unwrap();
+        // 语句无响应后暂停一段时间再重连（见 `Store::went_unanswered`）。
+        std::thread::sleep(RECONNECT_PAUSE.0);
         assert_eq!(store.meta("k").unwrap().as_deref(), Some(b"x".as_slice()), "再用的时候连一条新的");
     }
 
@@ -1168,7 +1362,9 @@ mod tests {
         assert!(woken.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())).is_ready());
 
         // 数据库那边其实还在做，做完就提交了：这次改动是算数的。调用方要是把这个错当成"没有做"，就错了。
-        // 问得出来：数据库那边做完之前是"还没做完"，然后是"算了数"。
+        // 可以查明（无响应后先暂停一段时间再重连）：数据库那边做完之前是"还没做完"，然后是"算了数"。
+        assert!(matches!(store.settle_commits(), Err(StoreError::Disconnected)), "暂停期间无法查询提交结果");
+        std::thread::sleep(RECONNECT_PAUSE.0);
         let deadline = Instant::now() + Duration::from_secs(20);
         let answer = loop {
             let answer = store.settle_commits().unwrap();

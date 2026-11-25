@@ -56,6 +56,6 @@ pub mod store;
 mod sync;
 pub mod webui;
 
-pub use controller::{ALPN, Admitted, Controller, Opened, RouteAnswers, TickFailed, Timing};
+pub use controller::{ALPN, Admitted, Controller, Opened, RouteAnswers, TickFailed, Timing, Waits};
 pub use error::{Capability, Entity, Error, Rejection};
 pub use server::{ServeOptions, Server};

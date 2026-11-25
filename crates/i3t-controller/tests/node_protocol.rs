@@ -395,6 +395,63 @@ async fn a_node_stays_online_while_the_controller_is_stuck_handling_its_messages
 }
 
 #[tokio::test]
+async fn signals_answers_and_package_requests_do_not_wait_for_a_controller_stuck_on_the_store() {
+    /// controller 卡住的时长，长于等路由查询回答的期限（3 秒）。
+    const STALL: Duration = Duration::from_secs(4);
+    let running = Running::start(fast_timing()).await;
+    let network = running.network("home");
+    let (mut a, mut b) = (Node::new(), Node::new());
+    for node in [&mut a, &mut b] {
+        node.modern = Some("0.2.0");
+        node.enroll(&running, &running.secret(network.id, &[])).await.unwrap();
+    }
+    let (a_id, b_id) = (a.id(), b.id());
+    settle(&mut [&mut a, &mut b]).await;
+
+    // 两端各收到一条路由查询，之后 controller 卡在锁上，例如等待无响应的数据库。
+    let controller = Arc::clone(&running.controller);
+    let asking = tokio::spawn(async move { controller.path(network.id, a_id, b_id).await.unwrap() });
+    let ToNode::RouteQuery { request: forward, .. } = next_other(&mut a).await else { panic!("a 应该收到路由查询") };
+    let ToNode::RouteQuery { request: reverse, .. } = next_other(&mut b).await else { panic!("b 应该收到路由查询") };
+    let controller = Arc::clone(&running.controller);
+    let (held, holding) = oneshot::channel();
+    let stuck = tokio::task::spawn_blocking(move || {
+        let _stalled = controller.stall();
+        held.send(()).unwrap();
+        std::thread::sleep(STALL);
+    });
+    holding.await.unwrap();
+
+    // 每个节点先发一份上报（要等锁才能处理，排在它自己的队列里），再发不读写存储的消息：后者不排在上报后面。
+    a.send(ToController::Report(Box::default())).await;
+    b.send(ToController::Report(Box::default())).await;
+    let answer = |peer| RouteAnswer {
+        peer,
+        route: Some(Route::Direct { addr: "203.0.113.9:20330".parse().unwrap() }),
+        rtt_ms: Some(7),
+        since: None,
+        detail: None,
+        connection_rtt_ms: None,
+    };
+    a.send(ToController::RouteAnswer { request: forward, answer: answer(b_id) }).await;
+    b.send(ToController::RouteAnswer { request: reverse, answer: answer(a_id) }).await;
+    let signal = Signal::PunchRequest { endpoints: vec!["203.0.113.1:20330".parse().unwrap()] };
+    a.send(ToController::Signal { to: b_id, signal: signal.clone() }).await;
+    assert_eq!(next_other(&mut b).await, ToNode::Signal { from: a_id, signal }, "信令照常转发");
+    let platform = "linux-x86_64".parse().unwrap();
+    let version = "0.9.0".parse().unwrap();
+    a.send(ToController::PackageRequest { request: 5, version, platform, offset: 0, len: 1 }).await;
+    assert!(matches!(next_other(&mut a).await, ToNode::PackageUnavailable { request: 5, .. }), "取包照常回复");
+    assert!(!stuck.is_finished(), "以上都发生在 controller 卡住期间");
+
+    stuck.await.unwrap();
+    let view = timeout(PATIENCE, asking).await.unwrap().unwrap();
+    assert_eq!((view.forward.source, view.forward.rtt_ms), (PathSource::Query, Some(7)), "回答在等待期限内交给了问的人");
+    assert_eq!((view.reverse.source, view.reverse.rtt_ms), (PathSource::Query, Some(7)));
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_grant_waits_for_the_destination_but_not_forever() {
     let timing = Timing { ack_timeout: Duration::from_millis(300), ..fast_timing() };
     let running = Running::start(timing).await;

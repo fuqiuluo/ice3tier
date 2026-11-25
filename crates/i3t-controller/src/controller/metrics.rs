@@ -16,7 +16,6 @@ pub(crate) struct Counters {
     pub(crate) version_failures: u64,
     pub(crate) release_checks: u64,
     pub(crate) release_check_failures: u64,
-    pub(crate) package_bytes: u64,
     pub(crate) route_queries: u64,
 }
 
@@ -65,7 +64,8 @@ impl Controller {
         );
         out.counter("i3t_controller_release_checks_total", "启动以来检查发布源的次数", &[], counters.release_checks);
         out.counter("i3t_controller_release_check_failures_total", "启动以来检查发布源失败的次数", &[], counters.release_check_failures);
-        out.counter("i3t_controller_package_bytes_sent_total", "启动以来发送给节点的更新包字节数", &[], counters.package_bytes);
+        let package_bytes = inner.switchboard().package_bytes;
+        out.counter("i3t_controller_package_bytes_sent_total", "启动以来发送给节点的更新包字节数", &[], package_bytes);
         Ok(out.finish())
     }
 }

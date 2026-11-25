@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use i3t_model::admin::{LogRef, NetworkId, Node, NodeDetail, RelaySettings, Timestamp, UpdateNode, action};
-use i3t_model::control::ToNode;
 use i3t_model::netmap::ExitRole;
 use i3t_proto::NodeId;
 use serde_json::{Map, Value, json};
@@ -262,7 +261,8 @@ impl Controller {
         })?;
         tracing::info!(node = %id, name = %node.name, "删除节点，吊销它的公钥");
         // 先告诉它自己，再从别人那里去掉它。它的连接随着发送队列的关闭而结束。
-        inner.send(id, ToNode::Revoked);
+        let revoked = inner.switchboard().revoke(id);
+        inner.delivered(id, revoked);
         inner.forget_node(id);
         let refreshed = inner.refresh(network, Seeds::All, None);
         // 若被删节点正占用 relay 更新轮次，则推进至下一个 relay；即使 netmap 重算失败也需执行，因为节点已被删除。
@@ -342,13 +342,13 @@ impl Inner {
 
     /// 一个节点不存在了：丢掉它的下发状态和排着的工作，别的节点也不再记着它。
     pub(crate) fn forget_node(&mut self, id: NodeId) {
+        self.switchboard().disconnect(id);
         self.live.remove(&id);
         self.sync.remove(&id);
         self.dirty.remove(&id);
         self.routes.remove(&id);
         self.usage.forget(id);
         self.stats_forget(id);
-        self.drop_route_queries(id);
         self.updates.forget(id);
         for sync in self.sync.values_mut() {
             sync.forget(id);

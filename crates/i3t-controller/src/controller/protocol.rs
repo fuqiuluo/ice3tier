@@ -7,12 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use i3t_model::admin::{LogRef, action};
 use i3t_model::control::{
     Hello, MAX_LOCAL_ADDRESSES, MAX_PACKAGE_CHUNK, MAX_PEER_USE, MAX_RELAY_USERS, MAX_REPORTED_SWITCHES, RelayTry, Report, RouteSwitch,
-    Signal, ToController, ToNode, VnetReport, VnetState,
+    ToController, ToNode, VnetReport, VnetState,
 };
 use i3t_model::netmap::Attachment;
 use i3t_model::update::{Platform, Version};
@@ -20,6 +20,7 @@ use i3t_proto::{NodeId, PublicKey};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use super::switchboard::{Answer, Undelivered};
 use super::usage::UsageReport;
 use super::{Controller, Inner, Live, Seeds, first_failure};
 use crate::error::{Entity, Error, Rejection, error_chain};
@@ -41,6 +42,17 @@ impl VnetFacts for Inner {
     fn lacks_vnet(&self, node: NodeId) -> bool {
         self.no_vnet.contains(&node)
     }
+}
+
+/// [`Controller::handle`] 处理一条消息要等什么（[`Controller::waits`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waits {
+    /// 什么都不等：只拿一把很短的锁（转发信令、交回查询的回答），可以直接在异步任务里处理。
+    Nothing,
+    /// 读文件（取更新包），不拿 controller 的锁。
+    File,
+    /// 拿 controller 的锁，可能要等数据库。
+    Store,
 }
 
 /// 一条被接受的连接：哪个节点，第几条连接。之后这条连接上的消息都带着它交进来。
@@ -80,50 +92,69 @@ impl Controller {
 
     /// 处理一条已经被接受的连接上收到的消息。连接已经被顶替、或者节点已经被删掉时，消息被忽略。
     ///
+    /// 不读写存储的消息（[`Controller::waits`] 不是 [`Waits::Store`]）不拿 controller 的锁：拿着它的操作可能正在等数据库，
+    /// 转发信令、交回查询的回答、给节点更新包不该跟着等（见 [`switchboard`](super::switchboard)）。
+    ///
     /// # Errors
     ///
     /// 读写存储失败。这条消息没有处理完，连接可以继续用。
     pub fn handle(&self, session: Admitted, remote: IpAddr, message: ToController) -> Result<(), Error> {
-        let mut inner = self.lock();
-        if inner.live.get(&session.node).is_none_or(|live| live.conn != session.conn) {
-            return Ok(());
-        }
-        let outcome = match message {
-            // 取包要读文件，不能拿着锁做：这里只查出缓存在哪里。
+        match message {
             ToController::PackageRequest { request, version, platform, offset, len } => {
-                let cached =
-                    inner.updates.cached_package(&version, platform.as_str()).map(|(path, artifact)| (path.to_owned(), artifact.size));
-                drop(inner);
-                self.package_request(session, request, &version, &platform, cached, PackageRange { offset, len });
-                return Ok(());
+                self.package_request(session, request, &version, &platform, PackageRange { offset, len });
+                Ok(())
             }
             ToController::RouteAnswer { request, answer } => {
-                inner.route_answered(session.node, request, answer);
+                self.switchboard().answered(session, request, Answer::Route(answer));
                 Ok(())
             }
             ToController::BackboneAnswer { request, rows } => {
-                inner.backbone_answered(session.node, request, rows);
+                self.switchboard().answered(session, request, Answer::Backbone(rows));
                 Ok(())
             }
-            ToController::TestReport(report) => inner.test_reported(session.node, *report),
             ToController::ExitTestAnswer { request, result } => {
-                inner.exit_test_answered(session.node, request, *result);
+                self.switchboard().answered(session, request, Answer::ExitTest(*result));
                 Ok(())
             }
-            ToController::Report(report) => inner.report(session.node, *report),
-            ToController::Ack { version } => inner.ack(session.node, version),
             ToController::Signal { to, signal } => {
-                inner.signal(session.node, to, signal);
+                self.on_switchboard(|switchboard| switchboard.signal(session, to, signal));
                 Ok(())
             }
-            // 节点的本地声明变了的时候会在同一条连接上再发一次。
-            ToController::Hello(hello) => inner.rehello(session.node, &hello, remote),
             ToController::Heartbeat => Ok(()),
             ToController::Enroll { .. } => {
                 tracing::debug!(node = %session.node, "忽略已经报到的连接上的注册请求");
                 Ok(())
             }
-        };
+            ToController::TestReport(report) => self.handle_locked(session, |inner| inner.test_reported(session.node, *report)),
+            ToController::Report(report) => self.handle_locked(session, |inner| inner.report(session.node, *report)),
+            ToController::Ack { version } => self.handle_locked(session, |inner| inner.ack(session.node, version)),
+            // 节点的本地声明变了的时候会在同一条连接上再发一次。
+            ToController::Hello(hello) => self.handle_locked(session, |inner| inner.rehello(session.node, &hello, remote)),
+        }
+    }
+
+    /// [`Controller::handle`] 处理这条消息要等什么。节点的连接据此分开处理消息，不读写存储的不排在同一个节点等数据库的消息后面。
+    #[must_use]
+    pub const fn waits(message: &ToController) -> Waits {
+        match message {
+            ToController::RouteAnswer { .. }
+            | ToController::BackboneAnswer { .. }
+            | ToController::ExitTestAnswer { .. }
+            | ToController::Signal { .. }
+            | ToController::Heartbeat
+            | ToController::Enroll { .. } => Waits::Nothing,
+            ToController::PackageRequest { .. } => Waits::File,
+            ToController::TestReport(_) | ToController::Report(_) | ToController::Ack { .. } | ToController::Hello(_) => Waits::Store,
+        }
+    }
+
+    /// 拿着 controller 的锁处理一条消息。连接已经被顶替、或者节点已经被删掉时忽略。
+    fn handle_locked(&self, session: Admitted, handle: impl FnOnce(&mut Inner) -> Result<(), Error>) -> Result<(), Error> {
+        let mut inner = self.lock();
+        if inner.live.get(&session.node).is_none_or(|live| live.conn != session.conn) {
+            return Ok(());
+        }
+        let outcome = handle(&mut inner);
         self.wake_if_needed(&inner);
         outcome
     }
@@ -157,36 +188,43 @@ impl Controller {
     }
 
     /// 节点要更新包里的一段。包是公开的发布文件，所以只要是已经报到的节点就给，不看它有没有收到过更新指令。
-    /// `cached` 是调用方在锁内查到的缓存文件及其大小，读文件在锁外进行，回复时再取一次锁。
-    fn package_request(
-        &self,
-        session: Admitted,
-        request: u64,
-        version: &Version,
-        platform: &Platform,
-        cached: Option<(PathBuf, u64)>,
-        range: PackageRange,
-    ) {
-        let is_current = |inner: &Inner| inner.live.get(&session.node).is_some_and(|live| live.conn == session.conn);
+    ///
+    /// 不拿 controller 的锁：缓存在哪里、回复放进发送队列都只用到 [`Switchboard`](super::switchboard::Switchboard)，读文件时什么锁都不拿。
+    /// 回复无法放入发送队列（节点未及时读取、连接已关闭）时断开节点（见 [`Switchboard::send`](super::switchboard::Switchboard::send)）。
+    fn package_request(&self, session: Admitted, request: u64, version: &Version, platform: &Platform, range: PackageRange) {
+        let cached = {
+            let switchboard = self.switchboard();
+            if !switchboard.is_current(session) {
+                return;
+            }
+            switchboard.cached_package(version, platform.as_str())
+        };
         let chunk = match cached {
             Some((path, size)) => range.read(&path, size),
             None => Err(format!("controller 未缓存 {version} 版本 {platform} 平台的更新包")),
         };
-        let mut inner = self.lock();
-        if !is_current(&inner) {
-            return;
-        }
-        let reply = match chunk {
+        let (reply, bytes) = match chunk {
             Ok(data) => {
-                inner.counters.package_bytes += u64::try_from(data.len()).unwrap_or(u64::MAX);
-                ToNode::PackageChunk { request, data }
+                let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                (ToNode::PackageChunk { request, data }, bytes)
             }
             Err(reason) => {
                 tracing::warn!(node = %session.node, %version, %platform, offset = range.offset, %reason, "无法提供节点请求的更新包片段");
-                ToNode::PackageUnavailable { request, reason }
+                (ToNode::PackageUnavailable { request, reason }, 0)
             }
         };
-        inner.send(session.node, reply);
+        self.on_switchboard(|switchboard| {
+            if !switchboard.is_current(session) {
+                return;
+            }
+            match switchboard.send(session.node, reply) {
+                Ok(()) => switchboard.package_bytes += bytes,
+                Err(Undelivered::Offline) => {}
+                Err(undelivered @ (Undelivered::Full | Undelivered::Closed)) => {
+                    tracing::warn!(node = %session.node, reason = undelivered.reason(), "断开节点");
+                }
+            }
+        });
     }
 }
 
@@ -245,7 +283,6 @@ impl Inner {
         let live = Live {
             conn,
             network: node.network,
-            outbox,
             mapping_varies: None,
             flows: 0,
             tx_bytes: 0,
@@ -267,8 +304,7 @@ impl Inner {
             peer_use: BTreeMap::new(),
             relay_use: None,
         };
-        self.drop_route_queries(node.id);
-        if self.live.insert(node.id, live).is_some() {
+        if self.go_online(node.id, live, outbox).is_some() {
             // 旧连接的发送队列随着被替换掉而关闭，那条连接自己会结束。
             tracing::info!(node = %node.id, "同一个节点的新连接顶替了旧连接");
         }
@@ -285,7 +321,7 @@ impl Inner {
         };
         if let Err(err) = outcome {
             // 它没能上线，就不在线：不再等它确认。不然它欠着的确认没人放，`give_up_on_slow_acks` 只看在线的节点。
-            self.live.remove(&node.id);
+            self.go_offline(node.id);
             self.stop_waiting_for(node.network, node.id);
             return Err(err);
         }
@@ -588,26 +624,6 @@ impl Inner {
         }
         self.store.set_node_acked(id, version)?;
         Ok(())
-    }
-
-    /// 把一条信令转给目的节点。只在两个节点互为对端时转，否则丢掉：信令不能用来探测或打扰看不见的节点。
-    fn signal(&mut self, from: NodeId, to: NodeId, signal: Signal) {
-        let knows = |a: NodeId, b: NodeId| self.sync.get(&a).is_some_and(|sync| sync.knows(b));
-        if !(knows(from, to) && knows(to, from)) {
-            tracing::debug!(%from, %to, "丢弃信令：两个节点互不为对端");
-            return;
-        }
-        let Some(live) = self.live.get(&to) else {
-            tracing::debug!(%from, %to, "丢弃信令：目的节点不在线");
-            return;
-        };
-        // 信令是尽力而为的。目的节点的队列已经积了一半时不再往里放：
-        // 不能让一个猛发信令的节点把别人的队列塞满，害得它被当成"不读"而断开。
-        if live.outbox.capacity() * 2 < live.outbox.max_capacity() {
-            tracing::debug!(%from, %to, "丢弃信令：目的节点发送队列积压");
-            return;
-        }
-        self.send(to, ToNode::Signal { from, signal });
     }
 }
 
