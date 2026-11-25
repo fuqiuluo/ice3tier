@@ -28,6 +28,7 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
+use tokio_postgres::config::Host;
 use tokio_postgres::error::Severity;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Config, NoTls, Row, Statement};
@@ -55,20 +56,61 @@ const _: () = assert!(RESPONSE_TIMEOUT.as_millis() < STATEMENT_TIMEOUT.as_millis
 /// 连接串未指定超时时，连接单个地址的默认超时时长。
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 等待驱动线程交回连接时在 [`connect_limit`] 基础上额外预留的余量：正常情况下驱动线程会在超时到达时自行报告连接失败。
+/// 等待驱动线程交回连接时在建连期限（[`connect_limit`]）基础上额外预留的余量：正常情况下驱动线程会在超时到达时自行报告连接失败。
 const HANDOVER_MARGIN: Duration = Duration::from_secs(5);
+
+/// 一个主机名最多按这么多个地址分配建连期限。常见的是一个 IPv4 地址加一个 IPv6 地址；解析出更多地址时，超出部分不再分配期限。
+const MAX_ADDRESSES_PER_HOST: u32 = 8;
 
 /// [`Session`] 被丢弃后，连接向数据库发送终止消息并优雅关闭的最长等待时间。正常情况下可瞬间完成。
 const GOODBYE: Duration = Duration::from_secs(1);
 
-/// 整个建连流程的总超时上限：包含地址解析、建连与认证。`tokio-postgres` 自带的 `connect_timeout` 仅覆盖端口连接
-/// 阶段，对端接受连接却无响应时会持续阻塞。连接串中指定了几个主机便分配几份配额；主机可通过主机名（`host`）、
-/// IP 地址（`hostaddr`）或两者同时指定，主机数取两者中的较大值。
-pub(super) fn connect_limit(config: &Config) -> Duration {
-    let each = config.get_connect_timeout().copied().unwrap_or(CONNECT_TIMEOUT);
-    let hosts = config.get_hosts().len().max(config.get_hostaddrs().len());
-    each.saturating_mul(u32::try_from(hosts).unwrap_or(u32::MAX).max(1))
+/// 整个建连流程的总超时上限，包含建连与认证：将要尝试的每个地址一份 `connect_timeout`（连接串未指定时为 [`CONNECT_TIMEOUT`]）。
+///
+/// `tokio-postgres` 依次尝试每个主机，以及主机名解析出的每个地址；端口连接失败或超时（`connect_timeout`）后换下一个地址，
+/// 端口连上之后的启动握手与认证却没有期限，所以整个建连另由这里的期限兜底。按地址分配：只按主机分配的话，排在前面、
+/// 丢弃连接请求的地址（例如主机名同时有 IPv6 和 IPv4 地址，而 IPv6 不通）就会用完全部期限，后面可用的地址轮不到。
+/// 端口连上之后不再响应的地址仍会一直占用期限，`tokio-postgres` 不会换下一个地址。
+pub(super) fn connect_limit(config: &Config, addresses: u32) -> Duration {
+    per_address(config).saturating_mul(addresses.max(1))
 }
+
+/// 连接一个地址的期限：连接串里的 `connect_timeout`，未指定时为 [`CONNECT_TIMEOUT`]。
+fn per_address(config: &Config) -> Duration {
+    config.get_connect_timeout().copied().unwrap_or(CONNECT_TIMEOUT)
+}
+
+/// 连接串里有几个主机：主机可通过主机名（`host`）、IP 地址（`hostaddr`）或两者同时指定，取两者中的较大值，至少为 1。
+fn hosts(config: &Config) -> u32 {
+    let hosts = config.get_hosts().len().max(config.get_hostaddrs().len());
+    u32::try_from(hosts).unwrap_or(u32::MAX).max(1)
+}
+
+/// 建连时 `tokio-postgres` 将依次尝试的地址个数，与它选择地址的方式相同：写了 `hostaddr` 的主机和 Unix 套接字各一个，
+/// 主机名按解析出的地址数计，每个至多 [`MAX_ADDRESSES_PER_HOST`] 个。每次解析最多等待一个地址的期限；解析失败或超时的主机
+/// 按一个计（`tokio-postgres` 同样会解析它并报告失败）。
+pub(super) async fn addresses(config: &Config) -> u32 {
+    let each = per_address(config);
+    let (names, addresses, ports) = (config.get_hosts(), config.get_hostaddrs(), config.get_ports());
+    let mut total: u32 = 0;
+    for index in 0..names.len().max(addresses.len()) {
+        let count = match (addresses.get(index), names.get(index)) {
+            (None, Some(Host::Tcp(name))) => {
+                let port = ports.get(index).or_else(|| ports.first()).copied().unwrap_or(DEFAULT_PORT);
+                match tokio::time::timeout(each, tokio::net::lookup_host((name.as_str(), port))).await {
+                    Ok(Ok(found)) => u32::try_from(found.count()).unwrap_or(u32::MAX).clamp(1, MAX_ADDRESSES_PER_HOST),
+                    Ok(Err(_)) | Err(_) => 1,
+                }
+            }
+            _ => 1,
+        };
+        total = total.saturating_add(count);
+    }
+    total.max(1)
+}
+
+/// 连接串未指定端口时 PostgreSQL 的端口。
+const DEFAULT_PORT: u16 = 5432;
 
 /// 设置等锁期限的语句：其他连接持有锁时最多等待 `timeout`，超时则该语句失败。
 pub(super) fn lock_timeout_sql(timeout: Duration) -> String {
@@ -144,7 +186,8 @@ impl Session {
     /// 在驱动线程上开始连接数据库，不等待结果。连上之后先在驱动线程上执行 `setup`（初始设置，如等锁期限），
     /// 执行成功才交出连接：初始设置无响应时，同样只占用驱动线程。
     pub(super) fn start(config: &Config, setup: Option<String>) -> Result<Connecting, StoreError> {
-        let limit = connect_limit(config);
+        // 驱动线程先解析地址（每个主机至多一个地址的期限），再按地址数确定建连期限（至多每个主机 `MAX_ADDRESSES_PER_HOST` 份）。
+        let longest = per_address(config).saturating_mul(hosts(config)).saturating_mul(MAX_ADDRESSES_PER_HOST + 1);
         let (sender, receiver) = mpsc::channel();
         let (in_use, dropped) = oneshot::channel();
         let config = config.clone();
@@ -159,6 +202,7 @@ impl Session {
                 }
             };
             runtime.block_on(async move {
+                let limit = connect_limit(&config, addresses(&config).await);
                 // 到了期限就丢掉这次建连：套接字随之关掉，这条线程退出。
                 let failed = match tokio::time::timeout(limit, config.connect(NoTls)).await {
                     Ok(Ok((client, connection))) => {
@@ -189,7 +233,7 @@ impl Session {
             });
         };
         thread::Builder::new().name("i3t-postgres".to_owned()).spawn(drive).map_err(StoreError::Driver)?;
-        let deadline = started.checked_add(limit.saturating_add(setup_limit).saturating_add(HANDOVER_MARGIN));
+        let deadline = started.checked_add(longest.saturating_add(setup_limit).saturating_add(HANDOVER_MARGIN));
         Ok(Connecting { receiver, started, deadline })
     }
 

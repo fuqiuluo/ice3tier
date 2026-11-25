@@ -32,7 +32,7 @@
 //! 调用方（持有 controller 锁）只在建连开始后的一小段时间内等待结果（[`RECONNECT_WAIT`]，上一次重连失败后为 [`RETRY_WAIT`]），
 //! 数据库可达时通常在此期间完成，读写照常进行；
 //! 超出这段时间仍未连上则返回 [`StoreError::Reconnecting`]，建连继续在后台进行，此后的读写立即失败，直到建连有了结果。
-//! 若在持锁期间同步等待建连（多主机时可达数十秒），会冻结整个 controller，使所有节点连接因长时间无法处理而被判定离线。
+//! 若在持锁期间同步等待建连（每个主机、每个解析出的地址各有一份期限，可达数十秒），会冻结整个 controller，使所有节点连接因长时间无法处理而被判定离线。
 //! 断的那一刻正在做的读写报错。
 //! 若断开发生在事务中，事务不会生效且数据库侧会自动回滚，仅有一种情况结果不确定：连接断在发出提交指令之后、收到响应之前。
 //! 此时数据库可能已提交也可能未提交，此处返回 [`StoreError::CommitUnknown`]，调用方不可按未执行处理。
@@ -1743,6 +1743,58 @@ mod tests {
         }
     }
 
+    /// 在 `address` 上放一个从不接受连接、连接队列已满的监听：之后的连接请求被丢弃，与地址不通相同。
+    /// 这台机器上做不到（没有这个地址，或者队列满时直接拒绝）时返回 `None`。
+    fn dropping_connections_on(runtime: &tokio::runtime::Runtime, address: std::net::SocketAddr) -> Option<impl Sized> {
+        let _entered = runtime.enter();
+        let socket = if address.is_ipv6() { tokio::net::TcpSocket::new_v6() } else { tokio::net::TcpSocket::new_v4() }.ok()?;
+        socket.bind(address).ok()?;
+        let listener = socket.listen(0).ok()?;
+        let mut queued = Vec::new();
+        for _ in 0..8 {
+            match std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)) {
+                Ok(stream) => queued.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Some((listener, queued)),
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn an_address_that_drops_connection_requests_leaves_time_for_the_next_address_of_the_same_host() {
+        use std::net::ToSocketAddrs as _;
+        use std::sync::atomic::AtomicBool;
+
+        let scratch = Scratch::new();
+        // 代理只听 127.0.0.1；同一端口的 IPv6 回环不通。`localhost` 先解析出 ::1、再解析出 127.0.0.1 的机器上，
+        // 这和主机名同时有 IPv6、IPv4 地址而 IPv6 被防火墙丢弃时一样。
+        let proxied = proxy_cancelling_rollback(&scratch.database(), Arc::new(AtomicBool::new(false)));
+        let port = proxied.0.get_ports()[0];
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let Some(_blackhole) = dropping_connections_on(&runtime, std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))) else {
+            return;
+        };
+        let resolved: Vec<std::net::SocketAddr> = ("localhost", port).to_socket_addrs().unwrap().collect();
+        if !resolved.first().is_some_and(std::net::SocketAddr::is_ipv6) || !resolved.iter().any(std::net::SocketAddr::is_ipv4) {
+            return;
+        }
+
+        let mut config = Config::new();
+        config.host("localhost").port(port).connect_timeout(Duration::from_secs(3));
+        if let Some(user) = proxied.0.get_user() {
+            config.user(user);
+        }
+        if let Some(dbname) = proxied.0.get_dbname() {
+            config.dbname(dbname);
+        }
+        if let Some(options) = proxied.0.get_options() {
+            config.options(options);
+        }
+        let store = Store::open(&Database(config)).expect("::1 不通，换 127.0.0.1 连上：每个地址各有一份期限");
+        store.set_meta("k", b"v").unwrap();
+    }
+
     #[test]
     fn a_rollback_that_fails_on_a_working_connection_drops_the_connection_and_the_store_recovers() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1862,11 +1914,19 @@ mod tests {
         let error = Store::open(&database).err().expect("这个端口上没有数据库");
         assert!(matches!(error, StoreError::Connect(_)), "去连了，而不是说连接串读不懂：{error:?}");
 
-        // 建连的期限按主机的个数给：写名字、写地址都算。
-        let limit = |text: &str| session::connect_limit(&text.parse::<Database>().unwrap().0);
-        assert_eq!(limit("hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), Duration::from_secs(6));
-        assert_eq!(limit("host=a.example,b.example,c.example user=i3t connect_timeout=3"), Duration::from_secs(9));
-        assert_eq!(limit("host=a.example,b.example hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), Duration::from_secs(6));
+        // 建连的期限按将要尝试的地址给：写了地址的主机各一个，只写名字的按解析出的地址数计。
+        let addresses = |text: &str| {
+            let config = text.parse::<Database>().unwrap().0;
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(session::addresses(&config))
+        };
+        assert_eq!(addresses("hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), 2);
+        assert_eq!(addresses("host=a.example,b.example hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), 2);
+        assert_eq!(addresses("host=127.0.0.1,192.0.2.1 user=i3t"), 2);
+        assert!(addresses("host=localhost user=i3t") >= 1);
+        let config = "hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3".parse::<Database>().unwrap().0;
+        assert_eq!(session::connect_limit(&config, 2), Duration::from_secs(6));
+        assert_eq!(session::connect_limit(&config, 0), Duration::from_secs(3), "至少一份");
     }
 
     #[test]
