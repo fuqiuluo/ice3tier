@@ -5,7 +5,7 @@
 //!
 //! `/api/v1` 下面的请求都要带管理令牌（`Authorization: Bearer <令牌>`）。只有一个管理员，没有角色。
 //! 不要令牌的只有两样：WebUI 的静态文件（[`WebUi`]），和 `/metrics`。后者只有合计的数，没有节点的名字和地址，
-//! 这样抓指标的程序不用拿着能改一切的管理令牌。
+//! 这样抓指标的程序不用拿着能改一切的管理令牌。`/metrics` 同一时刻只计算一次（见 [`Metrics`]）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,6 +32,7 @@ use i3t_proto::NodeId;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::Semaphore;
 
 use crate::controller::Controller;
 use crate::error::{Error, error_chain};
@@ -102,7 +103,8 @@ pub fn router(controller: Arc<Controller>, webui: &WebUi) -> Router {
         .layer(middleware::from_fn_with_state(Arc::clone(&controller), require_admin))
         .with_state(Arc::clone(&controller));
 
-    let router = Router::new().route("/metrics", get(metrics)).with_state(controller).nest(API_PREFIX, api);
+    let metrics_state = Metrics { controller, turn: Arc::new(Semaphore::new(1)) };
+    let router = Router::new().route("/metrics", get(metrics)).with_state(metrics_state).nest(API_PREFIX, api);
     webui.attach(router)
 }
 
@@ -345,8 +347,26 @@ struct CheckQuery {
 /// Prometheus 的文本格式。
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-async fn metrics(State(app): State<App>) -> Reply {
-    let text = blocking(&app, Controller::metrics).await?;
+/// `/metrics` 用的状态：controller，和同一时刻只允许一次计算的名额。
+///
+/// `/metrics` 不要令牌，计算要在阻塞线程池里拿 controller 的锁、读存储。交给阻塞线程池的任务不会随连接断开而取消：
+/// 若不加限制，客户端发出请求后立即断开，就能让排队的计算无限累积、占满阻塞线程池，节点的报到、上报和管理请求都排在后面。
+/// 名额在连接上异步等待，连接断开时通常随之放弃（hyper 已读入后续数据、或请求带有未读完的请求体时不再检测断开，请求继续排队，
+/// 排队的请求数受连接名额限制）；
+/// 拿到之后随计算一起交给阻塞线程池，计算完成才归还。
+#[derive(Clone)]
+struct Metrics {
+    controller: App,
+    turn: Arc<Semaphore>,
+}
+
+async fn metrics(State(metrics): State<Metrics>) -> Reply {
+    let turn = Arc::clone(&metrics.turn).acquire_owned().await.expect("名额从不关闭");
+    let text = blocking(&metrics.controller, move |controller| {
+        let _turn = turn;
+        controller.metrics()
+    })
+    .await?;
     Ok(([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], text).into_response())
 }
 
