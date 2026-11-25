@@ -156,6 +156,11 @@ impl Inner {
         self.flush_after = Some(Instant::now() + RETRY_DELAY);
     }
 
+    /// 截至 `now` 仍处于退避期（见 [`Self::back_off`]）。`now` 取自本次调用开始时，调用期间开始的退避同样计入。
+    pub(crate) fn backing_off(&self, now: Instant) -> bool {
+        self.flush_after.is_some_and(|after| now < after)
+    }
+
     /// 提交的回答没有回来的那些事务（[`StoreError::CommitUnknown`](crate::store::StoreError::CommitUnknown)）：
     /// 问数据库它们后来算了数没有。算了数的话，数据库里已经是改过的样子，而提交之后才做的那些事当时没有做
     /// （调用方带着错误返回了）：照数据库现在的样子补上。不补的话，一条删掉了的规则、一个删掉了的节点会一直留在
@@ -334,18 +339,26 @@ impl Inner {
     }
 
     /// 节点不再在线：去掉它的连接，记下最近在线的时间，并且不再等它确认。
+    ///
+    /// 处于退避期（[`Self::back_off`]）时不记录最近在线的时间：该时间仅用于界面显示，不值得持有 controller 锁等待数据库响应；
+    /// 节点参与的测试的结果同样交由后台任务写入（见 [`Inner::tests_node_gone`]）。
     pub(crate) fn drop_session(&mut self, node: NodeId) {
+        let now = Instant::now();
         let Some(live) = self.live.remove(&node) else { return };
         // 注册时那一条连接不算"最近在线"。
         if !live.enrolling
+            && !self.backing_off(now)
             && let Err(err) = self.store.set_node_last_seen(node, self.clock.now())
         {
             // 只影响界面上的"最近在线"，不值得让调用方的操作失败。
             tracing::warn!(%node, "记录节点最近在线的时间失败：{err}");
+            if err.is_database_wide() {
+                self.back_off();
+            }
         }
         self.drop_route_queries(node);
         self.stop_waiting_for(live.network, node);
-        self.tests_node_gone(node);
+        self.tests_node_gone(node, now);
     }
 
     /// 不再等 `node` 确认：等它确认才能继续的对端现在就可以继续。

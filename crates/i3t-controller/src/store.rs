@@ -340,10 +340,16 @@ impl Store {
         Ok(settled)
     }
 
-    /// 测试用：有没有提交的结果还不知道。
-    #[cfg(test)]
+    /// 是否仍有提交结果未知且尚未查明的事务（[`StoreError::CommitUnknown`]）。返回 `false` 时，此前提交结果未知的事务在数据库侧均已完成，
+    /// 已生效的变更对其他连接均可见。
     pub(crate) fn has_unsettled_commits(&self) -> bool {
         !self.unsettled.borrow().is_empty()
+    }
+
+    /// 测试用：提交结果未知且尚未查明的事务数量。
+    #[cfg(test)]
+    pub(crate) fn unsettled_commits(&self) -> usize {
+        self.unsettled.borrow().len()
     }
 
     /// 测试用：让数据库只能读，或者恢复成能写，模拟数据库暂时写不进去。
@@ -385,6 +391,12 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn execute_batch(&self, sql: &str) {
         self.run(|session| session.batch(sql)).unwrap();
+    }
+
+    /// 测试用：执行一条仅返回单个 `bigint` 值的查询。
+    #[cfg(test)]
+    pub(crate) fn query_i64(&self, sql: &str) -> i64 {
+        self.query_one(sql, &[], |row| row.try_get(0)).unwrap()
     }
 
     /// 测试用：从现在起 `on`（比如 `INSERT ON tests`）报错，模拟一串写里只有前面的写进去了。
