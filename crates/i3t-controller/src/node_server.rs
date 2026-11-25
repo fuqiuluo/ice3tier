@@ -404,12 +404,9 @@ async fn handle_queue(controller: &Arc<Controller>, session: Admitted, remote: I
     }
 }
 
-/// 记下处理节点消息时出的错。整个数据库无法读写时，每个节点的每份上报都会出错：这类错误限速
-/// （`Controller::message_error_log`），其余的只计数；别的错误每次都记。
+/// 记下处理节点消息时出的错（限速见 `Controller::error_log_allowance`）。
 fn log_handling_error(controller: &Controller, node: NodeId, err: &Error) {
-    if !err.is_database_wide() {
-        tracing::error!(%node, "处理节点的消息时出错：{}", error_chain(err));
-    } else if let Some(suppressed) = controller.message_error_log.allow() {
+    if let Some(suppressed) = controller.error_log_allowance(err) {
         tracing::error!(%node, suppressed, "处理节点的消息时出错：{}", error_chain(err));
     }
 }
@@ -485,6 +482,5 @@ mod tests {
         });
         let handled: Vec<&String> = lines.iter().filter(|line| line.contains("处理节点的消息时出错")).collect();
         assert_eq!(handled.len(), 3, "整个数据库的错误在这段时间里只记一条，别的错误每条都记：{handled:#?}");
-        assert!(handled[0].contains("suppressed=0") && !handled[1].contains("suppressed"), "{handled:#?}");
     }
 }

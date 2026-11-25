@@ -499,6 +499,12 @@ impl Controller {
         self.wake.notified().await;
     }
 
+    /// 处理节点消息、节点报到时出的错是否记一条错误日志，记的话返回此前省略了几条。整个数据库无法读写时，每个节点的每份上报、
+    /// 每次回连都会出错：这类错误限速（[`Controller::message_error_log`]）；其余错误每条都记。
+    pub(crate) fn error_log_allowance(&self, err: &Error) -> Option<u64> {
+        if err.is_database_wide() { self.message_error_log.allow() } else { Some(0) }
+    }
+
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().expect("controller state mutex poisoned")
     }

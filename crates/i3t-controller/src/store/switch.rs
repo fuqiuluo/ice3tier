@@ -150,6 +150,38 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_keeps_the_same_switches_as_writing_them_one_by_one() {
+        let (mut store, network, nodes) = store_with_nodes(4);
+        let switch = |from: NodeId, to: NodeId, at: u64| NewSwitch {
+            network,
+            from,
+            to,
+            at,
+            previous: Route::None,
+            route: Route::Direct { addr: "203.0.113.7:20330".parse().unwrap() },
+            cause: RouteCause::DirectVerified,
+        };
+        // 网络里编号最小的一条属于节点对 0-1；这一对共有 KEEP_SWITCHES 条，其中时刻最早的另有一条（at=10）。
+        store.insert_switches(&[switch(nodes[0], nodes[1], 100)]).unwrap();
+        let fillers = KEEP_PER_NETWORK - u32::try_from(KEEP_SWITCHES).unwrap();
+        store.execute_batch(&format!(
+            "INSERT INTO route_switches (network_id, from_node, to_node, at, previous, route, cause)
+             SELECT a.network_id, a.id, b.id, n, '0', '0', '0'
+             FROM nodes a, nodes b, generate_series(1, {fillers}) AS n
+             WHERE a.id = (SELECT id FROM nodes ORDER BY id OFFSET 2 LIMIT 1) AND b.id = (SELECT id FROM nodes ORDER BY id OFFSET 3 LIMIT 1)"
+        ));
+        let pair: Vec<NewSwitch> = [10].into_iter().chain(200..218).map(|at| switch(nodes[0], nodes[1], at)).collect();
+        store.insert_switches(&pair).unwrap();
+        assert_eq!(store.query_i64("SELECT COUNT(*) FROM route_switches"), i64::from(KEEP_PER_NETWORK));
+
+        // 逐条写入时：第一条挤掉编号最小的那条（节点对 0-1 剩 19 条），第二条使这一对回到 20 条，at=10 的一条留下。
+        store.insert_switches(&[switch(nodes[0], nodes[2], 500), switch(nodes[0], nodes[1], 500)]).unwrap();
+        let kept: Vec<u64> = store.switches(nodes[0], nodes[1]).unwrap().into_iter().map(|switch| switch.at).collect();
+        assert!(kept.contains(&10), "与逐条写入时相同：{kept:?}");
+        assert_eq!(store.query_i64("SELECT COUNT(*) FROM route_switches"), i64::from(KEEP_PER_NETWORK));
+    }
+
+    #[test]
     fn a_network_keeps_its_latest_switches_up_to_the_limit() {
         let (mut store, network, nodes) = store_with_nodes(3);
         // 这个网络已经记满了：最老的编号最小。

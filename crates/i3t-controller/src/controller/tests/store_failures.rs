@@ -495,14 +495,14 @@ fn a_report_whose_route_switches_cannot_be_recorded_still_records_the_rest() {
     lab.settle(&mut [&mut a, &mut b]);
     lab.controller.lock().store.block("no_switches", "INSERT ON route_switches", None);
 
-    // 换路只记进界面上的历史：记不下时，同一份上报里的端点照样记下。
+    // 换路只记进界面上的历史：无法记录时，同一份上报里的端点仍然记下。
     let endpoint: SocketAddr = "203.0.113.5:20330".parse().unwrap();
     let switch =
         RouteSwitch { peer: b.id, from: Route::None, to: Route::Direct { addr: endpoint }, cause: RouteCause::DirectVerified, age_secs: 0 };
     let report = Report { endpoints: vec![endpoint], switches: vec![switch], ..Report::default() };
     let handled = lab.controller.handle(a.session, REMOTE, ToController::Report(Box::new(report)));
-    assert!(handled.is_err(), "换路没有记下，错误照样交回");
-    assert_eq!(lab.controller.lock().store.node(a.id).unwrap().unwrap().endpoints, [endpoint], "端点照样记下");
+    assert!(handled.is_err(), "换路未记录，仍交回错误");
+    assert_eq!(lab.controller.lock().store.node(a.id).unwrap().unwrap().endpoints, [endpoint], "端点已记录");
     assert!(lab.controller.lock().store.switches(a.id, b.id).unwrap().is_empty());
     lab.controller.lock().store.unblock("no_switches", "route_switches");
 }

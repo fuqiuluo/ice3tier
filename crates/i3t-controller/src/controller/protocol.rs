@@ -85,10 +85,7 @@ impl Controller {
         };
         self.wake_if_needed(&inner);
         outcome.map_err(|err| {
-            // 数据库无法读写时，每个回连的节点都会报到失败：限速，其余的只计数。
-            if !err.is_database_wide() {
-                tracing::error!(key = ?key, %remote, "处理节点报到时出错：{}", error_chain(&err));
-            } else if let Some(suppressed) = self.message_error_log.allow() {
+            if let Some(suppressed) = self.error_log_allowance(&err) {
                 tracing::error!(key = ?key, %remote, suppressed, "处理节点报到时出错：{}", error_chain(&err));
             }
             Rejection::Internal
@@ -496,10 +493,14 @@ impl Inner {
 
         let Some(node) = self.store.node(id)? else { return Ok(()) };
         self.stats_reported(&node, &report);
-        // 换路只记进界面上的历史：记不下时照样处理这份上报的其余部分（更新进度、relay 探测、端点与挂靠），错误最后交回。
+        // 换路只记进界面上的历史：无法记录时仍处理这份上报的其余部分（更新进度、relay 探测、端点与挂靠）。其余部分也出错时
+        // 交回其余部分的错误；换路的错误只记在调试日志里，不另记一条错误日志：两者多半出于同一个原因（例如数据库只读）。
         let switched = self.switches_reported(&node, &report.switches);
         let applied = self.state_reported(node, report);
-        first_failure(applied, switched)
+        if let (Err(_), Err(err)) = (&applied, &switched) {
+            tracing::debug!(node = %id, "记录节点上报的换路失败：{}", error_chain(err));
+        }
+        applied.and(switched)
     }
 
     /// 记下上报里的状态：代理与转发、更新进度、挂靠与 relay 探测、虚拟网卡、本地地址、端点。`node` 是这个节点在存储里的记录。
