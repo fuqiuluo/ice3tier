@@ -7,11 +7,12 @@
 
 mod texts;
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{CommandFactory, Parser};
@@ -30,6 +31,13 @@ const LOG_ENV: &str = "I3T_LOG";
 /// 数据库的连接串也可以放在数据目录里的这个文件里，`--database-url` 和环境变量都没有给时读它。
 /// 安装脚本把连接串写在这里（只有 controller 的用户读得了），所以只凭数据目录就能启动、就能重新生成管理令牌。
 const DATABASE_URL_FILE: &str = "database.url";
+
+/// 服务停止后，关闭运行时时等待阻塞线程上未完成调用的最长时间。
+///
+/// 数据库读写等短调用在此期限内正常完成。从发布源检查版本、下载更新包的调用可能持续数分钟，若一直等待，停服会超出
+/// Docker Compose（默认 10 秒）或 systemd 的期限而被强制终止。超过期限后进程直接退出：下载未完成的文件使用临时名称，
+/// 下次重新下载。
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 // 帮助的文字在文字目录里（`texts`），由 `command` 按语言装上去，所以这里不写文档注释：clap 会把它们当成说明。
 #[derive(Parser)]
@@ -91,8 +99,8 @@ fn main() -> ExitCode {
     let outcome = if args.reset_admin_token {
         reset_admin_token(&args)
     } else {
-        match tokio::runtime::Runtime::new() {
-            Ok(runtime) => runtime.block_on(serve(args)),
+        match block_on(serve(args)) {
+            Ok(outcome) => outcome,
             Err(error) => {
                 eprintln!("i3t-controller: {}", lang.labelled(texts::texts().start_runtime, &error.to_string()));
                 return ExitCode::FAILURE;
@@ -106,6 +114,19 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// 在新建的多线程运行时上运行 `future` 直至完成，再关闭运行时，最多等待 [`RUNTIME_SHUTDOWN_GRACE`]。
+///
+/// # Errors
+///
+/// 无法创建运行时。
+fn block_on<F: Future>(future: F) -> io::Result<F::Output> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let output = runtime.block_on(future);
+    // 直接 drop 运行时会无限期等待全部阻塞调用结束。
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    Ok(output)
 }
 
 /// 日志写到标准错误。`default` 是没有设 [`LOG_ENV`] 时的级别。
@@ -253,4 +274,49 @@ fn abort_on_panic() {
         default_hook(info);
         std::process::abort();
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    /// 在运行时上启动一个阻塞调用，等它开始执行后即返回，不等待其结束（与停服时被取消的后台任务一致）。
+    /// 未开始执行的阻塞调用在运行时关闭时会被直接丢弃，所以必须等它开始。
+    async fn start_blocking(call: impl FnOnce() + Send + 'static) {
+        let (started, wait_started) = oneshot::channel();
+        drop(tokio::task::spawn_blocking(move || {
+            // 发送失败说明等待方已不在，无需处理。
+            let _ = started.send(());
+            call();
+        }));
+        wait_started.await.expect("阻塞调用在开始执行前被丢弃");
+    }
+
+    #[test]
+    fn stopping_waits_for_short_blocking_calls() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        block_on(start_blocking(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        }))
+        .unwrap();
+        assert!(finished.load(Ordering::SeqCst), "关闭运行时未等待 200 毫秒的阻塞调用完成");
+    }
+
+    #[test]
+    fn stopping_does_not_wait_for_long_blocking_calls() {
+        let started = Instant::now();
+        block_on(start_blocking(|| std::thread::sleep(Duration::from_secs(20)))).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < RUNTIME_SHUTDOWN_GRACE + Duration::from_secs(5),
+            "关闭运行时等待了 {elapsed:?}，超出期限 {RUNTIME_SHUTDOWN_GRACE:?}"
+        );
+    }
 }
