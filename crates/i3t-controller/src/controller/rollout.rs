@@ -176,9 +176,9 @@ impl Inner {
     fn roll_out_at(&mut self, now: Instant, failures: &mut Failures) -> Result<(), Error> {
         self.settle_relay_turns(now, failures)?;
 
-        // 按网络一次读出全部节点，再按节点编号依次处理在线的：每个在线节点各读一次的话，节点重连时每份首次上报都要读一遍全部
-        // 在线节点，controller 重启后的重连合计按节点数的平方增长。一个网络整体读不出来（又不是整个数据库的故障）时，
-        // 这个网络的在线节点逐个读，单个节点读取失败只跳过它，同上。
+        // 按网络一条语句读出全部节点，再按节点编号依次处理在线的：每个在线节点各读一条语句的话，节点重连时每份首次上报都要
+        // 执行在线节点数那么多条，controller 重启后的重连合计执行的语句数按节点数的平方增长（读出的行数仍与网络内的节点数成正比）。
+        // 一个网络无法整体读出（又不是整个数据库的故障）时，这个网络的在线节点逐个读取，单个节点读取失败只跳过它，同上。
         let networks: BTreeSet<NetworkId> = self.live.values().map(|live| live.network).collect();
         let mut records = BTreeMap::new();
         let mut unsure = BTreeSet::new();

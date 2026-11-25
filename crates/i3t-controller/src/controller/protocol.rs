@@ -85,7 +85,12 @@ impl Controller {
         };
         self.wake_if_needed(&inner);
         outcome.map_err(|err| {
-            tracing::error!(key = ?key, %remote, "处理节点报到时出错：{}", error_chain(&err));
+            // 数据库无法读写时，每个回连的节点都会报到失败：限速，其余的只计数。
+            if !err.is_database_wide() {
+                tracing::error!(key = ?key, %remote, "处理节点报到时出错：{}", error_chain(&err));
+            } else if let Some(suppressed) = self.message_error_log.allow() {
+                tracing::error!(key = ?key, %remote, suppressed, "处理节点报到时出错：{}", error_chain(&err));
+            }
             Rejection::Internal
         })
     }

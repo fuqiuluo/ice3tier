@@ -404,9 +404,12 @@ async fn handle_queue(controller: &Arc<Controller>, session: Admitted, remote: I
     }
 }
 
-/// 记下处理节点消息时出的错。限速（`Controller::message_error_log`）：数据库连不上时，每个节点的每份上报都会出错。
+/// 记下处理节点消息时出的错。整个数据库无法读写时，每个节点的每份上报都会出错：这类错误限速
+/// （`Controller::message_error_log`），其余的只计数；别的错误每次都记。
 fn log_handling_error(controller: &Controller, node: NodeId, err: &Error) {
-    if let Some(suppressed) = controller.message_error_log.allow() {
+    if !err.is_database_wide() {
+        tracing::error!(%node, "处理节点的消息时出错：{}", error_chain(err));
+    } else if let Some(suppressed) = controller.message_error_log.allow() {
         tracing::error!(%node, suppressed, "处理节点的消息时出错：{}", error_chain(err));
     }
 }
@@ -459,4 +462,29 @@ async fn reply_and_close(writer: &mut (impl AsyncWrite + Unpin), reply: ToNode, 
 async fn close(writer: &mut (impl AsyncWrite + Unpin)) {
     // 关不关得干净不影响任何状态：连接反正要丢弃了。
     let _ = timeout(Duration::from_secs(1), writer.shutdown()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::testing::{Lab, logged};
+    use crate::error::Entity;
+    use crate::store::StoreError;
+
+    #[test]
+    fn errors_of_a_database_that_cannot_be_used_are_logged_once_in_a_while_and_other_errors_every_time() {
+        let mut lab = Lab::new();
+        let network = lab.network("home").id;
+        let (a, b) = (lab.join(network, &[]), lab.join(network, &[]));
+        let lines = logged(|| {
+            for node in [a.id, b.id, a.id] {
+                log_handling_error(&lab.controller, node, &Error::Store(StoreError::Disconnected));
+            }
+            log_handling_error(&lab.controller, b.id, &Error::NotFound(Entity::Node));
+            log_handling_error(&lab.controller, a.id, &Error::NotFound(Entity::Node));
+        });
+        let handled: Vec<&String> = lines.iter().filter(|line| line.contains("处理节点的消息时出错")).collect();
+        assert_eq!(handled.len(), 3, "整个数据库的错误在这段时间里只记一条，别的错误每条都记：{handled:#?}");
+        assert!(handled[0].contains("suppressed=0") && !handled[1].contains("suppressed"), "{handled:#?}");
+    }
 }

@@ -78,7 +78,7 @@ const CONTROLLER_KEY_META: &str = "controller_key";
 const COOLDOWN_SECS: u64 = 90 * 24 * 60 * 60;
 /// 拒绝没有注册的公钥、无效的令牌这一类日志多久最多记一条。谁都能拿一把新生成的公钥连上来，不限的话日志会被刷满。
 const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(10);
-/// 处理节点消息出错的日志多久最多记一条，其余的只计数。
+/// 整个数据库无法读写时，处理节点消息出错的日志多久最多记一条，其余的只计数。
 const MESSAGE_ERROR_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// controller 里的几个时间。默认值是协议约定的，测试里会改短。
@@ -142,7 +142,7 @@ pub struct Controller {
     check_wake: Notify,
     /// 给还没认出来的连接的拒绝日志限速。
     pub(crate) refusal_log: Throttle,
-    /// 给处理节点消息出错的日志限速：数据库连不上时，每个节点的每份上报都会出错。
+    /// 给整个数据库无法读写时处理节点消息、节点报到出错的日志限速：这时每个节点的每份上报、每次回连都会出错。
     pub(crate) message_error_log: Throttle,
     /// 同一个控制器的节点监听器共用核验配额。重开监听时，旧的阻塞任务仍可能在运行。
     pub(crate) verification_quota: Arc<VerificationQuota>,

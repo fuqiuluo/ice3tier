@@ -4,8 +4,6 @@
 //! - 一对节点（两个方向一共）只留最近的 [`KEEP_SWITCHES`] 条，一个网络一共最多 [`KEEP_PER_NETWORK`] 条：
 //!   互相通信、又换过路的节点对再多，表的大小也有上限。
 
-use std::collections::BTreeSet;
-
 use super::codec::{Int, Json, SqlNetwork, SqlNode, Unsigned};
 use super::{Store, StoreError};
 use i3t_model::admin::{KEEP_SWITCHES, NetworkId, SwitchView, Timestamp};
@@ -28,10 +26,9 @@ pub struct NewSwitch {
 }
 
 impl Store {
-    /// 记下一批换路，然后删掉涉及的节点对和网络多出来的老记录。
+    /// 记下一批换路，每条之后删掉这一对和这个网络多出来的老记录，留下的与逐条记下时相同。
     ///
-    /// 全部在一个事务里：要么都记下，要么都不记，提交时只落盘一次，而不是每条语句各落盘一次。按节点对删老记录在每条之后做，
-    /// 留下的与逐条记下时相同；按网络删老记录要扫描这个网络的全部记录，所以一批只做一次（只按编号保留最新的，结果相同）。
+    /// 全部在一个事务里：要么都记下，要么都不记，提交时只落盘一次，而不是每条语句各落盘一次。
     ///
     /// # Errors
     ///
@@ -40,23 +37,10 @@ impl Store {
         if switches.is_empty() {
             return Ok(());
         }
-        let networks: BTreeSet<NetworkId> = switches.iter().map(|switch| switch.network).collect();
-        self.atomically(|store| {
-            for switch in switches {
-                store.insert_switch(switch)?;
-            }
-            for network in networks {
-                store.execute(
-                    "DELETE FROM route_switches WHERE network_id = $1 AND id NOT IN (
-                         SELECT id FROM route_switches WHERE network_id = $1 ORDER BY id DESC LIMIT $2)",
-                    &[&SqlNetwork(network), &Int(KEEP_PER_NETWORK)],
-                )?;
-            }
-            Ok(())
-        })
+        self.atomically(|store| switches.iter().try_for_each(|switch| store.insert_switch(switch)))
     }
 
-    /// 记下一次换路，然后把这一对多出来的老记录删掉。网络多出来的老记录由调用方删（见 [`Store::insert_switches`]）。
+    /// 记下一次换路，然后把这一对和这个网络多出来的老记录删掉。
     fn insert_switch(&self, switch: &NewSwitch) -> Result<(), StoreError> {
         self.execute(
             "INSERT INTO route_switches (network_id, from_node, to_node, at, previous, route, cause) VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -77,6 +61,11 @@ impl Store {
                  SELECT id FROM route_switches WHERE network_id = $1 AND ((from_node = $2 AND to_node = $3) OR (from_node = $3 AND to_node = $2))
                  ORDER BY at DESC, id DESC LIMIT $4)",
             &[&SqlNetwork(switch.network), &SqlNode(switch.from), &SqlNode(switch.to), &Int(keep)],
+        )?;
+        self.execute(
+            "DELETE FROM route_switches WHERE network_id = $1 AND id NOT IN (
+                 SELECT id FROM route_switches WHERE network_id = $1 ORDER BY id DESC LIMIT $2)",
+            &[&SqlNetwork(switch.network), &Int(KEEP_PER_NETWORK)],
         )?;
         Ok(())
     }
@@ -158,5 +147,31 @@ mod tests {
         store.insert_switches(&[switch(nodes[1])]).unwrap();
         assert_eq!(store.switches(nodes[0], nodes[1]).unwrap().len(), 1);
         store.insert_switches(&[]).unwrap();
+    }
+
+    #[test]
+    fn a_network_keeps_its_latest_switches_up_to_the_limit() {
+        let (mut store, network, nodes) = store_with_nodes(3);
+        // 这个网络已经记满了：最老的编号最小。
+        store.execute_batch(&format!(
+            "INSERT INTO route_switches (network_id, from_node, to_node, at, previous, route, cause)
+             SELECT a.network_id, a.id, b.id, n, '0', '0', '0'
+             FROM nodes a, nodes b, generate_series(1, {KEEP_PER_NETWORK}) AS n
+             WHERE a.id = (SELECT MIN(id) FROM nodes) AND b.id = (SELECT MIN(id) FROM nodes WHERE id > a.id)"
+        ));
+        let oldest = store.query_i64("SELECT MIN(id) FROM route_switches");
+        let switch = NewSwitch {
+            network,
+            from: nodes[0],
+            to: nodes[2],
+            at: 10,
+            previous: Route::None,
+            route: Route::Direct { addr: "203.0.113.7:20330".parse().unwrap() },
+            cause: RouteCause::DirectVerified,
+        };
+        store.insert_switches(&[switch.clone(), switch]).unwrap();
+        assert_eq!(store.query_i64("SELECT COUNT(*) FROM route_switches"), i64::from(KEEP_PER_NETWORK), "不超过上限");
+        assert_eq!(store.query_i64("SELECT MIN(id) FROM route_switches"), oldest + 2, "删掉的是最老的两条");
+        assert_eq!(store.switches(nodes[0], nodes[2]).unwrap().len(), 2, "新记下的都在");
     }
 }
