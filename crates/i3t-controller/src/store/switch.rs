@@ -4,6 +4,8 @@
 //! - 一对节点（两个方向一共）只留最近的 [`KEEP_SWITCHES`] 条，一个网络一共最多 [`KEEP_PER_NETWORK`] 条：
 //!   互相通信、又换过路的节点对再多，表的大小也有上限。
 
+use std::collections::BTreeSet;
+
 use super::codec::{Int, Json, SqlNetwork, SqlNode, Unsigned};
 use super::{Store, StoreError};
 use i3t_model::admin::{KEEP_SWITCHES, NetworkId, SwitchView, Timestamp};
@@ -26,12 +28,36 @@ pub struct NewSwitch {
 }
 
 impl Store {
-    /// 记下一次换路，然后把这一对和这个网络多出来的老记录删掉。
+    /// 记下一批换路，然后删掉涉及的节点对和网络多出来的老记录。
+    ///
+    /// 全部在一个事务里：要么都记下，要么都不记，提交时只落盘一次，而不是每条语句各落盘一次。按节点对删老记录在每条之后做，
+    /// 留下的与逐条记下时相同；按网络删老记录要扫描这个网络的全部记录，所以一批只做一次（只按编号保留最新的，结果相同）。
     ///
     /// # Errors
     ///
-    /// 写数据库失败，包括两个节点有一个不存在。
-    pub fn insert_switch(&self, switch: &NewSwitch) -> Result<(), StoreError> {
+    /// 写数据库失败，包括有节点不存在。
+    pub fn insert_switches(&mut self, switches: &[NewSwitch]) -> Result<(), StoreError> {
+        if switches.is_empty() {
+            return Ok(());
+        }
+        let networks: BTreeSet<NetworkId> = switches.iter().map(|switch| switch.network).collect();
+        self.atomically(|store| {
+            for switch in switches {
+                store.insert_switch(switch)?;
+            }
+            for network in networks {
+                store.execute(
+                    "DELETE FROM route_switches WHERE network_id = $1 AND id NOT IN (
+                         SELECT id FROM route_switches WHERE network_id = $1 ORDER BY id DESC LIMIT $2)",
+                    &[&SqlNetwork(network), &Int(KEEP_PER_NETWORK)],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// 记下一次换路，然后把这一对多出来的老记录删掉。网络多出来的老记录由调用方删（见 [`Store::insert_switches`]）。
+    fn insert_switch(&self, switch: &NewSwitch) -> Result<(), StoreError> {
         self.execute(
             "INSERT INTO route_switches (network_id, from_node, to_node, at, previous, route, cause) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             &[
@@ -51,11 +77,6 @@ impl Store {
                  SELECT id FROM route_switches WHERE network_id = $1 AND ((from_node = $2 AND to_node = $3) OR (from_node = $3 AND to_node = $2))
                  ORDER BY at DESC, id DESC LIMIT $4)",
             &[&SqlNetwork(switch.network), &SqlNode(switch.from), &SqlNode(switch.to), &Int(keep)],
-        )?;
-        self.execute(
-            "DELETE FROM route_switches WHERE network_id = $1 AND id NOT IN (
-                 SELECT id FROM route_switches WHERE network_id = $1 ORDER BY id DESC LIMIT $2)",
-            &[&SqlNetwork(switch.network), &Int(KEEP_PER_NETWORK)],
         )?;
         Ok(())
     }
@@ -85,7 +106,7 @@ mod tests {
 
     #[test]
     fn a_pair_keeps_its_latest_switches_in_both_directions_and_they_go_with_the_node() {
-        let (store, network, nodes) = store_with_nodes(3);
+        let (mut store, network, nodes) = store_with_nodes(3);
         let relayed = Route::Relay { relays: vec![nodes[2]] };
         let direct = Route::Direct { addr: "203.0.113.7:20330".parse().unwrap() };
         let switch = |from, to, at, previous: &Route, route: &Route| NewSwitch {
@@ -97,9 +118,10 @@ mod tests {
             route: route.clone(),
             cause: RouteCause::DirectVerified,
         };
-        store.insert_switch(&switch(nodes[0], nodes[1], 10, &Route::None, &relayed)).unwrap();
-        store.insert_switch(&switch(nodes[0], nodes[1], 20, &relayed, &direct)).unwrap();
-        store.insert_switch(&switch(nodes[1], nodes[0], 15, &Route::None, &relayed)).unwrap();
+        store
+            .insert_switches(&[switch(nodes[0], nodes[1], 10, &Route::None, &relayed), switch(nodes[0], nodes[1], 20, &relayed, &direct)])
+            .unwrap();
+        store.insert_switches(&[switch(nodes[1], nodes[0], 15, &Route::None, &relayed)]).unwrap();
         let forward = store.switches(nodes[0], nodes[1]).unwrap();
         assert_eq!(
             forward.iter().map(|switch| (switch.at, switch.to.clone())).collect::<Vec<_>>(),
@@ -107,14 +129,34 @@ mod tests {
         );
         assert_eq!(store.switches(nodes[1], nodes[0]).unwrap().len(), 1, "两个方向分开查");
 
-        for at in 100..130 {
-            store.insert_switch(&switch(nodes[0], nodes[1], at, &relayed, &direct)).unwrap();
-        }
+        let batch: Vec<NewSwitch> = (100..130).map(|at| switch(nodes[0], nodes[1], at, &relayed, &direct)).collect();
+        store.insert_switches(&batch).unwrap();
         let kept = store.switches(nodes[0], nodes[1]).unwrap().len() + store.switches(nodes[1], nodes[0]).unwrap().len();
         assert_eq!(kept, KEEP_SWITCHES, "一对节点两个方向一共只留这么多");
         assert_eq!(store.switches(nodes[0], nodes[1]).unwrap()[0].at, 129);
 
         store.delete_node(nodes[1]).unwrap();
         assert!(store.switches(nodes[0], nodes[1]).unwrap().is_empty(), "节点删掉时它的记录跟着删");
+    }
+
+    #[test]
+    fn a_batch_of_switches_is_recorded_as_a_whole_or_not_at_all() {
+        let (mut store, network, nodes) = store_with_nodes(2);
+        let switch = |to| NewSwitch {
+            network,
+            from: nodes[0],
+            to,
+            at: 10,
+            previous: Route::None,
+            route: Route::Direct { addr: "203.0.113.7:20330".parse().unwrap() },
+            cause: RouteCause::DirectVerified,
+        };
+        // 第二条的对端不存在：这一批一条也不记。
+        let gone = NodeId::new(9999).unwrap();
+        assert!(store.insert_switches(&[switch(nodes[1]), switch(gone)]).is_err());
+        assert!(store.switches(nodes[0], nodes[1]).unwrap().is_empty(), "前面那条也撤销了");
+        store.insert_switches(&[switch(nodes[1])]).unwrap();
+        assert_eq!(store.switches(nodes[0], nodes[1]).unwrap().len(), 1);
+        store.insert_switches(&[]).unwrap();
     }
 }

@@ -539,14 +539,17 @@ impl Inner {
         Ok(())
     }
 
-    /// 节点报的换路记进历史。只记对端还是这个网络里的节点的；一次最多 [`MAX_REPORTED_SWITCHES`] 条。
+    /// 节点报的换路记进历史。只记对端还是这个网络里的节点的；一次最多 [`MAX_REPORTED_SWITCHES`] 条，一起写入（见 [`Store::insert_switches`]）。
+    ///
+    /// [`Store::insert_switches`]: crate::store::Store::insert_switches
     fn switches_reported(&mut self, node: &NodeRecord, switches: &[RouteSwitch]) -> Result<(), Error> {
         let now = self.clock.now();
+        let mut recorded = Vec::new();
         for switch in switches.iter().take(MAX_REPORTED_SWITCHES) {
             if self.store.node(switch.peer)?.is_none_or(|peer| peer.network != node.network) {
                 continue;
             }
-            self.store.insert_switch(&NewSwitch {
+            recorded.push(NewSwitch {
                 network: node.network,
                 from: node.id,
                 to: switch.peer,
@@ -554,9 +557,9 @@ impl Inner {
                 previous: switch.from.clone(),
                 route: switch.to.clone(),
                 cause: switch.cause.clone(),
-            })?;
+            });
         }
-        Ok(())
+        Ok(self.store.insert_switches(&recorded)?)
     }
 
     /// 将节点上报的 relay 连通性探测结果合并到持久化记录中。若可达性发生变化，则触发本节点及其对端的 netmap 重算，
