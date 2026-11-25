@@ -677,9 +677,9 @@ impl OpenTransaction<'_> {
                 self.0.transaction.set(Transaction::None);
                 Ok(())
             }
-            // 数据库答了话、说提交不了：事务没有算数。连接早就不能用、提交根本没发出去的也是。
+            // 数据库已响应并拒绝提交：事务未生效。连接早已不可用、提交请求根本未发出时同样未生效。
             Err(error @ (StoreError::Disconnected | StoreError::Postgres(_))) if !error.left_unanswered() => Err(error),
-            // 发出去了，回答没有回来：数据库那边可能已经提交了。
+            // 提交请求已发出、未收到响应：数据库侧可能已经提交。
             Err(error) => {
                 self.0.transaction.set(Transaction::None);
                 // 什么都没改过的事务算不算数都一样，没有要过后去问的。
