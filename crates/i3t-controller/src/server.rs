@@ -83,8 +83,9 @@ impl Server {
     /// 开始服务，直到 `shutdown` 完成。之后不再接受新的连接和请求，等手上的收尾再返回：
     /// 在线的节点被记为离线，它们会自己重连。
     ///
-    /// 返回时，发布源检查或更新包下载可能仍在阻塞线程上进行，持续数分钟。关闭运行时应设定等待期限
-    /// （`Runtime::shutdown_timeout`），直接 drop 运行时会一直等到它们结束。
+    /// 返回时阻塞线程上可能仍有未完成的调用：后台的发布源检查与更新包下载、对外地址的 DNS 查询（这两项仅在
+    /// `follow_releases` 时存在），管理 API 触发的发布源检查，以及数据库无响应时等待中的读写。其中发布源检查与下载
+    /// 可能持续数分钟。关闭运行时应设定等待期限（`Runtime::shutdown_timeout`），直接 drop 运行时会一直等到它们结束。
     ///
     /// # Errors
     ///
@@ -267,8 +268,16 @@ async fn follow_releases(controller: Arc<Controller>, mut shutdown: watch::Recei
     };
     let fetches = async {
         loop {
-            if let Err(err) = blocking(&controller, Controller::fetch_packages).await {
-                tracing::error!("记录更新包获取结果失败：{}", error_chain(&err));
+            // 每次只在阻塞线程上取一个包：停服时本任务在两个包之间被取消，不再开始下一个平台的下载。
+            loop {
+                match blocking(&controller, Controller::fetch_next_package).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(err) => {
+                        tracing::error!("记录更新包获取结果失败：{}", error_chain(&err));
+                        break;
+                    }
+                }
             }
             controller.wait_for_wanted_packages().await;
         }

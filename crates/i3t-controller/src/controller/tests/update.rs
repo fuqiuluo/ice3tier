@@ -1164,3 +1164,32 @@ fn update_metrics_follow_the_rollout() {
     }
     assert!(metrics.contains("i3t_controller_snapshots_sent_total "));
 }
+
+#[test]
+fn the_background_task_fetches_one_package_per_call() {
+    const WINDOWS: &str = "windows-x86_64";
+    let mut fleet = Fleet::new();
+    fleet.publisher.publish(NEW, &[(LINUX, b"the new program"), (WINDOWS, b"the windows program")]);
+    fleet.controller().check_release().unwrap();
+    // 不经 `Fleet::node`：它在上报后会取回全部的包。节点保持在线直到测试结束。
+    let _members: Vec<_> = [LINUX, WINDOWS]
+        .into_iter()
+        .map(|platform| {
+            let member = fleet.lab.join_as(fleet.network, &Hello { platform: platform.to_owned(), ..modern_hello(OLD) });
+            member.report_update(fleet.controller(), UpdateStatus::Idle);
+            member
+        })
+        .collect();
+    let cached = |fleet: &Fleet| {
+        let release = fleet.controller().update_overview().unwrap().release.unwrap();
+        release.packages.iter().filter(|package| package.state == PackageState::Cached).count()
+    };
+    assert_eq!(cached(&fleet), 0, "两个平台的包均应处于待下载状态");
+
+    // 每次只取一个：停服时后台任务在两次调用之间被取消，不再开始下一个平台的下载。
+    assert!(fleet.controller().fetch_next_package().unwrap());
+    assert_eq!(cached(&fleet), 1);
+    assert!(fleet.controller().fetch_next_package().unwrap());
+    assert_eq!(cached(&fleet), 2);
+    assert!(!fleet.controller().fetch_next_package().unwrap(), "已没有待取的包");
+}

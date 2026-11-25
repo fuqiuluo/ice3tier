@@ -99,8 +99,17 @@ fn main() -> ExitCode {
     let outcome = if args.reset_admin_token {
         reset_admin_token(&args)
     } else {
-        match block_on(serve(args)) {
-            Ok(outcome) => outcome,
+        match block_on(serve(args), RUNTIME_SHUTDOWN_GRACE) {
+            Ok(stopped) => {
+                if stopped.abandoned_blocking {
+                    tracing::warn!("停服时仍有阻塞调用（如发布源检查、更新包下载）在 {RUNTIME_SHUTDOWN_GRACE:?} 内未完成，已放弃等待");
+                }
+                // 在运行时关闭之后输出：关闭期间残留的阻塞调用仍可能输出日志。
+                if stopped.output.is_ok() {
+                    tracing::info!("controller 已停止");
+                }
+                stopped.output
+            }
             Err(error) => {
                 eprintln!("i3t-controller: {}", lang.labelled(texts::texts().start_runtime, &error.to_string()));
                 return ExitCode::FAILURE;
@@ -116,21 +125,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// 在新建的多线程运行时上运行 `future` 直至完成，再关闭运行时，最多等待 [`RUNTIME_SHUTDOWN_GRACE`]。
+/// [`block_on`] 的结果。
+struct Stopped<T> {
+    output: T,
+    /// 关闭运行时达到期限时仍有阻塞调用未完成，已放弃等待。
+    abandoned_blocking: bool,
+}
+
+/// 在新建的多线程运行时上运行 `future` 直至完成，再关闭运行时，最多等待 `grace`。
 ///
 /// # Errors
 ///
 /// 无法创建运行时。
-fn block_on<F: Future>(future: F) -> io::Result<F::Output> {
+fn block_on<F: Future>(future: F, grace: Duration) -> io::Result<Stopped<F::Output>> {
     let runtime = tokio::runtime::Runtime::new()?;
     let output = runtime.block_on(future);
     let closing = Instant::now();
     // 直接 drop 运行时会无限期等待全部阻塞调用结束。
-    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
-    if closing.elapsed() >= RUNTIME_SHUTDOWN_GRACE {
-        tracing::warn!("停服时仍有阻塞调用（如发布源检查、更新包下载）在 {RUNTIME_SHUTDOWN_GRACE:?} 内未完成，已放弃等待");
-    }
-    Ok(output)
+    runtime.shutdown_timeout(grace);
+    // tokio 不返回是否超时，因此按耗时判断。阻塞调用恰好在期限到达时结束的情况也记为放弃，概率极小。
+    Ok(Stopped { output, abandoned_blocking: closing.elapsed() >= grace })
 }
 
 /// 日志写到标准错误。`default` 是没有设 [`LOG_ENV`] 时的级别。
@@ -224,9 +238,7 @@ async fn serve(args: Args) -> anyhow::Result<()> {
     if !args.admin_listen.ip().is_loopback() {
         tracing::warn!(admin = %args.admin_listen, "管理 API 没有绑在回环地址上：它是明文 HTTP，管理令牌会在网络上明文传输");
     }
-    server.run(shutdown_signal()).await.context(t.run_failed)?;
-    tracing::info!("controller 已停止");
-    Ok(())
+    server.run(shutdown_signal()).await.context(t.run_failed)
 }
 
 /// 等 Ctrl-C；在 Unix 上也等 SIGTERM（systemd 和容器停服务时发的是它）。
@@ -283,10 +295,14 @@ fn abort_on_panic() {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
 
     use tokio::sync::oneshot;
 
     use super::*;
+
+    /// 测试用的期限：足以让短调用完成，又不使测试久等。
+    const GRACE: Duration = Duration::from_millis(500);
 
     /// 在运行时上启动一个阻塞调用，等它开始执行后即返回，不等待其结束（与停服时被取消的后台任务一致）。
     /// 未开始执行的阻塞调用在运行时关闭时会被直接丢弃，所以必须等它开始。
@@ -304,22 +320,32 @@ mod tests {
     fn stopping_waits_for_short_blocking_calls() {
         let finished = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&finished);
-        block_on(start_blocking(move || {
-            std::thread::sleep(Duration::from_millis(200));
+        let call = move || {
+            std::thread::sleep(Duration::from_millis(100));
             flag.store(true, Ordering::SeqCst);
-        }))
-        .unwrap();
-        assert!(finished.load(Ordering::SeqCst), "关闭运行时未等待 200 毫秒的阻塞调用完成");
+        };
+        let stopped = block_on(start_blocking(call), GRACE).unwrap();
+        assert!(finished.load(Ordering::SeqCst), "关闭运行时未等待 100 毫秒的阻塞调用完成");
+        assert!(!stopped.abandoned_blocking, "阻塞调用已在期限 {GRACE:?} 内完成，却记为放弃等待");
     }
 
     #[test]
-    fn stopping_does_not_wait_for_long_blocking_calls() {
+    fn stopping_gives_up_on_long_blocking_calls() {
+        let (release, wait_release) = mpsc::channel::<()>();
+        let (done, wait_done) = mpsc::channel();
+        let call = move || {
+            // 关闭运行时之后由测试放行。最多阻塞 20 秒：关闭运行时若一直等待，测试以失败结束，不会一直挂起。
+            let _ = wait_release.recv_timeout(Duration::from_secs(20));
+            // 发送失败说明测试已结束，无需处理。
+            let _ = done.send(());
+        };
         let started = Instant::now();
-        block_on(start_blocking(|| std::thread::sleep(Duration::from_secs(20)))).unwrap();
+        let stopped = block_on(start_blocking(call), GRACE).unwrap();
         let elapsed = started.elapsed();
-        assert!(
-            elapsed < RUNTIME_SHUTDOWN_GRACE + Duration::from_secs(5),
-            "关闭运行时等待了 {elapsed:?}，超出期限 {RUNTIME_SHUTDOWN_GRACE:?}"
-        );
+        drop(release);
+        assert!(elapsed < GRACE + Duration::from_secs(5), "关闭运行时等待了 {elapsed:?}，超出期限 {GRACE:?}");
+        assert!(stopped.abandoned_blocking, "阻塞调用在期限 {GRACE:?} 内未完成，却未记为放弃等待");
+        // 放行后阻塞线程随即结束，不留到测试进程退出。
+        wait_done.recv_timeout(Duration::from_secs(5)).expect("放行后阻塞调用未在 5 秒内结束");
     }
 }

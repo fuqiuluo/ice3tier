@@ -31,6 +31,7 @@
 //!     follow_releases: true,
 //! };
 //! let server = Server::bind(Arc::new(opened.controller), options).await?;
+//! // 返回后关闭运行时应设定等待期限（`Runtime::shutdown_timeout`），原因见 `Server::run` 的文档。
 //! server.run(async { tokio::signal::ctrl_c().await.ok(); }).await
 //! # }
 //! ```

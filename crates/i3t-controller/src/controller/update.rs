@@ -363,15 +363,27 @@ impl Controller {
     ///
     /// 读写存储失败。取包本身的失败不在这里：原因记在那个平台的包上，下次查发布源时再试。
     pub fn fetch_packages(&self) -> Result<(), Error> {
-        loop {
-            let Some(job) = self.lock().next_fetch() else { return Ok(()) };
-            let outcome = job.run();
-            let mut inner = self.lock();
-            let finished = inner.fetch_finished(&job, outcome);
-            // 出错时也要叫醒：还有别的平台的包排着的话，取包的任务等的就是这一声。
-            self.wake_if_needed(&inner);
-            finished?;
-        }
+        while self.fetch_next_package()? {}
+        Ok(())
+    }
+
+    /// 取回一个有节点要用、尚未取回的包。阻塞到取完，期间不持有 controller 的锁。返回是否处理了一个包（下载失败也算），
+    /// 没有待取的包时返回 `false`。
+    ///
+    /// 后台任务逐个调用：停服时任务在两个包之间被取消，不再开始下一个平台的下载。
+    ///
+    /// # Errors
+    ///
+    /// 读写存储失败。下载本身的失败不作为错误返回：原因记录在该平台的包上，下次检查发布源时重试。
+    pub(crate) fn fetch_next_package(&self) -> Result<bool, Error> {
+        let Some(job) = self.lock().next_fetch() else { return Ok(false) };
+        let outcome = job.run();
+        let mut inner = self.lock();
+        let finished = inner.fetch_finished(&job, outcome);
+        // 出错时也要叫醒：还有别的平台的包排着的话，取包的任务等的就是这一声。
+        self.wake_if_needed(&inner);
+        finished?;
+        Ok(true)
     }
 
     /// 等到有包要取。
