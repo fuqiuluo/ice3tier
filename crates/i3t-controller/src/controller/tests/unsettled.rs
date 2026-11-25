@@ -56,8 +56,8 @@ fn be_impatient_for(lab: &Lab, timeout: Duration) {
     lab.controller.lock().store.set_response_timeout(timeout);
 }
 
-/// 提交没等到回答之后，存储暂停一小段才重连（见 `Store::went_unanswered`）。等它过去：之后的读写照常连得上数据库，
-/// 那次提交在数据库那边仍然卡着。
+/// 提交未收到响应后，存储层暂停一段时间才重连（见 `Store::went_unanswered`）。等待暂停结束：此后的读写可以正常连接数据库，
+/// 而那次提交在数据库侧仍处于阻塞状态。
 fn after_the_reconnect_pause() {
     std::thread::sleep(crate::store::RECONNECT_PAUSE.0);
 }

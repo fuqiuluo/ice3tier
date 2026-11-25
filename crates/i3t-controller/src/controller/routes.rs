@@ -88,7 +88,7 @@ impl PendingQuery {
         self.node
     }
 
-    /// 问的人已经不等了。
+    /// 查询方已放弃等待。
     pub(super) fn is_abandoned(&self) -> bool {
         match &self.reply {
             Reply::Route(reply) => reply.is_closed(),
@@ -97,12 +97,12 @@ impl PendingQuery {
         }
     }
 
-    /// 把 `from` 的回答交给问的人。回答的节点或种类和查询对不上时原样交还查询，它接着等。
+    /// 将 `from` 的应答交给查询方。应答节点或应答类型与查询不匹配时原样交还该查询，继续等待。
     pub(super) fn answer(self, from: NodeId, answer: Answer) -> Result<(), Self> {
         if from != self.node {
             return Err(self);
         }
-        // 问的人等不及已经走了也没有关系：发送失败的结果不用看。
+        // 查询方可能已超时放弃，发送失败无需处理。
         match (self.reply, answer) {
             (Reply::Route(reply), Answer::Route(answer)) => {
                 let _unread = reply.send(answer);

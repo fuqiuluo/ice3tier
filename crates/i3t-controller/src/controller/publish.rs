@@ -13,7 +13,7 @@ use i3t_proto::NodeId;
 use tokio::sync::mpsc;
 
 use super::switchboard::Undelivered;
-use super::{Deferred, Failures, Inner, Live, admin_token_hash};
+use super::{Admitted, Deferred, Failures, Inner, Live, admin_token_hash};
 use crate::access::AccessMap;
 use crate::error::Error;
 use crate::netmap::{NetworkView, Relation};
@@ -334,16 +334,39 @@ impl Inner {
         self.delivered(node, sent)
     }
 
-    /// 消息有没有放进节点的发送队列（[`Self::send`]）。放不进去（队列满了、连接已经关了）时断开这个节点。
+    /// 处理放入节点发送队列的结果（[`Self::send`]）：无法放入（队列已满、连接已关闭）时断开该节点。
     pub(crate) fn delivered(&mut self, node: NodeId, sent: Result<(), Undelivered>) -> bool {
         match sent {
             Ok(()) => true,
+            // 不持有本锁时消息无法放入，连接已从 `Switchboard` 去掉，`live` 中仍有记录：同样断开。
+            Err(Undelivered::Offline) if self.live.contains_key(&node) => {
+                tracing::warn!(%node, "节点的连接此前因消息无法放入发送队列而去掉，断开节点");
+                self.drop_session(node);
+                false
+            }
             Err(Undelivered::Offline) => false,
             Err(undelivered @ (Undelivered::Full | Undelivered::Closed)) => {
                 tracing::warn!(%node, reason = undelivered.reason(), "断开节点");
                 self.drop_session(node);
                 false
             }
+        }
+    }
+
+    /// 不持有本锁时因消息无法放入发送队列而去掉了连接的节点（见 `Switchboard::send`）：将它们记为离线。
+    /// 去掉连接的一方会唤醒后台任务（`Controller::on_switchboard`），后台每一轮都核对一遍。
+    pub(crate) fn drop_lost_sessions(&mut self) {
+        let lost: Vec<NodeId> = {
+            let switchboard = self.switchboard();
+            self.live
+                .iter()
+                .filter(|(node, live)| !switchboard.is_current(Admitted { node: **node, conn: live.conn }))
+                .map(|(node, _)| *node)
+                .collect()
+        };
+        for node in lost {
+            tracing::warn!(%node, "节点的连接因消息无法放入发送队列而去掉，断开节点");
+            self.drop_session(node);
         }
     }
 

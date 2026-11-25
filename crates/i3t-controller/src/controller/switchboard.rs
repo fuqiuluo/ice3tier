@@ -4,8 +4,10 @@
 //! 转发信令、交回查询的回答、取更新包都不读写存储，这几样状态另放在 [`Switchboard`] 里、单独加锁，数据库卡住时这些消息照常处理
 //! （见 [`Controller::handle`](super::Controller::handle)）。
 //!
-//! 这几样仍由拿着 `Inner` 的锁的操作维护，和 `Inner` 自己的状态一起改：总是先拿 `Inner` 的锁、再拿这一把。
-//! 拿着这一把时不读写存储、不读写文件，只拿这一把的一方因此最多等一小会儿。
+//! 登记连接、记下查询、切换发布由持有 `Inner` 锁的操作完成，与 `Inner` 自己的状态同时修改：总是先拿 `Inner` 的锁、再拿这一把。
+//! 不持有 `Inner` 锁的一方只取走查询的应答、累加计数，以及在消息无法放入发送队列时去掉连接；连接只在持有 `Inner` 锁时登记，
+//! 所以这里的连接总是 `Inner::live` 中同一序号的连接，或者已被去掉、`live` 中尚未清除（见 [`Switchboard::send`]）。
+//! 持有这一把锁时不读写存储、不读写文件，只拿这一把锁的一方最多等待很短的时间。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -22,9 +24,10 @@ use super::routes::{PendingQuery, Reply};
 
 #[derive(Debug, Default)]
 pub(crate) struct Switchboard {
-    /// 在线节点当前的连接，和 `Inner::live` 同时增删。发送队列只在这里有一份：连接被顶替或者去掉时队列随之关闭，
-    /// 那条连接自己会结束。
+    /// 在线节点当前的连接。发送队列只在这里有一份：连接被顶替或者去掉时队列随之关闭，那条连接随之结束。
     lines: BTreeMap<NodeId, Line>,
+    /// 自上次取走以来是否因消息无法放入发送队列而去掉过连接；不持有 `Inner` 锁时去掉的，`Inner::live` 中可能仍记着在线（见 [`Self::take_lost`]）。
+    lost: bool,
     /// 已经发给节点、还在等回答的查询。
     queries: BTreeMap<u64, PendingQuery>,
     /// 当前发布里已经取到缓存里的包。
@@ -103,8 +106,9 @@ impl Switchboard {
         self.lines.get(&session.node).is_some_and(|line| line.conn == session.conn)
     }
 
-    /// 把一条消息放进节点的发送队列。放不进去（队列满了、连接已经关了）时去掉这条连接：发送队列随之关闭，
-    /// 那条连接自己会结束并记为离线，和断开它一样。
+    /// 将一条消息放入节点的发送队列。无法放入（队列已满、连接已关闭）时去掉这条连接，效果等同于断开：发送队列随之关闭，
+    /// 那条连接随之结束。`Inner::live` 中的记录由持有 `Inner` 锁的一方清除：经 `Inner` 发送时当场清除，
+    /// 不持有 `Inner` 锁时由后台任务清除（见 [`Self::take_lost`]）。
     pub(crate) fn send(&mut self, node: NodeId, message: ToNode) -> Result<(), Undelivered> {
         let line = self.lines.get(&node).ok_or(Undelivered::Offline)?;
         let undelivered = match line.outbox.try_send(message) {
@@ -113,7 +117,14 @@ impl Switchboard {
             Err(TrySendError::Closed(_)) => Undelivered::Closed,
         };
         self.disconnect(node);
+        self.lost = true;
         Err(undelivered)
+    }
+
+    /// 自上次调用以来是否因消息无法放入发送队列而去掉过连接。不持有 `Inner` 锁的一方据此唤醒后台任务，
+    /// 由它将这些节点记为离线（`Inner::drop_lost_sessions`）。
+    pub(crate) fn take_lost(&mut self) -> bool {
+        std::mem::take(&mut self.lost)
     }
 
     /// 把一份 netmap 放进节点的发送队列，并记下里面写着的对端：转发信令时，两个节点都收到了写着对方的 netmap 才转。
@@ -132,7 +143,10 @@ impl Switchboard {
         self.lines.get(&node).map(|line| &line.peers)
     }
 
-    /// 把 `session` 的节点发来的一条信令转给 `to`。只在两个节点互为对端时转，否则丢掉：信令不能用来探测或打扰看不见的节点。
+    /// 将 `session` 对应节点发来的信令转发给 `to`。仅当两个节点互为对端时转发，否则丢弃：信令不得用于探测或打扰不可见的节点。
+    ///
+    /// 「互为对端」指两个节点当前的连接都已放入写着对方的 netmap。节点重连报到、新的 netmap 尚未放入队列期间（包括其间的存储读写），
+    /// 发给它的信令会被丢弃；netmap 无法写入存储期间，按此前放入队列的 netmap 判断。
     pub(crate) fn signal(&mut self, session: Admitted, to: NodeId, signal: Signal) {
         let from = session.node;
         let knows = |node: NodeId, peer: NodeId| self.lines.get(&node).is_some_and(|line| line.peers.contains(&peer));
@@ -140,9 +154,9 @@ impl Switchboard {
             tracing::debug!(%from, %to, "丢弃信令：两个节点互不为对端，或者目的节点不在线");
             return;
         }
-        // 信令是尽力而为的。目的节点的队列已经积了一半时不再往里放：
-        // 不能让一个猛发信令的节点把别人的队列塞满，害得它被当成"不读"而断开。
-        // 往队列里放东西都要拿着这把锁，所以看过还空着一半之后，放的时候不会满。
+        // 信令尽力而为。目的节点的队列已积压一半时不再放入：
+        // 不能让频繁发送信令的节点占满其他节点的队列，使其被视为未及时读取而断开。
+        // 放入队列均需持有这把锁，因此确认仍有一半空位之后，放入时不会满。
         if self.lines.get(&to).is_some_and(|line| line.outbox.capacity() * 2 < line.outbox.max_capacity()) {
             tracing::debug!(%from, %to, "丢弃信令：目的节点发送队列积压");
             return;
@@ -152,7 +166,7 @@ impl Switchboard {
         }
     }
 
-    /// 给节点发第 `request` 号查询 `message`，记下谁在等回答。先记下再发：回答可能在这把锁放开之后马上到。
+    /// 向节点发送第 `request` 号查询 `message`，并登记等待应答的一方。先登记再发送：应答可能在这把锁释放之后立即到达。
     pub(super) fn query(&mut self, node: NodeId, request: u64, message: ToNode, reply: Reply) -> Result<(), Undelivered> {
         // 顺带清理调用方已放弃等待的查询：若节点长期不应答，这些条目不会自行移除。
         self.queries.retain(|_, pending| !pending.is_abandoned());
@@ -164,7 +178,7 @@ impl Switchboard {
         sent
     }
 
-    /// `session` 的节点回答了第 `request` 号查询。来源节点或回答的种类和查询对不上时忽略，原来的查询接着等。
+    /// `session` 对应节点应答了第 `request` 号查询。应答节点或应答类型与查询不匹配时忽略，原查询继续等待。
     pub(crate) fn answered(&mut self, session: Admitted, request: u64, answer: Answer) {
         let node = session.node;
         if !self.is_current(session) {

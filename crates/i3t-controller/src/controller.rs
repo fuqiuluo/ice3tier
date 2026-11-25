@@ -503,6 +503,17 @@ impl Controller {
         self.switchboard.lock().expect("switchboard mutex poisoned")
     }
 
+    /// 不拿大锁，在 [`Switchboard`] 上执行 `f`。其间因消息无法放入发送队列而去掉了连接时，唤醒后台任务将这些节点记为离线：
+    /// `Inner::live` 只能在持有大锁时修改（见 `Inner::drop_lost_sessions`）。
+    fn on_switchboard<T>(&self, f: impl FnOnce(&mut Switchboard) -> T) -> T {
+        let mut switchboard = self.switchboard();
+        let value = f(&mut switchboard);
+        if switchboard.take_lost() {
+            self.wake.notify_one();
+        }
+        value
+    }
+
     /// 还没有别人拿着这个 controller 的时候直接改它里面的东西，给 `with_…` 这几个装配用的方法用。
     fn inner_mut(&mut self) -> &mut Inner {
         self.inner.get_mut().expect("controller state mutex poisoned")
@@ -655,6 +666,7 @@ impl Inner {
     /// 退避期间（见 [`Inner::flush_after`]）的每一轮也都不做。它们每写一次存储都要拿着 controller 的锁等满一次超时，
     /// 所有连接和管理请求都被拖住；退避期间不做，是因为排上重试的重算刚叫醒了后台任务，它马上就会再来一轮。
     fn tick_work(&mut self, now: Instant, wall: Timestamp, failures: &mut Failures) -> Option<Instant> {
+        self.drop_lost_sessions();
         self.give_up_on_slow_acks(now);
         let unsettled = failures.keep(self.settle_commits(now));
         let no_udp = self.no_udp_tick(now, failures);

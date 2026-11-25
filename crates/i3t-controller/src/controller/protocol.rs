@@ -117,7 +117,7 @@ impl Controller {
                 Ok(())
             }
             ToController::Signal { to, signal } => {
-                self.switchboard().signal(session, to, signal);
+                self.on_switchboard(|switchboard| switchboard.signal(session, to, signal));
                 Ok(())
             }
             ToController::Heartbeat => Ok(()),
@@ -190,7 +190,7 @@ impl Controller {
     /// 节点要更新包里的一段。包是公开的发布文件，所以只要是已经报到的节点就给，不看它有没有收到过更新指令。
     ///
     /// 不拿 controller 的锁：缓存在哪里、回复放进发送队列都只用到 [`Switchboard`](super::switchboard::Switchboard)，读文件时什么锁都不拿。
-    /// 回复放不进队列（节点不读、连接已关）时断开节点（见 [`Switchboard::send`](super::switchboard::Switchboard::send)）。
+    /// 回复无法放入发送队列（节点未及时读取、连接已关闭）时断开节点（见 [`Switchboard::send`](super::switchboard::Switchboard::send)）。
     fn package_request(&self, session: Admitted, request: u64, version: &Version, platform: &Platform, range: PackageRange) {
         let cached = {
             let switchboard = self.switchboard();
@@ -203,26 +203,28 @@ impl Controller {
             Some((path, size)) => range.read(&path, size),
             None => Err(format!("controller 未缓存 {version} 版本 {platform} 平台的更新包")),
         };
-        let mut switchboard = self.switchboard();
-        if !switchboard.is_current(session) {
-            return;
-        }
-        let reply = match chunk {
+        let (reply, bytes) = match chunk {
             Ok(data) => {
-                switchboard.package_bytes += u64::try_from(data.len()).unwrap_or(u64::MAX);
-                ToNode::PackageChunk { request, data }
+                let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                (ToNode::PackageChunk { request, data }, bytes)
             }
             Err(reason) => {
                 tracing::warn!(node = %session.node, %version, %platform, offset = range.offset, %reason, "无法提供节点请求的更新包片段");
-                ToNode::PackageUnavailable { request, reason }
+                (ToNode::PackageUnavailable { request, reason }, 0)
             }
         };
-        match switchboard.send(session.node, reply) {
-            Ok(()) | Err(Undelivered::Offline) => {}
-            Err(undelivered @ (Undelivered::Full | Undelivered::Closed)) => {
-                tracing::warn!(node = %session.node, reason = undelivered.reason(), "断开节点");
+        self.on_switchboard(|switchboard| {
+            if !switchboard.is_current(session) {
+                return;
             }
-        }
+            match switchboard.send(session.node, reply) {
+                Ok(()) => switchboard.package_bytes += bytes,
+                Err(Undelivered::Offline) => {}
+                Err(undelivered @ (Undelivered::Full | Undelivered::Closed)) => {
+                    tracing::warn!(node = %session.node, reason = undelivered.reason(), "断开节点");
+                }
+            }
+        });
     }
 }
 
