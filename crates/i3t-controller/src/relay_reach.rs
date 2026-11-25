@@ -104,7 +104,7 @@ pub(crate) fn egress_ip(record: &NodeRecord) -> Option<IpAddr> {
 }
 
 /// 互联网上看得到的地址：不是私有、回环、链路本地、运营商级 NAT、组播、未指定的地址。
-fn is_public(ip: IpAddr) -> bool {
+pub(crate) fn is_public(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(ip) => {
             let carrier_nat = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64;
