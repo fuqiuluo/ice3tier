@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use i3t_crypto::tls;
 use i3t_model::control::{MAX_FRAME_LEN, ToController, ToNode};
-use i3t_proto::PublicKey;
+use i3t_proto::{NodeId, PublicKey};
 use tokio::io::{AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -35,7 +35,7 @@ use tokio_rustls::LazyConfigAcceptor;
 use tokio_rustls::server::TlsStream;
 
 use crate::controller::{Admitted, Controller, Waits};
-use crate::error::{Rejection, error_chain};
+use crate::error::{Error, Rejection, error_chain};
 use crate::frame::{FrameError, read_frame, write_frame};
 use crate::gate::{Gate, Limits, Pass, Throttle};
 use crate::server::blocking;
@@ -356,7 +356,7 @@ fn spawn_reader(
                         // 只拿一把很短的锁，不进阻塞线程池：那里可能挤满了等 controller 的锁的任务。
                         Waits::Nothing => {
                             if let Err(err) = controller.handle(session, remote, message) {
-                                tracing::error!(%node, "处理节点的消息时出错：{}", error_chain(&err));
+                                log_handling_error(&controller, node, &err);
                             }
                             continue;
                         }
@@ -399,8 +399,15 @@ async fn handle_queue(controller: &Arc<Controller>, session: Admitted, remote: I
     while let Some(message) = queue.recv().await {
         let handled = blocking(controller, move |controller| controller.handle(session, remote, message)).await;
         if let Err(err) = handled {
-            tracing::error!(node = %session.node, "处理节点的消息时出错：{}", error_chain(&err));
+            log_handling_error(controller, session.node, &err);
         }
+    }
+}
+
+/// 记下处理节点消息时出的错。限速（`Controller::message_error_log`）：数据库连不上时，每个节点的每份上报都会出错。
+fn log_handling_error(controller: &Controller, node: NodeId, err: &Error) {
+    if let Some(suppressed) = controller.message_error_log.allow() {
+        tracing::error!(%node, suppressed, "处理节点的消息时出错：{}", error_chain(err));
     }
 }
 

@@ -78,6 +78,8 @@ const CONTROLLER_KEY_META: &str = "controller_key";
 const COOLDOWN_SECS: u64 = 90 * 24 * 60 * 60;
 /// 拒绝没有注册的公钥、无效的令牌这一类日志多久最多记一条。谁都能拿一把新生成的公钥连上来，不限的话日志会被刷满。
 const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(10);
+/// 处理节点消息出错的日志多久最多记一条，其余的只计数。
+const MESSAGE_ERROR_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// controller 里的几个时间。默认值是协议约定的，测试里会改短。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +142,8 @@ pub struct Controller {
     check_wake: Notify,
     /// 给还没认出来的连接的拒绝日志限速。
     pub(crate) refusal_log: Throttle,
+    /// 给处理节点消息出错的日志限速：数据库连不上时，每个节点的每份上报都会出错。
+    pub(crate) message_error_log: Throttle,
     /// 同一个控制器的节点监听器共用核验配额。重开监听时，旧的阻塞任务仍可能在运行。
     pub(crate) verification_quota: Arc<VerificationQuota>,
 }
@@ -326,6 +330,7 @@ impl Controller {
             release_wake: Notify::new(),
             check_wake: Notify::new(),
             refusal_log: Throttle::new(REFUSAL_LOG_EVERY),
+            message_error_log: Throttle::new(MESSAGE_ERROR_LOG_EVERY),
             verification_quota: VerificationQuota::new(PENDING),
         })
     }
@@ -663,8 +668,8 @@ impl Inner {
     /// 别的工作要它回来的时刻照样算，调用方过一会儿再来（见 [`Failures::into_tick`]）。
     ///
     /// 只有整个数据库都读写不了时（连不上、只读了、盘满了）例外：后面不急的清理、存测试结果、开始矩阵里排着的测试这一轮不做，
-    /// 退避期间（见 [`Inner::flush_after`]）的每一轮也都不做。它们每写一次存储都要拿着 controller 的锁等满一次超时，
-    /// 所有连接和管理请求都被拖住；退避期间不做，是因为排上重试的重算刚叫醒了后台任务，它马上就会再来一轮。
+    /// 退避期间（见 [`Inner::flush_after`]）的每一轮也都不做。这时它们的写入只会失败，还可能拿着 controller 的锁等一次数据库
+    /// （存储层在语句无响应之后暂停，暂停期间立即失败）；退避期间不做，是因为排上重试的重算刚叫醒了后台任务，它马上就会再来一轮。
     fn tick_work(&mut self, now: Instant, wall: Timestamp, failures: &mut Failures) -> Option<Instant> {
         self.drop_lost_sessions();
         self.give_up_on_slow_acks(now);
