@@ -92,7 +92,8 @@ async fn a_direct_test_finds_the_path_measures_every_probe_and_needs_the_peer_to
         let summary = report.summary();
         assert_eq!((summary.sent, summary.answered, summary.loss_permille), (20, 20, 0), "{report:?}");
         assert_eq!((report.peer_received, report.same_path), (Some(20), 20));
-        assert!(summary.min_us <= summary.avg_us && summary.avg_us <= summary.p95_us, "{summary:?}");
+        // 不比较平均值与 p95：20 个样本中只要有一个很慢，平均值就可能高于第 19 个样本。各统计量之间的关系由 diag 的单元测试覆盖。
+        assert!(summary.p95_us.is_some_and(|p95| p95 < 50_000), "回环上的往返 p95 不到 50ms：{summary:?}");
         assert!(summary.avg_us.is_some_and(|avg| avg < 50_000), "回环上的往返不到 50ms：{summary:?}");
         assert!(report.peer_addr.is_some());
 

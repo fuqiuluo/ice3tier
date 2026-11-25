@@ -5,11 +5,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use i3t_model::admin::{CreateEnrollToken, CreateRule, Direction, NetworkId, RelaySettings, UpdateNode};
-use i3t_model::control::{Declared, Hello, PROTOCOL_REVISION, RelayTry, Report, ToController, ToNode, TryOutcome};
+use i3t_model::control::{
+    Declared, Hello, PROTOCOL_REVISION, RelayTry, Report, Route, RouteCause, RouteSwitch, ToController, ToNode, TryOutcome,
+};
 use i3t_proto::NodeId;
 use tokio::sync::mpsc;
 
-use super::super::testing::{CAN_DO_ALL, Lab, Member, hello, logged};
+use super::super::testing::{CAN_DO_ALL, Lab, Member, REMOTE, hello, logged};
 use super::super::{Controller, Failures, Timing};
 use super::ordering::{block_column_of, report_endpoints, two_unconnected};
 use super::{is_woken, relations};
@@ -483,4 +485,24 @@ fn nodes_that_keep_failing_in_a_background_rollout_are_left_to_the_background_lo
     for member in &members[..2] {
         readable(&lab, member.id);
     }
+}
+
+#[test]
+fn a_report_whose_route_switches_cannot_be_recorded_still_records_the_rest() {
+    let mut lab = Lab::new();
+    let network = lab.network("home").id;
+    let (mut a, mut b) = (lab.join(network, &[]), lab.join(network, &[]));
+    lab.settle(&mut [&mut a, &mut b]);
+    lab.controller.lock().store.block("no_switches", "INSERT ON route_switches", None);
+
+    // 换路只记进界面上的历史：无法记录时，同一份上报里的端点仍然记下。
+    let endpoint: SocketAddr = "203.0.113.5:20330".parse().unwrap();
+    let switch =
+        RouteSwitch { peer: b.id, from: Route::None, to: Route::Direct { addr: endpoint }, cause: RouteCause::DirectVerified, age_secs: 0 };
+    let report = Report { endpoints: vec![endpoint], switches: vec![switch], ..Report::default() };
+    let handled = lab.controller.handle(a.session, REMOTE, ToController::Report(Box::new(report)));
+    assert!(handled.is_err(), "换路未记录，仍交回错误");
+    assert_eq!(lab.controller.lock().store.node(a.id).unwrap().unwrap().endpoints, [endpoint], "端点已记录");
+    assert!(lab.controller.lock().store.switches(a.id, b.id).unwrap().is_empty());
+    lab.controller.lock().store.unblock("no_switches", "route_switches");
 }

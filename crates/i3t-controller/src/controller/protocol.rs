@@ -85,7 +85,9 @@ impl Controller {
         };
         self.wake_if_needed(&inner);
         outcome.map_err(|err| {
-            tracing::error!(key = ?key, %remote, "处理节点报到时出错：{}", error_chain(&err));
+            if let Some(suppressed) = self.error_log_allowance(&err) {
+                tracing::error!(key = ?key, %remote, suppressed, "处理节点报到时出错：{}", error_chain(&err));
+            }
             Rejection::Internal
         })
     }
@@ -489,9 +491,21 @@ impl Inner {
         }
         self.routes_reported(id, std::mem::take(&mut report.routes), std::mem::take(&mut report.route_kinds), report.routes_full);
 
-        let Some(mut node) = self.store.node(id)? else { return Ok(()) };
+        let Some(node) = self.store.node(id)? else { return Ok(()) };
         self.stats_reported(&node, &report);
-        self.switches_reported(&node, &report.switches)?;
+        // 换路只记进界面上的历史：无法记录时仍处理这份上报的其余部分（更新进度、relay 探测、端点与挂靠）。其余部分也出错时
+        // 交回其余部分的错误；换路的错误只记在调试日志里，不另记一条错误日志：两者多半出于同一个原因（例如数据库只读）。
+        let switched = self.switches_reported(&node, &report.switches);
+        let applied = self.state_reported(node, report);
+        if let (Err(_), Err(err)) = (&applied, &switched) {
+            tracing::debug!(node = %id, "记录节点上报的换路失败：{}", error_chain(err));
+        }
+        applied.and(switched)
+    }
+
+    /// 记下上报里的状态：代理与转发、更新进度、挂靠与 relay 探测、虚拟网卡、本地地址、端点。`node` 是这个节点在存储里的记录。
+    fn state_reported(&mut self, mut node: NodeRecord, report: Report) -> Result<(), Error> {
+        let id = node.id;
         let Report { run, exit, exits, proxies, listeners, forwards, .. } = report;
         self.usage_reported(&node, UsageReport { run, exit, exits, proxies, listeners, forwards });
         let report = Report { exits: Vec::new(), proxies: Vec::new(), listeners: Vec::new(), forwards: Vec::new(), exit: None, ..report };
@@ -539,14 +553,17 @@ impl Inner {
         Ok(())
     }
 
-    /// 节点报的换路记进历史。只记对端还是这个网络里的节点的；一次最多 [`MAX_REPORTED_SWITCHES`] 条。
+    /// 节点报的换路记进历史。只记对端还是这个网络里的节点的；一次最多 [`MAX_REPORTED_SWITCHES`] 条，一起写入（见 [`Store::insert_switches`]）。
+    ///
+    /// [`Store::insert_switches`]: crate::store::Store::insert_switches
     fn switches_reported(&mut self, node: &NodeRecord, switches: &[RouteSwitch]) -> Result<(), Error> {
         let now = self.clock.now();
+        let mut recorded = Vec::new();
         for switch in switches.iter().take(MAX_REPORTED_SWITCHES) {
             if self.store.node(switch.peer)?.is_none_or(|peer| peer.network != node.network) {
                 continue;
             }
-            self.store.insert_switch(&NewSwitch {
+            recorded.push(NewSwitch {
                 network: node.network,
                 from: node.id,
                 to: switch.peer,
@@ -554,9 +571,9 @@ impl Inner {
                 previous: switch.from.clone(),
                 route: switch.to.clone(),
                 cause: switch.cause.clone(),
-            })?;
+            });
         }
-        Ok(())
+        Ok(self.store.insert_switches(&recorded)?)
     }
 
     /// 将节点上报的 relay 连通性探测结果合并到持久化记录中。若可达性发生变化，则触发本节点及其对端的 netmap 重算，

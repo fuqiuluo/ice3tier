@@ -22,10 +22,10 @@
 //!
 //! 离线的节点什么都不用记：它重新连上来的时候和别的节点一样过一遍这些规矩。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use i3t_model::admin::UpdateWait;
+use i3t_model::admin::{NetworkId, UpdateWait};
 use i3t_model::control::ToNode;
 use i3t_model::update::{FailureKind, Platform, UpdateTiming, Version};
 use i3t_proto::NodeId;
@@ -176,23 +176,40 @@ impl Inner {
     fn roll_out_at(&mut self, now: Instant, failures: &mut Failures) -> Result<(), Error> {
         self.settle_relay_turns(now, failures)?;
 
+        // 按网络一条语句读出全部节点，再按节点编号依次处理在线的：每个在线节点各读一条语句的话，节点重连时每份首次上报都要
+        // 执行在线节点数那么多条，controller 重启后的重连合计执行的语句数按节点数的平方增长（读出的行数仍与网络内的节点数成正比）。
+        // 一个网络无法整体读出（又不是整个数据库的故障）时，这个网络的在线节点逐个读取，单个节点读取失败只跳过它，同上。
+        let networks: BTreeSet<NetworkId> = self.live.values().map(|live| live.network).collect();
+        let mut records = BTreeMap::new();
+        let mut unsure = BTreeSet::new();
+        for network in networks {
+            match self.store.nodes(network) {
+                Ok(nodes) => records.extend(nodes.into_iter().map(|node| (node.id, node))),
+                Err(err) if err.is_database_wide() => return Err(err.into()),
+                Err(_) => {
+                    let members: Vec<NodeId> = self.live.iter().filter(|(_, live)| live.network == network).map(|(id, _)| *id).collect();
+                    for id in members {
+                        match self.store.node(id) {
+                            Ok(Some(node)) => {
+                                records.insert(id, node);
+                            }
+                            Ok(None) => {}
+                            Err(err) if err.is_database_wide() => return Err(err.into()),
+                            Err(err) => {
+                                if self.live.get(&id).is_some_and(|live| live.order.as_ref().is_some_and(|order| !order.failed)) {
+                                    unsure.insert(network);
+                                }
+                                failures.keep(Err::<(), _>(err.into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let online: Vec<NodeId> = self.live.keys().copied().collect();
         let mut wanted = Vec::new();
-        let mut unsure = BTreeSet::new();
         for id in online {
-            let node = match self.store.node(id) {
-                Ok(Some(node)) => node,
-                Ok(None) => continue,
-                Err(err) if err.is_database_wide() => return Err(err.into()),
-                Err(err) => {
-                    let ordered = self.live.get(&id).filter(|live| live.order.as_ref().is_some_and(|order| !order.failed));
-                    if let Some(live) = ordered {
-                        unsure.insert(live.network);
-                    }
-                    failures.keep(Err::<(), _>(err.into()));
-                    continue;
-                }
-            };
+            let Some(node) = records.remove(&id) else { continue };
             let plan = self.plan(&node);
             let current = self.live.get(&id).and_then(|live| live.order.clone());
             match (plan.wanted, plan.available) {
