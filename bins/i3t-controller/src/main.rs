@@ -157,6 +157,7 @@ fn init_logging(default: &str) {
 
 /// 解析数据库连接配置：优先使用 `--database-url`（或对应环境变量），未提供时读取数据目录中的 [`DATABASE_URL_FILE`]。
 /// 解析失败时仅报告错误原因而不输出连接串，避免泄露密码。
+/// 连接串指向公网地址时告警：到数据库的连接不加密（见 [`Database`]）。
 fn database(data_dir: &Path, given: Option<&str>) -> anyhow::Result<Database> {
     let t = texts::texts();
     // 空的环境变量当作没有给。
@@ -173,7 +174,16 @@ fn database(data_dir: &Path, given: Option<&str>) -> anyhow::Result<Database> {
             }
         }
     };
-    text.parse().map_err(|error| anyhow::Error::new(error).context(t.read_database_url))
+    let database: Database = text.parse().map_err(|error| anyhow::Error::new(error).context(t.read_database_url))?;
+    let public = database.public_addrs();
+    if !public.is_empty() {
+        tracing::warn!(
+            database = ?public,
+            "数据库位于公网地址：到数据库的连接既不加密也不验证对端，链路上的第三方可读取、篡改 controller 的数据，\
+             并可冒充数据库获取其密码。应将数据库部署在本机或可信内网中"
+        );
+    }
+    Ok(database)
 }
 
 /// 重新生成管理令牌，打在标准输出上。不需要对外地址，也不会在写错的目录或者空的库里建出一个新的 controller。
