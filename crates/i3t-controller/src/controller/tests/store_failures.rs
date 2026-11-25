@@ -404,6 +404,8 @@ fn a_database_that_does_not_answer_is_waited_for_once_to_find_who_has_no_udp() {
     drop(inner);
 
     other.execute_batch("ROLLBACK");
+    // 没等到回答之后，存储暂停一小段再重连。
+    std::thread::sleep(crate::store::RECONNECT_PAUSE.0);
     lab.controller.lock().no_udp_tick(Instant::now(), &mut Failures::default());
     assert!(lab.controller.lock().no_udp_dirty.is_empty());
 }

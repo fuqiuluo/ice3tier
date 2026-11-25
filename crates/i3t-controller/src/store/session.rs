@@ -42,6 +42,15 @@ pub(super) type Params<'a> = &'a [&'a (dyn ToSql + Sync)];
 /// 超时后视为该连接已失效，后续将建立新连接替换。
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// 连接串、角色或数据库没有设置时，数据库执行一条语句的服务端期限（`statement_timeout`）。
+///
+/// 长于 [`RESPONSE_TIMEOUT`]：等不到回答时这边先放弃、丢掉连接，数据库却要等语句执行完才发现连接没了，这期间语句照样占着锁和
+/// 连接名额。有了这个期限，数据库最晚在此时取消它。不能短于等回答的期限：那样执行慢的语句会以单条语句的错误（57014）返回，
+/// 不再算作整个数据库的故障，读写一个接一个地照样等下去（见 [`Store`](super::Store) 的「等多久」）。
+pub const STATEMENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+const _: () = assert!(RESPONSE_TIMEOUT.as_millis() < STATEMENT_TIMEOUT.as_millis(), "语句的服务端期限须长于等回答的期限");
+
 /// 连接串未指定超时时，连接单个地址的默认超时时长。
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -63,6 +72,15 @@ pub(super) fn connect_limit(config: &Config) -> Duration {
 /// 设置等锁期限的语句：其他连接持有锁时最多等待 `timeout`，超时则该语句失败。
 pub(super) fn lock_timeout_sql(timeout: Duration) -> String {
     format!("SET lock_timeout = {}", timeout.as_millis().max(1))
+}
+
+/// 把这条连接上语句的服务端期限设为 [`STATEMENT_TIMEOUT`]，仅当它仍是 PostgreSQL 的默认值时：连接串（`options`）、
+/// 角色或数据库上已经设置的（包括明确设为 0 的）保留不改。
+pub(super) fn statement_timeout_sql() -> String {
+    format!(
+        "SELECT set_config('statement_timeout', '{}', false) FROM pg_settings WHERE name = 'statement_timeout' AND source = 'default'",
+        STATEMENT_TIMEOUT.as_millis()
+    )
 }
 
 pub(super) struct Session {
