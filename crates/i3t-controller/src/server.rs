@@ -84,8 +84,9 @@ impl Server {
     /// 在线的节点被记为离线，它们会自己重连。
     ///
     /// 返回时阻塞线程上可能仍有未完成的调用：后台的发布源检查与更新包下载、对外地址的 DNS 查询（这两项仅在
-    /// `follow_releases` 时存在），管理 API 触发的发布源检查，以及数据库无响应时等待中的读写。其中发布源检查与下载
-    /// 可能持续数分钟。关闭运行时应设定等待期限（`Runtime::shutdown_timeout`），直接 drop 运行时会一直等到它们结束。
+    /// `follow_releases` 时存在），管理 API 触发的发布源检查，以及数据库无响应时等待中的读写。其中发布源检查最长约
+    /// 1 分钟，更新包下载可能持续数分钟。关闭运行时应设定等待期限（`Runtime::shutdown_timeout`），直接 drop 运行时会
+    /// 一直等到它们结束。
     ///
     /// # Errors
     ///
@@ -250,7 +251,7 @@ const PUBLIC_HOST_REFRESH: Duration = Duration::from_secs(10 * 60);
 ///
 /// 查和取都要走网络，在阻塞线程上做，期间不拿 controller 的锁。失败了只记日志：原因在管理 API 里看得到，下一轮再试。
 /// 两项任务彼此独立：发布源不可达时单次检查需等待超时，不能因此阻塞更新包下载（管理员可能已将发布源修改为可达地址）。
-async fn follow_releases(controller: Arc<Controller>, mut shutdown: watch::Receiver<bool>) {
+pub(crate) async fn follow_releases(controller: Arc<Controller>, mut shutdown: watch::Receiver<bool>) {
     let checks = async {
         let mut next_check = tokio::time::Instant::now();
         loop {
@@ -268,7 +269,7 @@ async fn follow_releases(controller: Arc<Controller>, mut shutdown: watch::Recei
     };
     let fetches = async {
         loop {
-            // 每次只在阻塞线程上取一个包：停服时本任务在两个包之间被取消，不再开始下一个平台的下载。
+            // 每次只在阻塞线程上取一个包：停服时本任务被取消，进行中的下载继续，不再开始下一个平台的下载。
             loop {
                 match blocking(&controller, Controller::fetch_next_package).await {
                     Ok(true) => {}
@@ -283,9 +284,11 @@ async fn follow_releases(controller: Arc<Controller>, mut shutdown: watch::Recei
         }
     };
     tokio::select! {
+        // 先检查停服信号：一个包下载完成与停服信号同时到达时，不再开始下一个平台的下载。
+        biased;
+        _ = shutdown.changed() => {}
         () = checks => {}
         () = fetches => {}
-        _ = shutdown.changed() => {}
     }
 }
 
