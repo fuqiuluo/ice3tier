@@ -669,7 +669,7 @@ impl OpenTransaction<'_> {
         if self.0.transaction.get() == Transaction::Failed {
             return Err(StoreError::Aborted);
         }
-        // 先记下这个事务的编号：提交的回答要是回不来，过后凭它问得出事务算了数没有。什么都没改过的事务没有编号。
+        // 先记录事务编号：提交的响应未能返回时，可凭它事后查询事务是否已生效。未做任何修改的事务没有编号。
         let transaction: Option<String> =
             self.0.run(|session| Ok(session.query_one("SELECT pg_current_xact_id_if_assigned()::text", &[])?.try_get(0)?))?;
         match self.0.on_session(|session| session.batch("COMMIT")) {
@@ -682,7 +682,7 @@ impl OpenTransaction<'_> {
             // 提交请求已发出、未收到响应：数据库侧可能已经提交。
             Err(error) => {
                 self.0.transaction.set(Transaction::None);
-                // 什么都没改过的事务算不算数都一样，没有要过后去问的。
+                // 未做任何修改的事务无论是否生效结果均相同，无需事后查询。
                 if let Some(transaction) = transaction {
                     self.0.unsettled.borrow_mut().push(transaction);
                     if let Some(wake) = &self.0.unsettled_wake {
@@ -1789,13 +1789,16 @@ mod tests {
         if let Some(user) = proxied.0.get_user() {
             config.user(user);
         }
+        if let Some(password) = proxied.0.get_password() {
+            config.password(password);
+        }
         if let Some(dbname) = proxied.0.get_dbname() {
             config.dbname(dbname);
         }
         if let Some(options) = proxied.0.get_options() {
             config.options(options);
         }
-        let store = Store::open(&Database(config)).expect("::1 不通，换 127.0.0.1 连上：每个地址各有一份期限");
+        let store = Store::open(&Database(config)).expect("::1 无法连接时应改连 127.0.0.1：每个地址各有一份期限");
         store.set_meta("k", b"v").unwrap();
     }
 
@@ -1920,11 +1923,11 @@ mod tests {
         let error = Store::open(&database).err().expect("这个端口上没有数据库");
         assert!(matches!(error, StoreError::Connect(_)), "去连了，而不是说连接串读不懂：{error:?}");
 
-        // 建连的期限按将要尝试的地址给：写了地址的主机各一个，只写名字的按解析出的地址数计。
+        // 建连期限按将要尝试的地址数分配：写了地址的主机各一个，只写名字的按解析出的地址数计。
         let addresses = |text: &str| {
             let config = text.parse::<Database>().unwrap().0;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            runtime.block_on(session::addresses(&config))
+            runtime.block_on(session::addresses(&config)).addresses
         };
         assert_eq!(addresses("hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), 2);
         assert_eq!(addresses("host=a.example,b.example hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3"), 2);
@@ -1936,6 +1939,14 @@ mod tests {
         let config = "hostaddr=192.0.2.1,192.0.2.2 user=i3t connect_timeout=3".parse::<Database>().unwrap().0;
         assert_eq!(session::connect_limit(&config, 2), Duration::from_secs(6));
         assert_eq!(session::connect_limit(&config, 0), Duration::from_secs(3), "至少一份");
+    }
+
+    #[test]
+    fn a_huge_connect_timeout_means_no_time_limit() {
+        // 期限算不出时刻：不设期限，照常去连（这个端口上没有数据库，立即被拒绝），驱动线程不因此崩溃。
+        let database: Database = "hostaddr=127.0.0.1 port=1 user=i3t connect_timeout=9223372036854775807".parse().unwrap();
+        let error = Store::open(&database).err().expect("这个端口上没有数据库");
+        assert!(matches!(error, StoreError::Connect(_)), "{error:?}");
     }
 
     #[test]

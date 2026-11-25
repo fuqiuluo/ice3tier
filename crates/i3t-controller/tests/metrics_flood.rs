@@ -25,11 +25,11 @@ fn threads() -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metrics_requests_from_clients_that_hang_up_do_not_pile_up_in_the_blocking_pool() {
-    /// 发出请求后断开的客户端个数，多于每个来源的连接名额（32）：被挤掉的连接同样留下过请求。
+    /// 发出请求后断开的客户端个数。
     const CLIENTS: usize = 40;
     let running = Running::start(fast_timing()).await;
 
-    // controller 卡在锁上：每一次 /metrics 的计算都要等它。不限制的话，每个已经交给阻塞线程池的计算各占一条线程等着。
+    // controller 卡在锁上：每一次 /metrics 的计算都要等它。若不加限制，每个已经交给阻塞线程池的计算各占用一条阻塞线程等待。
     let controller = Arc::clone(&running.controller);
     let (held, holding) = oneshot::channel();
     let (release, released) = std::sync::mpsc::channel::<()>();
@@ -41,21 +41,19 @@ async fn metrics_requests_from_clients_that_hang_up_do_not_pile_up_in_the_blocki
     holding.await.unwrap();
 
     let before = threads();
-    let mut clients = Vec::new();
+    // 客户端逐个发出请求、等它开始处理，再断开。名额若不随计算一起交给阻塞线程池，断开时名额即被归还，下一个请求又能交出一次计算。
     for _ in 0..CLIENTS {
         let mut stream = TcpStream::connect(running.admin_addr).await.unwrap();
         stream.write_all(b"GET /metrics HTTP/1.1\r\nhost: controller\r\n\r\n").await.unwrap();
-        clients.push(stream);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(stream);
     }
-    // 等请求都开始处理，再全部断开。
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    drop(clients);
     tokio::time::sleep(Duration::from_millis(300)).await;
     let grown = threads().saturating_sub(before);
 
     release.send(()).unwrap();
     stuck.await.unwrap();
-    assert!(grown < 10, "{CLIENTS} 个发完请求就断开的客户端让阻塞线程增加了 {grown} 条：计算应当同一时刻只有一次");
+    assert!(grown < 10, "{CLIENTS} 个发出请求后即断开的客户端使阻塞线程增加了 {grown} 条：同一时刻应当只有一次计算");
 
     // 放开之后照常回答。
     let answered = metrics_status_line(&running).await;

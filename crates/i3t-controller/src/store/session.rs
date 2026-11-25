@@ -56,7 +56,7 @@ const _: () = assert!(RESPONSE_TIMEOUT.as_millis() < STATEMENT_TIMEOUT.as_millis
 /// 连接串未指定超时时，连接单个地址的默认超时时长。
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 等待驱动线程交回连接时在建连期限（[`connect_limit`]）基础上额外预留的余量：正常情况下驱动线程会在超时到达时自行报告连接失败。
+/// 等待驱动线程交回连接时，在建连期限的上限与初始设置的期限之外额外预留的余量：正常情况下驱动线程会在超时到达时自行报告连接失败。
 const HANDOVER_MARGIN: Duration = Duration::from_secs(5);
 
 /// 一个主机名最多按这么多个地址分配建连期限。常见的是一个 IPv4 地址加一个 IPv6 地址；解析出更多地址时，超出部分不再分配期限。
@@ -72,8 +72,8 @@ const GOODBYE: Duration = Duration::from_secs(1);
 /// 丢弃连接请求的地址（例如主机名同时有 IPv6 和 IPv4 地址，而 IPv6 不通）就会用完全部期限，后面可用的地址无法得到尝试。
 /// 端口连上之后不再响应的地址仍会一直占用期限，`tokio-postgres` 不会换下一个地址。
 ///
-/// 地址个数由驱动线程先解析一次得出（[`addresses`]），期限从开始解析时算起：解析无响应时总耗时不会因此加倍。
-/// `tokio-postgres` 建连时还会再解析一次，主机名的解析因此多一次往返。
+/// 地址个数由驱动线程先解析一次得出（[`addresses`]）。`tokio-postgres` 建连时还会再解析一次：先行解析成功所用的时间另外加到期限上，
+/// 解析慢的主机名不会因为解析了两次而超出期限；解析无响应时不加，总耗时不会因此加倍。
 pub(super) fn connect_limit(config: &Config, addresses: u32) -> Duration {
     per_address(config).saturating_mul(addresses.max(1))
 }
@@ -89,27 +89,41 @@ fn hosts(config: &Config) -> u32 {
     u32::try_from(hosts).unwrap_or(u32::MAX).max(1)
 }
 
+/// 先行解析的结果（[`addresses`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Resolved {
+    /// 建连时 `tokio-postgres` 将依次尝试的地址个数，至少为 1。
+    pub(super) addresses: u32,
+    /// 解析成功的那几次一共用了多久。
+    pub(super) took: Duration,
+}
+
 /// 建连时 `tokio-postgres` 将依次尝试的地址个数，与它选择地址的方式相同：写了 `hostaddr` 的主机和 Unix 套接字各一个，
 /// 主机名按解析出的地址数计，每个至多 [`MAX_ADDRESSES_PER_HOST`] 个。每次解析最多等待一个地址的期限；解析失败或超时的主机
 /// 按一个计（`tokio-postgres` 同样会解析它并报告失败）。
-pub(super) async fn addresses(config: &Config) -> u32 {
+pub(super) async fn addresses(config: &Config) -> Resolved {
     let each = per_address(config);
     let (names, addresses, ports) = (config.get_hosts(), config.get_hostaddrs(), config.get_ports());
-    let mut total: u32 = 0;
+    let mut resolved = Resolved { addresses: 0, took: Duration::ZERO };
     for index in 0..names.len().max(addresses.len()) {
         let count = match (addresses.get(index), names.get(index)) {
             (None, Some(Host::Tcp(name))) => {
                 let port = ports.get(index).or_else(|| ports.first()).copied().unwrap_or(DEFAULT_PORT);
+                let began = std::time::Instant::now();
                 match tokio::time::timeout(each, tokio::net::lookup_host((name.as_str(), port))).await {
-                    Ok(Ok(found)) => u32::try_from(found.count()).unwrap_or(u32::MAX).clamp(1, MAX_ADDRESSES_PER_HOST),
+                    Ok(Ok(found)) => {
+                        resolved.took = resolved.took.saturating_add(began.elapsed());
+                        u32::try_from(found.count()).unwrap_or(u32::MAX).clamp(1, MAX_ADDRESSES_PER_HOST)
+                    }
                     Ok(Err(_)) | Err(_) => 1,
                 }
             }
             _ => 1,
         };
-        total = total.saturating_add(count);
+        resolved.addresses = resolved.addresses.saturating_add(count);
     }
-    total.max(1)
+    resolved.addresses = resolved.addresses.max(1);
+    resolved
 }
 
 /// 连接串未指定端口时 PostgreSQL 的端口。
@@ -189,7 +203,7 @@ impl Session {
     /// 在驱动线程上开始连接数据库，不等待结果。连上之后先在驱动线程上执行 `setup`（初始设置，如等锁期限），
     /// 执行成功才交出连接：初始设置无响应时，同样只占用驱动线程。
     pub(super) fn start(config: &Config, setup: Option<String>) -> Result<Connecting, StoreError> {
-        // 驱动线程先解析地址（每个主机至多一个地址的期限），再按地址数确定建连期限（至多每个主机 `MAX_ADDRESSES_PER_HOST` 份）。
+        // 驱动线程最晚在建连期限的上限（每个主机 `MAX_ADDRESSES_PER_HOST` 份）加上先行解析成功所用的时间（至多每个主机一份）之后结束。
         let longest = per_address(config).saturating_mul(hosts(config)).saturating_mul(MAX_ADDRESSES_PER_HOST + 1);
         let (sender, receiver) = mpsc::channel();
         let (in_use, dropped) = oneshot::channel();
@@ -206,9 +220,15 @@ impl Session {
             };
             runtime.block_on(async move {
                 let began = tokio::time::Instant::now();
-                let limit = connect_limit(&config, addresses(&config).await);
-                // 到了期限就丢掉这次建连：套接字随之关掉，这条线程退出。
-                let failed = match tokio::time::timeout_at(began + limit, config.connect(NoTls)).await {
+                let resolved = addresses(&config).await;
+                let limit = connect_limit(&config, resolved.addresses);
+                // 到了期限就丢掉这次建连：套接字随之关掉，这条线程退出。期限极大、算不出时刻时不设期限。
+                let connecting = config.connect(NoTls);
+                let connected = match began.checked_add(limit.saturating_add(resolved.took)) {
+                    Some(deadline) => tokio::time::timeout_at(deadline, connecting).await,
+                    None => Ok(connecting.await),
+                };
+                let failed = match connected {
                     Ok(Ok((client, connection))) => {
                         let mut connection = pin!(connection);
                         match set_up(&client, connection.as_mut(), setup.as_deref()).await {
